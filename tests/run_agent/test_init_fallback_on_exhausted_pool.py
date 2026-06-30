@@ -100,7 +100,7 @@ def test_init_codex_app_server_does_not_require_provider_api_key():
 
     assert agent.api_mode == "codex_app_server"
     assert agent.client is None
-    assert agent.api_key == ""
+    assert agent.api_key == "no-key-required"
     assert agent.base_url == "https://chatgpt.com/backend-api/codex"
     resolve_client.assert_not_called()
     openai_client.assert_not_called()

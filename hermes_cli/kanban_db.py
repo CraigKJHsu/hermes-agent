@@ -5942,6 +5942,10 @@ def _terminate_reclaimed_worker(
     if kill is None:
         return info
 
+    if not _pid_alive(pid):
+        info["terminated"] = True
+        return info
+
     info["termination_attempted"] = True
     try:
         kill(int(pid), signal.SIGTERM)
