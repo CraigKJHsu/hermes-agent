@@ -2666,6 +2666,32 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if parents:
+                    parent_subs = conn.execute(
+                        """
+                        SELECT DISTINCT platform, chat_id, thread_id, user_id, notifier_profile
+                        FROM kanban_notify_subs
+                        WHERE task_id IN (""" + ",".join("?" * len(parents)) + ")",
+                        parents,
+                    ).fetchall()
+                    for sub in parent_subs:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO kanban_notify_subs
+                                (task_id, platform, chat_id, thread_id, user_id,
+                                 notifier_profile, created_at, last_event_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                            """,
+                            (
+                                task_id,
+                                sub["platform"],
+                                sub["chat_id"],
+                                sub["thread_id"] or "",
+                                sub["user_id"],
+                                sub["notifier_profile"],
+                                now,
+                            ),
+                        )
                 _append_event(
                     conn,
                     task_id,
@@ -5194,6 +5220,37 @@ def decompose_triage_task(
             },
         )
 
+        # Keep the originating user/channel in the loop after fan-out.
+        # A ClawOps or gateway-created root task can block, get unblocked,
+        # decompose into children, and only later wake the root for final
+        # summary. Inheriting the root subscriptions means child terminal
+        # events and the eventual root completion still route back to the
+        # same chat instead of leaving progress only in the kanban DB.
+        root_subs = conn.execute(
+            "SELECT platform, chat_id, thread_id, user_id, notifier_profile "
+            "FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        for sub in root_subs:
+            for cid in child_ids:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO kanban_notify_subs
+                        (task_id, platform, chat_id, thread_id, user_id,
+                         notifier_profile, created_at, last_event_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        cid,
+                        sub["platform"],
+                        sub["chat_id"],
+                        sub["thread_id"] or "",
+                        sub["user_id"],
+                        sub["notifier_profile"],
+                        now,
+                    ),
+                )
+
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
@@ -7657,7 +7714,10 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            toolsets_set = set(_get_platform_tools(cfg, "cli"))
+            if "browser" in toolsets_set:
+                toolsets_set.add("browser-cdp")
+            toolsets = sorted(toolsets_set)
         finally:
             reset_hermes_home_override(token)
         return toolsets or None

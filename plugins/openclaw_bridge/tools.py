@@ -80,6 +80,46 @@ def _blocked_result(task: dict[str, Any] | None, reason: str) -> dict[str, Any]:
     }
 
 
+def _blocked_capability_result(
+    task: dict[str, Any] | None,
+    reason: str,
+    next_action: str,
+) -> dict[str, Any]:
+    result = _blocked_result(task, reason)
+    result["recommended_next_action"] = next_action
+    result["errors"] = ["external_capability_unavailable"]
+    return result
+
+
+def _requires_external_browser_capability(task: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        [
+            str(task.get("objective") or ""),
+            " ".join(str(item) for item in task.get("context_refs") or []),
+            " ".join(str(item) for item in task.get("allowed_tools") or []),
+        ]
+    ).lower()
+    external_targets = ("facebook", "fb marketplace", "marketplace", "社團")
+    external_actions = (
+        "post",
+        "publish",
+        "listing",
+        "join",
+        "inspect",
+        "check",
+        "facebook",
+        "刊登",
+        "發布",
+        "發佈",
+        "貼文",
+        "檢查",
+        "加入",
+    )
+    return any(target in haystack for target in external_targets) and any(
+        action in haystack for action in external_actions
+    )
+
+
 def _default_transport(task: dict[str, Any]) -> dict[str, Any]:
     config = load_openclaw_bridge_config()
     if config is None:
@@ -311,6 +351,12 @@ def delegate_to_openclaw(
     risk = task["risk_level"]
     if task["requires_confirmation"] or risk in {"high", "critical"}:
         return _blocked_result(task, f"Delegated task risk_level={risk} requires approval.")
+    if _requires_external_browser_capability(task):
+        return _blocked_capability_result(
+            task,
+            "Facebook/external browser work cannot be delegated to the OpenClaw dry-run bridge.",
+            "Route this task to a browser-capable executor with explicit audit evidence.",
+        )
 
     policy = load_tool_policy(policy_path)
     for action in task["allowed_tools"]:
@@ -326,8 +372,10 @@ def delegate_to_openclaw(
     return validate_delegated_result(result)
 
 
-def handle_openclaw_delegate(args: dict[str, Any]) -> str:
-    return json.dumps(delegate_to_openclaw(args), ensure_ascii=False)
+def handle_openclaw_delegate(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
+    merged_args = dict(args or {})
+    merged_args.update({k: v for k, v in kwargs.items() if v is not None})
+    return json.dumps(delegate_to_openclaw(merged_args), ensure_ascii=False)
 
 
 def _objective_from_raw_args(raw_args: str) -> str:
@@ -440,4 +488,64 @@ def pre_gateway_dispatch(*, event: Any, **_kwargs: Any) -> dict[str, str] | None
         rest = rest.strip() or "ClawOps runtime task"
         return {"action": "rewrite", "text": f"/clawops {rest}"}
 
+    if _should_route_external_browser_work_to_clawops(text):
+        return {"action": "rewrite", "text": f"/clawops {text}"}
+
     return None
+
+
+def _should_route_external_browser_work_to_clawops(text: str) -> bool:
+    """Conservatively route real external browser work away from Hermes."""
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    # Keep explanatory questions with Hermes.  They may mention Facebook and
+    # posting without asking for browser execution.
+    explanation_markers = (
+        "說明",
+        "為何",
+        "為什麼",
+        "怎麼",
+        "如何",
+        "風險",
+        "建議",
+        "解釋",
+        "what is",
+        "why",
+        "how ",
+    )
+    if any(marker in lowered for marker in explanation_markers):
+        return False
+
+    external_targets = (
+        "facebook",
+        "fb marketplace",
+        "marketplace",
+        "社團",
+        "交流團",
+        "group",
+        "商品表單",
+    )
+    execution_actions = (
+        "繼續",
+        "執行",
+        "刊登",
+        "發布",
+        "發佈",
+        "貼文",
+        "上傳",
+        "照片",
+        "點 next",
+        "next",
+        "檢查",
+        "核對",
+        "只讀",
+        "post",
+        "publish",
+        "submit",
+        "upload",
+        "join",
+    )
+    return any(target in lowered for target in external_targets) and any(
+        action in lowered for action in execution_actions
+    )
