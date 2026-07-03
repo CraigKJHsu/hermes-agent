@@ -63,6 +63,45 @@ def test_high_risk_task_stops_at_approval_gate():
     assert "approval" in result["recommended_next_action"].lower()
 
 
+def test_critical_risk_task_stops_at_approval_gate():
+    from plugins.openclaw_bridge.tools import delegate_to_openclaw
+
+    result = delegate_to_openclaw(
+        {
+            "objective": "Rotate production credentials",
+            "risk_level": "critical",
+            "allowed_tools": ["credentials"],
+            "requested_by": "hermes",
+        },
+        transport=lambda _task: {"status": "succeeded"},
+    )
+
+    assert result["status"] == "blocked"
+    assert result["requires_human_review"] is True
+    assert "risk_level=critical" in result["summary"]
+
+
+def test_requires_confirmation_stops_before_transport():
+    from plugins.openclaw_bridge.tools import delegate_to_openclaw
+
+    def fail_transport(_task):
+        raise AssertionError("requires_confirmation tasks must not reach OpenClaw")
+
+    result = delegate_to_openclaw(
+        {
+            "objective": "Send a Telegram message",
+            "risk_level": "low",
+            "requires_confirmation": True,
+            "allowed_tools": ["telegram.send"],
+            "requested_by": "hermes",
+        },
+        transport=fail_transport,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["requires_human_review"] is True
+
+
 def test_low_risk_task_builds_valid_delegated_task_and_uses_transport():
     from plugins.openclaw_bridge.tools import delegate_to_openclaw
 
@@ -97,6 +136,59 @@ def test_low_risk_task_builds_valid_delegated_task_and_uses_transport():
     assert len(seen) == 1
     assert seen[0]["objective"] == "Read status"
     assert seen[0]["requires_confirmation"] is False
+
+
+def test_external_facebook_work_is_not_sent_to_dry_run_bridge():
+    from plugins.openclaw_bridge.tools import delegate_to_openclaw
+
+    def fail_transport(_task):
+        raise AssertionError("dry-run bridge must not receive real Facebook work")
+
+    result = delegate_to_openclaw(
+        {
+            "objective": "檢查 Facebook 20 個社團，可刊登就實際刊登貼文",
+            "risk_level": "low",
+            "allowed_tools": ["status_check"],
+            "requested_by": "hermes",
+            "context_refs": ["kanban:t_16d6dfe3"],
+        },
+        transport=fail_transport,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["requires_human_review"] is True
+    assert "Facebook" in result["summary"]
+    assert "browser-capable executor" in result["recommended_next_action"]
+
+
+def test_openclaw_delegate_handler_accepts_registry_keyword_args(monkeypatch):
+    import json
+
+    from plugins.openclaw_bridge import tools
+
+    def fake_delegate(args):
+        return {
+            "task_id": args["task_id"],
+            "status": "succeeded",
+            "summary": args["objective"],
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "none",
+        }
+
+    monkeypatch.setattr(tools, "delegate_to_openclaw", fake_delegate)
+
+    output = tools.handle_openclaw_delegate(
+        {"objective": "Check Facebook status"},
+        task_id="kanban-t-1",
+    )
+
+    result = json.loads(output)
+    assert result["task_id"] == "kanban-t-1"
+    assert result["summary"] == "Check Facebook status"
 
 
 def test_plugin_registers_tool_command_and_gateway_hook():
@@ -139,6 +231,33 @@ def test_pre_gateway_dispatch_routes_clawops_requests_to_runtime_queue():
         "action": "rewrite",
         "text": "/clawops check queue callback",
     }
+
+
+def test_pre_gateway_dispatch_routes_facebook_publish_work_to_clawops():
+    from types import SimpleNamespace
+
+    from plugins.openclaw_bridge.tools import pre_gateway_dispatch
+
+    event = SimpleNamespace(text="請繼續 #7 咖啡器材新舊交流團的刊登流程，只允許點 Next，不要送出")
+    assert pre_gateway_dispatch(event=event) == {
+        "action": "rewrite",
+        "text": "/clawops 請繼續 #7 咖啡器材新舊交流團的刊登流程，只允許點 Next，不要送出",
+    }
+
+    upload = SimpleNamespace(text="Facebook 社團商品表單照片上傳後檢查 Next 是否解除鎖定")
+    assert pre_gateway_dispatch(event=upload) == {
+        "action": "rewrite",
+        "text": "/clawops Facebook 社團商品表單照片上傳後檢查 Next 是否解除鎖定",
+    }
+
+
+def test_pre_gateway_dispatch_does_not_route_facebook_explanation_to_clawops():
+    from types import SimpleNamespace
+
+    from plugins.openclaw_bridge.tools import pre_gateway_dispatch
+
+    event = SimpleNamespace(text="請說明 Facebook 社團刊登有哪些風險")
+    assert pre_gateway_dispatch(event=event) is None
 
 
 def test_pre_gateway_dispatch_keeps_openclaw_requests_as_bridge_preview():
@@ -267,6 +386,40 @@ def test_low_risk_task_posts_to_openclaw_bridge_when_configured(monkeypatch):
     assert seen["payload"]["dryRun"] is True
     assert seen["payload"]["requestedBy"] == "hermes"
     assert seen["payload"]["input"]["objective"] == "Ask team for status"
+
+
+def test_openclaw_payload_contract_forces_dry_run_and_fixed_route():
+    from urllib.parse import urljoin
+
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "contract-1",
+            "objective": "Check bridge status",
+            "risk_level": "low",
+            "allowed_tools": ["status_check"],
+            "requested_by": "hermes",
+            "context_refs": ["telegram:test"],
+            "output_format": "markdown",
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    payload = tools._openclaw_payload(task, config)
+
+    assert urljoin(config.base_url + "/", tools.DEFAULT_OPENCLAW_BRIDGE_PATH.lstrip("/")) == (
+        "http://127.0.0.1:18789/api/plugins/hermes-bridge/tasks"
+    )
+    assert payload["taskId"] == "agents.ask_team"
+    assert payload["dryRun"] is True
+    assert payload["allowedTools"] == ["status_check"]
+    assert payload["requiresConfirmation"] is False
+    assert payload["idempotencyKey"] == "contract-1"
 
 
 def test_openclaw_bridge_config_can_read_tokens_from_env_file(monkeypatch, tmp_path):
