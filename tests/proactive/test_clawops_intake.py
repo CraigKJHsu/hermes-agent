@@ -138,7 +138,9 @@ def test_facebook_clawops_task_declares_browser_upload_capabilities(tmp_path, mo
     assert "Post/Publish/Submit" in row.body
     assert "stop before Post/Publish/Submit" in row.body
     assert "Approved-copy auto-publish" not in row.body
-    assert "Hermes must not perform this browser UI work directly" in row.body
+    assert "browser-capable Hermes/ClawOps runtime" in row.body
+    assert "Do not route this task through the OpenClaw dry-run bridge" in row.body
+    assert "Hermes must not perform this browser UI work directly" not in row.body
 
 
 def test_facebook_preapproved_copy_task_allows_auto_publish(tmp_path, monkeypatch):
@@ -218,11 +220,40 @@ def test_natural_language_secondhand_facebook_publish_routes_to_browser_worker(
     assert "browser_upload_files" in row.body
 
 
+def test_natural_language_secondhand_posting_status_routes_to_browser_ops_worker(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    task = create_clawops_task(
+        "請列出目前已經有刊登的所有社團群組清單，並顯示相關的狀態",
+        source={"platform": "telegram", "chat_id": "chat-1"},
+    )
+
+    with kb.connect_closing(db_path) as conn:
+        row = kb.get_task(conn, task.task_id)
+
+    assert row is not None
+    assert row.assignee == "clawops-browser"
+    assert "project: secondhand_commerce" in row.body
+    assert "task_type: browser_ops" in row.body
+    assert "assigned_agent: secondhand_commerce" in row.body
+    assert "assigned_worker: clawops.browser" in row.body
+    assert "runtime_profile: clawops-browser" in row.body
+    assert "browser-capable Hermes/ClawOps runtime" in row.body
+    assert "ClawOps/OpenClaw may execute only delegated work" not in row.body
+    assert "Do not route this task through the OpenClaw dry-run bridge" in row.body
+    assert "Hermes must not perform this browser UI work directly" not in row.body
+
+
 def test_infer_clawops_metadata_covers_known_project_agents():
     cases = [
         ("請規劃 Hahow 課程大綱", "hahow_course", "course_design"),
         ("請規劃課程招生行銷活動", "course_marketing", "campaign"),
         ("二手咖啡機 Facebook 社團發佈", "secondhand_commerce", "browser_publish"),
+        ("請列出目前已經有刊登的所有社團群組清單，並顯示狀態", "secondhand_commerce", "browser_ops"),
         ("ingrids SEO 內容規劃", "ingrids_marketing", "product_marketing"),
         ("修正 OpenClaw bridge health check", "hub_ops", "devops"),
     ]

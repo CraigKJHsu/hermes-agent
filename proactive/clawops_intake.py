@@ -46,6 +46,9 @@ EXTERNAL_BROWSER_ACTION_TERMS = (
     "檢查",
     "核對",
     "只讀",
+    "列出",
+    "清單",
+    "狀態",
 )
 AUTO_PUBLISH_APPROVAL_TERMS = (
     "已確認",
@@ -204,7 +207,7 @@ def _body_from_objective(
     publish_preapproved = auto_publish_preapproved(objective, source=source)
     execution_owner = (
         "Browser-capable Hermes/ClawOps runtime may execute only the delegated browser work in this queued task."
-        if needs_external_browser and publish_preapproved
+        if needs_external_browser
         else "ClawOps/OpenClaw may execute only delegated work in this queued task."
     )
     lines = [
@@ -276,7 +279,7 @@ def infer_clawops_metadata(
 
 
 def _infer_project(haystack: str) -> str:
-    if any(term in haystack for term in ("二手", "secondhand", "咖啡機", "facebook", "marketplace", "社團", "商品")):
+    if any(term in haystack for term in ("二手", "secondhand", "咖啡機", "咖啡器材", "facebook", "marketplace", "社團", "群組", "交流團", "商品")):
         return "secondhand_commerce"
     if any(term in haystack for term in ("hahow", "課綱", "課程大綱", "課程設計", "proposal")):
         return "hahow_course"
@@ -291,6 +294,8 @@ def _infer_project(haystack: str) -> str:
 
 def _infer_task_type(haystack: str, project: str) -> str:
     if requires_external_browser_capabilities(haystack):
+        if any(term in haystack for term in ("列出", "清單", "狀態", "已經有刊登", "已刊登", "目前刊登")):
+            return "browser_ops"
         return "browser_publish" if any(term in haystack for term in ("發佈", "發布", "刊登", "post", "publish", "listing")) else "browser_ops"
     if any(term in haystack for term in ("health", "bridge", "runtime", "修正", "fix", "deploy", "部署")):
         return "devops"
@@ -373,8 +378,8 @@ def _external_browser_capability_contract_for(
         ]
     else:
         execution_boundary = [
-            "- This task must be executed by ClawOps/OpenClaw, not by Hermes directly.",
-            "- Hermes must not perform this browser UI work directly; Hermes only owns intake, approvals, monitoring, and final user-facing summary.",
+            "- This task must be executed by the browser-capable Hermes/ClawOps runtime with audit evidence.",
+            "- Do not route this task through the OpenClaw dry-run bridge; that bridge cannot execute Facebook/external browser side effects.",
         ]
 
     return [
