@@ -248,12 +248,103 @@ def test_natural_language_secondhand_posting_status_routes_to_browser_ops_worker
     assert "Hermes must not perform this browser UI work directly" not in row.body
 
 
+def test_secondhand_image_generation_routes_to_content_worker(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    task = create_clawops_task(
+        "二手望遠鏡拍賣：請生成圖片素材與商品圖草稿，讓我確認後再使用",
+        source={"platform": "telegram", "chat_id": "chat-1"},
+    )
+
+    with kb.connect_closing(db_path) as conn:
+        row = kb.get_task(conn, task.task_id)
+
+    assert row is not None
+    assert row.assignee == "clawops-content"
+    assert "project: secondhand_commerce" in row.body
+    assert "task_type: content_draft" in row.body
+    assert "assigned_agent: content_creator" in row.body
+    assert "assigned_worker: clawops.content" in row.body
+    assert "runtime_profile: clawops-content" in row.body
+    assert "Required capabilities: image_generate" in row.body
+    assert "OpenClaw" not in row.body
+    assert "Do not route this task through any dry-run bridge" in row.body
+
+
+def test_facebook_listing_image_generation_routes_to_content_before_browser(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    task = create_clawops_task(
+        "我要的是像官方商品圖那種不同角度、同一台 130EQ，適合 Facebook 二手拍賣群組刊登的生成圖",
+        source={"platform": "telegram", "chat_id": "chat-1"},
+    )
+
+    with kb.connect_closing(db_path) as conn:
+        row = kb.get_task(conn, task.task_id)
+
+    assert row is not None
+    assert row.assignee == "clawops-content"
+    assert "project: secondhand_commerce" in row.body
+    assert "task_type: content_draft" in row.body
+    assert "assigned_agent: content_creator" in row.body
+    assert "assigned_worker: clawops.content" in row.body
+    assert "runtime_profile: clawops-content" in row.body
+    assert "Image generation capability contract:" in row.body
+    assert "External browser capability contract:" not in row.body
+
+
+def test_course_marketing_image_generation_routes_to_content_worker_and_marketing_operator(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    task = create_clawops_task(
+        "課程行銷：請生成招生推廣圖片素材與社群圖，交給我確認後再使用",
+        source={"platform": "telegram", "chat_id": "chat-1"},
+    )
+
+    with kb.connect_closing(db_path) as conn:
+        row = kb.get_task(conn, task.task_id)
+
+    assert row is not None
+    assert row.assignee == "clawops-content"
+    assert "project: course_marketing" in row.body
+    assert "task_type: campaign" in row.body
+    assert "assigned_agent: marketing_operator" in row.body
+    assert "assigned_worker: clawops.content" in row.body
+    assert "runtime_profile: clawops-content" in row.body
+    assert "Required capabilities: image_generate" in row.body
+    assert "OpenClaw" not in row.body
+    assert "Do not route this task through any dry-run bridge" in row.body
+
+
+def test_course_marketing_image_generation_routes_to_marketing_operator():
+    inferred = infer_clawops_metadata(
+        "課程行銷：請生成招生推廣圖片素材與社群圖",
+        source={},
+    )
+
+    assert inferred["project"] == "course_marketing"
+    assert inferred["task_type"] == "campaign"
+
+
 def test_infer_clawops_metadata_covers_known_project_agents():
     cases = [
         ("請規劃 Hahow 課程大綱", "hahow_course", "course_design"),
         ("請規劃課程招生行銷活動", "course_marketing", "campaign"),
         ("二手咖啡機 Facebook 社團發佈", "secondhand_commerce", "browser_publish"),
         ("請列出目前已經有刊登的所有社團群組清單，並顯示狀態", "secondhand_commerce", "browser_ops"),
+        ("二手望遠鏡 生成圖片素材", "secondhand_commerce", "content_draft"),
         ("ingrids SEO 內容規劃", "ingrids_marketing", "product_marketing"),
         ("修正 OpenClaw bridge health check", "hub_ops", "devops"),
     ]

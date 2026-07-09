@@ -846,10 +846,14 @@ def image_generate_tool(
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
 ) -> str:
-    """Generate an image from a text prompt, or edit a source image, via FAL.
+    """Generate an image from a text prompt, or edit a source image.
 
-    Routing: when ``image_url`` (or ``reference_image_urls``) is provided AND
-    the configured model declares an ``edit_endpoint``, the call routes to that
+    Routing: direct Python callers first honor any configured non-FAL
+    ``image_gen.provider`` so Codex/ClawOps MCP paths behave like the
+    agent-facing ``image_generate`` ToolSpec handler. If no non-FAL provider is
+    selected, this falls back to the in-tree FAL implementation. In that path,
+    when ``image_url`` (or ``reference_image_urls``) is provided AND the
+    configured model declares an ``edit_endpoint``, the call routes to that
     image-to-image / edit endpoint; otherwise it's plain text-to-image.
 
     The agent-facing schema exposes ``prompt``, ``aspect_ratio``, ``image_url``
@@ -861,6 +865,21 @@ def image_generate_tool(
     Returns a JSON string with ``{"success": bool, "image": url | None,
     "modality": "text" | "image", "error": str, "error_type": str}``.
     """
+    configured_provider = _read_configured_image_provider()
+    if (
+        isinstance(configured_provider, str)
+        and configured_provider.strip()
+        and configured_provider.strip().lower() != "fal"
+    ):
+        dispatched = _dispatch_to_plugin_provider(
+            prompt,
+            aspect_ratio,
+            image_url=image_url,
+            reference_image_urls=reference_image_urls,
+        )
+        if dispatched is not None:
+            return dispatched
+
     model_id, meta = _resolve_fal_model()
 
     # Collect any source images (primary + references) into one ordered list.

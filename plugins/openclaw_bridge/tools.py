@@ -120,6 +120,51 @@ def _requires_external_browser_capability(task: dict[str, Any]) -> bool:
     )
 
 
+def _is_explicit_openclaw_dry_run(task: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        [
+            str(task.get("requested_by") or ""),
+            str(task.get("openclaw_task_id") or ""),
+            " ".join(str(item) for item in task.get("context_refs") or []),
+        ]
+    ).lower()
+    return "openclaw-dry-run" in haystack or "dry-run" in haystack
+
+
+def _requires_clawops_runtime(task: dict[str, Any]) -> bool:
+    """Return True for work that should enter the Hermes-owned ClawOps queue."""
+    if _is_explicit_openclaw_dry_run(task):
+        return False
+    haystack = " ".join(
+        [
+            str(task.get("objective") or ""),
+            " ".join(str(item) for item in task.get("context_refs") or []),
+            " ".join(str(item) for item in task.get("allowed_tools") or []),
+        ]
+    ).lower()
+    runtime_terms = (
+        "clawops",
+        "content creator",
+        "marketing operator",
+        "secondhand_commerce",
+        "course_marketing",
+        "ingrids_marketing",
+        "content_draft",
+        "campaign",
+        "product_marketing",
+        "生成圖片",
+        "生圖",
+        "圖片生成",
+        "產出圖",
+        "產生圖",
+        "image generation",
+        "image_generate",
+        "generate image",
+        "image_gen",
+    )
+    return any(term in haystack for term in runtime_terms)
+
+
 def _default_transport(task: dict[str, Any]) -> dict[str, Any]:
     config = load_openclaw_bridge_config()
     if config is None:
@@ -351,6 +396,12 @@ def delegate_to_openclaw(
     risk = task["risk_level"]
     if task["requires_confirmation"] or risk in {"high", "critical"}:
         return _blocked_result(task, f"Delegated task risk_level={risk} requires approval.")
+    if _requires_clawops_runtime(task):
+        return _blocked_capability_result(
+            task,
+            "This work belongs in the Hermes-owned ClawOps runtime queue, not the OpenClaw dry-run bridge.",
+            "Create a /clawops task so HubOps routing can assign the appropriate ClawOps worker/agent.",
+        )
     if _requires_external_browser_capability(task):
         return _blocked_capability_result(
             task,

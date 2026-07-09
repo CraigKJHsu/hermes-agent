@@ -161,6 +161,63 @@ def test_external_facebook_work_is_not_sent_to_dry_run_bridge():
     assert "browser-capable executor" in result["recommended_next_action"]
 
 
+def test_clawops_runtime_work_is_not_sent_to_dry_run_bridge():
+    from plugins.openclaw_bridge.tools import delegate_to_openclaw
+
+    def fail_transport(_task):
+        raise AssertionError("ClawOps runtime work must not reach OpenClaw dry-run")
+
+    result = delegate_to_openclaw(
+        {
+            "objective": "請交給 ClawOps Content Creator 生成二手拍賣需要的圖片素材",
+            "risk_level": "low",
+            "allowed_tools": ["image_generate"],
+            "requested_by": "hermes",
+            "context_refs": ["telegram:secondhand-topic"],
+        },
+        transport=fail_transport,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["requires_human_review"] is True
+    assert "ClawOps runtime queue" in result["summary"]
+    assert "/clawops" in result["recommended_next_action"]
+
+
+def test_explicit_openclaw_dry_run_still_uses_transport():
+    from plugins.openclaw_bridge.tools import delegate_to_openclaw
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "succeeded",
+            "summary": "dry-run ok",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "none",
+        }
+
+    result = delegate_to_openclaw(
+        {
+            "objective": "Validate bridge health",
+            "risk_level": "low",
+            "allowed_tools": ["status_check"],
+            "requested_by": "hermes",
+            "context_refs": ["telegram:openclaw-dry-run"],
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "succeeded"
+    assert seen[0]["objective"] == "Validate bridge health"
+
+
 def test_openclaw_delegate_handler_accepts_registry_keyword_args(monkeypatch):
     import json
 

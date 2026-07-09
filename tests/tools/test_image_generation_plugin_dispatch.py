@@ -97,3 +97,46 @@ class TestPluginDispatch:
         assert payload["success"] is True
         assert payload["provider"] == "codex"
         assert payload["aspect_ratio"] == "portrait"
+
+    def test_direct_image_generate_tool_uses_configured_non_fal_provider(
+        self, monkeypatch, tmp_path
+    ):
+        from tools import image_generation_tool
+        from agent import image_gen_registry as registry_module
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("image_gen:\n  provider: codex\n")
+
+        monkeypatch.setattr(
+            image_generation_tool,
+            "_read_configured_image_provider",
+            lambda: "codex",
+        )
+        monkeypatch.setattr(
+            image_generation_tool,
+            "_read_configured_image_model",
+            lambda: "gpt-image-2-medium",
+        )
+        monkeypatch.setattr(
+            plugins_module,
+            "_ensure_plugins_discovered",
+            lambda force=False: None,
+        )
+        monkeypatch.setattr(
+            registry_module,
+            "get_provider",
+            lambda name: _FakeCodexProvider() if name == "codex" else None,
+        )
+
+        result = image_generation_tool.image_generate_tool(
+            prompt="draw a telescope",
+            aspect_ratio="square",
+            image_url="https://example.com/reference.png",
+            reference_image_urls=["data:image/png;base64,AAAA"],
+        )
+        payload = json.loads(result)
+
+        assert payload["success"] is True
+        assert payload["provider"] == "codex"
+        assert payload["image"] == "/tmp/codex-test.png"

@@ -1,8 +1,8 @@
 """Hermes-owned intake for ClawOps runtime work.
 
 This module deliberately stops at kanban task creation. Hermes remains the
-planner and user-facing owner; ClawOps/OpenClaw workers only receive queued
-execution work and report results back through the existing kanban notifier.
+planner and user-facing owner; ClawOps workers only receive queued execution
+work and report results back through the existing kanban notifier.
 """
 
 from __future__ import annotations
@@ -65,6 +65,22 @@ AUTO_PUBLISH_APPROVAL_TERMS = (
     "auto publish",
     "approved copy",
     "preapproved",
+)
+IMAGE_CONTENT_TERMS = (
+    "生成圖片",
+    "生圖",
+    "圖片生成",
+    "產出圖",
+    "產生圖",
+    "視覺素材",
+    "圖片素材",
+    "商品圖",
+    "宣傳圖",
+    "image generation",
+    "image_generate",
+    "generate image",
+    "image_gen",
+    "visual asset",
 )
 
 
@@ -203,12 +219,15 @@ def _body_from_objective(
     source: Optional[Mapping[str, Any]] = None,
     hubops_envelope: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    needs_external_browser = requires_external_browser_capabilities(objective, source=source)
+    needs_image_generation = requires_image_generation_capabilities(objective, source=source)
+    needs_external_browser = requires_external_browser_capabilities(objective, source=source) and not needs_image_generation
     publish_preapproved = auto_publish_preapproved(objective, source=source)
     execution_owner = (
         "Browser-capable Hermes/ClawOps runtime may execute only the delegated browser work in this queued task."
         if needs_external_browser
-        else "ClawOps/OpenClaw may execute only delegated work in this queued task."
+        else "ClawOps content runtime may execute only the delegated content and asset work in this queued task."
+        if needs_image_generation
+        else "ClawOps runtime may execute only delegated work in this queued task."
     )
     lines = [
         "ClawOps runtime task created by Hermes.",
@@ -229,6 +248,8 @@ def _body_from_objective(
                 auto_publish_preapproved=publish_preapproved,
             )
         )
+    if needs_image_generation:
+        lines.extend(_image_generation_capability_contract())
     if source:
         lines.extend(["", "Source:"])
         for key in sorted(source):
@@ -293,6 +314,8 @@ def _infer_project(haystack: str) -> str:
 
 
 def _infer_task_type(haystack: str, project: str) -> str:
+    if any(term in haystack for term in IMAGE_CONTENT_TERMS):
+        return "campaign" if project == "course_marketing" else "content_draft"
     if requires_external_browser_capabilities(haystack):
         if any(term in haystack for term in ("列出", "清單", "狀態", "已經有刊登", "已刊登", "目前刊登")):
             return "browser_ops"
@@ -354,6 +377,31 @@ def requires_external_browser_capabilities(
     return any(term in haystack for term in EXTERNAL_BROWSER_TARGET_TERMS) and any(
         term in haystack for term in EXTERNAL_BROWSER_ACTION_TERMS
     )
+
+
+def requires_image_generation_capabilities(
+    objective: str,
+    *,
+    source: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return True for delegated work that needs ClawOps content image generation."""
+    haystack_parts = [objective or ""]
+    if source:
+        haystack_parts.extend(str(v) for v in source.values() if v is not None)
+    haystack = " ".join(haystack_parts).lower()
+    return any(term in haystack for term in IMAGE_CONTENT_TERMS)
+
+
+def _image_generation_capability_contract() -> list[str]:
+    return [
+        "",
+        "Image generation capability contract:",
+        "- This task must be executed by the ClawOps content runtime using the assigned content sub agent.",
+        "- Required capabilities: image_generate, local artifact write access, and report_generate for generated asset paths.",
+        "- Do not route this task through any dry-run bridge; it must either produce image files or call kanban_block with block_kind=capability and the concrete missing provider.",
+        "- If FAL_KEY, Nous Portal login, or another configured image provider is unavailable, stop and report the missing provider instead of fabricating image completion.",
+        "- Generated images for resale listings must be labeled as AI-assisted/reference visuals unless the task explicitly uses actual user-provided photos.",
+    ]
 
 
 def _external_browser_capability_contract() -> list[str]:
