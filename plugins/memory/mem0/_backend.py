@@ -1,7 +1,10 @@
-"""Backend abstraction for Mem0 Platform and OSS modes."""
+"""Backend abstraction for Mem0 Platform, OSS, and REST modes."""
 
 from __future__ import annotations
 
+import json
+import urllib.parse
+import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -87,6 +90,124 @@ class PlatformBackend(Mem0Backend):
 
     def delete(self, memory_id: str) -> dict:
         self._client.delete(memory_id=memory_id)
+        return {"result": "Memory deleted.", "memory_id": memory_id}
+
+
+class RestBackend(Mem0Backend):
+    """Wraps the self-hosted Mem0 REST server."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        search_path: str = "/search",
+        memories_path: str = "/memories",
+        timeout: float = 10.0,
+    ):
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._search_path = self._normalize_path(search_path)
+        self._memories_path = self._normalize_path(memories_path)
+        self._timeout = timeout
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        path = (path or "").strip()
+        if not path:
+            return "/"
+        return path if path.startswith("/") else f"/{path}"
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> Any:
+        url = f"{self._base_url}{path}"
+        if query:
+            filtered = {k: v for k, v in query.items() if v is not None}
+            if filtered:
+                url = f"{url}?{urllib.parse.urlencode(filtered)}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": self._api_key,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            raw = resp.read()
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    @staticmethod
+    def _simple_filters(filters: dict) -> dict:
+        """REST server expects flat user_id/agent_id/run_id filters."""
+        return {
+            key: value
+            for key in ("user_id", "agent_id", "run_id")
+            if (value := filters.get(key)) is not None
+        }
+
+    def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = True) -> list[dict]:
+        response = self._request(
+            "POST",
+            self._search_path,
+            body={
+                "query": query,
+                "filters": self._simple_filters(filters),
+                "top_k": top_k,
+            },
+        )
+        return _unwrap_results(response)
+
+    def get_all(self, *, filters: dict, page: int = 1, page_size: int = 100) -> dict:
+        query = self._simple_filters(filters)
+        query["top_k"] = page * page_size
+        response = self._request("GET", self._memories_path, query=query)
+        results = _unwrap_results(response)
+        count = response.get("count", len(results)) if isinstance(response, dict) else len(results)
+        start = (page - 1) * page_size
+        return {"results": results[start : start + page_size], "count": count}
+
+    def add(
+        self,
+        messages: list,
+        *,
+        user_id: str,
+        agent_id: str,
+        infer: bool = False,
+        metadata: dict | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "messages": messages,
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "infer": infer,
+        }
+        if metadata:
+            body["metadata"] = metadata
+        return self._request("POST", self._memories_path, body=body)
+
+    def update(self, memory_id: str, text: str) -> dict:
+        escaped = urllib.parse.quote(memory_id, safe="")
+        response = self._request("PUT", f"{self._memories_path}/{escaped}", body={"text": text})
+        if isinstance(response, dict):
+            return response
+        return {"result": "Memory updated.", "memory_id": memory_id}
+
+    def delete(self, memory_id: str) -> dict:
+        escaped = urllib.parse.quote(memory_id, safe="")
+        response = self._request("DELETE", f"{self._memories_path}/{escaped}")
+        if isinstance(response, dict):
+            return response
         return {"result": "Memory deleted.", "memory_id": memory_id}
 
 

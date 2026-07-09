@@ -2,7 +2,7 @@
 
 import pytest
 
-from plugins.memory.mem0._backend import Mem0Backend, PlatformBackend, OSSBackend
+from plugins.memory.mem0._backend import Mem0Backend, PlatformBackend, OSSBackend, RestBackend
 
 
 class FakePlatformClient:
@@ -207,3 +207,74 @@ class TestOSSBackend:
         backend, _ = self._make()
         result = backend.delete("m1")
         assert result == {"result": "Memory deleted.", "memory_id": "m1"}
+
+
+class FakeHttpResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        import json
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class TestRestBackend:
+
+    def test_search_posts_to_search_endpoint(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append((req, timeout))
+            return FakeHttpResponse({"results": [{"id": "m1", "memory": "fact", "score": 0.9}]})
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        backend = RestBackend(base_url="http://127.0.0.1:8888", api_key="test-key")
+        result = backend.search("hello", filters={"user_id": "u1"}, top_k=3)
+
+        assert result[0]["memory"] == "fact"
+        req, timeout = calls[0]
+        assert req.full_url == "http://127.0.0.1:8888/search"
+        assert req.get_method() == "POST"
+        assert req.headers["X-api-key"] == "test-key"
+        assert timeout == 10.0
+
+    def test_get_all_uses_flat_query_filters(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(req)
+            return FakeHttpResponse({"results": [{"id": "m1", "memory": "fact"}], "count": 1})
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        backend = RestBackend(base_url="http://127.0.0.1:8888/", api_key="test-key")
+        result = backend.get_all(filters={"user_id": "u1"}, page=1, page_size=10)
+
+        assert result["count"] == 1
+        assert calls[0].full_url == "http://127.0.0.1:8888/memories?user_id=u1&top_k=10"
+
+    def test_add_posts_messages_to_memories_endpoint(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(req)
+            return FakeHttpResponse({"results": [{"id": "m1", "memory": "fact"}]})
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        backend = RestBackend(base_url="http://127.0.0.1:8888", api_key="test-key")
+        result = backend.add(
+            [{"role": "user", "content": "fact"}],
+            user_id="u1",
+            agent_id="a1",
+            infer=False,
+            metadata={"channel": "test"},
+        )
+
+        assert result["results"][0]["id"] == "m1"
+        assert calls[0].full_url == "http://127.0.0.1:8888/memories"
+        assert calls[0].get_method() == "POST"

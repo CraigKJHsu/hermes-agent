@@ -1,6 +1,6 @@
 # Mem0 Memory Provider
 
-Server-side LLM fact extraction with semantic search and hybrid multi-signal retrieval via the Mem0 Platform v3 API.
+Server-side LLM fact extraction with semantic search and hybrid multi-signal retrieval via Mem0 Platform, OSS, or a self-hosted Mem0 REST server.
 
 ## Requirements
 
@@ -25,7 +25,8 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `mode` | `platform` | `platform` (Mem0 Cloud) or `oss` (self-hosted) |
+| `mode` | `platform` | `platform` (Mem0 Cloud), `oss` (in-process self-hosted), or `rest` (self-hosted REST server) |
+| `base_url` | `http://127.0.0.1:8888` | Mem0 REST server base URL for `rest` mode |
 | `user_id` | `hermes-user` | User identifier on Mem0 |
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `true` | Rerank search results for relevance (platform mode only) |
@@ -136,6 +137,28 @@ curl http://localhost:6333/healthz
 ```bash
 # Verify PostgreSQL is running and accepting connections:
 pg_isready -h localhost -p 5432
+```
+
+## REST (Self-Hosted Server) Mode
+
+Use this when another local service runs the Mem0 API and Hermes should share it
+with other agents.
+
+`$HERMES_HOME/mem0.json`:
+
+```json
+{
+  "mode": "rest",
+  "base_url": "http://127.0.0.1:8888",
+  "user_id": "kj",
+  "agent_id": "hermes-grace"
+}
+```
+
+`$HERMES_HOME/.env`:
+
+```bash
+MEM0_API_KEY=<self-hosted X-API-Key value>
 ```
 
 ### OSS: Ollama not reachable

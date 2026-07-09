@@ -12,7 +12,9 @@ Secret (lives in $HERMES_HOME/.env or the environment):
 
 Behavioral settings (live in $HERMES_HOME/mem0.json, set via `hermes memory
 setup`):
-  mode               — Backend mode: "platform" (default) or "oss"
+  mode               — Backend mode: "platform" (default), "oss", or "rest"
+  base_url           — REST server URL for rest mode (default:
+                       http://127.0.0.1:8888)
   user_id            — Canonical user identifier. When set, it is applied
                        uniformly across every gateway (CLI, Telegram, Slack,
                        Discord, …) so the same human gets one merged memory
@@ -80,6 +82,7 @@ def _load_config() -> dict:
     config = {
         "mode": os.environ.get("MEM0_MODE", "platform"),
         "api_key": os.environ.get("MEM0_API_KEY", ""),
+        "base_url": os.environ.get("MEM0_BASE_URL", "http://127.0.0.1:8888"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "oss": {},
     }
@@ -217,6 +220,8 @@ class Mem0MemoryProvider(MemoryProvider):
         mode = cfg.get("mode", "platform")
         if mode == "oss":
             return bool(cfg.get("oss", {}).get("vector_store"))
+        if mode == "rest":
+            return bool(cfg.get("api_key") and cfg.get("base_url"))
         return bool(cfg.get("api_key"))
 
     def save_config(self, values, hermes_home):
@@ -239,7 +244,8 @@ class Mem0MemoryProvider(MemoryProvider):
         mode = cfg.get("mode", "platform")
         api_key_required = mode != "oss"
         return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": api_key_required, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "api_key", "description": "Mem0 API key", "secret": True, "required": api_key_required, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "base_url", "description": "Mem0 REST base URL", "default": "http://127.0.0.1:8888"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
@@ -250,22 +256,29 @@ class Mem0MemoryProvider(MemoryProvider):
         post_setup(hermes_home, config)
 
     def _create_backend(self):
-        # Lazy-install the mem0 SDK on demand before either backend imports
-        # it. ensure() honors security.allow_lazy_installs (default true) and,
-        # on a sealed Docker venv, redirects the install to the durable
-        # target. On failure we fall through so the import inside the backend
-        # produces the canonical error, captured below.
         try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("memory.mem0", prompt=False)
-        except ImportError:
-            pass
-        except Exception:
-            pass
-        try:
+            if self._mode != "rest":
+                # Lazy-install the mem0 SDK on demand before SDK-backed modes import
+                # it. REST mode uses urllib and does not need mem0ai installed.
+                try:
+                    from tools.lazy_deps import ensure as _lazy_ensure
+                    _lazy_ensure("memory.mem0", prompt=False)
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
             if self._mode == "oss":
                 from ._backend import OSSBackend
                 return OSSBackend(self._config.get("oss", {}))
+            if self._mode == "rest":
+                from ._backend import RestBackend
+                return RestBackend(
+                    base_url=self._config.get("base_url", "http://127.0.0.1:8888"),
+                    api_key=self._api_key,
+                    search_path=self._config.get("search_path", "/search"),
+                    memories_path=self._config.get("memories_path", "/memories"),
+                    timeout=float(self._config.get("timeout", 10.0)),
+                )
             from ._backend import PlatformBackend
             return PlatformBackend(self._api_key)
         except Exception as e:
@@ -356,7 +369,12 @@ class Mem0MemoryProvider(MemoryProvider):
         return {"channel": self._channel} if self._channel else {}
 
     def system_prompt_block(self) -> str:
-        mode_label = "platform (cloud API)" if self._mode == "platform" else "OSS (self-hosted)"
+        if self._mode == "platform":
+            mode_label = "platform (cloud API)"
+        elif self._mode == "rest":
+            mode_label = "REST (self-hosted server)"
+        else:
+            mode_label = "OSS (self-hosted)"
         rerank_note = " Rerank is available on search." if self._mode == "platform" else ""
         return (
             "# Mem0 Memory\n"
