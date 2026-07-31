@@ -192,6 +192,10 @@ def test_fast_translation_output_and_detail_prompt():
     assert "delivery is ambiguous" in ambiguous_prompt
     assert "MUST be self-contained" in ambiguous_prompt
     assert "include the directly usable translation" in ambiguous_prompt
+    failed_delivery_prompt = build_detail_lane_prompt(delivery_failed=True)
+    assert "definitely did not deliver" in failed_delivery_prompt
+    assert "MUST therefore be self-contained" in failed_delivery_prompt
+    assert "every required pronunciation field" in failed_delivery_prompt
     failed_prompt = build_failed_lane_prompt()
     assert "definitely failed" in failed_prompt
     assert "Lead with the directly usable translation" in failed_prompt
@@ -1106,7 +1110,7 @@ async def test_deliver_fast_translation_requires_classified_delivery_capability(
         source=event.source,
     )
 
-    assert value is None
+    assert value == "delivery_failed"
     adapter.send.assert_not_awaited()
 
 
@@ -1135,7 +1139,7 @@ async def test_deliver_fast_translation_fails_open_on_send_error():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "delivery_failed"
 
 
 @pytest.mark.asyncio
@@ -1149,6 +1153,70 @@ async def test_deliver_fast_translation_honors_adapter_ambiguous_result():
                 delivery_ambiguous=True,
             ),
         ),
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda source, anchor=None: None
+    runner._reply_anchor_for_event = lambda event: None
+    event = MessageEvent(text="persistent", source=_source())
+    task = asyncio.create_task(asyncio.sleep(0, result="持久的"))
+    job = {
+        "task": task,
+        "started_at": time.monotonic(),
+        "delivery_timeout": 1.0,
+    }
+
+    value = await runner._deliver_fast_translation(
+        job,
+        event=event,
+        source=event.source,
+    )
+
+    assert value == "ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_deliver_fast_translation_prefers_ambiguity_over_success():
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(
+        send_with_delivery_deadline=AsyncMock(
+            return_value=SendResult(success=True, delivery_ambiguous=True),
+        ),
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda source, anchor=None: None
+    runner._reply_anchor_for_event = lambda event: None
+    event = MessageEvent(text="persistent", source=_source())
+    task = asyncio.create_task(asyncio.sleep(0, result="持久的"))
+    job = {
+        "task": task,
+        "started_at": time.monotonic(),
+        "delivery_timeout": 1.0,
+    }
+
+    value = await runner._deliver_fast_translation(
+        job,
+        event=event,
+        source=event.source,
+    )
+
+    assert value == "ambiguous"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        None,
+        SimpleNamespace(success=False),
+        SendResult(success=False, delivery_ambiguous=None),
+    ],
+)
+async def test_deliver_fast_translation_treats_untyped_result_as_ambiguous(
+    malformed_result,
+):
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(
+        send_with_delivery_deadline=AsyncMock(return_value=malformed_result),
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._thread_metadata_for_source = lambda source, anchor=None: None
@@ -1195,7 +1263,7 @@ async def test_deliver_fast_translation_adapter_exception_falls_back():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "ambiguous"
 
 
 @pytest.mark.asyncio
@@ -1223,7 +1291,7 @@ async def test_deliver_fast_translation_local_exception_falls_back():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "ambiguous"
 
 
 @pytest.mark.asyncio
@@ -1252,4 +1320,4 @@ async def test_deliver_fast_translation_adapter_timeout_falls_back():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "ambiguous"

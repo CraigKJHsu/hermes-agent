@@ -141,8 +141,23 @@ def format_fast_translation(value: str) -> str:
     return value.strip()
 
 
-def build_detail_lane_prompt(*, delivery_ambiguous: bool = False) -> str:
+def build_detail_lane_prompt(
+    *,
+    delivery_ambiguous: bool = False,
+    delivery_failed: bool = False,
+) -> str:
     """Tell the conversational lane how to follow the first-pass attempt."""
+    if delivery_failed:
+        return (
+            "[Trusted gateway note: The stateless fast-translation lane "
+            "successfully generated the directly usable translation and any "
+            "required K.K. notation, but the platform definitely did not "
+            "deliver that standalone message. The detailed response itself "
+            "MUST therefore be self-contained: include the directly usable "
+            "translation and every required pronunciation field within its "
+            "teaching structure, then follow the selected detail skill and "
+            "output contract completely.]"
+        )
     if delivery_ambiguous:
         return (
             "[Trusted gateway note: The stateless fast-translation lane sent "

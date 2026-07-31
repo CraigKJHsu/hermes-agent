@@ -65,7 +65,12 @@ def test_normalize_fast_then_default_translation_profile():
     }
     assert detail_lane_skill(profile, "delivered") == "translator-detail"
     assert detail_lane_skill(profile, "ambiguous") == "translator-detail"
+    assert detail_lane_skill(profile, "delivery_failed") == "translator-detail"
     assert detail_lane_skill(profile, None) == "translator-fast"
+    assert (
+        detail_lane_output_contract(profile, "delivery_failed")
+        == "translator_mastery_self_contained"
+    )
     contract_prompt = detail_lane_contract_prompt(profile, "delivered")
     assert contract_prompt is not None
     for heading in (

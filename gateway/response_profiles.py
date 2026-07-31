@@ -1125,9 +1125,11 @@ def detail_lane_prompt(
     profile: Dict[str, Any],
     *,
     delivery_ambiguous: bool = False,
+    delivery_failed: bool = False,
 ) -> str:
     return _handler_for_profile(profile)["detail_prompt"](
         delivery_ambiguous=delivery_ambiguous,
+        delivery_failed=delivery_failed,
     )
 
 
@@ -1140,7 +1142,7 @@ def _detail_lane_route(
         return None
     if delivery_status == "delivered":
         route_name = "on_fast_success"
-    elif delivery_status == "ambiguous":
+    elif delivery_status in {"ambiguous", "delivery_failed"}:
         route_name = "on_fast_ambiguous"
     else:
         route_name = "on_fast_failure"
