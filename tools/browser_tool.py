@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import shutil
 import sys
@@ -1364,6 +1365,7 @@ _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
 # supplies or edits the expected page identity.
 _snapshot_ref_contexts: Dict[str, Dict[str, Any]] = {}
 _group_post_composer_contexts: Dict[str, Dict[str, Any]] = {}
+_facebook_crosspost_contexts: Dict[str, Dict[str, Any]] = {}
 _snapshot_ref_lock = threading.Lock()
 _LOCAL_SUFFIX = "::local"
 
@@ -2732,12 +2734,23 @@ def _snapshot_ax_nodes(
         role = node.get("role", {}).get("value")
         name = node.get("name", {}).get("value")
         if backend_id and role:
-            captured.append({
+            captured_node = {
                 "backend_node_id": int(backend_id),
                 "role": str(role).strip(),
                 "name": str(name or "").strip(),
                 "captured_session_id": captured_session_id,
-            })
+            }
+            for prop in list(node.get("properties") or []):
+                if prop.get("name") != "checked":
+                    continue
+                checked = (prop.get("value") or {}).get("value")
+                if isinstance(checked, bool):
+                    captured_node["checked"] = checked
+                elif str(checked).casefold() in {"true", "false"}:
+                    captured_node["checked"] = (
+                        str(checked).casefold() == "true"
+                    )
+            captured.append(captured_node)
     if not captured:
         return [], "Accessibility tree contained no bindable backend nodes"
     return captured, None
@@ -2866,6 +2879,8 @@ def _remember_snapshot_refs(
                     node.get("captured_session_id") or ""
                 ),
             }
+            if "checked" in node:
+                normalized_refs[ref]["checked"] = bool(node["checked"])
             snapshot_lines.append(
                 f"- {role} {json.dumps(name, ensure_ascii=False)} [ref={ref}]"
             )
@@ -3001,6 +3016,14 @@ def _run_atomic_ref_action(
     parsed = urlsplit(current_url)
     kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     group_match = re.match(r"^/groups/(\d+)(?:/|$)", parsed.path)
+    marketplace_item_match = re.match(
+        r"^/marketplace/item/(\d+)/?$",
+        parsed.path,
+    )
+    marketplace_selling_match = re.match(
+        r"^/marketplace/you/selling/?$",
+        parsed.path,
+    )
     normalized_host = str(parsed.hostname or "").rstrip(".").casefold()
     is_facebook_host = (
         normalized_host == "facebook.com"
@@ -3010,10 +3033,40 @@ def _run_atomic_ref_action(
         parsed.path == "/groups"
         or parsed.path.startswith("/groups/")
     )
+    crosspost_listing_id: Optional[str] = None
+    crosspost_group_ids: frozenset[str] = frozenset()
+    crosspost_allowed = False
+    is_crosspost_source_surface = bool(
+        marketplace_item_match is not None
+        or marketplace_selling_match is not None
+    )
+    if is_facebook_host and is_crosspost_source_surface:
+        try:
+            with _kanban_db.connect_closing() as scope_conn:
+                (
+                    crosspost_listing_id,
+                    crosspost_group_ids,
+                    crosspost_allowed,
+                ) = _kanban_db.grace_task_facebook_crosspost_permissions(
+                    scope_conn,
+                    kanban_task_id,
+                )
+        except Exception:
+            crosspost_listing_id = None
+            crosspost_group_ids = frozenset()
+            crosspost_allowed = False
     if (
         is_facebook_host
         and not is_group_route
         and _kanban_db.external_platform_for_url(current_url) != "facebook"
+        and not (
+            is_crosspost_source_surface
+            and crosspost_allowed
+            and (
+                marketplace_item_match is None
+                or marketplace_item_match.group(1) == crosspost_listing_id
+            )
+        )
     ):
         return json.dumps({
             "success": False,
@@ -3069,10 +3122,216 @@ def _run_atomic_ref_action(
             "在想些什麼？",
         }
     )
+    is_crosspost_more_options = (
+        action == "click"
+        and normalized_role == "button"
+        and (
+            normalized_name == "more options"
+            or normalized_name.startswith("more options for ")
+            or normalized_name == "更多選項"
+            or normalized_name.startswith("更多選項：")
+        )
+    )
+    is_crosspost_open_dialog = (
+        action == "click"
+        and normalized_role in {"button", "link", "menuitem"}
+        and normalized_name in {
+            "list in more places",
+            "list your item in more places",
+            "刊登到更多地方",
+            "在更多地方刊登",
+        }
+    )
+    is_crosspost_group_select = (
+        action == "click"
+        and normalized_role in {
+            "checkbox", "menuitemcheckbox", "option", "switch",
+        }
+    )
+    is_crosspost_submit = (
+        action == "click"
+        and normalized_role == "button"
+        and normalized_name in {"post", "發布", "list", "刊登"}
+    )
     required_group_id: Optional[str] = None
     reserved_group_id: Optional[str] = None
     reserved_group_effect: Optional[str] = None
     group_post_context_action: Optional[str] = None
+    crosspost_stage: Optional[str] = None
+    required_marketplace_listing_id: Optional[str] = None
+    allowed_crosspost_group_ids: list[str] = []
+    selected_crosspost_group_ids: list[str] = []
+    reserved_crosspost_group_ids: list[str] = []
+    crosspost_source_token: Optional[str] = None
+    if is_facebook_host and is_crosspost_source_surface:
+        live_listing_id = (
+            marketplace_item_match.group(1)
+            if marketplace_item_match is not None
+            else crosspost_listing_id
+        )
+        if (
+            not crosspost_allowed
+            or not live_listing_id
+            or crosspost_listing_id != live_listing_id
+            or not crosspost_group_ids
+        ):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Facebook Marketplace cross-post blocked: the exact "
+                    "listing and destination groups are not bound to a "
+                    "consumed approval challenge."
+                ),
+            }, ensure_ascii=False)
+        required_marketplace_listing_id = live_listing_id
+        allowed_crosspost_group_ids = sorted(crosspost_group_ids)
+        with _snapshot_ref_lock:
+            crosspost_context = _facebook_crosspost_contexts.get(
+                browser_task_id
+            )
+        expected_crosspost_context = {
+            "page_identity": page_identity,
+            "kanban_task_id": kanban_task_id,
+            "kanban_run_id": _kanban_worker_run_id(),
+            "listing_id": live_listing_id,
+            "allowed_group_ids": allowed_crosspost_group_ids,
+        }
+        context_matches = bool(crosspost_context) and all(
+            crosspost_context.get(key) == value
+            for key, value in expected_crosspost_context.items()
+        )
+        if is_crosspost_more_options:
+            crosspost_stage = "open_menu"
+            crosspost_source_token = secrets.token_hex(16)
+        elif is_crosspost_open_dialog:
+            if (
+                context_matches
+                and crosspost_context.get("stage") == "menu_open"
+            ):
+                # This is only a candidate source-menu transition.  The CDP
+                # supervisor still proves atomically that the clicked control
+                # is inside the unique menu opened by the marked source.
+                crosspost_source_token = str(
+                    crosspost_context.get("source_token") or ""
+                )
+                if not crosspost_source_token:
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            "Facebook Marketplace cross-post blocked: the "
+                            "source-listing capability token is missing."
+                        ),
+                    }, ensure_ascii=False)
+                crosspost_stage = "open_dialog_from_menu"
+            else:
+                # Facebook may expose this control directly on the item page
+                # or the seller's listing row.  The renderer must still bind
+                # the exact control to the approved listing before clicking.
+                crosspost_source_token = secrets.token_hex(16)
+                crosspost_stage = "open_dialog_direct"
+        elif is_crosspost_group_select:
+            if (
+                not context_matches
+                or crosspost_context.get("stage")
+                not in {"dialog_open", "selecting"}
+            ):
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "Facebook Marketplace cross-post blocked: group "
+                        "selection is outside the authorized List in more "
+                        "places dialog state."
+                    ),
+                }, ensure_ascii=False)
+            crosspost_source_token = str(
+                crosspost_context.get("source_token") or ""
+            )
+            if not crosspost_source_token:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "Facebook Marketplace cross-post blocked: the "
+                        "source-listing capability token is missing."
+                    ),
+                }, ensure_ascii=False)
+            if metadata.get("checked") is True:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "Facebook Marketplace cross-post blocked: the group "
+                        "option is already selected; reconcile before clicking."
+                    ),
+                }, ensure_ascii=False)
+            crosspost_stage = "select_group"
+        elif is_crosspost_submit:
+            selected_crosspost_group_ids = (
+                list(crosspost_context.get("selected_group_ids") or [])
+                if context_matches
+                else []
+            )
+            crosspost_context_stage = (
+                str(crosspost_context.get("stage") or "")
+                if context_matches
+                else ""
+            )
+            if (
+                crosspost_context_stage == "dialog_open"
+                and not selected_crosspost_group_ids
+            ):
+                # The renderer will prove that every approved destination was
+                # already checked before it can dispatch the final Post.
+                selected_crosspost_group_ids = sorted(crosspost_group_ids)
+            crosspost_source_token = (
+                str(crosspost_context.get("source_token") or "")
+                if context_matches
+                else ""
+            )
+            if (
+                not selected_crosspost_group_ids
+                or not crosspost_source_token
+                or set(selected_crosspost_group_ids) != crosspost_group_ids
+                or crosspost_context_stage not in {
+                    "dialog_open", "selecting",
+                }
+            ):
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "Facebook Marketplace cross-post blocked: final Post "
+                        "requires at least one atomically verified authorized "
+                        "group selection."
+                    ),
+                }, ensure_ascii=False)
+            crosspost_stage = "submit"
+            try:
+                with _kanban_db.connect_closing() as reserve_conn:
+                    reserve_error = _kanban_db.reserve_external_group_posts(
+                        reserve_conn,
+                        kanban_task_id,
+                        selected_crosspost_group_ids,
+                        expected_run_id=_kanban_worker_run_id(),
+                        allow_crosspost=True,
+                    )
+            except Exception as exc:
+                reserve_error = (
+                    "Facebook cross-post external-effect reservation failed "
+                    f"closed: {type(exc).__name__}: {exc}"
+                )
+            if reserve_error:
+                return json.dumps(
+                    {"success": False, "error": reserve_error},
+                    ensure_ascii=False,
+                )
+            reserved_crosspost_group_ids = selected_crosspost_group_ids
+        else:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Facebook Marketplace cross-post blocked: only a "
+                    "listing-bound More options / List in more places path, "
+                    "authorized group selection, and final Post are allowed."
+                ),
+            }, ensure_ascii=False)
     if is_facebook_host and is_join_button and group_match is None:
         return json.dumps({
             "success": False,
@@ -3095,8 +3354,13 @@ def _run_atomic_ref_action(
     ):
         try:
             with _kanban_db.connect_closing() as scope_conn:
-                task = _kanban_db.get_task(scope_conn, kanban_task_id)
-            body = task.body if task is not None else ""
+                (
+                    allowed_group_ids,
+                    group_posting_allowed,
+                ) = _kanban_db.grace_task_facebook_group_permissions(
+                    scope_conn,
+                    kanban_task_id,
+                )
         except Exception as exc:
             return json.dumps({
                 "success": False,
@@ -3105,10 +3369,6 @@ def _run_atomic_ref_action(
                     f"{type(exc).__name__}: {exc}"
                 ),
             }, ensure_ascii=False)
-        allowed_group_ids = _kanban_db.grace_external_group_ids(body)
-        group_posting_allowed = (
-            _kanban_db.grace_allows_facebook_group_posting(body)
-        )
         group_id = group_match.group(1)
         if group_id not in allowed_group_ids:
             return json.dumps({
@@ -3199,23 +3459,31 @@ def _run_atomic_ref_action(
             reserved_group_id = group_id
 
     def _release_known_pre_dispatch(reason: str) -> None:
-        if not reserved_group_id or not reserved_group_effect:
-            return
         try:
-            with _kanban_db.connect_closing() as release_conn:
-                if reserved_group_effect == "join":
-                    _kanban_db.release_external_group_join_reservation(
-                        release_conn,
-                        kanban_task_id,
-                        reserved_group_id,
-                        expected_run_id=_kanban_worker_run_id(),
-                        reason=reason,
-                    )
-                else:
+            if reserved_group_id and reserved_group_effect:
+                with _kanban_db.connect_closing() as release_conn:
+                    if reserved_group_effect == "join":
+                        _kanban_db.release_external_group_join_reservation(
+                            release_conn,
+                            kanban_task_id,
+                            reserved_group_id,
+                            expected_run_id=_kanban_worker_run_id(),
+                            reason=reason,
+                        )
+                    else:
+                        _kanban_db.release_external_group_post_reservation(
+                            release_conn,
+                            kanban_task_id,
+                            reserved_group_id,
+                            expected_run_id=_kanban_worker_run_id(),
+                            reason=reason,
+                        )
+            for crosspost_group_id in reserved_crosspost_group_ids:
+                with _kanban_db.connect_closing() as release_conn:
                     _kanban_db.release_external_group_post_reservation(
                         release_conn,
                         kanban_task_id,
-                        reserved_group_id,
+                        crosspost_group_id,
                         expected_run_id=_kanban_worker_run_id(),
                         reason=reason,
                     )
@@ -3248,22 +3516,41 @@ def _run_atomic_ref_action(
                 # Hold the writer lease through the complete browser mutation.
                 # Cancellation/completion/reassignment uses the same SQLite
                 # write boundary and cannot interleave after this check.
-                action_result = supervisor.guarded_dom_action(
-                    backend_node_id=int(metadata["backend_node_id"]),
-                    expected_page_identity=page_identity,
-                    action=action,
-                    text=text,
-                    expected_role=str(metadata["role"]),
-                    expected_name=str(metadata["name"]),
-                    required_group_id=required_group_id,
-                    captured_session_id=captured_session_id,
-                    require_group_composer=(
+                guarded_action_args = {
+                    "backend_node_id": int(metadata["backend_node_id"]),
+                    "expected_page_identity": page_identity,
+                    "action": action,
+                    "text": text,
+                    "expected_role": str(metadata["role"]),
+                    "expected_name": str(metadata["name"]),
+                    "required_group_id": required_group_id,
+                    "captured_session_id": captured_session_id,
+                    "require_group_composer": (
                         group_post_context_action in {"compose", "submit"}
                     ),
+                }
+                if required_marketplace_listing_id is not None:
+                    guarded_action_args.update({
+                        "required_marketplace_listing_id": (
+                            required_marketplace_listing_id
+                        ),
+                        "allowed_crosspost_group_ids": (
+                            allowed_crosspost_group_ids
+                        ),
+                        "selected_crosspost_group_ids": (
+                            selected_crosspost_group_ids
+                        ),
+                        "crosspost_stage": crosspost_stage,
+                        "crosspost_source_token": crosspost_source_token,
+                    })
+                action_result = supervisor.guarded_dom_action(
+                    **guarded_action_args,
                 )
     except Exception as exc:
         with _snapshot_ref_lock:
             _snapshot_ref_contexts.pop(browser_task_id, None)
+        # The backend may have raised after renderer dispatch. Preserve every
+        # durable reservation for reconciliation; never make this retryable.
         return json.dumps({
             "success": False,
             "error": (
@@ -3276,6 +3563,9 @@ def _run_atomic_ref_action(
         # is required even when the exact-node action fails.
         _snapshot_ref_contexts.pop(browser_task_id, None)
     if not action_result.get("ok"):
+        # Only a positive pre-dispatch failure may release reservations. CDP
+        # timeout/disconnect responses carry dispatch_ambiguous and remain
+        # create_started so a retry cannot duplicate the external effect.
         if not action_result.get("dispatch_ambiguous"):
             _release_known_pre_dispatch(
                 str(action_result.get("error") or "pre-dispatch validation failed")
@@ -3295,6 +3585,92 @@ def _run_atomic_ref_action(
     elif group_post_context_action == "submit":
         with _snapshot_ref_lock:
             _group_post_composer_contexts.pop(browser_task_id, None)
+    if crosspost_stage == "open_menu":
+        with _snapshot_ref_lock:
+            _facebook_crosspost_contexts[browser_task_id] = {
+                "page_identity": page_identity,
+                "kanban_task_id": kanban_task_id,
+                "kanban_run_id": _kanban_worker_run_id(),
+                "listing_id": required_marketplace_listing_id,
+                "allowed_group_ids": allowed_crosspost_group_ids,
+                "selected_group_ids": [],
+                "source_token": crosspost_source_token,
+                "stage": "menu_open",
+            }
+    elif crosspost_stage in {
+        "open_dialog_from_menu", "open_dialog_direct",
+    }:
+        with _snapshot_ref_lock:
+            if crosspost_stage == "open_dialog_direct":
+                _facebook_crosspost_contexts[browser_task_id] = {
+                    "page_identity": page_identity,
+                    "kanban_task_id": kanban_task_id,
+                    "kanban_run_id": _kanban_worker_run_id(),
+                    "listing_id": required_marketplace_listing_id,
+                    "allowed_group_ids": allowed_crosspost_group_ids,
+                    "selected_group_ids": [],
+                    "source_token": crosspost_source_token,
+                    "stage": "dialog_open",
+                }
+            else:  # open_dialog_from_menu
+                context = _facebook_crosspost_contexts.get(browser_task_id)
+                if context is not None:
+                    context["stage"] = "dialog_open"
+                    context["selected_group_ids"] = []
+    elif crosspost_stage == "select_group":
+        result_value = action_result.get("result")
+        selected_group_id = None
+        if isinstance(result_value, Mapping):
+            selected_group_id = (
+                result_value.get("crosspost_group_id")
+                or result_value.get("crosspostGroupId")
+            )
+        if selected_group_id not in allowed_crosspost_group_ids:
+            with _snapshot_ref_lock:
+                _facebook_crosspost_contexts.pop(browser_task_id, None)
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Facebook Marketplace cross-post failed closed: the "
+                    "atomic group binding returned no authorized group id; "
+                    "the dialog must be reopened and reconciled before any "
+                    "further action."
+                ),
+            }, ensure_ascii=False)
+        raw_preselected_group_ids = []
+        if isinstance(result_value, Mapping):
+            raw_preselected_group_ids = list(
+                result_value.get("crosspost_preselected_group_ids")
+                or result_value.get("crosspostPreselectedGroupIds")
+                or []
+            )
+        preselected_group_ids = {
+            str(group_id or "").strip()
+            for group_id in raw_preselected_group_ids
+        }
+        if not preselected_group_ids.issubset(
+            set(allowed_crosspost_group_ids)
+        ):
+            with _snapshot_ref_lock:
+                _facebook_crosspost_contexts.pop(browser_task_id, None)
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Facebook Marketplace cross-post failed closed: the "
+                    "dialog reported an unauthorized preselected group."
+                ),
+            }, ensure_ascii=False)
+        with _snapshot_ref_lock:
+            context = _facebook_crosspost_contexts.get(browser_task_id)
+            if context is not None:
+                selected = set(context.get("selected_group_ids") or [])
+                selected.update(preselected_group_ids)
+                selected.add(selected_group_id)
+                context["selected_group_ids"] = sorted(selected)
+                context["stage"] = "selecting"
+    elif crosspost_stage == "submit":
+        with _snapshot_ref_lock:
+            _facebook_crosspost_contexts.pop(browser_task_id, None)
     return json.dumps({
         "success": True,
         "result": action_result.get("result"),
@@ -3592,6 +3968,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     with _snapshot_ref_lock:
         _group_post_composer_contexts.pop(nav_session_key, None)
         _group_post_composer_contexts.pop(effective_task_id, None)
+        _facebook_crosspost_contexts.pop(nav_session_key, None)
+        _facebook_crosspost_contexts.pop(effective_task_id, None)
 
     # Always-blocked floor: cloud metadata / IMDS endpoints are denied
     # regardless of backend, hybrid routing, or allow_private_urls.
@@ -5127,6 +5505,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         with _snapshot_ref_lock:
             _snapshot_ref_contexts.pop(task_id, None)
             _group_post_composer_contexts.pop(task_id, None)
+            _facebook_crosspost_contexts.pop(task_id, None)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.

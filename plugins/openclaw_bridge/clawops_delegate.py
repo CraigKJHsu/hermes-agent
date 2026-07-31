@@ -74,6 +74,31 @@ def _approval_token_candidate(message_text: str) -> str:
     return match.group(1) if match is not None else ""
 
 
+def _requires_structured_facebook_crosspost(
+    task_type: str,
+    external_targets: list[str],
+) -> bool:
+    """Identify Marketplace-to-group publishing before issuing approval."""
+    if str(task_type or "").strip().casefold() != "browser_publish":
+        return False
+    target_text = " ".join(external_targets).casefold()
+    has_marketplace_source = (
+        "marketplace" in target_text
+        or "市集" in target_text
+        or "/marketplace/item/" in target_text
+    )
+    has_group_destination = (
+        "group" in target_text
+        or "社團" in target_text
+        or "/groups/" in target_text
+    )
+    return (
+        "facebook" in target_text
+        and has_marketplace_source
+        and has_group_destination
+    )
+
+
 _GOAL = {
     "type": "object",
     "properties": {
@@ -163,6 +188,35 @@ CLAWOPS_DELEGATE_PARAMETERS = {
             "description": (
                 "Exact external platforms or destinations affected by a "
                 "controlled external action; required when approval is needed."
+            ),
+        },
+        "facebook_crosspost": {
+            "type": "object",
+            "properties": {
+                "marketplace_listing_id": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$",
+                    "description": (
+                        "Exact existing Facebook Marketplace listing id."
+                    ),
+                },
+                "group_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[0-9]+$"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": (
+                        "Exact Facebook group ids selected through List in "
+                        "more places."
+                    ),
+                },
+            },
+            "required": ["marketplace_listing_id", "group_ids"],
+            "additionalProperties": False,
+            "description": (
+                "Required for an existing Marketplace listing cross-post to "
+                "Facebook groups. The approval fingerprint binds both the "
+                "source listing and every destination group."
             ),
         },
         "request_instance_id": {
@@ -597,6 +651,26 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             for item in list(args.get("external_targets") or [])
             if str(item).strip()
         ]
+        raw_facebook_crosspost = args.get("facebook_crosspost")
+        facebook_crosspost = (
+            json.loads(json.dumps(raw_facebook_crosspost))
+            if isinstance(raw_facebook_crosspost, dict)
+            else None
+        )
+        if _requires_structured_facebook_crosspost(
+            task_type,
+            external_targets,
+        ) and facebook_crosspost is None:
+            raise ValueError(
+                "Facebook Marketplace group cross-post approval requires "
+                "facebook_crosspost.marketplace_listing_id and exact "
+                "facebook_crosspost.group_ids before an approval token can "
+                "be issued."
+            )
+        if facebook_crosspost is not None and task_type != "browser_publish":
+            raise ValueError(
+                "facebook_crosspost is only valid for task_type=browser_publish."
+            )
         supplied_request_instance = str(
             args.get("request_instance_id") or ""
         ).strip()
@@ -668,6 +742,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                             args.get("completion_mode") or ""
                         ).strip(),
                         "external_targets": external_targets,
+                        "facebook_crosspost": facebook_crosspost,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -733,6 +808,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         }
         if external_targets:
             contract["external_targets"] = external_targets
+        if facebook_crosspost is not None:
+            contract["facebook_crosspost"] = facebook_crosspost
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -941,6 +1018,37 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_id=session_id,
                         lease_owner=callback_lease_owner,
                     )
+                    (
+                        source_crosspost_listing_id,
+                        source_crosspost_group_ids,
+                    ) = kb.accepted_grace_callback_facebook_crosspost_scope(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                    )
+                    if (
+                        source_crosspost_listing_id is not None
+                        and source_crosspost_group_ids
+                        and facebook_crosspost is None
+                    ):
+                        raise ValueError(
+                            "Origin callback locks an exact Facebook cross-post "
+                            "scope; facebook_crosspost cannot be omitted."
+                        )
+                    if facebook_crosspost is not None:
+                        kb.validate_grace_callback_facebook_crosspost_scope(
+                            conn,
+                            review_task_id=origin_review_id,
+                            event_id=origin_event_id,
+                            listing_id=str(
+                                facebook_crosspost.get(
+                                    "marketplace_listing_id"
+                                ) or ""
+                            ),
+                            group_ids=list(
+                                facebook_crosspost.get("group_ids") or []
+                            ),
+                        )
                 else:
                     kb.validate_accepted_grace_callback_origin(
                         conn,

@@ -794,6 +794,11 @@ class CDPSupervisor:
         text: Optional[str] = None,
         captured_session_id: Optional[str] = None,
         require_group_composer: bool = False,
+        required_marketplace_listing_id: Optional[str] = None,
+        allowed_crosspost_group_ids: Optional[List[str]] = None,
+        selected_crosspost_group_ids: Optional[List[str]] = None,
+        crosspost_stage: Optional[str] = None,
+        crosspost_source_token: Optional[str] = None,
         timeout: float = 10.0,
     ) -> Dict[str, Any]:
         """Mutate one captured AX node after an in-turn page identity check."""
@@ -831,7 +836,7 @@ class CDPSupervisor:
             {
                 "objectId": object_id,
                 "functionDeclaration": """
-                function(token, requireGroupComposer) {
+                function(token, requireGroupComposer, requireCrosspostDialog) {
                   const prior = this.__hermesAtomicGuard;
                   if (prior?.observer) prior.observer.disconnect();
                   if (prior?.listener && prior?.eventTypes) {
@@ -862,6 +867,10 @@ class CDPSupervisor:
                     const dialog = this.closest?.('[role="dialog"]');
                     if (dialog) targets.push(dialog);
                   }
+                  if (requireCrosspostDialog) {
+                    const dialog = this.closest?.('[role="dialog"]');
+                    if (dialog) targets.push(dialog);
+                  }
                   for (const target of new Set(targets)) {
                     state.observer.observe(target, {
                       subtree: true,
@@ -879,6 +888,11 @@ class CDPSupervisor:
                 "arguments": [
                     {"value": guard_token},
                     {"value": bool(require_group_composer)},
+                    {
+                        "value": crosspost_stage in {
+                            "select_group", "submit",
+                        }
+                    },
                 ],
                 "returnByValue": True,
             },
@@ -967,7 +981,10 @@ class CDPSupervisor:
                     "objectId": object_id,
                     "functionDeclaration": """
                     function(
-                      expected, token, requiredGroupId, requireGroupComposer
+                      expected, token, requiredGroupId, requireGroupComposer,
+                      requiredListingId, allowedCrosspostGroupIds,
+                      selectedCrosspostGroupIds, crosspostStage,
+                      crosspostSourceToken
                     ) {
                       const guard = this.__hermesAtomicGuard;
                       const fail = message => {
@@ -1014,6 +1031,435 @@ class CDPSupervisor:
                           );
                         }
                       }
+                      let crosspostGroupId = null;
+                      let crosspostPreselectedGroupIds = [];
+                      if (requiredListingId) {
+                        const listingMatch = location.pathname.match(
+                          /^\\/marketplace\\/item\\/([0-9]+)\\/?$/
+                        );
+                        const sellingRoute = (
+                          /^\\/marketplace\\/you\\/selling\\/?$/
+                            .test(location.pathname)
+                        );
+                        if (
+                          (!listingMatch && !sellingRoute)
+                          || (
+                            listingMatch
+                            && listingMatch[1] !== String(requiredListingId)
+                          )
+                        ) {
+                          fail(
+                            "Current route is not an authorized Marketplace listing source"
+                          );
+                        }
+                        const allowedIds = new Set(
+                          (allowedCrosspostGroupIds || []).map(String)
+                        );
+                        const expectedSelectedIds = new Set(
+                          (selectedCrosspostGroupIds || []).map(String)
+                        );
+                        if (
+                          ![
+                            "open_menu", "open_dialog_from_menu",
+                            "open_dialog_direct",
+                            "select_group", "submit"
+                          ].includes(crosspostStage)
+                        ) fail("Unsupported Marketplace cross-post stage");
+                        if (!crosspostSourceToken) {
+                          fail("Marketplace source capability token is missing");
+                        }
+                        const listingIdsIn = container => {
+                          const ids = new Set();
+                          for (const candidate of [container, ...(
+                            container.querySelectorAll?.(
+                              '[data-listing-id], '
+                              + '[data-marketplace-listing-id], '
+                              + 'a[href*="/marketplace/item/"]'
+                            ) || []
+                          )]) {
+                            for (const attribute of [
+                              "data-listing-id",
+                              "data-marketplace-listing-id"
+                            ]) {
+                              const value = candidate.getAttribute?.(attribute);
+                              if (/^[0-9]+$/.test(value || "")) ids.add(value);
+                            }
+                            const href = candidate.getAttribute?.("href") || "";
+                            const match = href.match(
+                              /\\/marketplace\\/item\\/([0-9]+)(?:\\/|[?#]|$)/
+                            );
+                            if (match) ids.add(match[1]);
+                          }
+                          return ids;
+                        };
+                        const flow = this.ownerDocument.__hermesCrosspostFlow;
+                        let sourceControl = null;
+                        const bindSourceControl = () => {
+                          const listingContainerSelector = [
+                            "[data-listing-id]",
+                            "[data-marketplace-listing-id]",
+                            'a[href*="/marketplace/item/"]',
+                            "article", "li"
+                          ].join(", ");
+                          let sourceBound = false;
+                          let listingNode = this;
+                          for (
+                            let depth = 0;
+                            listingNode && depth < 10;
+                            depth += 1, listingNode = listingNode.parentElement
+                          ) {
+                            if (!listingNode.matches?.(
+                              listingContainerSelector
+                            )) continue;
+                            const sourceIds = listingIdsIn(listingNode);
+                            if (sourceIds.size > 1) {
+                              fail(
+                                "Cross-post control belongs to a shared listing container"
+                              );
+                            }
+                            if (sourceIds.size === 1) {
+                              if (!sourceIds.has(String(requiredListingId))) {
+                                fail(
+                                  "Cross-post control belongs to a different listing"
+                                );
+                              }
+                              sourceBound = true;
+                              break;
+                            }
+                          }
+                          if (!sourceBound) {
+                            fail(
+                              "Cross-post control is not bound to the authorized listing"
+                            );
+                          }
+                        };
+                        if (
+                          crosspostStage === "open_menu"
+                          || crosspostStage === "open_dialog_direct"
+                        ) {
+                          bindSourceControl();
+                          sourceControl = this;
+                        } else {
+                          if (
+                            !flow
+                            || flow.token !== crosspostSourceToken
+                            || flow.listingId !== String(requiredListingId)
+                          ) {
+                            fail(
+                              "Marketplace cross-post source flow is not bound"
+                            );
+                          }
+                          const markedSources = [...this.ownerDocument.querySelectorAll(
+                            'button, a, [role="button"], [role="link"], '
+                            + '[role="menuitem"]'
+                          )].filter(candidate =>
+                            candidate.__hermesCrosspostSource?.token
+                              === crosspostSourceToken
+                            && candidate.__hermesCrosspostSource?.listingId
+                              === String(requiredListingId)
+                          );
+                          if (markedSources.length !== 1) {
+                            fail(
+                              "Marketplace source control is no longer unique"
+                            );
+                          }
+                          sourceControl = markedSources[0];
+                        }
+                        if (crosspostStage === "open_dialog_from_menu") {
+                          if (flow.stage !== "menu_open") {
+                            fail("Marketplace source menu state changed");
+                          }
+                          const menu = this.closest?.('[role="menu"]');
+                          const controlledId = sourceControl.getAttribute(
+                            "aria-controls"
+                          );
+                          if (controlledId) {
+                            if (
+                              !menu
+                              || this.ownerDocument.getElementById(controlledId)
+                                !== menu
+                            ) {
+                              fail(
+                                "List in more places is not in the source menu"
+                              );
+                            }
+                          } else {
+                            const visibleMenus = [...(
+                              this.ownerDocument.querySelectorAll('[role="menu"]')
+                            )].filter(candidate => {
+                              const style = getComputedStyle(candidate);
+                              const rect = candidate.getBoundingClientRect();
+                              return (
+                                rect.width > 0 && rect.height > 0
+                                && style.display !== "none"
+                                && style.visibility !== "hidden"
+                              );
+                            });
+                            if (
+                              sourceControl.getAttribute("aria-expanded")
+                                !== "true"
+                              || !menu
+                              || visibleMenus.length !== 1
+                              || visibleMenus[0] !== menu
+                            ) {
+                              fail(
+                                "List in more places is not uniquely bound to the source menu"
+                              );
+                            }
+                          }
+                        } else if (crosspostStage === "open_dialog_direct") {
+                          if (flow) {
+                            fail(
+                              "Direct List in more places did not start a fresh source flow"
+                            );
+                          }
+                        }
+                        if (
+                          crosspostStage === "select_group"
+                          || crosspostStage === "submit"
+                        ) {
+                          const dialog = this.closest?.('[role="dialog"]');
+                          const dialogText = [
+                            dialog?.getAttribute("aria-label") || "",
+                            dialog?.innerText || ""
+                          ].join(" ").replace(/\\s+/g, " ").toLowerCase();
+                          const isCrosspostDialog = (
+                            dialogText.includes("list in more places")
+                            || dialogText.includes("list your item in more places")
+                            || dialogText.includes("刊登到更多地方")
+                            || dialogText.includes("更多地方")
+                          );
+                          if (!dialog || !isCrosspostDialog) {
+                            fail(
+                              "Target is not the authorized List in more places dialog"
+                            );
+                          }
+                          if (
+                            crosspostStage === "select_group"
+                            && !["dialog_requested", "selecting"].includes(
+                              flow.stage
+                            )
+                          ) {
+                            fail("Marketplace source dialog state changed");
+                          }
+                          if (
+                            crosspostStage === "submit"
+                            && !["dialog_requested", "selecting"].includes(
+                              flow.stage
+                            )
+                          ) {
+                            fail("Marketplace source selection state changed");
+                          }
+                          const discoverGroupId = control => {
+                            const containerSelector = [
+                              "label", "li", '[role="checkbox"]',
+                              '[role="menuitemcheckbox"]', '[role="option"]',
+                              '[role="switch"]', "[data-group-id]",
+                              "[data-groupid]"
+                            ].join(", ");
+                            const selectionSelector = [
+                              '[role="checkbox"]',
+                              '[role="menuitemcheckbox"]', '[role="option"]',
+                              '[role="switch"]', 'input[type="checkbox"]'
+                            ].join(", ");
+                            let node = control;
+                            for (
+                              let depth = 0;
+                              node && node !== dialog && depth < 8;
+                              depth += 1, node = node.parentElement
+                            ) {
+                              const selectionControls = [
+                                ...(node.matches?.(selectionSelector)
+                                  ? [node] : []),
+                                ...node.querySelectorAll(selectionSelector)
+                              ];
+                              const roots = selectionControls.filter(candidate =>
+                                !selectionControls.some(other =>
+                                  other !== candidate
+                                  && other.contains(candidate)
+                                )
+                              );
+                              if (
+                                roots.length !== 1
+                                || !(
+                                  roots[0] === control
+                                  || roots[0].contains(control)
+                                  || control.contains?.(roots[0])
+                                )
+                              ) {
+                                fail(
+                                  "Cross-post option is not a unique selection row"
+                                );
+                              }
+                              if (!node.matches?.(containerSelector)) continue;
+                              const ids = new Set();
+                              for (const link of node.querySelectorAll(
+                                'a[href*="/groups/"]'
+                              )) {
+                                const href = link.getAttribute("href") || "";
+                                const match = href.match(
+                                  /\\/groups\\/([0-9]+)(?:\\/|[?#]|$)/
+                                );
+                                if (match) ids.add(match[1]);
+                              }
+                              for (const candidate of [node, ...(
+                                node.querySelectorAll(
+                                  "[data-group-id], [data-groupid]"
+                                )
+                              )]) {
+                                for (const attribute of [
+                                  "data-group-id", "data-groupid"
+                                ]) {
+                                  const value = candidate.getAttribute?.(
+                                    attribute
+                                  );
+                                  if (/^[0-9]+$/.test(value || "")) {
+                                    ids.add(value);
+                                  }
+                                }
+                              }
+                              if (ids.size > 1) {
+                                fail(
+                                  "Cross-post option maps to multiple group ids"
+                                );
+                              }
+                              if (ids.size === 1) return [...ids][0];
+                            }
+                            return null;
+                          };
+                          const selectedControls = [...dialog.querySelectorAll(
+                            '[role="checkbox"][aria-checked="true"], '
+                            + '[role="menuitemcheckbox"][aria-checked="true"], '
+                            + '[role="switch"][aria-checked="true"], '
+                            + '[role="option"][aria-selected="true"], '
+                            + 'input[type="checkbox"]:checked'
+                          )];
+                          const actualSelectedIds = new Set();
+                          for (const selectedControl of selectedControls) {
+                            const selectedId = discoverGroupId(selectedControl);
+                            if (!selectedId || !allowedIds.has(selectedId)) {
+                              fail(
+                                "Selected cross-post option is not bound to an authorized group id"
+                              );
+                            }
+                            actualSelectedIds.add(selectedId);
+                          }
+                          if (crosspostStage === "submit") {
+                            const allSelectionControls = [...(
+                              dialog.querySelectorAll([
+                                '[role="checkbox"]',
+                                '[role="menuitemcheckbox"]',
+                                '[role="switch"]', '[role="option"]',
+                                'input[type="checkbox"]'
+                              ].join(", "))
+                            )];
+                            const optionRoots = allSelectionControls.filter(
+                              candidate => !allSelectionControls.some(other =>
+                                other !== candidate && other.contains(candidate)
+                              )
+                            );
+                            if (!optionRoots.length) {
+                              fail("Cross-post destination list is empty");
+                            }
+                            const unknownStateControls = [...(
+                              dialog.querySelectorAll(
+                                "[aria-checked], [aria-selected]"
+                              )
+                            )].filter(candidate =>
+                              !candidate.matches([
+                                '[role="checkbox"]',
+                                '[role="menuitemcheckbox"]',
+                                '[role="switch"]', '[role="option"]'
+                              ].join(", "))
+                            );
+                            if (unknownStateControls.length) {
+                              fail(
+                                "Cross-post dialog has an unknown selection control"
+                              );
+                            }
+                            const enumeratedGroupIds = new Set();
+                            for (const optionRoot of optionRoots) {
+                              const optionId = discoverGroupId(optionRoot);
+                              if (
+                                !optionId || enumeratedGroupIds.has(optionId)
+                              ) {
+                                fail(
+                                  "Cross-post destination rows are not uniquely enumerable"
+                                );
+                              }
+                              enumeratedGroupIds.add(optionId);
+                            }
+                            const scrollContainers = new Set();
+                            for (const optionRoot of optionRoots) {
+                              let ancestor = optionRoot.parentElement;
+                              while (ancestor && ancestor !== dialog) {
+                                const style = getComputedStyle(ancestor);
+                                if (
+                                  /(auto|scroll)/.test(style.overflowY)
+                                  && ancestor.scrollHeight
+                                    > ancestor.clientHeight + 1
+                                ) scrollContainers.add(ancestor);
+                                ancestor = ancestor.parentElement;
+                              }
+                            }
+                            const dialogStyle = getComputedStyle(dialog);
+                            if (
+                              /(auto|scroll)/.test(dialogStyle.overflowY)
+                              && dialog.scrollHeight > dialog.clientHeight + 1
+                            ) scrollContainers.add(dialog);
+                            if (scrollContainers.size) {
+                              const setSizes = optionRoots.map(option => Number(
+                                option.getAttribute("aria-setsize")
+                                || option.closest?.("[aria-setsize]")
+                                  ?.getAttribute("aria-setsize")
+                              ));
+                              const positions = optionRoots.map(option => Number(
+                                option.getAttribute("aria-posinset")
+                              ));
+                              const declaredSize = setSizes[0];
+                              const completeAriaSet = (
+                                Number.isInteger(declaredSize)
+                                && declaredSize === optionRoots.length
+                                && setSizes.every(size => size === declaredSize)
+                                && new Set(positions).size === declaredSize
+                                && positions.every(position =>
+                                  Number.isInteger(position)
+                                  && position >= 1
+                                  && position <= declaredSize
+                                )
+                              );
+                              if (!completeAriaSet) {
+                                fail(
+                                  "Cross-post destination list may be virtualized"
+                                );
+                              }
+                            }
+                          }
+                          if (crosspostStage === "select_group") {
+                            const discovered = discoverGroupId(this);
+                            if (!discovered || !allowedIds.has(discovered)) {
+                              fail(
+                                "Cross-post option is not bound to an authorized group id"
+                              );
+                            }
+                            crosspostGroupId = discovered;
+                            crosspostPreselectedGroupIds = [
+                              ...actualSelectedIds
+                            ];
+                          } else if (crosspostStage === "submit") {
+                            if (
+                              actualSelectedIds.size !== expectedSelectedIds.size
+                              || [...expectedSelectedIds].some(
+                                id => !actualSelectedIds.has(id)
+                              )
+                            ) {
+                              fail(
+                                "Selected cross-post groups changed before final Post"
+                              );
+                            }
+                          }
+                        }
+                      }
                       const rect = this.getBoundingClientRect();
                       const x = rect.left + rect.width / 2;
                       const y = rect.top + rect.height / 2;
@@ -1045,12 +1491,54 @@ class CDPSupervisor:
                       }
                       guard.observer.disconnect();
                       delete this.__hermesAtomicGuard;
+                      if (requiredListingId) {
+                        if (
+                          crosspostStage === "open_menu"
+                          || crosspostStage === "open_dialog_direct"
+                        ) {
+                          Object.defineProperty(
+                            this, "__hermesCrosspostSource", {
+                              value: {
+                                token: crosspostSourceToken,
+                                listingId: String(requiredListingId)
+                              },
+                              configurable: true
+                            }
+                          );
+                          Object.defineProperty(
+                            this.ownerDocument, "__hermesCrosspostFlow", {
+                              value: {
+                                token: crosspostSourceToken,
+                                listingId: String(requiredListingId),
+                                stage: (
+                                  crosspostStage === "open_menu"
+                                    ? "menu_open" : "dialog_requested"
+                                )
+                              },
+                              configurable: true,
+                              writable: true
+                            }
+                          );
+                        } else if (
+                          crosspostStage === "open_dialog_from_menu"
+                        ) {
+                          this.ownerDocument.__hermesCrosspostFlow.stage =
+                            "dialog_requested";
+                        } else if (crosspostStage === "select_group") {
+                          this.ownerDocument.__hermesCrosspostFlow.stage =
+                            "selecting";
+                        } else if (crosspostStage === "submit") {
+                          delete sourceControl.__hermesCrosspostSource;
+                          delete this.ownerDocument.__hermesCrosspostFlow;
+                        }
+                      }
                       // The hit test, page identity check, group binding, and
                       // dispatch run in one renderer task. This cannot click a
                       // replacement document between separate CDP calls.
                       this.click();
                       return {
-                        ok: true, action: "click", pageIdentity: expected
+                        ok: true, action: "click", pageIdentity: expected,
+                        crosspostGroupId, crosspostPreselectedGroupIds
                       };
                     }
                     """,
@@ -1059,6 +1547,11 @@ class CDPSupervisor:
                         {"value": guard_token},
                         {"value": required_group_id},
                         {"value": bool(require_group_composer)},
+                        {"value": required_marketplace_listing_id},
+                        {"value": list(allowed_crosspost_group_ids or [])},
+                        {"value": list(selected_crosspost_group_ids or [])},
+                        {"value": crosspost_stage},
+                        {"value": crosspost_source_token},
                     ],
                     "returnByValue": True,
                     "userGesture": True,

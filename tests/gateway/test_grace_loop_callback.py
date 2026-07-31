@@ -255,7 +255,14 @@ def test_orphan_callback_cannot_be_listed_or_claimed(tmp_path, monkeypatch):
         )
 
 
-def _review_chain(db_path, *, event_kind="completed", accepted=True):
+def _review_chain(
+    db_path,
+    *,
+    event_kind="completed",
+    accepted=True,
+    review_body=None,
+    review_metadata=None,
+):
     with kb.connect_closing(db_path) as conn:
         execution_id = kb.create_task(
             conn, title="execution", assignee="clawops-content",
@@ -264,7 +271,9 @@ def _review_chain(db_path, *, event_kind="completed", accepted=True):
         review_id = kb.create_task(
             conn,
             title="Grace review",
+            body=review_body,
             assignee="default",
+            created_by="grace-loop-compiler",
             parents=(execution_id,),
         )
         _bind_delegation(
@@ -286,7 +295,11 @@ def _review_chain(db_path, *, event_kind="completed", accepted=True):
         if event_kind == "blocked":
             assert kb.block_task(conn, review_id, reason="KJ must choose a price")
         else:
-            metadata = {"review_outcome": "accepted"} if accepted else {"review_outcome": "unknown"}
+            metadata = review_metadata or (
+                {"review_outcome": "accepted"}
+                if accepted
+                else {"review_outcome": "unknown"}
+            )
             assert kb.complete_task(
                 conn, review_id, summary="review complete", metadata=metadata,
             )
@@ -338,6 +351,65 @@ def test_accepted_review_wakes_grace_once(tmp_path, monkeypatch):
         callback = kb.get_grace_loop_callback(conn, review_id)
     assert callback["state"] == "delivered"
     assert callback["last_event_id"] > 0
+
+
+def test_callback_prompt_exposes_exact_accepted_facebook_crosspost_scope(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "facebook-scope-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    listing_id = "37276725125275496"
+    group_ids = ["1333742673375089", "897927458651235"]
+    review_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: grace_review\n"
+        "```json\n"
+        + json.dumps({
+            "memory": {
+                "working": [
+                    "後續外部跨貼必須嚴格綁定群組IDs："
+                    + "、".join(group_ids),
+                ],
+            },
+        }, ensure_ascii=False)
+        + "\n```"
+    )
+    _, review_id = _review_chain(
+        db_path,
+        review_body=review_body,
+        review_metadata={
+            "review_outcome": "accepted",
+            "verified_evidence": {
+                "listing_id": listing_id,
+                "url": (
+                    "https://www.facebook.com/marketplace/item/"
+                    f"{listing_id}/"
+                ),
+            },
+        },
+    )
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    prompt = adapter.handled[0].text
+    assert (
+        f"callback_facebook_crosspost_source_listing_id={listing_id}"
+        in prompt
+    )
+    assert (
+        'callback_facebook_crosspost_destination_group_ids='
+        '["1333742673375089", "897927458651235"]'
+        in prompt
+    )
+    assert "never add, remove, or substitute a destination" in prompt
 
 
 def test_accepted_review_waits_for_background_turn_before_checking_outcome(

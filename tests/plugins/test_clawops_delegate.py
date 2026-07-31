@@ -134,6 +134,23 @@ def _bind_callback_delegation(
     )
 
 
+def _facebook_discovery_review_body(listing_id, group_ids):
+    groups = "、".join(group_ids)
+    contract = {
+        "memory": {
+            "working": [
+                f"後續外部跨貼必須嚴格綁定群組IDs：{groups}",
+            ],
+        },
+    }
+    return (
+        "GRACE_LOOP_CONTRACT_STAGE: grace_review\n"
+        "```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+
+
 @pytest.mark.parametrize(
     ("message", "accepted"),
     [
@@ -407,6 +424,154 @@ def test_delegate_internal_callback_can_create_but_not_consume_external_approval
         )
         assert challenge["state"] == "pending"
         assert len(kb.list_tasks(conn)) == 2
+
+
+def test_internal_callback_crosspost_is_bound_to_accepted_listing_and_groups(
+    tmp_path,
+    monkeypatch,
+):
+    listing_id = "37276725125275496"
+    group_ids = ["1333742673375089", "897927458651235"]
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "callback-anchor",
+        "HERMES_SESSION_MESSAGE_TEXT": "[SYSTEM: callback]",
+        "HERMES_SESSION_INTERNAL": "true",
+        "HERMES_GRACE_CALLBACK_LEASE_OWNER": "callback-owner",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    review_body = _facebook_discovery_review_body(listing_id, group_ids)
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body=review_body,
+            created_by="grace-loop-compiler",
+            parents=(execution_id,),
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=execution_id,
+            review_id=review_id,
+            contract_fingerprint="f" * 64,
+            suffix="facebook-scope-callback",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="f" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={
+                "review_outcome": "accepted",
+                "verified_evidence": {
+                    "listing_id": listing_id,
+                    "url": (
+                        "https://www.facebook.com/marketplace/item/"
+                        f"{listing_id}/"
+                    ),
+                },
+            },
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="callback-owner",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, status, started_at, ended_at, outcome, metadata
+                ) VALUES (?, 'done', 10, 11, 'completed', ?)
+                """,
+                (
+                    review_id,
+                    json.dumps({
+                        "review_outcome": "accepted",
+                        "verified_evidence": {
+                            "listing_id": "99999999999999999",
+                        },
+                    }),
+                ),
+            )
+        assert kb.accepted_grace_callback_facebook_crosspost_scope(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+        ) == (listing_id, frozenset(group_ids))
+
+    args = _nested_args()
+    args.update({
+        "task_type": "browser_publish",
+        "risk_level": "medium",
+        "external_targets": [
+            f"Facebook Marketplace listing ID: {listing_id}",
+            f"Facebook group ID: {group_ids[0]}",
+            "Facebook group ID: 709787531936565",
+        ],
+        "facebook_crosspost": {
+            "marketplace_listing_id": listing_id,
+            "group_ids": [group_ids[0], "709787531936565"],
+        },
+        "origin_callback_review_id": review_id,
+        "origin_callback_event_id": callback["event_id"],
+    })
+    args["goal"]["objective"] = "將既有 Marketplace 刊登跨貼到指定社團"
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    drifted = json.loads(handle_clawops_delegate(args))
+
+    assert drifted["status"] == "rejected"
+    assert "locked by the origin Loop Contract" in drifted["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0] == 0
+
+    omitted = json.loads(json.dumps(args))
+    omitted.pop("facebook_crosspost")
+    omitted["external_targets"] = ["Facebook Marketplace"]
+    missing_binding = json.loads(handle_clawops_delegate(omitted))
+
+    assert missing_binding["status"] == "rejected"
+    assert "facebook_crosspost cannot be omitted" in missing_binding["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0] == 0
+
+    args["external_targets"] = [
+        f"https://www.facebook.com/marketplace/item/{listing_id}/",
+        *[
+            f"https://www.facebook.com/groups/{group_id}/"
+            for group_id in group_ids
+        ],
+    ]
+    args["facebook_crosspost"]["group_ids"] = group_ids
+    exact = json.loads(handle_clawops_delegate(args))
+
+    assert exact["status"] == "approval_required"
+    assert exact["task_created"] is False
 
 
 def test_delegate_rejects_approved_external_work_from_non_owner(
@@ -933,6 +1098,76 @@ def test_model_visible_schema_exposes_required_nested_parameters():
     )
     assert "listing" not in CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"]
     validate(_nested_args(), CLAWOPS_DELEGATE_PARAMETERS)
+
+
+def test_facebook_marketplace_crosspost_requires_structured_exact_ids(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-crosspost",
+        "HERMES_SESSION_MESSAGE_TEXT": "請準備跨貼",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args.update({
+        "task_type": "browser_publish",
+        "risk_level": "medium",
+        "external_targets": [
+            "Facebook Marketplace existing listing → "
+            "Facebook group 1333742673375089",
+        ],
+    })
+    args["goal"]["objective"] = "將既有 Marketplace 刊登跨貼到指定社團"
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    rejected = json.loads(handle_clawops_delegate(args))
+
+    assert rejected["status"] == "rejected"
+    assert "facebook_crosspost" in rejected["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0] == 0
+
+    args["external_targets"] = [
+        "Facebook 市集項目 915975414881937 → 社團 "
+        "https://www.facebook.com/groups/1333742673375089",
+    ]
+    localized_rejected = json.loads(handle_clawops_delegate(args))
+    assert localized_rejected["status"] == "rejected"
+    assert "facebook_crosspost" in localized_rejected["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0] == 0
+
+    args["facebook_crosspost"] = {
+        "marketplace_listing_id": "915975414881937",
+        "group_ids": ["1333742673375089"],
+    }
+    args["external_targets"] = [
+        "Facebook Marketplace item 915975414881937 → "
+        "Facebook Group 1333742673375089",
+    ]
+    approved_shape = json.loads(handle_clawops_delegate(args))
+
+    assert approved_shape["status"] == "approval_required"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        challenge = kb.get_grace_approval_challenge(
+            conn,
+            approved_shape["approval_token"],
+        )
+    persisted = json.loads(challenge["delegation_args"])
+    assert persisted["facebook_crosspost"] == args["facebook_crosspost"]
 
 
 def test_callback_outcome_requires_active_internal_callback(

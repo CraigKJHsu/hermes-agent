@@ -26,6 +26,7 @@ class DelegationResult:
 def render_execution_body(contract: Mapping[str, Any]) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
+    crosspost_guidance = _render_facebook_crosspost_guidance(worker_contract)
     return "\n".join(
         [
             "GRACE_LOOP_CONTRACT_STAGE: execution",
@@ -47,12 +48,45 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "capability, or a specific human decision prevents completion of the contracted deliverables.",
             "Stop on success, approval boundary, blocker, no-progress limit, iteration limit, or runtime limit.",
             *authorization_guidance,
+            *crosspost_guidance,
             "",
             "```json",
             json.dumps(worker_contract, ensure_ascii=False, indent=2, sort_keys=True),
             "```",
         ]
     )
+
+
+def _render_facebook_crosspost_guidance(
+    contract: Mapping[str, Any],
+) -> list[str]:
+    crosspost = contract.get("facebook_crosspost")
+    if not isinstance(crosspost, Mapping):
+        return []
+    listing_id = str(crosspost.get("marketplace_listing_id") or "").strip()
+    group_ids = [
+        str(group_id or "").strip()
+        for group_id in list(crosspost.get("group_ids") or [])
+    ]
+    if not listing_id or not group_ids:
+        return [
+            "Facebook cross-post scope is malformed. Block without clicking "
+            "Marketplace mutation controls.",
+        ]
+    return [
+        "Facebook existing-listing cross-post scope (authoritative): use only "
+        f"Marketplace listing {listing_id}. First inspect "
+        f"https://www.facebook.com/marketplace/item/{listing_id}; if that "
+        "page does not expose List in more places, inspect Marketplace "
+        "Selling / Your listings and use only a control atomically bound to "
+        "that same listing ID.",
+        "More options → List in more places and a listing-bound direct List "
+        "in more places control are equivalent authorized entry paths. "
+        "Read-only navigation and snapshots may locate either path, but Share, "
+        "Sell Something, Edit, Boost, stock changes, and create-item routes "
+        "remain forbidden. The guarded dialog may select only these group "
+        f"ids: {', '.join(group_ids)}.",
+    ]
 
 
 def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> str:

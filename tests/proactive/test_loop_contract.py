@@ -114,3 +114,124 @@ def test_grace_bodies_require_durable_external_effect_handoff():
     assert "metadata.external_effects" in execution
     assert "all cumulative evidence" in review
     assert "external-effect ledger" in review
+
+
+def test_facebook_crosspost_guidance_allows_bound_selling_fallback():
+    contract = _contract()
+    contract["external_targets"] = [
+        "https://www.facebook.com/marketplace/item/111/",
+        "https://www.facebook.com/groups/222/",
+    ]
+    contract["facebook_crosspost"] = {
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+
+    body = render_execution_body(contract)
+
+    assert "Marketplace Selling / Your listings" in body
+    assert "atomically bound to that same listing ID" in body
+    assert "listing-bound direct List in more places" in body
+    assert "Do not use Marketplace Selling-list controls" not in body
+    assert "Share, Sell Something, Edit, Boost" in body
+
+
+@pytest.mark.parametrize(
+    "external_target",
+    [
+        "Facebook Marketplace item 999 → Facebook Group 222",
+        "Facebook Marketplace item 111 → Facebook Group 999",
+    ],
+)
+def test_facebook_crosspost_requires_canonical_matching_display_ids(
+    external_target,
+):
+    contract = _contract()
+    contract["external_targets"] = [external_target]
+    contract["facebook_crosspost"] = {
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+
+    with pytest.raises(LoopContractError, match="facebook_crosspost"):
+        validate_loop_contract(contract)
+
+
+def test_facebook_crosspost_accepts_canonical_matching_display_ids():
+    contract = _contract()
+    contract["external_targets"] = [
+        "Facebook Marketplace item 111 → Facebook Group 222",
+    ]
+    contract["facebook_crosspost"] = {
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+
+    validated = validate_loop_contract(contract)
+
+    assert validated["facebook_crosspost"] == contract["facebook_crosspost"]
+
+
+@pytest.mark.parametrize(
+    "external_targets",
+    [
+        [
+            "https://www.facebook.com/marketplace/item/111/",
+            "https://www.facebook.com/groups/222/",
+        ],
+        [
+            "Facebook Marketplace listing ID: 111",
+            "Facebook group ID: 222",
+        ],
+        [
+            "Facebook 市集項目 111 → 社團 "
+            "https://www.facebook.com/groups/222/",
+        ],
+        [
+            "facebook.com/marketplace/item/111",
+            "facebook.com/groups/222",
+        ],
+        ["facebook:marketplace:111", "facebook:group:222"],
+        ["Facebook Marketplace item 111.", "Facebook 群組 222）"],
+        ["facebook.com/marketplace/item/111.", "facebook:group:222!"],
+        ['"Facebook Marketplace item 111."', "(Facebook Group 222.)"],
+    ],
+)
+def test_facebook_crosspost_accepts_explicit_url_and_id_labels(
+    external_targets,
+):
+    contract = _contract()
+    contract["external_targets"] = external_targets
+    contract["facebook_crosspost"] = {
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+
+    validated = validate_loop_contract(contract)
+
+    assert validated["facebook_crosspost"] == contract["facebook_crosspost"]
+
+
+def test_facebook_crosspost_rejects_embedded_lookalike_hosts_and_urns():
+    bad_targets = [
+        [
+            "https://evil.example/facebook.com/marketplace/item/111",
+            "https://evil.example/facebook.com/groups/222",
+        ],
+        [
+            "https://evil.example/path;facebook.com/marketplace/item/111",
+            "https://evil.example/path;facebook.com/groups/222",
+        ],
+        ["facebook.com/marketplace/item/111_suffix", "facebook:group:222-x"],
+        ["evilfacebook.com/marketplace/item/111", "notfacebook:group:222"],
+    ]
+    for external_targets in bad_targets:
+        contract = _contract()
+        contract["external_targets"] = external_targets
+        contract["facebook_crosspost"] = {
+            "marketplace_listing_id": "111",
+            "group_ids": ["222"],
+        }
+
+        with pytest.raises(LoopContractError, match="facebook_crosspost"):
+            validate_loop_contract(contract)
