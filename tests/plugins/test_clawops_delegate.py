@@ -1644,6 +1644,123 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     assert len(tasks) == 4
 
 
+def test_fresh_turn_can_create_checkpoint_from_delivered_execution_blocker(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "fresh-after-blocker",
+        "HERMES_SESSION_MESSAGE_TEXT": "請依建議建立精確核准關卡",
+        "HERMES_SESSION_INTERNAL": "false",
+        "HERMES_GRACE_CALLBACK_BOARD": "",
+        "HERMES_GRACE_CALLBACK_LEASE_OWNER": "",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook controlled cross-post",
+            assignee="clawops-browser",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=execution_id,
+            review_id=review_id,
+            contract_fingerprint="e" * 64,
+            suffix="delivered-execution-blocker",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="e" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="Approved item-page route is unavailable",
+            kind="capability",
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="delivered-blocker-lease",
+        )
+        assert kb.finish_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="delivered-blocker-lease",
+        )
+        delivered = kb.get_grace_loop_callback(conn, review_id)
+        assert delivered["state"] == "delivered"
+        assert delivered["outcome_kind"] is None
+
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    args = _external_listing_args()
+    args["task_type"] = "browser_readonly"
+    args["risk_level"] = "low"
+    args["external_targets"] = ["Facebook Marketplace"]
+    args.update({
+        "origin_callback_review_id": review_id,
+        "origin_callback_event_id": callback["event_id"],
+        "origin_callback_board": "default",
+    })
+
+    values["HERMES_SESSION_ID"] = "wrong-session"
+    wrong_session = json.loads(handle_clawops_delegate(args))
+    assert wrong_session["status"] == "rejected"
+    assert "not valid on any durable board" in wrong_session["reason"]
+
+    values["HERMES_SESSION_ID"] = "grace-session-1"
+    challenge = json.loads(handle_clawops_delegate(args))
+    assert challenge["status"] == "approval_required"
+    with kb.connect_closing() as conn:
+        challenge_row = kb.get_grace_approval_challenge(
+            conn, challenge["approval_token"],
+        )
+        assert challenge_row["origin_review_task_id"] == review_id
+        assert challenge_row["origin_event_id"] == callback["event_id"]
+        assert len(kb.list_tasks(conn)) == 2
+        assert kb.unblock_task(conn, execution_id)
+        with pytest.raises(ValueError, match="unresolved execution blocker"):
+            kb.validate_delivered_grace_callback_approval_origin(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+            )
+
+
 def test_execution_blocker_can_create_durable_approval_checkpoint(
     tmp_path,
     monkeypatch,

@@ -343,7 +343,7 @@ def _canonical_sections(args: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _resolve_completed_callback_board(
+def _resolve_callback_approval_board(
     *,
     review_task_id: str,
     event_id: int,
@@ -358,7 +358,7 @@ def _resolve_completed_callback_board(
         slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
         try:
             with kb.connect_closing(board=slug) as conn:
-                kb.validate_completed_approval_blocker(
+                kb.validate_delivered_grace_callback_approval_origin(
                     conn,
                     review_task_id=review_task_id,
                     event_id=event_id,
@@ -370,9 +370,13 @@ def _resolve_completed_callback_board(
         except (ValueError, OSError):
             continue
         matches.append(slug)
-    if len(matches) != 1:
+    if not matches:
         raise ValueError(
-            "Fresh callback approval must resolve to exactly one durable board."
+            "Fresh callback approval origin is not valid on any durable board."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Fresh callback approval origin resolved to multiple durable boards."
         )
     return matches[0]
 
@@ -622,7 +626,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         ):
             resolved_board = approval_board
             if approval_challenge is None:
-                resolved_board = _resolve_completed_callback_board(
+                resolved_board = _resolve_callback_approval_board(
                     review_task_id=origin_review_id,
                     event_id=origin_event_id,
                     platform=platform,
@@ -1075,7 +1079,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             if approval_challenge is None:
                 with kb.connect_closing(board=board) as conn:
-                    kb.validate_completed_approval_blocker(
+                    kb.validate_delivered_grace_callback_approval_origin(
                         conn,
                         review_task_id=origin_review_id,
                         event_id=origin_event_id,

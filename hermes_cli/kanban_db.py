@@ -12770,6 +12770,87 @@ def validate_completed_approval_blocker(
     return dict(row)
 
 
+def validate_delivered_grace_callback_approval_origin(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+) -> dict:
+    """Validate a delivered callback that may mint a fresh approval challenge.
+
+    The normal path is a callback with a durable ``approval_blocked`` outcome.
+    Grace may instead finish delivery after reporting an execution blocker,
+    before it has created a challenge.  That callback is also a valid origin,
+    but only while the exact execution ``blocked`` event is still unresolved
+    and no callback outcome has been recorded.
+    """
+    row = conn.execute(
+        """
+        SELECT c.*
+          FROM grace_loop_callbacks AS c
+         WHERE c.review_task_id = ?
+           AND c.state = 'delivered'
+           AND c.last_event_id = ?
+           AND c.platform = ?
+           AND c.chat_id = ?
+           AND c.thread_id = ?
+           AND c.session_id = ?
+           AND (
+               (
+                   c.outcome_event_id = ?
+                   AND c.outcome_kind = 'approval_blocked'
+               )
+               OR
+               (
+                   c.outcome_event_id IS NULL
+                   AND c.outcome_kind IS NULL
+                   AND c.outcome_payload IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                         FROM task_events AS e
+                        WHERE e.id = ?
+                          AND e.task_id = c.execution_task_id
+                          AND e.kind IN ('blocked', 'block_loop_detected')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM task_events AS later
+                        WHERE later.task_id = c.execution_task_id
+                          AND later.id > ?
+                          AND later.kind IN (
+                              'unblocked', 'promoted', 'claimed', 'spawned',
+                              'completed', 'blocked', 'block_loop_detected',
+                              'gave_up', 'crashed', 'timed_out'
+                          )
+                   )
+               )
+           )
+        """,
+        (
+            review_task_id.strip(),
+            int(event_id),
+            platform.strip().lower(),
+            chat_id.strip(),
+            (thread_id or "").strip(),
+            session_id.strip(),
+            int(event_id),
+            int(event_id),
+            int(event_id),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "Fresh approval turn is not bound to a delivered approval "
+            "checkpoint or unresolved execution blocker on this board and "
+            "session."
+        )
+    return dict(row)
+
+
 def validate_consumed_grace_approval_origin(
     conn: sqlite3.Connection,
     *,
