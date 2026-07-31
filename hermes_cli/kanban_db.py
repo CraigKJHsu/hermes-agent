@@ -329,9 +329,13 @@ _EXTERNAL_CREATE_HOSTS = {
     }),
 }
 _FACEBOOK_GROUP_TARGET_RE = re.compile(
-    r"Facebook Group ([0-9]+)(?:（[^）]+）)?",
+    r"Facebook Group (?P<group_id>[0-9]+)"
+    r"(?:(?:（[^）]+）)|(?:「[^」]+」))?"
+    r"(?:https://(?:www\.)?facebook\.com/groups/"
+    r"(?P<url_group_id>[0-9]+)/?)?",
     flags=re.IGNORECASE,
 )
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
@@ -368,10 +372,48 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
         normalized = str(target or "").strip()
         match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
         if match is not None:
-            group_ids.add(match.group(1))
+            group_id = match.group("group_id")
+            url_group_id = match.group("url_group_id")
+            if url_group_id is not None and url_group_id != group_id:
+                return frozenset()
+            group_ids.add(group_id)
         elif normalized.casefold().startswith("facebook group"):
             return frozenset()
     return frozenset(group_ids)
+
+
+def _grace_contract_has_human_approval(
+    contract: Mapping[str, Any],
+) -> bool:
+    """Recognize legacy elevation or one exact consumed challenge proof."""
+    authorization = contract.get("authorization")
+    if (
+        isinstance(authorization, Mapping)
+        and authorization.get("human_approved") is True
+    ):
+        return True
+    provenance = contract.get("approval_provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    return (
+        provenance.get("source")
+        == "one_time_authenticated_owner_challenge"
+        and provenance.get("scope_binding")
+        == "exact_loop_contract_fingerprint"
+        and provenance.get("internal") is False
+        and bool(str(provenance.get("platform") or "").strip())
+        and bool(str(provenance.get("requested_message_id") or "").strip())
+        and bool(str(provenance.get("approved_message_id") or "").strip())
+        and _SHA256_HEX_RE.fullmatch(
+            str(provenance.get("user_id_sha256") or "")
+        ) is not None
+        and _SHA256_HEX_RE.fullmatch(
+            str(provenance.get("challenge_token_sha256") or "")
+        ) is not None
+        and _SHA256_HEX_RE.fullmatch(
+            str(provenance.get("contract_fingerprint") or "")
+        ) is not None
+    )
 
 
 def grace_allows_facebook_group_posting(body: str) -> bool:
@@ -381,16 +423,15 @@ def grace_allows_facebook_group_posting(body: str) -> bool:
     contract = _grace_compiled_contract(body)
     if contract is None or not grace_external_group_ids(body):
         return False
-    authorization = contract.get("authorization")
     routing = contract.get("routing")
-    if not isinstance(authorization, Mapping) or not isinstance(routing, Mapping):
+    if not isinstance(routing, Mapping):
         return False
     resolved = routing.get("resolved")
     resolved_task_type = (
         resolved.get("task_type") if isinstance(resolved, Mapping) else None
     )
     return (
-        authorization.get("human_approved") is True
+        _grace_contract_has_human_approval(contract)
         and str(
             routing.get("task_type") or resolved_task_type or ""
         ).strip().casefold() == "browser_publish"

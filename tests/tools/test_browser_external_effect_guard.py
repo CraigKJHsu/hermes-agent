@@ -771,6 +771,79 @@ def test_lowercase_group_targets_and_browser_publish_authority_are_accepted():
     assert kb.grace_allows_facebook_group_posting(body) is True
 
 
+def test_compiler_display_group_targets_and_challenge_proof_are_accepted():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"approval_provenance":{'
+        '"source":"one_time_authenticated_owner_challenge",'
+        '"scope_binding":"exact_loop_contract_fingerprint",'
+        '"internal":false,"platform":"telegram",'
+        '"requested_message_id":"2391","approved_message_id":"2395",'
+        f'"user_id_sha256":"{"a" * 64}",'
+        f'"challenge_token_sha256":"{"b" * 64}",'
+        f'"contract_fingerprint":"{"c" * 64}"'
+        '},'
+        '"external_targets":['
+        '"Facebook Group 897927458651235「大台灣二手家具家電交流*'
+        '免費贈送＆民眾/店家買賣」'
+        'https://www.facebook.com/groups/897927458651235/",'
+        '"Facebook Group 1466446866915040「二手｜液晶電視 中古 家電'
+        ' 買賣交流 社團」'
+        'https://www.facebook.com/groups/1466446866915040/"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset({
+        "897927458651235",
+        "1466446866915040",
+    })
+    assert kb.grace_allows_facebook_group_posting(body) is True
+
+
+def test_compiler_display_group_target_rejects_mismatched_url_id():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":['
+        '"Facebook Group 897927458651235「大台灣二手家具家電交流」'
+        'https://www.facebook.com/groups/1466446866915040/"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset()
+    assert kb.grace_allows_facebook_group_posting(body) is False
+
+
+def test_compiler_display_group_target_rejects_unstructured_trailing_text():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"external_targets":['
+        '"Facebook Group 897927458651235 untrusted note"]}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset()
+
+
+def test_group_posting_rejects_incomplete_challenge_proof():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"approval_provenance":{'
+        '"source":"one_time_authenticated_owner_challenge",'
+        '"scope_binding":"exact_loop_contract_fingerprint",'
+        '"internal":false,"platform":"telegram",'
+        '"requested_message_id":"2391","approved_message_id":"2395",'
+        f'"user_id_sha256":"{"a" * 64}",'
+        f'"challenge_token_sha256":"{"b" * 64}"'
+        '},"external_targets":["Facebook Group 897927458651235"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset({
+        "897927458651235",
+    })
+    assert kb.grace_allows_facebook_group_posting(body) is False
+
+
 def test_group_post_reservation_is_one_shot(tmp_path):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path)
