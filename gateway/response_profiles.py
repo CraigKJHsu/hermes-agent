@@ -730,21 +730,34 @@ def translator_detail_validation_errors(
             "### 4. 實用例句",
             "### 5. 延伸學習",
         )
-        example_numbers = re.findall(
-            r"(?m)^\s*(\d+)[.)]\s+\S", example_section
+        example_markers = list(
+            re.finditer(
+                r"(?m)^\s*(\d+)[.)]\s+\S.*$",
+                example_section,
+            )
         )
+        example_numbers = [
+            marker.group(1)
+            for marker in example_markers
+        ]
         if example_numbers != ["1", "2"]:
             errors.append("實用例句必須包含編號 1、2 的兩個英中例句。")
-        example_lines = re.findall(
-            r"(?m)^\s*\d+[.)]\s+.+$",
-            example_section,
-        )
+        example_blocks = [
+            example_section[
+                marker.start():(
+                    example_markers[index + 1].start()
+                    if index + 1 < len(example_markers)
+                    else len(example_section)
+                )
+            ]
+            for index, marker in enumerate(example_markers)
+        ]
         if any(
             not (
-                re.search(r"[A-Za-z]", line)
-                and re.search(r"[\u3400-\u9fff]", line)
+                re.search(r"[A-Za-z]", block)
+                and re.search(r"[\u3400-\u9fff]", block)
             )
-            for line in example_lines
+            for block in example_blocks
         ):
             errors.append("每個實用例句都必須同時包含英文與繁體中文翻譯。")
         collocations = _content_after("**常用搭配詞 (Collocation)**")

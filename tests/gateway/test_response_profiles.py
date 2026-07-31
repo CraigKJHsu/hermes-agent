@@ -309,6 +309,72 @@ def test_term_examples_must_each_be_bilingual():
     assert "每個實用例句都必須同時包含英文與繁體中文翻譯。" in errors
 
 
+def test_term_examples_accept_multiline_bilingual_blocks():
+    response = """### 1. 基本資訊與翻譯
+**單字／詞彙**：Invaded
+**音標**：[ɪnˈveɪdɪd]
+**詞性與繁體中文解釋**：動詞 invade 的過去式，表示「入侵；侵入」。
+### 2. 構詞拆解（字根、字首、字尾）
+**字首 (Prefix)**：in- 表示「進入」。
+**字根 (Root)**：vad 與「走、前進」有關。
+**字尾 (Suffix)**：-ed 表示過去式。
+### 3. 記憶法與聯想助手
+**邏輯組合**：走進他人領土，引申為入侵。
+**記憶小撇步**：想像外來軍隊走進城內。
+### 4. 實用例句
+1. The army invaded the country at dawn.
+   - 中譯：軍隊在黎明時入侵了該國。
+2. We felt as if our privacy had been invaded.
+   - 中譯：我們覺得自己的隱私仿彿受到了侵犯。
+### 5. 延伸學習
+**同／反義詞**：attack／defend
+**常用搭配詞 (Collocation)**：
+- invade a country
+- invade someone's privacy
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "Invaded",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="入侵了\nK.K.：[ɪnˈveɪdɪd]",
+    ) == []
+
+
+def test_term_example_blocks_validate_each_translation_independently():
+    response = """### 1. 基本資訊與翻譯
+**單字／詞彙**：curriculum
+**音標**：[kəˈrɪkjələm]
+**詞性與繁體中文解釋**：名詞，課程。
+### 2. 構詞拆解（字根、字首、字尾）
+**字首 (Prefix)**：無。
+**字根 (Root)**：curr，跑。
+**字尾 (Suffix)**：-um，名詞。
+### 3. 記憶法與聯想助手
+**邏輯組合**：學習要走的路。
+**記憶小撇步**：想成課程路線。
+### 4. 實用例句
+1. The curriculum changed.
+   - 中譯：課程改變了。
+2. We reviewed the curriculum.
+### 5. 延伸學習
+**同／反義詞**：syllabus／無直接反義詞
+**常用搭配詞 (Collocation)**：
+- school curriculum
+- national curriculum
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "curriculum",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+    )
+
+    assert "每個實用例句都必須同時包含英文與繁體中文翻譯。" in errors
+
+
 def test_duplicate_required_heading_is_rejected():
     response = """### 1. 整句翻譯
 已於上一則快速翻譯提供，這裡不重複全文。
