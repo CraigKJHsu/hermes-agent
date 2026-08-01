@@ -102,7 +102,14 @@ def _requires_structured_facebook_crosspost(
 _GOAL = {
     "type": "object",
     "properties": {
-        "objective": {"type": "string"},
+        "objective": {
+            "type": "string",
+            "description": (
+                "Post-approval task outcome for the delegated worker. Never "
+                "use approval challenge, checkpoint, or token creation as the "
+                "worker objective; clawops_delegate creates that artifact."
+            ),
+        },
         "deliverables": _LIST,
         "non_goals": _LIST,
     },

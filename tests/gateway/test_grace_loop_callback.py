@@ -344,6 +344,8 @@ def test_accepted_review_wakes_grace_once(tmp_path, monkeypatch):
     assert "retry the unchanged contract with approval_token" in event.text
     assert "Never end an incomplete outcome with only a generic statement" in event.text
     assert "immediately call clawops_delegate" in event.text
+    assert "must describe the external action that will execute after approval" in event.text
+    assert "Never make approval-challenge" in event.text
     assert f"origin_callback_review_id={review_id}" in event.text
     assert "grace_callback_outcome exactly once" in event.text
     assert "internal delegation of an already-authorized safe continuation is allowed" in event.text

@@ -1091,6 +1091,11 @@ def test_model_visible_schema_exposes_required_nested_parameters():
     assert CLAWOPS_DELEGATE_PARAMETERS["properties"]["goal"]["required"] == [
         "objective", "deliverables", "non_goals",
     ]
+    objective_description = CLAWOPS_DELEGATE_PARAMETERS["properties"]["goal"][
+        "properties"
+    ]["objective"]["description"]
+    assert "Post-approval task outcome" in objective_description
+    assert "Never use approval challenge" in objective_description
     assert "goal" in CLAWOPS_DELEGATE_PARAMETERS["required"]
     assert "contract_fingerprint" not in CLAWOPS_DELEGATE_PARAMETERS["properties"]
     assert CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"] == list(
