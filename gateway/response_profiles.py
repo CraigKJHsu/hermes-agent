@@ -1000,8 +1000,20 @@ def normalize_response_profile(value: Any) -> Optional[Dict[str, Any]]:
     failure_route = _detail_route(
         "on_fast_failure",
         legacy_skill,
-        allow_output_contract=False,
     )
+    if failure_route is not None:
+        failure_contract = failure_route["output_contract"]
+        if failure_contract == "translator_mastery":
+            failure_route["output_contract"] = (
+                "translator_mastery_self_contained"
+            )
+        elif failure_contract not in {
+            None,
+            "translator_mastery_self_contained",
+        }:
+            # A failed fast lane cannot satisfy contracts that assume a
+            # confirmed first reply (or other success-only handoff formats).
+            return None
     if ambiguous_route is None or failure_route is None:
         return None
 

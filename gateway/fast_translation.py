@@ -209,8 +209,9 @@ def build_failed_lane_prompt(
         "[Trusted gateway note: The stateless fast-translation lane definitely "
         "failed before delivering a translation. Treat the current user "
         f"message as text to translate. {target_note}{operator_instructions} "
-        "Lead with the directly usable translation, then add only concise "
-        "useful detail.]"
+        "Lead with the directly usable translation. If a detail skill or output "
+        "contract is selected for this turn, follow it completely; otherwise "
+        "add only concise useful detail.]"
     )
 
 

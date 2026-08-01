@@ -199,6 +199,7 @@ def test_fast_translation_output_and_detail_prompt():
     failed_prompt = build_failed_lane_prompt()
     assert "definitely failed" in failed_prompt
     assert "Lead with the directly usable translation" in failed_prompt
+    assert "follow it completely" in failed_prompt
     targeted_failed_prompt = build_failed_lane_prompt(
         target_language="zh-TW",
         instructions="Preserve product names.",
@@ -1051,6 +1052,39 @@ async def test_deliver_fast_translation_times_out_without_sending():
     assert value is None
     adapter.send.assert_not_awaited()
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_fast_timeout_does_not_wait_for_cancellation_resistant_cleanup():
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    event = MessageEvent(text="persistent", source=_source())
+
+    async def slow_cleanup():
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.5)
+            return "late cleanup"
+
+    task = asyncio.create_task(slow_cleanup())
+    job = {
+        "task": task,
+        "started_at": time.monotonic(),
+        "delivery_timeout": 0.05,
+    }
+    started = time.monotonic()
+
+    value = await runner._deliver_fast_translation(
+        job,
+        event=event,
+        source=event.source,
+    )
+
+    assert value is None
+    assert time.monotonic() - started < 0.2
+    assert not task.done()
+    await task
 
 
 @pytest.mark.asyncio

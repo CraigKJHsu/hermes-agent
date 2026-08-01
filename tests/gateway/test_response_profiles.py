@@ -84,6 +84,33 @@ def test_normalize_fast_then_default_translation_profile():
     assert detail_lane_contract_prompt(profile, None) is None
 
 
+def test_fast_failure_can_select_self_contained_translator_detail_contract():
+    profile = normalize_response_profile(
+        {
+            "strategy": "fast_then_default",
+            "fast_lane": {"handler": "translation"},
+            "detail_lane": {
+                "on_fast_success": {
+                    "skill": "translator-detail",
+                    "output_contract": "translator_mastery_after_fast",
+                },
+                "on_fast_failure": {
+                    "skill": "translator-detail",
+                    "output_contract": "translator_mastery_self_contained",
+                },
+            },
+        },
+    )
+
+    assert profile is not None
+    assert detail_lane_skill(profile, None) == "translator-detail"
+    assert (
+        detail_lane_output_contract(profile, None)
+        == "translator_mastery_self_contained"
+    )
+    assert detail_lane_contract_prompt(profile, None) is not None
+
+
 def test_translator_mastery_contract_covers_all_three_input_types():
     profile = normalize_response_profile(
         {

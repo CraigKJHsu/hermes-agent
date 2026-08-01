@@ -9974,13 +9974,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except asyncio.TimeoutError:
             task.cancel()
-            # Await cancellation so the async HTTP request is torn down before
-            # the ordinary lane continues; unlike to_thread, this does not
-            # leave provider work running in a shared executor.
-            await asyncio.gather(task, return_exceptions=True)
+            # Do not await provider teardown here. Native Gemini executes its
+            # HTTP request in a bounded worker thread, which cannot be stopped
+            # by awaiting Task cancellation and previously held the user's
+            # fallback response behind cleanup. Let cancellation propagate for
+            # one loop turn, then consume any eventual result out of band.
+            task.add_done_callback(self._consume_fast_lane_task_result)
+            await asyncio.sleep(0)
             logger.warning(
                 "Fast translation exceeded %.1fs delivery budget; "
-                "continuing with conversational lane",
+                "continuing with configured failure detail lane",
                 float(job["delivery_timeout"]),
             )
             return None
@@ -10110,6 +10113,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             len(fast_output),
         )
         return "delivered"
+
+    @staticmethod
+    def _consume_fast_lane_task_result(task: "asyncio.Task[Any]") -> None:
+        """Consume a cancelled fast-lane task without blocking user fallback."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            logger.debug(
+                "Fast translation background cleanup completed with an error",
+                exc_info=True,
+            )
 
     async def _deliver_fast_translation(
         self,
@@ -17681,6 +17697,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "⚠️ 第一則快速翻譯未能送達，而且備援的完整教學回覆"
                     "未通過完整性檢查。請再傳一次，我會重新提供完整翻譯"
                     "與解析。"
+                )
+            elif response_fast_lane_status is None and response_fast_lane_job:
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 第一則快速翻譯逾時，而且備援的完整教學回覆未通過"
+                    "完整性檢查。請再傳一次，我會重新提供完整翻譯與解析。"
                 )
             else:
                 agent.final_response_validation_failure_message = (
