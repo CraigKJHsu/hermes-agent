@@ -454,6 +454,90 @@ async def _run_direct_translation(
         return extract_direct_translation(response.json())
 
 
+async def _run_native_gemini_translation(
+    text: str,
+    config: Dict[str, Any],
+    *,
+    instructions: str,
+    timeout: float,
+) -> Optional[Any]:
+    """Call Gemini's native async endpoint without generic retry/fallback layers.
+
+    The conversational auxiliary client intentionally supports retries and
+    provider fallback.  Those semantics are useful for a normal agent turn but
+    can outlive the Translator lane's hard delivery deadline.  This dedicated
+    path keeps the configured Gemini model while making cancellation and the
+    total request budget authoritative.
+    """
+    if str(config.get("provider") or "").strip().lower() != "gemini":
+        return None
+
+    import httpx
+
+    from agent.gemini_native_adapter import (
+        bare_gemini_model_id,
+        build_gemini_request,
+        gemini_http_error,
+        is_native_gemini_base_url,
+        translate_gemini_response,
+    )
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    credentials = resolve_api_key_provider_credentials("gemini")
+    api_key = str(credentials.get("api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("Gemini fast translation requires an API key")
+
+    base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
+    if not is_native_gemini_base_url(base_url):
+        return None
+
+    model = bare_gemini_model_id(str(config.get("model") or "").strip())
+    if not model:
+        raise RuntimeError("Gemini fast translation requires a model")
+
+    request = build_gemini_request(
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": text},
+        ],
+        temperature=0,
+        max_tokens=int(config["max_tokens"]),
+    )
+    url = f"{base_url}/models/{model}:generateContent"
+    request_timeout = max(0.05, float(timeout))
+    try:
+        async with asyncio.timeout(request_timeout):
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(request_timeout),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    url,
+                    json=request,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "x-goog-api-key": api_key,
+                        "User-Agent": "hermes-agent (translator-fast-gemini)",
+                    },
+                )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "Gemini fast translation exceeded its request budget",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Gemini fast translation transport failed: {exc}") from exc
+
+    if response.status_code != 200:
+        raise gemini_http_error(response)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Gemini fast translation returned invalid JSON") from exc
+    return translate_gemini_response(payload, model=model)
+
+
 async def run_fast_translation(text: str, config: Dict[str, Any]) -> str:
     """Translate directly, falling back to a cancellable stateless LLM call."""
     started_at = time.monotonic()
@@ -509,18 +593,25 @@ async def run_fast_translation(text: str, config: Dict[str, Any]) -> str:
             float(config["delivery_timeout"]) - elapsed - 0.5,
         ),
     )
-    response = await async_call_llm(
-        task="fast_translation",
-        messages=[
-            {"role": "system", "content": fallback_instructions},
-            {"role": "user", "content": source_text},
-        ],
-        provider=config.get("provider"),
-        model=config.get("model"),
-        max_tokens=int(config["max_tokens"]),
-        temperature=0,
+    response = await _run_native_gemini_translation(
+        source_text,
+        config,
+        instructions=fallback_instructions,
         timeout=fallback_timeout,
     )
+    if response is None:
+        response = await async_call_llm(
+            task="fast_translation",
+            messages=[
+                {"role": "system", "content": fallback_instructions},
+                {"role": "user", "content": source_text},
+            ],
+            provider=config.get("provider"),
+            model=config.get("model"),
+            max_tokens=int(config["max_tokens"]),
+            temperature=0,
+            timeout=fallback_timeout,
+        )
     finish_reason: Optional[str] = None
     try:
         raw_finish_reason = response.choices[0].finish_reason

@@ -631,12 +631,17 @@ async def test_run_fast_translation_passes_profile_provider_and_model():
         },
     )
     assert config is not None
-    mocked_llm = AsyncMock(return_value=response)
+    mocked_gemini = AsyncMock(return_value=response)
+    mocked_llm = AsyncMock()
 
     with (
         patch(
             "gateway.fast_translation._run_direct_translation",
             new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "gateway.fast_translation._run_native_gemini_translation",
+            new=mocked_gemini,
         ),
         patch(
             "agent.auxiliary_client.async_call_llm",
@@ -648,11 +653,131 @@ async def test_run_fast_translation_passes_profile_provider_and_model():
             config,
         ) == "持久的\nK.K.：[pɚˈsɪstənt]"
 
-    assert mocked_llm.await_args.kwargs["provider"] == "gemini"
-    assert mocked_llm.await_args.kwargs["model"] == "gemini-3.5-flash-lite"
-    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    mocked_llm.assert_not_awaited()
+    assert mocked_gemini.await_args.args == ("persistent", config)
+    system_prompt = mocked_gemini.await_args.kwargs["instructions"]
     assert "Return exactly two plain-text lines" in system_prompt
     assert "K.K.：" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_native_gemini_translation_uses_cancellable_native_endpoint():
+    from gateway.fast_translation import _run_native_gemini_translation
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "Facebook 變更遭封鎖。"}],
+                            "role": "model",
+                        },
+                        "finishReason": "STOP",
+                    },
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.post_args = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            self.post_args = (args, kwargs)
+            return FakeResponse()
+
+    fake_client = FakeClient()
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+        },
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=fake_client),
+    ):
+        response = await _run_native_gemini_translation(
+            "Facebook mutation blocked.",
+            config,
+            instructions="Translate to Traditional Chinese.",
+            timeout=2.5,
+        )
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == "Facebook 變更遭封鎖。"
+    request_url = fake_client.post_args[0][0]
+    request_kwargs = fake_client.post_args[1]
+    assert request_url.endswith(
+        "/models/gemini-3.5-flash-lite:generateContent",
+    )
+    assert request_kwargs["headers"]["x-goog-api-key"] == "test-key"
+    assert request_kwargs["json"]["generationConfig"]["maxOutputTokens"] == 256
+    assert request_kwargs["json"]["contents"][0]["parts"][0]["text"] == (
+        "Facebook mutation blocked."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_native_gemini_translation_enforces_total_timeout():
+    from gateway.fast_translation import _run_native_gemini_translation
+
+    class SlowClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+        },
+    )
+    assert config is not None
+
+    started_at = time.monotonic()
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=SlowClient()),
+    ):
+        with pytest.raises(RuntimeError, match="request budget"):
+            await _run_native_gemini_translation(
+                "Facebook mutation blocked.",
+                config,
+                instructions="Translate to Traditional Chinese.",
+                timeout=0.05,
+            )
+
+    assert time.monotonic() - started_at < 0.5
 
 
 @pytest.mark.asyncio
