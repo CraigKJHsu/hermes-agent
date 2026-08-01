@@ -12865,7 +12865,7 @@ def validate_consumed_grace_approval_origin(
     """
     row = conn.execute(
         """
-        SELECT c.*
+        SELECT c.*, d.origin_event_id AS approval_origin_event_id
           FROM grace_delegations AS d
           JOIN grace_approval_challenges AS a
             ON a.token = d.challenge_token
@@ -12890,10 +12890,6 @@ def validate_consumed_grace_approval_origin(
            AND c.platform = d.platform
            AND c.chat_id = d.chat_id
            AND c.thread_id = d.thread_id
-           AND c.state = 'delivered'
-           AND c.last_event_id = d.origin_event_id
-           AND c.outcome_event_id = d.origin_event_id
-           AND c.outcome_kind = 'approval_blocked'
         """,
         (delegation_id.strip(),),
     ).fetchone()
@@ -12902,7 +12898,22 @@ def validate_consumed_grace_approval_origin(
             "Approved Grace delegation is not bound to one exact consumed "
             "challenge and delivered approval checkpoint."
         )
-    return dict(row)
+    callback = dict(row)
+    try:
+        return validate_delivered_grace_callback_approval_origin(
+            conn,
+            review_task_id=str(callback.get("review_task_id") or ""),
+            event_id=int(callback.get("approval_origin_event_id") or 0),
+            platform=str(callback.get("platform") or ""),
+            chat_id=str(callback.get("chat_id") or ""),
+            thread_id=str(callback.get("thread_id") or ""),
+            session_id=str(callback.get("session_id") or ""),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Approved Grace delegation is not bound to one exact consumed "
+            "challenge and delivered approval checkpoint."
+        ) from exc
 
 
 def record_grace_loop_callback_outcome(

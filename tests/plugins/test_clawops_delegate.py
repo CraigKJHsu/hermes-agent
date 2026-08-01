@@ -1753,6 +1753,22 @@ def test_fresh_turn_can_create_checkpoint_from_delivered_execution_blocker(
         assert challenge_row["origin_review_task_id"] == review_id
         assert challenge_row["origin_event_id"] == callback["event_id"]
         assert len(kb.list_tasks(conn)) == 2
+
+    values["HERMES_SESSION_MESSAGE_ID"] = "approve-after-delivered-blocker"
+    values["HERMES_SESSION_MESSAGE_TEXT"] = challenge["exact_reply"]
+    approval_args = json.loads(json.dumps(args))
+    approval_args["approval_token"] = challenge["approval_token"]
+    queued = json.loads(handle_clawops_delegate(approval_args))
+
+    assert queued["status"] == "queued"
+    with kb.connect_closing() as conn:
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=queued["delegation_id"],
+        )
+        assert delegation["state"] == "queued"
+        assert delegation["origin_review_task_id"] == review_id
+        assert delegation["origin_event_id"] == callback["event_id"]
+        assert len(kb.list_tasks(conn)) == 4
         assert kb.unblock_task(conn, execution_id)
         with pytest.raises(ValueError, match="unresolved execution blocker"):
             kb.validate_delivered_grace_callback_approval_origin(
