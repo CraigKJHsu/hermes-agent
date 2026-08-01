@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.server
 import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 import pytest
@@ -142,7 +144,12 @@ def _test_page_url() -> str:
     return "data:text/html;base64," + base64.b64encode(html.encode()).decode()
 
 
-def _fire_on_page(cdp_url: str, expression: str) -> None:
+def _fire_on_page(
+    cdp_url: str,
+    expression: str,
+    *,
+    page_url: str | None = None,
+) -> None:
     """Navigate the first page target to a data URL and fire `expression`."""
     import asyncio
     import websockets as _ws_mod
@@ -171,7 +178,11 @@ def _fire_on_page(cdp_url: str, expression: str) -> None:
                 "Target.attachToTarget", {"targetId": page["targetId"], "flatten": True}
             )
             sid = attach["result"]["sessionId"]
-            await call("Page.navigate", {"url": _test_page_url()}, session_id=sid)
+            await call(
+                "Page.navigate",
+                {"url": page_url or _test_page_url()},
+                session_id=sid,
+            )
             await asyncio.sleep(1.5)  # let the page load
             await call(
                 "Runtime.evaluate",
@@ -180,6 +191,109 @@ def _fire_on_page(cdp_url: str, expression: str) -> None:
             )
 
     asyncio.run(run())
+
+
+@pytest.fixture
+def marketplace_selling_page():
+    listing_id = "37276725125275496"
+    other_listing_id = "915975414881937"
+    short_listing_id = "777777777777777"
+    short_generic_listing_id = "888888888888888"
+    nested_link_listing_id = "999999999999999"
+    action_like_listing_id = "666666666666666"
+    nested_actions = (
+        "<div>" * 14
+        + '<button aria-label="More options for Kolin KD-291M06" '
+        + 'onclick="window.__kolinMenuOpened = true">More options</button>'
+        + "</div>" * 14
+    )
+    html = f"""<!doctype html>
+<html><head><title>Marketplace Selling fixture</title></head><body>
+<button aria-label="Unbound More options">Unbound More options</button>
+<div class="listing-card">
+  <div class="listing-details">
+    <button aria-label="Kolin KD-291M06">Kolin KD-291M06</button>
+  </div>
+  <button aria-label="Unrelated section More options">Unrelated</button>
+  <a aria-label="Boost listing for Kolin KD-291M06. Boost to reach more potential buyers"
+     href="/ad_center/create/listingad/?entry_point=LISTINGS_PROMOTE_BUTTON&amp;target_id={listing_id}">
+    Boost listing
+  </a>
+  <div class="listing-actions">{nested_actions}</div>
+</div>
+<div class="listing-card">
+  <a href="/marketplace/item/{other_listing_id}/">Other listing</a>
+  <a aria-label="Boost listing for Other listing. Boost to reach more potential buyers"
+     href="/ad_center/create/listingad/?entry_point=LISTINGS_PROMOTE_BUTTON&amp;target_id={other_listing_id}">
+    Boost listing
+  </a>
+  <button aria-label="More options for Other listing">More options</button>
+</div>
+<article>
+  <div>
+    <a href="/marketplace/item/{short_listing_id}/">Desk</a>
+    <button aria-label="More options">More options</button>
+  </div>
+</article>
+<div class="listing-card">
+  <a href="/marketplace/item/{short_generic_listing_id}/">Pen</a>
+  <a aria-label="Boost listing for Pen. Boost to reach more potential buyers"
+     href="/ad_center/create/listingad/?entry_point=LISTINGS_PROMOTE_BUTTON&amp;target_id={short_generic_listing_id}">
+    Boost listing
+  </a>
+  <button aria-label="More options for Pen">More options</button>
+  <button aria-label="More options for Pencil">Unrelated</button>
+</div>
+<div class="listing-card">
+  <a href="/marketplace/item/{nested_link_listing_id}/">
+    Chair
+    <button aria-label="Nested-link More options" onclick="event.preventDefault()">
+      More options
+    </button>
+  </a>
+</div>
+<div class="listing-card">
+  <a aria-label="Boost listing for More. Boost to reach more potential buyers"
+     href="/ad_center/create/listingad/?entry_point=LISTINGS_PROMOTE_BUTTON&amp;target_id={action_like_listing_id}">
+    Boost listing
+  </a>
+  <button aria-label="More options for">Unrelated generic action</button>
+</div>
+</body></html>"""
+    single_listing_html = f"""<!doctype html>
+<html><head><title>Single Marketplace Selling fixture</title></head><body>
+<button aria-label="Single-page unbound More options">Unbound</button>
+<div class="listing-card">
+  <button aria-label="Kolin KD-291M06">Kolin KD-291M06</button>
+  <a aria-label="Boost listing for Kolin KD-291M06. Boost to reach more potential buyers"
+     href="/ad_center/create/listingad/?entry_point=LISTINGS_PROMOTE_BUTTON&amp;target_id={listing_id}">
+    Boost listing
+  </a>
+  <div>{nested_actions}</div>
+</div>
+</body></html>"""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            page = single_listing_html if "single=1" in self.path else html
+            payload = page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    yield f"http://{host}:{port}/marketplace/you/selling", listing_id
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
 
 
 @pytest.fixture
@@ -300,6 +414,222 @@ def test_guarded_dom_action_revalidates_semantics_and_contenteditable(
     )
     assert rejected["ok"] is False
     assert "semantics changed" in rejected["error"]
+
+
+def test_guarded_marketplace_selling_action_binds_deep_generic_listing_row(
+    chrome_cdp,
+    supervisor_registry,
+    marketplace_selling_page,
+):
+    cdp_url, _port = chrome_cdp
+    page_url, listing_id = marketplace_selling_page
+    supervisor = supervisor_registry.get_or_start(
+        task_id="pytest-marketplace-selling-binding",
+        cdp_url=cdp_url,
+    )
+    _fire_on_page(cdp_url, "void 0", page_url=page_url)
+    identity_result = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": "`${location.href}|${performance.timeOrigin}`",
+            "returnByValue": True,
+        },
+    )
+    identity = identity_result["result"]["result"]["value"]
+    ax_result = supervisor.call_page_cdp("Accessibility.getFullAXTree")
+    nodes = ax_result["result"]["nodes"]
+
+    def backend_id(name):
+        return next(
+            node["backendDOMNodeId"]
+            for node in nodes
+            if node.get("role", {}).get("value") == "button"
+            and node.get("name", {}).get("value") == name
+        )
+
+    clicked = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("More options for Kolin KD-291M06"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="More options for Kolin KD-291M06",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="source-token",
+    )
+    assert clicked["ok"] is True, clicked
+    readback = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": "window.__kolinMenuOpened === true",
+            "returnByValue": True,
+        },
+    )
+    assert readback["result"]["result"]["value"] is True
+
+    unrelated_in_listing_section = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("Unrelated section More options"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Unrelated section More options",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="unrelated-section-token",
+    )
+    assert unrelated_in_listing_section["ok"] is False
+    assert "shared listing container" in unrelated_in_listing_section["error"]
+
+    semantic_row = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("More options"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="More options",
+        action="click",
+        required_marketplace_listing_id="777777777777777",
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="semantic-row-token",
+    )
+    assert semantic_row["ok"] is True, semantic_row
+
+    short_generic_row = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("More options for Pen"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="More options for Pen",
+        action="click",
+        required_marketplace_listing_id="888888888888888",
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="short-generic-row-token",
+    )
+    assert short_generic_row["ok"] is True, short_generic_row
+
+    substring_only = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("More options for Pencil"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="More options for Pencil",
+        action="click",
+        required_marketplace_listing_id="888888888888888",
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="substring-only-token",
+    )
+    assert substring_only["ok"] is False
+    assert "shared listing container" in substring_only["error"]
+
+    action_like_title = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("More options for"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="More options for",
+        action="click",
+        required_marketplace_listing_id="666666666666666",
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="action-like-title-token",
+    )
+    assert action_like_title["ok"] is False
+    assert "shared listing container" in action_like_title["error"]
+
+    nested_link_row = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("Nested-link More options"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Nested-link More options",
+        action="click",
+        required_marketplace_listing_id="999999999999999",
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="nested-link-row-token",
+    )
+    assert nested_link_row["ok"] is True, nested_link_row
+
+    wrong_listing = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("More options for Other listing"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="More options for Other listing",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="wrong-source-token",
+    )
+    assert wrong_listing["ok"] is False
+    assert "different listing" in wrong_listing["error"]
+
+    unbound = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("Unbound More options"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Unbound More options",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="unbound-source-token",
+    )
+    assert unbound["ok"] is False
+    assert "shared listing container" in unbound["error"]
+
+    single_page_url = f"{page_url}?single=1"
+    _fire_on_page(cdp_url, "void 0", page_url=single_page_url)
+    single_identity_result = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": "`${location.href}|${performance.timeOrigin}`",
+            "returnByValue": True,
+        },
+    )
+    single_identity = single_identity_result["result"]["result"]["value"]
+    single_nodes = supervisor.call_page_cdp(
+        "Accessibility.getFullAXTree"
+    )["result"]["nodes"]
+    single_unbound_id = next(
+        node["backendDOMNodeId"]
+        for node in single_nodes
+        if node.get("role", {}).get("value") == "button"
+        and node.get("name", {}).get("value")
+        == "Single-page unbound More options"
+    )
+    single_unbound = supervisor.guarded_dom_action(
+        backend_node_id=single_unbound_id,
+        expected_page_identity=single_identity,
+        expected_role="button",
+        expected_name="Single-page unbound More options",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="single-unbound-source-token",
+    )
+    assert single_unbound["ok"] is False
+    assert "lacks a bounded listing row" in single_unbound["error"]
+
+    single_bound_id = next(
+        node["backendDOMNodeId"]
+        for node in single_nodes
+        if node.get("role", {}).get("value") == "button"
+        and node.get("name", {}).get("value")
+        == "More options for Kolin KD-291M06"
+    )
+    single_bound = supervisor.guarded_dom_action(
+        backend_node_id=single_bound_id,
+        expected_page_identity=single_identity,
+        expected_role="button",
+        expected_name="More options for Kolin KD-291M06",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=["1333742673375089"],
+        crosspost_stage="open_menu",
+        crosspost_source_token="single-bound-source-token",
+    )
+    assert single_bound["ok"] is True, single_bound
 
 
 def test_main_frame_alert_detection_and_dismiss(chrome_cdp, supervisor_registry):

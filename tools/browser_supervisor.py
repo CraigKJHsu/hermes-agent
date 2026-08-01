@@ -984,7 +984,7 @@ class CDPSupervisor:
                       expected, token, requiredGroupId, requireGroupComposer,
                       requiredListingId, allowedCrosspostGroupIds,
                       selectedCrosspostGroupIds, crosspostStage,
-                      crosspostSourceToken
+                      crosspostSourceToken, expectedControlName
                     ) {
                       const guard = this.__hermesAtomicGuard;
                       const fail = message => {
@@ -1074,7 +1074,8 @@ class CDPSupervisor:
                             container.querySelectorAll?.(
                               '[data-listing-id], '
                               + '[data-marketplace-listing-id], '
-                              + 'a[href*="/marketplace/item/"]'
+                              + 'a[href*="/marketplace/item/"], '
+                              + 'a[href*="/ad_center/create/listingad/"]'
                             ) || []
                           )]) {
                             for (const attribute of [
@@ -1089,28 +1090,86 @@ class CDPSupervisor:
                               /\\/marketplace\\/item\\/([0-9]+)(?:\\/|[?#]|$)/
                             );
                             if (match) ids.add(match[1]);
+                            if (
+                              /\\/ad_center\\/create\\/listingad\\/(?:[?#]|$)/
+                                .test(href)
+                            ) {
+                              const targetMatch = href.match(
+                                /[?&]target_id=([0-9]+)(?:[&#]|$)/
+                              );
+                              if (targetMatch) ids.add(targetMatch[1]);
+                            }
                           }
                           return ids;
                         };
                         const flow = this.ownerDocument.__hermesCrosspostFlow;
                         let sourceControl = null;
                         const bindSourceControl = () => {
-                          const listingContainerSelector = [
+                          const listingScopeSelector = [
                             "[data-listing-id]",
                             "[data-marketplace-listing-id]",
                             'a[href*="/marketplace/item/"]',
-                            "article", "li"
+                            "article", "li", '[role="listitem"]'
                           ].join(", ");
+                          const pageScopeSelector = [
+                            "html", "body", "main", '[role="main"]',
+                            '[role="feed"]', '[role="list"]'
+                          ].join(", ");
+                          const normalizeLabel = value => String(value || "")
+                            .replace(/\\s+/g, " ").trim().toLowerCase();
+                          const hasSellingActionAssociation = candidate => {
+                            const controlName = normalizeLabel(
+                              expectedControlName
+                            );
+                            const controlPrefix = "more options for ";
+                            if (!controlName.startsWith(controlPrefix)) {
+                              return false;
+                            }
+                            const listingName = controlName.slice(
+                              controlPrefix.length
+                            ).trim();
+                            if (!listingName) return false;
+                            for (const link of candidate.querySelectorAll(
+                              'a[href*="/ad_center/create/listingad/"]'
+                              + '[href*="target_id="]'
+                            )) {
+                              const href = link.getAttribute("href") || "";
+                              if (
+                                !/\\/ad_center\\/create\\/listingad\\/(?:[?#]|$)/
+                                  .test(href)
+                              ) continue;
+                              const targetMatch = href.match(
+                                /[?&]target_id=([0-9]+)(?:[&#]|$)/
+                              );
+                              if (
+                                !targetMatch
+                                || targetMatch[1]
+                                  !== String(requiredListingId)
+                              ) continue;
+                              for (const value of [
+                                link.getAttribute("aria-label"),
+                                link.getAttribute("title"), link.innerText
+                              ]) {
+                                const actionName = normalizeLabel(value);
+                                const expectedPrefix = (
+                                  `boost listing for ${listingName}`
+                                );
+                                if (
+                                  actionName === expectedPrefix
+                                  || actionName.startsWith(`${expectedPrefix}.`)
+                                ) return true;
+                              }
+                            }
+                            return false;
+                          };
                           let sourceBound = false;
+                          let sawAuthorizedListing = false;
                           let listingNode = this;
-                          for (
-                            let depth = 0;
-                            listingNode && depth < 10;
-                            depth += 1, listingNode = listingNode.parentElement
-                          ) {
-                            if (!listingNode.matches?.(
-                              listingContainerSelector
-                            )) continue;
+                          while (listingNode) {
+                            // Facebook's Selling rows are deeply nested generic
+                            // divs.  A row is proven by a numeric item/data id or
+                            // by the same-row Boost target id plus matching full
+                            // action labels. Shared listing wrappers fail closed.
                             const sourceIds = listingIdsIn(listingNode);
                             if (sourceIds.size > 1) {
                               fail(
@@ -1123,13 +1182,27 @@ class CDPSupervisor:
                                   "Cross-post control belongs to a different listing"
                                 );
                               }
-                              sourceBound = true;
-                              break;
+                              sawAuthorizedListing = true;
+                              if (listingNode.matches?.(pageScopeSelector)) {
+                                fail(
+                                  "Cross-post control lacks a bounded listing row"
+                                );
+                              }
+                              if (
+                                listingNode.matches?.(listingScopeSelector)
+                                || hasSellingActionAssociation(listingNode)
+                              ) {
+                                sourceBound = true;
+                                break;
+                              }
                             }
+                            listingNode = listingNode.parentElement;
                           }
                           if (!sourceBound) {
                             fail(
-                              "Cross-post control is not bound to the authorized listing"
+                              sawAuthorizedListing
+                                ? "Cross-post control lacks a bounded listing row"
+                                : "Cross-post control is not bound to the authorized listing"
                             );
                           }
                         };
@@ -1552,6 +1625,7 @@ class CDPSupervisor:
                         {"value": list(selected_crosspost_group_ids or [])},
                         {"value": crosspost_stage},
                         {"value": crosspost_source_token},
+                        {"value": expected_name},
                     ],
                     "returnByValue": True,
                     "userGesture": True,
