@@ -45,6 +45,8 @@ def test_normalize_fast_translation_config_is_bounded():
     assert config is not None
     assert config["provider"] is None
     assert config["model"] is None
+    assert config["hedge_model"] is None
+    assert config["hedge_delay"] == 1.5
     assert config["pronunciation"] == ""
     assert config["direct_provider"] == ""
     assert config["delivery_timeout"] == 30.0
@@ -53,6 +55,29 @@ def test_normalize_fast_translation_config_is_bounded():
     assert config["direct_max_input_chars"] == 1000
     assert config["max_input_chars"] == 120
     assert config["max_tokens"] == 16
+
+
+def test_normalize_fast_translation_config_bounds_distinct_hedge_model():
+    config = normalize_fast_translation_config(
+        {
+            "model": "gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.1-flash-lite-preview",
+            "hedge_delay": 99,
+        },
+    )
+
+    assert config is not None
+    assert config["hedge_model"] == "gemini-3.1-flash-lite-preview"
+    assert config["hedge_delay"] == 5.0
+
+    same_model = normalize_fast_translation_config(
+        {
+            "model": "google/gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.5-flash-lite",
+        },
+    )
+    assert same_model is not None
+    assert same_model["hedge_model"] is None
 
 
 def test_normalize_fast_translation_config_rejects_non_finite_numbers():
@@ -778,6 +803,95 @@ async def test_run_native_gemini_translation_enforces_total_timeout():
             )
 
     assert time.monotonic() - started_at < 0.5
+
+
+@pytest.mark.asyncio
+async def test_run_hedged_native_gemini_translation_returns_delayed_hedge():
+    from gateway.fast_translation import _run_hedged_native_gemini_translation
+
+    primary_cancelled = asyncio.Event()
+    hedge_response = SimpleNamespace(model="gemini-3.1-flash-lite-preview")
+
+    async def fake_native(*args, model=None, **kwargs):
+        if model is not None:
+            return hedge_response
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            primary_cancelled.set()
+            raise
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.1-flash-lite-preview",
+            "hedge_delay": 0.25,
+        },
+    )
+    assert config is not None
+
+    with patch(
+        "gateway.fast_translation._run_native_gemini_translation",
+        new=AsyncMock(side_effect=fake_native),
+    ):
+        started_at = time.monotonic()
+        result = await _run_hedged_native_gemini_translation(
+            "失智症英文",
+            config,
+            instructions="Translate to English.",
+            timeout=1.0,
+        )
+
+    assert result is hedge_response
+    assert primary_cancelled.is_set()
+    assert 0.2 <= time.monotonic() - started_at < 0.7
+
+
+@pytest.mark.asyncio
+async def test_run_hedged_native_gemini_consumes_simultaneous_loser_error():
+    from gateway.fast_translation import _run_hedged_native_gemini_translation
+
+    hedge_started = asyncio.Event()
+    primary_response = SimpleNamespace(model="gemini-3.5-flash-lite")
+
+    async def fake_native(*args, model=None, **kwargs):
+        if model is not None:
+            hedge_started.set()
+            raise RuntimeError("hedge failed")
+        await hedge_started.wait()
+        return primary_response
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.1-flash-lite-preview",
+            "hedge_delay": 0.25,
+        },
+    )
+    assert config is not None
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        with patch(
+            "gateway.fast_translation._run_native_gemini_translation",
+            new=AsyncMock(side_effect=fake_native),
+        ):
+            result = await _run_hedged_native_gemini_translation(
+                "失智症英文",
+                config,
+                instructions="Translate to English.",
+                timeout=1.0,
+            )
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert result is primary_response
+    assert unhandled == []
 
 
 @pytest.mark.asyncio
