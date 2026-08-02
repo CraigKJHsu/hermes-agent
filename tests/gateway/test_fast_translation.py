@@ -191,6 +191,12 @@ def test_direct_provider_requires_explicit_compatible_config():
     assert pronunciation["pronunciation"] == "kk_single_english_word"
     assert pronunciation["direct_instructions_compatible"] is False
 
+    bilingual_pronunciation = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert bilingual_pronunciation is not None
+    assert bilingual_pronunciation["pronunciation"] == "kk_translation_terms"
+
 
 def test_eligible_fast_translation_text_excludes_commands_media_and_oversize():
     config = normalize_fast_translation_config({"max_input_chars": 5})
@@ -926,6 +932,115 @@ async def test_run_fast_translation_rejects_missing_required_kk_line():
 
 
 @pytest.mark.asyncio
+async def test_run_fast_translation_keeps_kk_after_english_directive():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="持久的\nK.K.：[pɚˈsɪstənt]",
+                ),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+    mocked_llm = AsyncMock(return_value=response)
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=mocked_llm,
+        ),
+    ):
+        result = await run_fast_translation(
+            "persistent，請翻譯成繁體中文",
+            config,
+        )
+
+    assert result == "持久的\nK.K.：[pɚˈsɪstənt]"
+    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    assert "source is one English word" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_requires_kk_for_short_chinese_term():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="dementia\nK.K.：[dɪˈmɛnʃə]",
+                ),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+    mocked_llm = AsyncMock(return_value=response)
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=mocked_llm,
+        ),
+    ):
+        result = await run_fast_translation("失智症英文", config)
+
+    assert result == "dementia\nK.K.：[dɪˈmɛnʃə]"
+    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    assert "exactly one English word" in system_prompt
+    assert "translated word" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_rejects_chinese_term_without_kk():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="dementia"),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=AsyncMock(return_value=response),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="required K.K."):
+            await run_fast_translation("失智症英文", config)
+
+
+@pytest.mark.asyncio
 async def test_run_fast_translation_does_not_request_kk_for_sentence():
     from gateway.fast_translation import run_fast_translation
 
@@ -957,6 +1072,75 @@ async def test_run_fast_translation_does_not_request_kk_for_sentence():
 
     system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
     assert "Return exactly two plain-text lines" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_does_not_request_kk_for_chinese_sentence():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="How are you today?",
+                ),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+    mocked_llm = AsyncMock(return_value=response)
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=mocked_llm,
+        ),
+    ):
+        await run_fast_translation("你今天好嗎", config)
+
+    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    assert "exactly one English word" in system_prompt
+    assert "more than one English word" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_does_not_require_kk_for_i_like_english():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="I like English"),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=AsyncMock(return_value=response),
+        ),
+    ):
+        result = await run_fast_translation("我喜歡英文", config)
+
+    assert result == "I like English"
 
 
 @pytest.mark.asyncio

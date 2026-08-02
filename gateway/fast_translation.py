@@ -90,7 +90,10 @@ def normalize_fast_translation_config(value: Any) -> Optional[Dict[str, Any]]:
     ):
         hedge_model = None
     pronunciation = str(value.get("pronunciation") or "").strip().lower()
-    if pronunciation not in {"kk_single_english_word"}:
+    if pronunciation not in {
+        "kk_single_english_word",
+        "kk_translation_terms",
+    }:
         pronunciation = ""
     return {
         "instructions": instructions or DEFAULT_INSTRUCTIONS,
@@ -246,7 +249,6 @@ _EN_WHITESPACE_DIRECTIVE = (
     r"\s+please\s+translate\s+(?:(?:it|this)\s+)?(?:into|to)\s+"
 )
 _TRAILING_PUNCTUATION = r"\s*[。.!！?？]*$"
-
 _TRAILING_TRANSLATION_DIRECTIVES = (
     # The requested target language is independent of the language used to
     # express the command (for example: "你好, Please translate this to English").
@@ -333,6 +335,34 @@ _TRANSLATION_LABEL_RE = re.compile(
     r"^\s*(?:translation|translated text|翻譯|譯文|解釋|explanation)\s*[：:]",
     re.IGNORECASE,
 )
+_TRAILING_TERM_SEPARATOR_RE = re.compile(r"[\s,，:：;；。.!！?？]+$")
+
+
+def _requires_fast_kk(
+    source_text: str,
+    target_language: str,
+    config: Dict[str, Any],
+    *,
+    translated_text: Optional[str] = None,
+) -> bool:
+    """Return whether this isolated term translation requires K.K. output."""
+    pronunciation = config.get("pronunciation")
+    if pronunciation not in {
+        "kk_single_english_word",
+        "kk_translation_terms",
+    }:
+        return False
+    stripped = source_text.strip()
+    if target_language == "zh-TW":
+        pronunciation_word = _TRAILING_TERM_SEPARATOR_RE.sub("", stripped)
+        return bool(_LATIN_WORD_RE.fullmatch(pronunciation_word))
+    if pronunciation != "kk_translation_terms" or target_language != "en":
+        return False
+    translated_word = _TRAILING_TERM_SEPARATOR_RE.sub(
+        "",
+        str(translated_text or "").strip(),
+    )
+    return bool(_LATIN_WORD_RE.fullmatch(translated_word))
 
 
 def prepare_direct_translation_input(text: str) -> tuple[str, str]:
@@ -388,10 +418,11 @@ def validate_fast_translation_output(
         for line in stripped.splitlines()
         if line.strip()
     ]
-    requires_kk = (
-        config.get("pronunciation") == "kk_single_english_word"
-        and target_language == "zh-TW"
-        and _LATIN_WORD_RE.fullmatch(source_text.strip())
+    requires_kk = _requires_fast_kk(
+        source_text,
+        target_language,
+        config,
+        translated_text=nonempty_lines[0] if nonempty_lines else None,
     )
     if requires_kk:
         if (
@@ -701,18 +732,41 @@ async def run_fast_translation(text: str, config: Dict[str, Any]) -> str:
         f"{str(config['instructions']).rstrip()}\n"
         f"Trusted gateway direction: translate the supplied text to {target_name}."
     )
-    if (
-        config.get("pronunciation") == "kk_single_english_word"
-        and target_language == "zh-TW"
-        and _LATIN_WORD_RE.fullmatch(source_text.strip())
-    ):
+    requires_source_word_kk = _requires_fast_kk(
+        source_text,
+        target_language,
+        config,
+    )
+    requires_conditional_english_kk = (
+        config.get("pronunciation") == "kk_translation_terms"
+        and target_language == "en"
+    )
+    if requires_source_word_kk or requires_conditional_english_kk:
+        if requires_conditional_english_kk:
+            pronunciation_instruction = (
+                "If the best directly usable English translation is exactly "
+                "one English word, return exactly two plain-text lines. Line "
+                "1 is that English word. Line 2 is `K.K.：[phonetic "
+                "transcription]`, using American K.K. phonetic notation for "
+                "the translated word. If the best translation contains more "
+                "than one English word, return only the translation and do "
+                "not add pronunciation or explanation."
+            )
+            ending_instruction = "Do not add markdown or any explanation."
+        else:
+            pronunciation_instruction = (
+                "The source is one English word. Return exactly two plain-text "
+                "lines. Line 1 is the directly usable Traditional Chinese "
+                "meaning. Line 2 is `K.K.：[phonetic transcription]`, using "
+                "American K.K. phonetic notation for the source word."
+            )
+            ending_instruction = (
+                "Both lines are required. Do not add markdown or any other "
+                "explanation."
+            )
         fallback_instructions = (
             f"{fallback_instructions}\n"
-            "The source is one English word. Return exactly two plain-text "
-            "lines. Line 1 is the directly usable Traditional Chinese meaning. "
-            "Line 2 is `K.K.：[phonetic transcription]`, using American K.K. "
-            "phonetic notation for the source word. Both lines are required. "
-            "Do not add markdown or any other explanation."
+            f"{pronunciation_instruction} {ending_instruction}"
         )
     elapsed = time.monotonic() - started_at
     fallback_timeout = min(
