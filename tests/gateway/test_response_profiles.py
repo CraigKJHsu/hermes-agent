@@ -521,7 +521,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
     ) in errors
 
 
-def test_repeated_core_word_pair_cannot_escape_core_word_section():
+def test_repeated_core_word_pair_outside_core_word_section_is_ignored():
     response = """### 1. 自然道地英文翻譯
 - A modular vending machine.
 - An automatic vending machine with modular components.
@@ -547,7 +547,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
         fast_output="Modular vending machine",
     )
 
-    assert "核心單字子欄位只能出現在第三節核心單字區內。" in errors
+    assert not any("核心單字" in error for error in errors)
 
 
 def test_empty_memory_field_cannot_borrow_next_word_declaration():
@@ -578,7 +578,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
 
     assert (
         "每個核心單字的字根與記憶子欄位"
-        "都必須在同一行提供實質內容。"
+        "都必須各自提供實質內容。"
     ) in errors
 
 
@@ -608,7 +608,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
 
     assert (
         "每個核心單字的字根與記憶子欄位"
-        "都必須在同一行提供實質內容。"
+        "都必須各自提供實質內容。"
     ) in errors
 
 
@@ -636,8 +636,183 @@ dogs（n.）狗
 
     assert (
         "每個核心單字的字根與記憶子欄位"
-        "都必須在同一行提供實質內容。"
+        "都必須各自提供實質內容。"
     ) in errors
+
+
+def test_sentence_core_word_fields_accept_multiline_markdown_content():
+    response = """## 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+## 2. 句型結構與文法解析
+**核心句型：**名詞片語。
+**句子成分拆解：**TIME Magazine's inaugural edition 是核心名詞片語。
+**關鍵文法焦點：**of 介系詞片語修飾 edition。
+## 3. 核心單字字根拆解
+- inaugural（adj.）首次的
+  - **字根拆解**：
+    源自 inaugurate，與「正式開始」有關。
+  - **記憶提示**：
+    把 inaugural 聯想成首次正式開幕。
+- edition（n.）版本
+  - **字根拆解**：
+    edit + -ion，指編輯後形成的版本。
+  - **記憶提示**：
+    edit 完成後產生一個 edition。
+## 4. 句型延伸與仿寫造句
+**句型套用範例：**The magazine released its inaugural ranking of hospitals. 這本雜誌發布了首屆醫院排名。
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "TIME Magazine’s inaugural edition of the World’s Top Universities of 2026",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="TIME 雜誌首屆 2026 年世界頂尖大學特刊",
+    ) == []
+
+
+def test_empty_memory_field_cannot_borrow_multiword_declaration():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：We 是 S，take part 是 V。
+**關鍵文法焦點**：現在簡單式。
+### 3. 核心單字字根拆解
+- participate（v.）參加
+  - **字根拆解**：part + capere。
+  - **記憶提示**：
+- **take part（v.）**
+  參加
+  - **字根拆解**：phrasal verb。
+  - **記憶提示**：take a part in something。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：We take part in class. 我們參與課堂活動。
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "We take part in the event.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="我們參加這項活動。",
+    )
+
+    assert (
+        "每個核心單字的字根與記憶子欄位"
+        "都必須各自提供實質內容。"
+    ) in errors
+
+
+def test_empty_final_memory_field_cannot_borrow_preposition_declaration():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：We 是 S，continued 是 V。
+**關鍵文法焦點**：過去式。
+### 3. 核心單字字根拆解
+- continue（v.）繼續
+  - **字根拆解**：con- + tenere。
+  - **記憶提示**：
+in spite of（prep.）
+儘管
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：We continued despite the rain. 儘管下雨，我們仍繼續進行。
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "We continued in spite of the rain.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="儘管下雨，我們仍繼續進行。",
+    )
+
+    assert (
+        "每個核心單字的字根與記憶子欄位"
+        "都必須各自提供實質內容。"
+    ) in errors
+
+
+def test_mnemonic_pos_reference_is_not_mistaken_for_next_declaration():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：We 是 S，participate 是 V。
+**關鍵文法焦點**：現在簡單式。
+### 3. 核心單字字根拆解
+- participate（v.）參與
+  - **字根拆解**：part + capere。
+  - **記憶提示**：
+    把 participate（v.）聯想成取得一部分。
+- in spite of（prep.）儘管
+  - **字根拆解**：介系詞片語，無現代字綴拆解。
+  - **記憶提示**：聯想「不顧阻礙」。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：We joined despite the rain. 儘管下雨，我們仍參加了。
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "We participate in spite of the rain.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="儘管下雨，我們仍參與。",
+    ) == []
+
+
+def test_final_memory_hint_may_begin_with_declaration_shaped_text():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：名詞片語。
+**句子成分拆解**：The edition 是核心名詞。
+**關鍵文法焦點**：所有格。
+### 3. 核心單字字根拆解
+- edition（n.）版本
+  - **字根拆解**：edit + -ion。
+  - **記憶提示**：
+    edit（v.）編輯，聯想到 edition 是編輯後的版本。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：The journal released a new edition. 這本期刊發行了新版。
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "The magazine's new edition",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="這本雜誌的新版。",
+    ) == []
+
+
+def test_repeatable_markers_outside_core_word_section_are_ignored():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：Dogs 是 S，bark 是 V。
+**關鍵文法焦點**：現在簡單式。
+### 3. 核心單字字根拆解
+- bark（v.）狗叫
+  - **字根拆解**：擬聲詞，無現代字綴拆解。
+  - **記憶提示**：聯想狗叫聲。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：Birds sing. 鳥會唱歌。
+仿寫時也可自問：**字根拆解**與**記憶提示**是否完整？
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "Dogs bark.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="狗會叫。",
+    )
+
+    assert not any("核心單字" in error for error in errors)
 
 
 def test_clear_sentence_cannot_select_term_template():

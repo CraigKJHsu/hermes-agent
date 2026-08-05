@@ -17683,30 +17683,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.final_response_validator = None
-            agent.final_response_repair_limit = 1
+            # A first repair usually restores the canonical Translator
+            # template. Keep one additional bounded attempt for a residual
+            # field-level omission before any terminal recovery message asks
+            # the user to retry a turn whose translation was not delivered.
+            agent.final_response_repair_limit = 2
             agent._response_contract_repair_attempts = 0
             agent._response_contract_repair_start_index = None
             if response_fast_lane_status == "ambiguous":
                 agent.final_response_validation_failure_message = (
                     "⚠️ Telegram 未能確認第一則快速翻譯是否送達，"
-                    "而詳細教學回覆也未通過完整性檢查。請再傳一次，"
-                    "我會重新提供完整翻譯與解析。"
+                    "而詳細教學回覆經內部修復後仍未通過完整性檢查。"
+                    "請重傳這則內容，我會重新提供完整翻譯與解析。"
                 )
             elif response_fast_lane_status == "delivery_failed":
                 agent.final_response_validation_failure_message = (
                     "⚠️ 第一則快速翻譯未能送達，而且備援的完整教學回覆"
-                    "未通過完整性檢查。請再傳一次，我會重新提供完整翻譯"
-                    "與解析。"
+                    "經內部修復後仍未通過完整性檢查。"
+                    "請重傳這則內容，我會重新提供完整翻譯與解析。"
                 )
             elif response_fast_lane_status is None and response_fast_lane_job:
                 agent.final_response_validation_failure_message = (
                     "⚠️ 第一則快速翻譯逾時，而且備援的完整教學回覆未通過"
-                    "完整性檢查。請再傳一次，我會重新提供完整翻譯與解析。"
+                    "完整性檢查。請重傳這則內容，我會重新提供完整翻譯與解析。"
                 )
             else:
                 agent.final_response_validation_failure_message = (
-                    "⚠️ 快速翻譯已完成，但詳細教學回覆未通過完整性檢查。"
-                    "請再傳一次，我會重新整理完整內容。"
+                    "⚠️ 快速翻譯已完成；詳細教學回覆經內部修復後"
+                    "仍未通過完整性檢查。你不需要重傳，下一則可直接繼續。"
                 )
             if detail_contract_name in {
                 "translator_mastery",
