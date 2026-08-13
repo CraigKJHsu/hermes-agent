@@ -1759,6 +1759,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _reply_anchor_for_event,
     merge_pending_message_event,
 )
@@ -9951,7 +9952,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         source: SessionSource,
     ) -> Optional[str]:
-        """Return ``delivered``, ``ambiguous``, or ``None`` for definite failure."""
+        """Return delivery evidence, or ``None`` when no usable output exists.
+
+        ``delivery_failed`` means the fast translation was generated but its
+        standalone platform send definitely failed.  That distinction lets the
+        detail lane remain complete instead of falling back to a short second
+        translation that discards pronunciation and teaching fields.
+        """
         if not job:
             return None
 
@@ -9967,13 +9974,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except asyncio.TimeoutError:
             task.cancel()
-            # Await cancellation so the async HTTP request is torn down before
-            # the ordinary lane continues; unlike to_thread, this does not
-            # leave provider work running in a shared executor.
-            await asyncio.gather(task, return_exceptions=True)
+            # Do not await provider teardown here. Native Gemini executes its
+            # HTTP request in a bounded worker thread, which cannot be stopped
+            # by awaiting Task cancellation and previously held the user's
+            # fallback response behind cleanup. Let cancellation propagate for
+            # one loop turn, then consume any eventual result out of band.
+            task.add_done_callback(self._consume_fast_lane_task_result)
+            await asyncio.sleep(0)
             logger.warning(
                 "Fast translation exceeded %.1fs delivery budget; "
-                "continuing with conversational lane",
+                "continuing with configured failure detail lane",
                 float(job["delivery_timeout"]),
             )
             return None
@@ -10010,9 +10020,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is None:
             logger.warning(
                 "Fast translation adapter unavailable; "
-                "continuing with conversational lane",
+                "continuing with self-contained detail lane",
             )
-            return None
+            return "delivery_failed"
 
         metadata = self._thread_metadata_for_source(
             source,
@@ -10027,9 +10037,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if send_remaining <= 0:
             logger.warning(
                 "Fast translation exhausted its delivery budget before send; "
-                "continuing with conversational lane",
+                "continuing with self-contained detail lane",
             )
-            return None
+            return "delivery_failed"
         metadata["send_timeout"] = send_remaining
         bounded_send = getattr(
             adapter,
@@ -10039,9 +10049,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not callable(bounded_send):
             logger.warning(
                 "Response fast-lane adapter has no classified delivery "
-                "deadline capability; continuing with conversational lane",
+                "deadline capability; continuing with self-contained detail lane",
             )
-            return None
+            return "delivery_failed"
         try:
             send_result = await bounded_send(
                 source.chat_id,
@@ -10052,33 +10062,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except asyncio.TimeoutError:
             logger.warning(
                 "Response fast-lane classified adapter unexpectedly raised a "
-                "timeout; continuing with the definite-failure fallback",
+                "timeout; treating delivery as ambiguous",
             )
-            return None
+            return "ambiguous"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
                 "Response fast-lane classified adapter raised instead of "
                 "returning delivery evidence; "
-                "continuing with the definite-failure translation fallback: %s",
+                "treating delivery as ambiguous: %s",
                 exc,
             )
-            return None
-        if not getattr(send_result, "success", False):
-            if getattr(send_result, "delivery_ambiguous", False):
-                logger.warning(
-                    "Fast translation adapter reported ambiguous delivery; "
-                    "continuing without a duplicate standalone translation: %s",
-                    getattr(send_result, "error", "unknown error"),
-                )
-                return "ambiguous"
+            return "ambiguous"
+        if (
+            not isinstance(send_result, SendResult)
+            or not isinstance(send_result.success, bool)
+            or not isinstance(send_result.delivery_ambiguous, bool)
+        ):
+            logger.warning(
+                "Fast translation adapter returned malformed delivery "
+                "evidence; treating delivery as ambiguous"
+            )
+            return "ambiguous"
+        if send_result.delivery_ambiguous:
+            logger.warning(
+                "Fast translation adapter reported ambiguous delivery; "
+                "continuing without a duplicate standalone translation: %s",
+                send_result.error or "unknown error",
+            )
+            return "ambiguous"
+        if not send_result.success:
             logger.warning(
                 "Fast translation delivery rejected; "
-                "continuing with conversational lane: %s",
-                getattr(send_result, "error", "unknown error"),
+                "continuing with self-contained detail lane: %s",
+                send_result.error or "unknown error",
             )
-            return None
+            return "delivery_failed"
 
         logger.info(
             "Response fast lane delivered: profile=%s handler=%s "
@@ -10093,6 +10113,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             len(fast_output),
         )
         return "delivered"
+
+    @staticmethod
+    def _consume_fast_lane_task_result(task: "asyncio.Task[Any]") -> None:
+        """Consume a cancelled fast-lane task without blocking user fallback."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            logger.debug(
+                "Fast translation background cleanup completed with an error",
+                exc_info=True,
+            )
 
     async def _deliver_fast_translation(
         self,
@@ -10200,6 +10233,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _response_fast_lane_job["profile"],
                     delivery_ambiguous=(
                         _response_fast_lane_status == "ambiguous"
+                    ),
+                    delivery_failed=(
+                        _response_fast_lane_status == "delivery_failed"
                     ),
                 )
             else:
@@ -17647,19 +17683,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.final_response_validator = None
-            agent.final_response_repair_limit = 1
+            # A first repair usually restores the canonical Translator
+            # template. Keep one additional bounded attempt for a residual
+            # field-level omission before any terminal recovery message asks
+            # the user to retry a turn whose translation was not delivered.
+            agent.final_response_repair_limit = 2
             agent._response_contract_repair_attempts = 0
             agent._response_contract_repair_start_index = None
             if response_fast_lane_status == "ambiguous":
                 agent.final_response_validation_failure_message = (
                     "⚠️ Telegram 未能確認第一則快速翻譯是否送達，"
-                    "而詳細教學回覆也未通過完整性檢查。請再傳一次，"
-                    "我會重新提供完整翻譯與解析。"
+                    "而詳細教學回覆經內部修復後仍未通過完整性檢查。"
+                    "請重傳這則內容，我會重新提供完整翻譯與解析。"
+                )
+            elif response_fast_lane_status == "delivery_failed":
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 第一則快速翻譯未能送達，而且備援的完整教學回覆"
+                    "經內部修復後仍未通過完整性檢查。"
+                    "請重傳這則內容，我會重新提供完整翻譯與解析。"
+                )
+            elif response_fast_lane_status is None and response_fast_lane_job:
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 第一則快速翻譯逾時，而且備援的完整教學回覆未通過"
+                    "完整性檢查。請重傳這則內容，我會重新提供完整翻譯與解析。"
                 )
             else:
                 agent.final_response_validation_failure_message = (
-                    "⚠️ 快速翻譯已完成，但詳細教學回覆未通過完整性檢查。"
-                    "請再傳一次，我會重新整理完整內容。"
+                    "⚠️ 快速翻譯已完成；詳細教學回覆經內部修復後"
+                    "仍未通過完整性檢查。你不需要重傳，下一則可直接繼續。"
                 )
             if detail_contract_name in {
                 "translator_mastery",

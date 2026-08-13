@@ -65,7 +65,12 @@ def test_normalize_fast_then_default_translation_profile():
     }
     assert detail_lane_skill(profile, "delivered") == "translator-detail"
     assert detail_lane_skill(profile, "ambiguous") == "translator-detail"
+    assert detail_lane_skill(profile, "delivery_failed") == "translator-detail"
     assert detail_lane_skill(profile, None) == "translator-fast"
+    assert (
+        detail_lane_output_contract(profile, "delivery_failed")
+        == "translator_mastery_self_contained"
+    )
     contract_prompt = detail_lane_contract_prompt(profile, "delivered")
     assert contract_prompt is not None
     for heading in (
@@ -77,6 +82,33 @@ def test_normalize_fast_then_default_translation_profile():
     ):
         assert heading in contract_prompt
     assert detail_lane_contract_prompt(profile, None) is None
+
+
+def test_fast_failure_can_select_self_contained_translator_detail_contract():
+    profile = normalize_response_profile(
+        {
+            "strategy": "fast_then_default",
+            "fast_lane": {"handler": "translation"},
+            "detail_lane": {
+                "on_fast_success": {
+                    "skill": "translator-detail",
+                    "output_contract": "translator_mastery_after_fast",
+                },
+                "on_fast_failure": {
+                    "skill": "translator-detail",
+                    "output_contract": "translator_mastery_self_contained",
+                },
+            },
+        },
+    )
+
+    assert profile is not None
+    assert detail_lane_skill(profile, None) == "translator-detail"
+    assert (
+        detail_lane_output_contract(profile, None)
+        == "translator_mastery_self_contained"
+    )
+    assert detail_lane_contract_prompt(profile, None) is not None
 
 
 def test_translator_mastery_contract_covers_all_three_input_types():
@@ -309,6 +341,72 @@ def test_term_examples_must_each_be_bilingual():
     assert "每個實用例句都必須同時包含英文與繁體中文翻譯。" in errors
 
 
+def test_term_examples_accept_multiline_bilingual_blocks():
+    response = """### 1. 基本資訊與翻譯
+**單字／詞彙**：Invaded
+**音標**：[ɪnˈveɪdɪd]
+**詞性與繁體中文解釋**：動詞 invade 的過去式，表示「入侵；侵入」。
+### 2. 構詞拆解（字根、字首、字尾）
+**字首 (Prefix)**：in- 表示「進入」。
+**字根 (Root)**：vad 與「走、前進」有關。
+**字尾 (Suffix)**：-ed 表示過去式。
+### 3. 記憶法與聯想助手
+**邏輯組合**：走進他人領土，引申為入侵。
+**記憶小撇步**：想像外來軍隊走進城內。
+### 4. 實用例句
+1. The army invaded the country at dawn.
+   - 中譯：軍隊在黎明時入侵了該國。
+2. We felt as if our privacy had been invaded.
+   - 中譯：我們覺得自己的隱私仿彿受到了侵犯。
+### 5. 延伸學習
+**同／反義詞**：attack／defend
+**常用搭配詞 (Collocation)**：
+- invade a country
+- invade someone's privacy
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "Invaded",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="入侵了\nK.K.：[ɪnˈveɪdɪd]",
+    ) == []
+
+
+def test_term_example_blocks_validate_each_translation_independently():
+    response = """### 1. 基本資訊與翻譯
+**單字／詞彙**：curriculum
+**音標**：[kəˈrɪkjələm]
+**詞性與繁體中文解釋**：名詞，課程。
+### 2. 構詞拆解（字根、字首、字尾）
+**字首 (Prefix)**：無。
+**字根 (Root)**：curr，跑。
+**字尾 (Suffix)**：-um，名詞。
+### 3. 記憶法與聯想助手
+**邏輯組合**：學習要走的路。
+**記憶小撇步**：想成課程路線。
+### 4. 實用例句
+1. The curriculum changed.
+   - 中譯：課程改變了。
+2. We reviewed the curriculum.
+### 5. 延伸學習
+**同／反義詞**：syllabus／無直接反義詞
+**常用搭配詞 (Collocation)**：
+- school curriculum
+- national curriculum
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "curriculum",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+    )
+
+    assert "每個實用例句都必須同時包含英文與繁體中文翻譯。" in errors
+
+
 def test_duplicate_required_heading_is_rejected():
     response = """### 1. 整句翻譯
 已於上一則快速翻譯提供，這裡不重複全文。
@@ -423,7 +521,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
     ) in errors
 
 
-def test_repeated_core_word_pair_cannot_escape_core_word_section():
+def test_repeated_core_word_pair_outside_core_word_section_is_ignored():
     response = """### 1. 自然道地英文翻譯
 - A modular vending machine.
 - An automatic vending machine with modular components.
@@ -449,7 +547,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
         fast_output="Modular vending machine",
     )
 
-    assert "核心單字子欄位只能出現在第三節核心單字區內。" in errors
+    assert not any("核心單字" in error for error in errors)
 
 
 def test_empty_memory_field_cannot_borrow_next_word_declaration():
@@ -480,7 +578,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
 
     assert (
         "每個核心單字的字根與記憶子欄位"
-        "都必須在同一行提供實質內容。"
+        "都必須各自提供實質內容。"
     ) in errors
 
 
@@ -510,7 +608,7 @@ The modular vending machine is easy to maintain. 這台模組化自動販賣機�
 
     assert (
         "每個核心單字的字根與記憶子欄位"
-        "都必須在同一行提供實質內容。"
+        "都必須各自提供實質內容。"
     ) in errors
 
 
@@ -538,8 +636,183 @@ dogs（n.）狗
 
     assert (
         "每個核心單字的字根與記憶子欄位"
-        "都必須在同一行提供實質內容。"
+        "都必須各自提供實質內容。"
     ) in errors
+
+
+def test_sentence_core_word_fields_accept_multiline_markdown_content():
+    response = """## 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+## 2. 句型結構與文法解析
+**核心句型：**名詞片語。
+**句子成分拆解：**TIME Magazine's inaugural edition 是核心名詞片語。
+**關鍵文法焦點：**of 介系詞片語修飾 edition。
+## 3. 核心單字字根拆解
+- inaugural（adj.）首次的
+  - **字根拆解**：
+    源自 inaugurate，與「正式開始」有關。
+  - **記憶提示**：
+    把 inaugural 聯想成首次正式開幕。
+- edition（n.）版本
+  - **字根拆解**：
+    edit + -ion，指編輯後形成的版本。
+  - **記憶提示**：
+    edit 完成後產生一個 edition。
+## 4. 句型延伸與仿寫造句
+**句型套用範例：**The magazine released its inaugural ranking of hospitals. 這本雜誌發布了首屆醫院排名。
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "TIME Magazine’s inaugural edition of the World’s Top Universities of 2026",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="TIME 雜誌首屆 2026 年世界頂尖大學特刊",
+    ) == []
+
+
+def test_empty_memory_field_cannot_borrow_multiword_declaration():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：We 是 S，take part 是 V。
+**關鍵文法焦點**：現在簡單式。
+### 3. 核心單字字根拆解
+- participate（v.）參加
+  - **字根拆解**：part + capere。
+  - **記憶提示**：
+- **take part（v.）**
+  參加
+  - **字根拆解**：phrasal verb。
+  - **記憶提示**：take a part in something。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：We take part in class. 我們參與課堂活動。
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "We take part in the event.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="我們參加這項活動。",
+    )
+
+    assert (
+        "每個核心單字的字根與記憶子欄位"
+        "都必須各自提供實質內容。"
+    ) in errors
+
+
+def test_empty_final_memory_field_cannot_borrow_preposition_declaration():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：We 是 S，continued 是 V。
+**關鍵文法焦點**：過去式。
+### 3. 核心單字字根拆解
+- continue（v.）繼續
+  - **字根拆解**：con- + tenere。
+  - **記憶提示**：
+in spite of（prep.）
+儘管
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：We continued despite the rain. 儘管下雨，我們仍繼續進行。
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "We continued in spite of the rain.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="儘管下雨，我們仍繼續進行。",
+    )
+
+    assert (
+        "每個核心單字的字根與記憶子欄位"
+        "都必須各自提供實質內容。"
+    ) in errors
+
+
+def test_mnemonic_pos_reference_is_not_mistaken_for_next_declaration():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：We 是 S，participate 是 V。
+**關鍵文法焦點**：現在簡單式。
+### 3. 核心單字字根拆解
+- participate（v.）參與
+  - **字根拆解**：part + capere。
+  - **記憶提示**：
+    把 participate（v.）聯想成取得一部分。
+- in spite of（prep.）儘管
+  - **字根拆解**：介系詞片語，無現代字綴拆解。
+  - **記憶提示**：聯想「不顧阻礙」。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：We joined despite the rain. 儘管下雨，我們仍參加了。
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "We participate in spite of the rain.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="儘管下雨，我們仍參與。",
+    ) == []
+
+
+def test_final_memory_hint_may_begin_with_declaration_shaped_text():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：名詞片語。
+**句子成分拆解**：The edition 是核心名詞。
+**關鍵文法焦點**：所有格。
+### 3. 核心單字字根拆解
+- edition（n.）版本
+  - **字根拆解**：edit + -ion。
+  - **記憶提示**：
+    edit（v.）編輯，聯想到 edition 是編輯後的版本。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：The journal released a new edition. 這本期刊發行了新版。
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "The magazine's new edition",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="這本雜誌的新版。",
+    ) == []
+
+
+def test_repeatable_markers_outside_core_word_section_are_ignored():
+    response = """### 1. 整句翻譯
+已於上一則快速翻譯提供，這裡不重複全文。
+### 2. 句型結構與文法解析
+**核心句型**：S + V。
+**句子成分拆解**：Dogs 是 S，bark 是 V。
+**關鍵文法焦點**：現在簡單式。
+### 3. 核心單字字根拆解
+- bark（v.）狗叫
+  - **字根拆解**：擬聲詞，無現代字綴拆解。
+  - **記憶提示**：聯想狗叫聲。
+### 4. 句型延伸與仿寫造句
+**句型套用範例**：Birds sing. 鳥會唱歌。
+仿寫時也可自問：**字根拆解**與**記憶提示**是否完整？
+"""
+
+    errors = translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "Dogs bark.",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="狗會叫。",
+    )
+
+    assert not any("核心單字" in error for error in errors)
 
 
 def test_clear_sentence_cannot_select_term_template():

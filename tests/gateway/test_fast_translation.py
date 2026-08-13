@@ -45,7 +45,10 @@ def test_normalize_fast_translation_config_is_bounded():
     assert config is not None
     assert config["provider"] is None
     assert config["model"] is None
+    assert config["hedge_model"] is None
+    assert config["hedge_delay"] == 1.5
     assert config["pronunciation"] == ""
+    assert config["reasoning_effort"] is None
     assert config["direct_provider"] == ""
     assert config["delivery_timeout"] == 30.0
     assert config["request_timeout"] == 1.0
@@ -53,6 +56,52 @@ def test_normalize_fast_translation_config_is_bounded():
     assert config["direct_max_input_chars"] == 1000
     assert config["max_input_chars"] == 120
     assert config["max_tokens"] == 16
+
+
+def test_normalize_fast_translation_config_bounds_distinct_hedge_model():
+    config = normalize_fast_translation_config(
+        {
+            "model": "gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.1-flash-lite-preview",
+            "hedge_delay": 99,
+        },
+    )
+
+    assert config is not None
+    assert config["hedge_model"] == "gemini-3.1-flash-lite-preview"
+    assert config["hedge_delay"] == 5.0
+
+    same_model = normalize_fast_translation_config(
+        {
+            "model": "google/gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.5-flash-lite",
+        },
+    )
+    assert same_model is not None
+    assert same_model["hedge_model"] is None
+
+    same_openai_model = normalize_fast_translation_config(
+        {
+            "model": "openai/gpt-5.6-luna",
+            "hedge_model": "gpt-5.6-luna",
+        },
+    )
+    assert same_openai_model is not None
+    assert same_openai_model["hedge_model"] is None
+
+
+def test_normalize_fast_translation_config_bounds_reasoning_effort():
+    configured = normalize_fast_translation_config(
+        {"reasoning_effort": "HIGH"},
+    )
+    invalid = normalize_fast_translation_config(
+        {"reasoning_effort": "minimal"},
+    )
+
+    assert configured is not None
+    assert configured["reasoning_effort"] == "high"
+    assert invalid is not None
+    assert invalid["reasoning_effort"] is None
 
 
 def test_normalize_fast_translation_config_rejects_non_finite_numbers():
@@ -166,6 +215,12 @@ def test_direct_provider_requires_explicit_compatible_config():
     assert pronunciation["pronunciation"] == "kk_single_english_word"
     assert pronunciation["direct_instructions_compatible"] is False
 
+    bilingual_pronunciation = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert bilingual_pronunciation is not None
+    assert bilingual_pronunciation["pronunciation"] == "kk_translation_terms"
+
 
 def test_eligible_fast_translation_text_excludes_commands_media_and_oversize():
     config = normalize_fast_translation_config({"max_input_chars": 5})
@@ -192,9 +247,14 @@ def test_fast_translation_output_and_detail_prompt():
     assert "delivery is ambiguous" in ambiguous_prompt
     assert "MUST be self-contained" in ambiguous_prompt
     assert "include the directly usable translation" in ambiguous_prompt
+    failed_delivery_prompt = build_detail_lane_prompt(delivery_failed=True)
+    assert "definitely did not deliver" in failed_delivery_prompt
+    assert "MUST therefore be self-contained" in failed_delivery_prompt
+    assert "every required pronunciation field" in failed_delivery_prompt
     failed_prompt = build_failed_lane_prompt()
     assert "definitely failed" in failed_prompt
     assert "Lead with the directly usable translation" in failed_prompt
+    assert "follow it completely" in failed_prompt
     targeted_failed_prompt = build_failed_lane_prompt(
         target_language="zh-TW",
         instructions="Preserve product names.",
@@ -626,12 +686,17 @@ async def test_run_fast_translation_passes_profile_provider_and_model():
         },
     )
     assert config is not None
-    mocked_llm = AsyncMock(return_value=response)
+    mocked_gemini = AsyncMock(return_value=response)
+    mocked_llm = AsyncMock()
 
     with (
         patch(
             "gateway.fast_translation._run_direct_translation",
             new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "gateway.fast_translation._run_native_gemini_translation",
+            new=mocked_gemini,
         ),
         patch(
             "agent.auxiliary_client.async_call_llm",
@@ -643,11 +708,373 @@ async def test_run_fast_translation_passes_profile_provider_and_model():
             config,
         ) == "持久的\nK.K.：[pɚˈsɪstənt]"
 
-    assert mocked_llm.await_args.kwargs["provider"] == "gemini"
-    assert mocked_llm.await_args.kwargs["model"] == "gemini-3.5-flash-lite"
-    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    mocked_llm.assert_not_awaited()
+    assert mocked_gemini.await_args.args == ("persistent", config)
+    system_prompt = mocked_gemini.await_args.kwargs["instructions"]
     assert "Return exactly two plain-text lines" in system_prompt
     assert "K.K.：" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_native_gemini_translation_uses_cancellable_native_endpoint():
+    from gateway.fast_translation import _run_native_gemini_translation
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "Facebook 變更遭封鎖。"}],
+                            "role": "model",
+                        },
+                        "finishReason": "STOP",
+                    },
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.post_args = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            self.post_args = (args, kwargs)
+            return FakeResponse()
+
+    fake_client = FakeClient()
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+        },
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=fake_client),
+    ):
+        response = await _run_native_gemini_translation(
+            "Facebook mutation blocked.",
+            config,
+            instructions="Translate to Traditional Chinese.",
+            timeout=2.5,
+        )
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == "Facebook 變更遭封鎖。"
+    request_url = fake_client.post_args[0][0]
+    request_kwargs = fake_client.post_args[1]
+    assert request_url.endswith(
+        "/models/gemini-3.5-flash-lite:generateContent",
+    )
+    assert request_kwargs["headers"]["x-goog-api-key"] == "test-key"
+    assert request_kwargs["json"]["generationConfig"]["maxOutputTokens"] == 256
+    assert request_kwargs["json"]["contents"][0]["parts"][0]["text"] == (
+        "Facebook mutation blocked."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_native_gemini_translation_enforces_total_timeout():
+    from gateway.fast_translation import _run_native_gemini_translation
+
+    class SlowClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+        },
+    )
+    assert config is not None
+
+    started_at = time.monotonic()
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=SlowClient()),
+    ):
+        with pytest.raises(RuntimeError, match="request budget"):
+            await _run_native_gemini_translation(
+                "Facebook mutation blocked.",
+                config,
+                instructions="Translate to Traditional Chinese.",
+                timeout=0.05,
+            )
+
+    assert time.monotonic() - started_at < 0.5
+
+
+@pytest.mark.asyncio
+async def test_run_native_openai_translation_uses_official_endpoint():
+    from gateway.fast_translation import _run_native_openai_translation
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "model": "gpt-5.6-luna",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"translation":"門房；禮賓人員",'
+                                '"kk":"ˌkɑn.siˈɛrʒ"}'
+                            ),
+                        },
+                    },
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.post_args = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            self.post_args = (args, kwargs)
+            return FakeResponse()
+
+    fake_client = FakeClient()
+    config = normalize_fast_translation_config(
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "none",
+            "pronunciation": "kk_translation_terms",
+            "max_tokens": 1024,
+        },
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://api.openai.com/v1",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=fake_client),
+    ):
+        response = await _run_native_openai_translation(
+            "concierge",
+            config,
+            instructions="Translate and add K.K. pronunciation.",
+            timeout=2.5,
+        )
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content.startswith("門房；禮賓人員")
+    request_url = fake_client.post_args[0][0]
+    request_kwargs = fake_client.post_args[1]
+    assert request_url == "https://api.openai.com/v1/chat/completions"
+    assert request_kwargs["headers"]["Authorization"] == "Bearer test-key"
+    assert request_kwargs["json"]["model"] == "gpt-5.6-luna"
+    assert request_kwargs["json"]["max_completion_tokens"] == 1024
+    assert request_kwargs["json"]["reasoning_effort"] == "none"
+    assert request_kwargs["json"]["response_format"]["type"] == "json_schema"
+    assert "temperature" not in request_kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_run_native_openai_translation_rejects_nonofficial_endpoint():
+    from gateway.fast_translation import _run_native_openai_translation
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+        },
+    )
+    assert config is not None
+
+    with patch(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        return_value={
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+        },
+    ):
+        with pytest.raises(RuntimeError, match="official api.openai.com"):
+            await _run_native_openai_translation(
+                "concierge",
+                config,
+                instructions="Translate.",
+                timeout=2.5,
+            )
+
+
+@pytest.mark.asyncio
+async def test_run_native_openai_translation_enforces_total_timeout():
+    from gateway.fast_translation import _run_native_openai_translation
+
+    class SlowClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+        },
+    )
+    assert config is not None
+
+    started_at = time.monotonic()
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://api.openai.com/v1",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=SlowClient()),
+    ):
+        with pytest.raises(RuntimeError, match="request budget"):
+            await _run_native_openai_translation(
+                "concierge",
+                config,
+                instructions="Translate.",
+                timeout=0.05,
+            )
+
+    assert time.monotonic() - started_at < 0.5
+
+
+@pytest.mark.asyncio
+async def test_run_hedged_native_gemini_translation_returns_delayed_hedge():
+    from gateway.fast_translation import _run_hedged_native_fast_translation
+
+    primary_cancelled = asyncio.Event()
+    hedge_response = SimpleNamespace(model="gemini-3.1-flash-lite-preview")
+
+    async def fake_native(*args, model=None, **kwargs):
+        if model is not None:
+            return hedge_response
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            primary_cancelled.set()
+            raise
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.1-flash-lite-preview",
+            "hedge_delay": 0.25,
+        },
+    )
+    assert config is not None
+
+    with patch(
+        "gateway.fast_translation._run_native_gemini_translation",
+        new=AsyncMock(side_effect=fake_native),
+    ):
+        started_at = time.monotonic()
+        result = await _run_hedged_native_fast_translation(
+            "失智症英文",
+            config,
+            instructions="Translate to English.",
+            timeout=1.0,
+        )
+
+    assert result is hedge_response
+    assert primary_cancelled.is_set()
+    assert 0.2 <= time.monotonic() - started_at < 0.7
+
+
+@pytest.mark.asyncio
+async def test_run_hedged_native_gemini_consumes_simultaneous_loser_error():
+    from gateway.fast_translation import _run_hedged_native_fast_translation
+
+    hedge_started = asyncio.Event()
+    primary_response = SimpleNamespace(model="gemini-3.5-flash-lite")
+
+    async def fake_native(*args, model=None, **kwargs):
+        if model is not None:
+            hedge_started.set()
+            raise RuntimeError("hedge failed")
+        await hedge_started.wait()
+        return primary_response
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "gemini",
+            "model": "gemini-3.5-flash-lite",
+            "hedge_model": "gemini-3.1-flash-lite-preview",
+            "hedge_delay": 0.25,
+        },
+    )
+    assert config is not None
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        with patch(
+            "gateway.fast_translation._run_native_gemini_translation",
+            new=AsyncMock(side_effect=fake_native),
+        ):
+            result = await _run_hedged_native_fast_translation(
+                "失智症英文",
+                config,
+                instructions="Translate to English.",
+                timeout=1.0,
+            )
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert result is primary_response
+    assert unhandled == []
 
 
 @pytest.mark.asyncio
@@ -682,6 +1109,115 @@ async def test_run_fast_translation_rejects_missing_required_kk_line():
 
 
 @pytest.mark.asyncio
+async def test_run_fast_translation_keeps_kk_after_english_directive():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="持久的\nK.K.：[pɚˈsɪstənt]",
+                ),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+    mocked_llm = AsyncMock(return_value=response)
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=mocked_llm,
+        ),
+    ):
+        result = await run_fast_translation(
+            "persistent，請翻譯成繁體中文",
+            config,
+        )
+
+    assert result == "持久的\nK.K.：[pɚˈsɪstənt]"
+    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    assert "source is one English word" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_requires_kk_for_short_chinese_term():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="dementia\nK.K.：[dɪˈmɛnʃə]",
+                ),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+    mocked_llm = AsyncMock(return_value=response)
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=mocked_llm,
+        ),
+    ):
+        result = await run_fast_translation("失智症英文", config)
+
+    assert result == "dementia\nK.K.：[dɪˈmɛnʃə]"
+    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    assert "exactly one English word" in system_prompt
+    assert "translated word" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_rejects_chinese_term_without_kk():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="dementia"),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=AsyncMock(return_value=response),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="required K.K."):
+            await run_fast_translation("失智症英文", config)
+
+
+@pytest.mark.asyncio
 async def test_run_fast_translation_does_not_request_kk_for_sentence():
     from gateway.fast_translation import run_fast_translation
 
@@ -713,6 +1249,75 @@ async def test_run_fast_translation_does_not_request_kk_for_sentence():
 
     system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
     assert "Return exactly two plain-text lines" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_does_not_request_kk_for_chinese_sentence():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="How are you today?",
+                ),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+    mocked_llm = AsyncMock(return_value=response)
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=mocked_llm,
+        ),
+    ):
+        await run_fast_translation("你今天好嗎", config)
+
+    system_prompt = mocked_llm.await_args.kwargs["messages"][0]["content"]
+    assert "exactly one English word" in system_prompt
+    assert "more than one English word" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_fast_translation_does_not_require_kk_for_i_like_english():
+    from gateway.fast_translation import run_fast_translation
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="I like English"),
+            )
+        ],
+    )
+    config = normalize_fast_translation_config(
+        {"pronunciation": "kk_translation_terms"},
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "gateway.fast_translation._run_direct_translation",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "agent.auxiliary_client.async_call_llm",
+            new=AsyncMock(return_value=response),
+        ),
+    ):
+        result = await run_fast_translation("我喜歡英文", config)
+
+    assert result == "I like English"
 
 
 @pytest.mark.asyncio
@@ -1050,6 +1655,39 @@ async def test_deliver_fast_translation_times_out_without_sending():
 
 
 @pytest.mark.asyncio
+async def test_fast_timeout_does_not_wait_for_cancellation_resistant_cleanup():
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    event = MessageEvent(text="persistent", source=_source())
+
+    async def slow_cleanup():
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.5)
+            return "late cleanup"
+
+    task = asyncio.create_task(slow_cleanup())
+    job = {
+        "task": task,
+        "started_at": time.monotonic(),
+        "delivery_timeout": 0.05,
+    }
+    started = time.monotonic()
+
+    value = await runner._deliver_fast_translation(
+        job,
+        event=event,
+        source=event.source,
+    )
+
+    assert value is None
+    assert time.monotonic() - started < 0.2
+    assert not task.done()
+    await task
+
+
+@pytest.mark.asyncio
 async def test_deliver_fast_translation_passes_outbound_deadline_to_adapter():
     runner = object.__new__(GatewayRunner)
 
@@ -1106,7 +1744,7 @@ async def test_deliver_fast_translation_requires_classified_delivery_capability(
         source=event.source,
     )
 
-    assert value is None
+    assert value == "delivery_failed"
     adapter.send.assert_not_awaited()
 
 
@@ -1135,7 +1773,7 @@ async def test_deliver_fast_translation_fails_open_on_send_error():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "delivery_failed"
 
 
 @pytest.mark.asyncio
@@ -1149,6 +1787,70 @@ async def test_deliver_fast_translation_honors_adapter_ambiguous_result():
                 delivery_ambiguous=True,
             ),
         ),
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda source, anchor=None: None
+    runner._reply_anchor_for_event = lambda event: None
+    event = MessageEvent(text="persistent", source=_source())
+    task = asyncio.create_task(asyncio.sleep(0, result="持久的"))
+    job = {
+        "task": task,
+        "started_at": time.monotonic(),
+        "delivery_timeout": 1.0,
+    }
+
+    value = await runner._deliver_fast_translation(
+        job,
+        event=event,
+        source=event.source,
+    )
+
+    assert value == "ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_deliver_fast_translation_prefers_ambiguity_over_success():
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(
+        send_with_delivery_deadline=AsyncMock(
+            return_value=SendResult(success=True, delivery_ambiguous=True),
+        ),
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda source, anchor=None: None
+    runner._reply_anchor_for_event = lambda event: None
+    event = MessageEvent(text="persistent", source=_source())
+    task = asyncio.create_task(asyncio.sleep(0, result="持久的"))
+    job = {
+        "task": task,
+        "started_at": time.monotonic(),
+        "delivery_timeout": 1.0,
+    }
+
+    value = await runner._deliver_fast_translation(
+        job,
+        event=event,
+        source=event.source,
+    )
+
+    assert value == "ambiguous"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        None,
+        SimpleNamespace(success=False),
+        SendResult(success=False, delivery_ambiguous=None),
+    ],
+)
+async def test_deliver_fast_translation_treats_untyped_result_as_ambiguous(
+    malformed_result,
+):
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(
+        send_with_delivery_deadline=AsyncMock(return_value=malformed_result),
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._thread_metadata_for_source = lambda source, anchor=None: None
@@ -1195,7 +1897,7 @@ async def test_deliver_fast_translation_adapter_exception_falls_back():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "ambiguous"
 
 
 @pytest.mark.asyncio
@@ -1223,7 +1925,7 @@ async def test_deliver_fast_translation_local_exception_falls_back():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "ambiguous"
 
 
 @pytest.mark.asyncio
@@ -1252,4 +1954,4 @@ async def test_deliver_fast_translation_adapter_timeout_falls_back():
         source=event.source,
     )
 
-    assert value is None
+    assert value == "ambiguous"

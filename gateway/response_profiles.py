@@ -75,7 +75,8 @@ _DETAIL_OUTPUT_CONTRACT_PROMPTS = {
         "Select 1-2 words. For each, include the word, part of speech, Chinese "
         "meaning, `**字根拆解**`, and `**記憶口訣／聯想**`. Do not invent "
         "morphemes; use a reliable etymology or state that no useful modern "
-        "decomposition exists.\n"
+        "decomposition exists. Put each field's substantive content on the "
+        "same line, or indent any continuation line beneath that field.\n"
         "### 4. 實用英文例句\n"
         "Provide at least one natural English example with a Chinese translation.\n"
         "TYPE 2 — English single word or non-sentential phrase. Use exactly "
@@ -105,6 +106,8 @@ _DETAIL_OUTPUT_CONTRACT_PROMPTS = {
         "### 3. 核心單字字根拆解\n"
         "Select 1-2 key words and include part of speech, Chinese meaning, "
         "`**字根拆解**`, and `**記憶提示**`; never invent morphology.\n"
+        "Put each field's substantive content on the same line, or indent any "
+        "continuation line beneath that field.\n"
         "### 4. 句型延伸與仿寫造句\n"
         "Include `**句型套用範例**` and its Traditional Chinese translation.\n"
         "The first fast reply may already contain a direct translation or K.K. "
@@ -361,6 +364,37 @@ _TRANSLATOR_REPEATABLE_FIELD_SECTIONS = {
 }
 
 
+def _normalize_translator_template_markers(value: str) -> str:
+    """Canonicalize harmless Markdown variants before contract validation."""
+    normalized = str(value or "")
+    markers = {
+        marker
+        for template in _TRANSLATOR_TEMPLATE_REQUIREMENTS.values()
+        for marker in template
+    } | {
+        "### 🔔 學習紀錄提醒",
+        "**複習時間與情境**",
+        "**溫馨提醒**",
+        "**繁體中文翻譯**",
+    }
+    for marker in markers:
+        if marker.startswith("### "):
+            title = marker[4:]
+            normalized = re.sub(
+                rf"(?m)^\s*#{{1,6}}\s+{re.escape(title)}\s*$",
+                marker,
+                normalized,
+            )
+        elif marker.startswith("**") and marker.endswith("**"):
+            label = marker[2:-2]
+            normalized = re.sub(
+                rf"\*\*{re.escape(label)}\s*([:：])\s*\*\*",
+                rf"{marker}\1",
+                normalized,
+            )
+    return normalized
+
+
 def classify_translator_input(value: Any) -> str:
     """Classify Translator Topic input for deterministic format validation."""
     text = str(value or "").strip()
@@ -423,7 +457,9 @@ def translator_detail_validation_errors(
     if contract not in _TRANSLATOR_CONTRACTS:
         return []
 
-    response = str(response_text or "").strip()
+    response = _normalize_translator_template_markers(
+        str(response_text or "").strip()
+    )
     if not response:
         return ["詳細教學回覆是空白。"]
 
@@ -521,14 +557,42 @@ def translator_detail_validation_errors(
         for pair in repeatable_field_pairs
         for field in pair
     }
+    repeatable_section = _TRANSLATOR_REPEATABLE_FIELD_SECTIONS.get(
+        input_type
+    )
+    repeatable_section_start = -1
+    repeatable_section_end = -1
+    repeatable_section_text = ""
+    if repeatable_section:
+        section_heading, next_heading = repeatable_section
+        repeatable_section_start = response.find(section_heading)
+        if repeatable_section_start >= 0:
+            repeatable_section_end = response.find(
+                next_heading,
+                repeatable_section_start + len(section_heading),
+            )
+            if repeatable_section_end < 0:
+                repeatable_section_end = len(response)
+            repeatable_section_text = response[
+                repeatable_section_start + len(section_heading):
+                repeatable_section_end
+            ]
     positions: list[int] = []
     for field in requirements:
-        position = response.find(field)
+        search_text = (
+            repeatable_section_text
+            if field in repeatable_fields
+            else response
+        )
+        relative_position = search_text.find(field)
+        position = relative_position
+        if field in repeatable_fields and relative_position >= 0:
+            position += repeatable_section_start
         if position < 0:
             errors.append(f"缺少必要標題或欄位：{field}")
         else:
             positions.append(position)
-            field_count = response.count(field)
+            field_count = search_text.count(field)
             if field in repeatable_fields:
                 if not 1 <= field_count <= 2:
                     errors.append(
@@ -539,38 +603,20 @@ def translator_detail_validation_errors(
     if len(positions) == len(requirements) and positions != sorted(positions):
         errors.append("必要標題或欄位的順序不正確。")
 
-    repeatable_section = _TRANSLATOR_REPEATABLE_FIELD_SECTIONS.get(
-        input_type
-    )
-    if repeatable_section:
-        section_heading, next_heading = repeatable_section
-        section_start = response.find(section_heading)
-        section_end = response.find(
-            next_heading,
-            section_start + len(section_heading),
-        )
-        if section_start >= 0 and section_end >= 0:
-            repeatable_positions = [
-                match.start()
-                for field in repeatable_fields
-                for match in re.finditer(re.escape(field), response)
-            ]
-            if any(
-                not section_start < position < section_end
-                for position in repeatable_positions
-            ):
-                errors.append(
-                    "核心單字子欄位只能出現在第三節核心單字區內。"
-                )
-
     for first_field, second_field in repeatable_field_pairs:
         first_positions = [
             match.start()
-            for match in re.finditer(re.escape(first_field), response)
+            for match in re.finditer(
+                re.escape(first_field),
+                repeatable_section_text,
+            )
         ]
         second_positions = [
             match.start()
-            for match in re.finditer(re.escape(second_field), response)
+            for match in re.finditer(
+                re.escape(second_field),
+                repeatable_section_text,
+            )
         ]
         if len(first_positions) != len(second_positions):
             errors.append(
@@ -626,29 +672,80 @@ def translator_detail_validation_errors(
         return bool(re.search(r"[A-Za-z0-9\u3400-\u9fff]", cleaned))
 
     if repeatable_section:
-        repeatable_matches = [
-            match
-            for field in repeatable_fields
-            for match in re.finditer(re.escape(field), response)
-        ]
+        def _field_block_has_substance(
+            match: re.Match[str],
+            boundary: int,
+        ) -> bool:
+            """Accept inline content or an immediately nested Markdown block."""
+            line_start = repeatable_section_text.rfind(
+                "\n", 0, match.start()
+            ) + 1
+            marker_line = repeatable_section_text[
+                line_start:match.start()
+            ]
+            marker_indent = len(marker_line) - len(marker_line.lstrip())
+            line_end = repeatable_section_text.find("\n", match.end())
+            if line_end < 0 or line_end > boundary:
+                line_end = boundary
+            if _has_substance(
+                repeatable_section_text[match.end():line_end]
+            ):
+                return True
 
-        def _same_line_field_content(match: re.Match[str]) -> str:
-            end = response.find("\n", match.end())
-            if end < 0:
-                end = len(response)
-            for boundary in all_markers:
-                position = response.find(boundary, match.end(), end)
-                if position >= 0:
-                    end = min(end, position)
-            return response[match.end():end]
+            cursor = line_end + 1
+            while cursor < boundary:
+                next_end = repeatable_section_text.find("\n", cursor)
+                if next_end < 0 or next_end > boundary:
+                    next_end = boundary
+                line = repeatable_section_text[cursor:next_end]
+                if line.strip():
+                    indentation = len(line) - len(line.lstrip())
+                    if indentation <= marker_indent:
+                        return False
+                    if _has_substance(line):
+                        return True
+                cursor = next_end + 1
+            return False
 
-        if any(
-            not _has_substance(_same_line_field_content(match))
-            for match in repeatable_matches
-        ):
+        incomplete_repeatable_content = False
+        for first_field, second_field in repeatable_field_pairs:
+            section_text = repeatable_section_text
+            first_matches = list(
+                re.finditer(re.escape(first_field), section_text)
+            )
+            second_matches = list(
+                re.finditer(re.escape(second_field), section_text)
+            )
+            if len(first_matches) != len(second_matches):
+                continue
+            for index, (first_match, second_match) in enumerate(
+                zip(first_matches, second_matches)
+            ):
+                if first_match.start() >= second_match.start():
+                    continue
+                second_end = (
+                    first_matches[index + 1].start()
+                    if index + 1 < len(first_matches)
+                    else len(section_text)
+                )
+                if not (
+                    _field_block_has_substance(
+                        first_match,
+                        second_match.start(),
+                    )
+                    and _field_block_has_substance(
+                        second_match,
+                        second_end,
+                    )
+                ):
+                    incomplete_repeatable_content = True
+                    break
+            if incomplete_repeatable_content:
+                break
+        if incomplete_repeatable_content:
             errors.append(
                 "每個核心單字的字根與記憶子欄位"
-                "都必須在同一行提供實質內容。"
+                "都必須各自提供實質內容。"
             )
 
     content_fields = [
@@ -730,21 +827,34 @@ def translator_detail_validation_errors(
             "### 4. 實用例句",
             "### 5. 延伸學習",
         )
-        example_numbers = re.findall(
-            r"(?m)^\s*(\d+)[.)]\s+\S", example_section
+        example_markers = list(
+            re.finditer(
+                r"(?m)^\s*(\d+)[.)]\s+\S.*$",
+                example_section,
+            )
         )
+        example_numbers = [
+            marker.group(1)
+            for marker in example_markers
+        ]
         if example_numbers != ["1", "2"]:
             errors.append("實用例句必須包含編號 1、2 的兩個英中例句。")
-        example_lines = re.findall(
-            r"(?m)^\s*\d+[.)]\s+.+$",
-            example_section,
-        )
+        example_blocks = [
+            example_section[
+                marker.start():(
+                    example_markers[index + 1].start()
+                    if index + 1 < len(example_markers)
+                    else len(example_section)
+                )
+            ]
+            for index, marker in enumerate(example_markers)
+        ]
         if any(
             not (
-                re.search(r"[A-Za-z]", line)
-                and re.search(r"[\u3400-\u9fff]", line)
+                re.search(r"[A-Za-z]", block)
+                and re.search(r"[\u3400-\u9fff]", block)
             )
-            for line in example_lines
+            for block in example_blocks
         ):
             errors.append("每個實用例句都必須同時包含英文與繁體中文翻譯。")
         collocations = _content_after("**常用搭配詞 (Collocation)**")
@@ -987,8 +1097,20 @@ def normalize_response_profile(value: Any) -> Optional[Dict[str, Any]]:
     failure_route = _detail_route(
         "on_fast_failure",
         legacy_skill,
-        allow_output_contract=False,
     )
+    if failure_route is not None:
+        failure_contract = failure_route["output_contract"]
+        if failure_contract == "translator_mastery":
+            failure_route["output_contract"] = (
+                "translator_mastery_self_contained"
+            )
+        elif failure_contract not in {
+            None,
+            "translator_mastery_self_contained",
+        }:
+            # A failed fast lane cannot satisfy contracts that assume a
+            # confirmed first reply (or other success-only handoff formats).
+            return None
     if ambiguous_route is None or failure_route is None:
         return None
 
@@ -1112,9 +1234,11 @@ def detail_lane_prompt(
     profile: Dict[str, Any],
     *,
     delivery_ambiguous: bool = False,
+    delivery_failed: bool = False,
 ) -> str:
     return _handler_for_profile(profile)["detail_prompt"](
         delivery_ambiguous=delivery_ambiguous,
+        delivery_failed=delivery_failed,
     )
 
 
@@ -1127,7 +1251,7 @@ def _detail_lane_route(
         return None
     if delivery_status == "delivered":
         route_name = "on_fast_success"
-    elif delivery_status == "ambiguous":
+    elif delivery_status in {"ambiguous", "delivery_failed"}:
         route_name = "on_fast_ambiguous"
     else:
         route_name = "on_fast_failure"
