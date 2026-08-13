@@ -48,6 +48,7 @@ def test_normalize_fast_translation_config_is_bounded():
     assert config["hedge_model"] is None
     assert config["hedge_delay"] == 1.5
     assert config["pronunciation"] == ""
+    assert config["reasoning_effort"] is None
     assert config["direct_provider"] == ""
     assert config["delivery_timeout"] == 30.0
     assert config["request_timeout"] == 1.0
@@ -78,6 +79,29 @@ def test_normalize_fast_translation_config_bounds_distinct_hedge_model():
     )
     assert same_model is not None
     assert same_model["hedge_model"] is None
+
+    same_openai_model = normalize_fast_translation_config(
+        {
+            "model": "openai/gpt-5.6-luna",
+            "hedge_model": "gpt-5.6-luna",
+        },
+    )
+    assert same_openai_model is not None
+    assert same_openai_model["hedge_model"] is None
+
+
+def test_normalize_fast_translation_config_bounds_reasoning_effort():
+    configured = normalize_fast_translation_config(
+        {"reasoning_effort": "HIGH"},
+    )
+    invalid = normalize_fast_translation_config(
+        {"reasoning_effort": "minimal"},
+    )
+
+    assert configured is not None
+    assert configured["reasoning_effort"] == "high"
+    assert invalid is not None
+    assert invalid["reasoning_effort"] is None
 
 
 def test_normalize_fast_translation_config_rejects_non_finite_numbers():
@@ -812,8 +836,161 @@ async def test_run_native_gemini_translation_enforces_total_timeout():
 
 
 @pytest.mark.asyncio
+async def test_run_native_openai_translation_uses_official_endpoint():
+    from gateway.fast_translation import _run_native_openai_translation
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "model": "gpt-5.6-luna",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"translation":"門房；禮賓人員",'
+                                '"kk":"ˌkɑn.siˈɛrʒ"}'
+                            ),
+                        },
+                    },
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.post_args = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            self.post_args = (args, kwargs)
+            return FakeResponse()
+
+    fake_client = FakeClient()
+    config = normalize_fast_translation_config(
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "none",
+            "pronunciation": "kk_translation_terms",
+            "max_tokens": 1024,
+        },
+    )
+    assert config is not None
+
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://api.openai.com/v1",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=fake_client),
+    ):
+        response = await _run_native_openai_translation(
+            "concierge",
+            config,
+            instructions="Translate and add K.K. pronunciation.",
+            timeout=2.5,
+        )
+
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content.startswith("門房；禮賓人員")
+    request_url = fake_client.post_args[0][0]
+    request_kwargs = fake_client.post_args[1]
+    assert request_url == "https://api.openai.com/v1/chat/completions"
+    assert request_kwargs["headers"]["Authorization"] == "Bearer test-key"
+    assert request_kwargs["json"]["model"] == "gpt-5.6-luna"
+    assert request_kwargs["json"]["max_completion_tokens"] == 1024
+    assert request_kwargs["json"]["reasoning_effort"] == "none"
+    assert request_kwargs["json"]["response_format"]["type"] == "json_schema"
+    assert "temperature" not in request_kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_run_native_openai_translation_rejects_nonofficial_endpoint():
+    from gateway.fast_translation import _run_native_openai_translation
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+        },
+    )
+    assert config is not None
+
+    with patch(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        return_value={
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+        },
+    ):
+        with pytest.raises(RuntimeError, match="official api.openai.com"):
+            await _run_native_openai_translation(
+                "concierge",
+                config,
+                instructions="Translate.",
+                timeout=2.5,
+            )
+
+
+@pytest.mark.asyncio
+async def test_run_native_openai_translation_enforces_total_timeout():
+    from gateway.fast_translation import _run_native_openai_translation
+
+    class SlowClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    config = normalize_fast_translation_config(
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+        },
+    )
+    assert config is not None
+
+    started_at = time.monotonic()
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://api.openai.com/v1",
+            },
+        ),
+        patch("httpx.AsyncClient", return_value=SlowClient()),
+    ):
+        with pytest.raises(RuntimeError, match="request budget"):
+            await _run_native_openai_translation(
+                "concierge",
+                config,
+                instructions="Translate.",
+                timeout=0.05,
+            )
+
+    assert time.monotonic() - started_at < 0.5
+
+
+@pytest.mark.asyncio
 async def test_run_hedged_native_gemini_translation_returns_delayed_hedge():
-    from gateway.fast_translation import _run_hedged_native_gemini_translation
+    from gateway.fast_translation import _run_hedged_native_fast_translation
 
     primary_cancelled = asyncio.Event()
     hedge_response = SimpleNamespace(model="gemini-3.1-flash-lite-preview")
@@ -842,7 +1019,7 @@ async def test_run_hedged_native_gemini_translation_returns_delayed_hedge():
         new=AsyncMock(side_effect=fake_native),
     ):
         started_at = time.monotonic()
-        result = await _run_hedged_native_gemini_translation(
+        result = await _run_hedged_native_fast_translation(
             "失智症英文",
             config,
             instructions="Translate to English.",
@@ -856,7 +1033,7 @@ async def test_run_hedged_native_gemini_translation_returns_delayed_hedge():
 
 @pytest.mark.asyncio
 async def test_run_hedged_native_gemini_consumes_simultaneous_loser_error():
-    from gateway.fast_translation import _run_hedged_native_gemini_translation
+    from gateway.fast_translation import _run_hedged_native_fast_translation
 
     hedge_started = asyncio.Event()
     primary_response = SimpleNamespace(model="gemini-3.5-flash-lite")
@@ -886,7 +1063,7 @@ async def test_run_hedged_native_gemini_consumes_simultaneous_loser_error():
             "gateway.fast_translation._run_native_gemini_translation",
             new=AsyncMock(side_effect=fake_native),
         ):
-            result = await _run_hedged_native_gemini_translation(
+            result = await _run_hedged_native_fast_translation(
                 "失智症英文",
                 config,
                 instructions="Translate to English.",

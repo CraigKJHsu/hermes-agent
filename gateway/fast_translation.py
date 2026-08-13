@@ -9,20 +9,23 @@ history and any follow-up explanation.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 
 def _canonical_fast_model_id(model: Optional[str]) -> str:
-    """Normalize provider-qualified Gemini IDs for hedge comparisons."""
+    """Normalize provider-qualified model IDs for hedge comparisons."""
     name = str(model or "").strip()
     lowered = name.lower()
-    for prefix in ("google/", "gemini/"):
+    for prefix in ("google/", "gemini/", "openai/"):
         if lowered.startswith(prefix):
             return name[len(prefix):].strip()
     return name
@@ -95,6 +98,9 @@ def normalize_fast_translation_config(value: Any) -> Optional[Dict[str, Any]]:
         "kk_translation_terms",
     }:
         pronunciation = ""
+    reasoning_effort = str(value.get("reasoning_effort") or "").strip().lower()
+    if reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
+        reasoning_effort = None
     return {
         "instructions": instructions or DEFAULT_INSTRUCTIONS,
         "provider": provider,
@@ -104,6 +110,7 @@ def normalize_fast_translation_config(value: Any) -> Optional[Dict[str, Any]]:
             "hedge_delay", 1.5, 0.25, 5.0,
         ),
         "pronunciation": pronunciation,
+        "reasoning_effort": reasoning_effort,
         "direct_provider": direct_provider,
         "direct_instructions_compatible": (
             not operator_instructions and not pronunciation
@@ -593,17 +600,214 @@ async def _run_native_gemini_translation(
     return translate_gemini_response(payload, model=selected_model)
 
 
-async def _run_hedged_native_gemini_translation(
+async def _run_native_openai_translation(
+    text: str,
+    config: Dict[str, Any],
+    *,
+    instructions: str,
+    timeout: float,
+    model: Optional[str] = None,
+) -> Optional[Any]:
+    """Call the official OpenAI endpoint within one cancellation budget."""
+    provider = str(config.get("provider") or "").strip().lower()
+    if provider not in {"openai", "openai-api"}:
+        return None
+
+    import httpx
+
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    credentials = resolve_api_key_provider_credentials("openai-api")
+    api_key = str(credentials.get("api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("OpenAI fast translation requires an API key")
+
+    base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
+    parsed_base = urlparse(base_url)
+    if parsed_base.scheme != "https" or parsed_base.hostname != "api.openai.com":
+        raise RuntimeError(
+            "OpenAI fast translation requires the official api.openai.com endpoint",
+        )
+
+    selected_model = _canonical_fast_model_id(
+        str(model or config.get("model") or "").strip(),
+    )
+    if not selected_model:
+        raise RuntimeError("OpenAI fast translation requires a model")
+
+    openai_instructions = instructions
+    structured_pronunciation = config.get("pronunciation") in {
+        "kk_single_english_word",
+        "kk_translation_terms",
+    }
+    if structured_pronunciation:
+        openai_instructions = (
+            f"{instructions.rstrip()}\n"
+            "Trusted structured-output direction: always provide an American "
+            "K.K. transcription in the `kk` field. Use the English source "
+            "word when the source is exactly one English word; otherwise use "
+            "the first English word of the English source or translation. The "
+            "`kk` field contains phonetic symbols only and must never be empty. "
+            "The `translation` field contains only the directly usable "
+            "translation."
+        )
+    request = {
+        "model": selected_model,
+        "messages": [
+            {"role": "system", "content": openai_instructions},
+            {"role": "user", "content": text},
+        ],
+        "max_completion_tokens": int(config["max_tokens"]),
+    }
+    if config.get("reasoning_effort"):
+        # GPT-5.6 Luna rejects temperature=0. Its supported `none` reasoning
+        # mode materially lowers first-reply latency for this bounded task.
+        request["reasoning_effort"] = str(config["reasoning_effort"])
+    if structured_pronunciation:
+        request["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "fast_translation",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "translation": {"type": "string", "minLength": 1},
+                        "kk": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["translation", "kk"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    request_timeout = max(0.05, float(timeout))
+    try:
+        async with asyncio.timeout(request_timeout):
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(request_timeout),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    f"{base_url}/chat/completions",
+                    json=request,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": "hermes-agent (translator-fast-openai)",
+                    },
+                )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "OpenAI fast translation exceeded its request budget",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(
+            f"OpenAI fast translation transport failed: {exc}",
+        ) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenAI fast translation returned invalid JSON") from exc
+    if response.status_code != 200:
+        error = payload.get("error") if isinstance(payload, dict) else {}
+        if not isinstance(error, dict):
+            error = {}
+        error_type = str(error.get("type") or error.get("code") or "unknown")
+        error_message = str(error.get("message") or "request failed")
+        raise RuntimeError(
+            f"OpenAI fast translation HTTP {response.status_code} "
+            f"({error_type}): {error_message}",
+        )
+    try:
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice["finish_reason"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            "OpenAI fast translation returned no final content",
+        ) from exc
+    if structured_pronunciation:
+        try:
+            structured = json.loads(content)
+            translation = str(structured["translation"]).strip()
+            kk = str(structured["kk"]).strip()
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "OpenAI fast translation returned invalid structured content",
+            ) from exc
+        kk = re.sub(r"^K\.K\.\s*[：:]\s*", "", kk, flags=re.IGNORECASE)
+        if (
+            (kk.startswith("[") and kk.endswith("]"))
+            or (kk.startswith("/") and kk.endswith("/"))
+        ):
+            kk = kk[1:-1].strip()
+        if not translation or not kk or "\n" in kk or "]" in kk:
+            raise RuntimeError(
+                "OpenAI fast translation returned invalid pronunciation",
+            )
+        _, target_language = prepare_direct_translation_input(text)
+        if _requires_fast_kk(
+            text,
+            target_language,
+            config,
+            translated_text=translation,
+        ):
+            content = f"{translation}\nK.K.：[{kk}]"
+        else:
+            content = translation
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                message=SimpleNamespace(content=content),
+            ),
+        ],
+        model=str(payload.get("model") or selected_model),
+    )
+
+
+async def _run_native_fast_translation(
+    text: str,
+    config: Dict[str, Any],
+    *,
+    instructions: str,
+    timeout: float,
+    model: Optional[str] = None,
+) -> Optional[Any]:
+    """Dispatch to a cancellable native provider implementation."""
+    provider = str(config.get("provider") or "").strip().lower()
+    if provider == "gemini":
+        return await _run_native_gemini_translation(
+            text,
+            config,
+            instructions=instructions,
+            timeout=timeout,
+            model=model,
+        )
+    if provider in {"openai", "openai-api"}:
+        return await _run_native_openai_translation(
+            text,
+            config,
+            instructions=instructions,
+            timeout=timeout,
+            model=model,
+        )
+    return None
+
+
+async def _run_hedged_native_fast_translation(
     text: str,
     config: Dict[str, Any],
     *,
     instructions: str,
     timeout: float,
 ) -> Optional[Any]:
-    """Race a delayed Gemini hedge against a slow primary model request."""
+    """Race a delayed native-provider hedge against a slow primary request."""
     hedge_model = str(config.get("hedge_model") or "").strip()
     if not hedge_model:
-        return await _run_native_gemini_translation(
+        return await _run_native_fast_translation(
             text,
             config,
             instructions=instructions,
@@ -613,7 +817,7 @@ async def _run_hedged_native_gemini_translation(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.05, float(timeout))
     primary = asyncio.create_task(
-        _run_native_gemini_translation(
+        _run_native_fast_translation(
             text,
             config,
             instructions=instructions,
@@ -642,10 +846,10 @@ async def _run_hedged_native_gemini_translation(
         remaining = deadline - loop.time()
         if remaining <= 0:
             raise RuntimeError(
-                "Gemini fast translation exceeded its request budget",
+                "Native fast translation exceeded its request budget",
             ) from last_error
         hedge = asyncio.create_task(
-            _run_native_gemini_translation(
+            _run_native_fast_translation(
                 text,
                 config,
                 instructions=instructions,
@@ -655,7 +859,7 @@ async def _run_hedged_native_gemini_translation(
         )
         pending.add(hedge)
         logger.info(
-            "Gemini fast translation hedge started after %.2fs: %s -> %s",
+            "Fast translation hedge started after %.2fs: %s -> %s",
             hedge_delay,
             config.get("model"),
             hedge_model,
@@ -686,10 +890,10 @@ async def _run_hedged_native_gemini_translation(
                 return winner
         if last_error is not None:
             raise RuntimeError(
-                "All Gemini fast translation attempts failed",
+                "All native fast translation attempts failed",
             ) from last_error
         raise RuntimeError(
-            "Gemini fast translation exceeded its request budget",
+            "Native fast translation exceeded its request budget",
         )
     finally:
         for task in pending:
@@ -776,7 +980,7 @@ async def run_fast_translation(text: str, config: Dict[str, Any]) -> str:
             float(config["delivery_timeout"]) - elapsed - 0.5,
         ),
     )
-    response = await _run_hedged_native_gemini_translation(
+    response = await _run_hedged_native_fast_translation(
         source_text,
         config,
         instructions=fallback_instructions,
