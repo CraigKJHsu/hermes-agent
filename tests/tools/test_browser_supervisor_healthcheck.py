@@ -102,7 +102,7 @@ async def test_crosspost_gate_recovers_missing_post_body_without_consuming_gate(
 
 
 @pytest.mark.asyncio
-async def test_crosspost_gate_completes_when_missing_post_body_is_blocked(
+async def test_crosspost_gate_retires_ambiguously_when_unknown_body_is_blocked(
     monkeypatch,
 ):
     supervisor = bs.CDPSupervisor("t-crosspost-body-blocked", "ws://unused")
@@ -146,8 +146,9 @@ async def test_crosspost_gate_completes_when_missing_post_body_is_blocked(
     ]
     assert gate.completed.is_set()
     assert gate.consumed is True
-    assert gate.result["dispatch_ambiguous"] is False
+    assert gate.result["dispatch_ambiguous"] is True
     assert gate.result["request_released"] is False
+    assert supervisor._crosspost_request_gate is None
 
 
 @pytest.fixture

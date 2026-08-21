@@ -4330,7 +4330,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 definition,
             )
     migration_state = conn.execute(
-        "SELECT reconciled FROM commerce_group_migration_state "
+        "SELECT reconciled, latest_group_effect_at, "
+        "reconciled_report_observed_at, note "
+        "FROM commerce_group_migration_state "
         "WHERE singleton_id = 1"
     ).fetchone()
     effects_table_exists = conn.execute(
@@ -4390,18 +4392,60 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             """
         ).fetchone()
         latest_at = int(latest_effect["latest_at"] or 0)
-        if latest_at:
+        previous_latest_at = int(
+            migration_state["latest_group_effect_at"] or 0
+        )
+        legacy_group_effect_invalidation = bool(
+            int(migration_state["reconciled"] or 0) == 0
+            and str(migration_state["note"] or "").startswith(
+                "A Facebook group effect requires commerce-ledger reconciliation."
+            )
+        )
+        if latest_at != previous_latest_at or legacy_group_effect_invalidation:
+            from hermes_cli.user_facing_report import (
+                SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS,
+            )
+
+            placeholders = ",".join(
+                "?" for _ in SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS
+            )
+            coverage = conn.execute(
+                "SELECT complete, observed_at FROM commerce_group_coverage "
+                f"WHERE subject_key IN ({placeholders})",
+                tuple(sorted(SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS)),
+            ).fetchall()
+            coverage_is_current = bool(
+                len(coverage)
+                == len(SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS)
+                and all(bool(row["complete"]) for row in coverage)
+                and min(int(row["observed_at"] or 0) for row in coverage)
+                > latest_at
+            )
+            report_is_newer = bool(
+                int(
+                    migration_state["reconciled_report_observed_at"] or 0
+                ) > latest_at
+            )
             conn.execute(
                 """
                 UPDATE commerce_group_migration_state
-                   SET latest_group_effect_at = MAX(latest_group_effect_at, ?),
-                       reconciled = CASE
-                           WHEN reconciled_report_observed_at <= ? THEN 0
-                           ELSE reconciled
-                       END
+                   SET latest_group_effect_at = ?,
+                       reconciled = ?,
+                       note = ?,
+                       updated_at = ?
                  WHERE singleton_id = 1
                 """,
-                (latest_at, latest_at),
+                (
+                    latest_at,
+                    1
+                    if latest_at == 0 or report_is_newer or coverage_is_current
+                    else 0,
+                    (
+                        "Removed unrelated Facebook group-join effects from "
+                        "the commerce reconciliation watermark."
+                    ),
+                    int(time.time()),
+                ),
             )
 
     grace_callback_table_exists = conn.execute(

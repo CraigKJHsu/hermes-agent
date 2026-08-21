@@ -249,6 +249,60 @@ def test_saved_evidence_finalization_does_not_hijack_status_questions():
     assert saved_evidence_finalization_turn_prompt(
         "不要使用已保存證據完成原任務 t_2f6b540f。"
     ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "勿用已保存證據完成原任務 t_2f6b540f。"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "不要使用已保存證據來完成原任務 t_2f6b540f。"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "Do not use saved evidence to resume finalization t_2f6b540f."
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "不要再使用已保存證據來完成原任務 t_2f6b540f。"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "Do not ever use saved evidence to resume finalization t_2f6b540f."
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "Use saved evidence to resume finalization t_2f6b540f, but don't do it."
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "請使用已保存證據完成原任務 t_2f6b540f，但先不要執行。"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "Use saved evidence to resume finalization t_2f6b540f. "
+        "Don't do that or open the browser."
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "Do not open the browser or use saved evidence to resume finalization "
+        "t_2f6b540f."
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "Use saved evidence to resume finalization t_2f6b540f, but don't "
+        "open the browser or resume finalization."
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "不要開瀏覽器或使用已保存證據完成原任務 t_2f6b540f。"
+    ) == ""
+
+    prompt = saved_evidence_finalization_turn_prompt(
+        "請使用已保存證據完成原任務 t_2f6b540f，不要開瀏覽器。"
+    )
+    assert "MUST call clawops_finalize_saved_evidence" in prompt
+    prompt = saved_evidence_finalization_turn_prompt(
+        "不要開瀏覽器，請使用已保存證據完成原任務 t_2f6b540f。"
+    )
+    assert "MUST call clawops_finalize_saved_evidence" in prompt
+    prompt = saved_evidence_finalization_turn_prompt(
+        "Use saved evidence to resume finalization t_2f6b540f "
+        "and don't open the browser."
+    )
+    assert "MUST call clawops_finalize_saved_evidence" in prompt
+    prompt = saved_evidence_finalization_turn_prompt(
+        "請使用已保存證據完成原任務 t_2f6b540f 並且不要開瀏覽器。"
+    )
+    assert "MUST call clawops_finalize_saved_evidence" in prompt
 
 
 def test_saved_evidence_finalization_preserves_nondefault_task_board(

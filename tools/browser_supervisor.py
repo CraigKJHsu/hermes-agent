@@ -1266,15 +1266,21 @@ class CDPSupervisor:
                         self._taint_and_retire_crosspost_request_gate(gate)
                         gate.completed.set()
                     return
+                # The broad GraphQL Fetch pattern also sees unrelated
+                # background POSTs. The body is unreadable, so we cannot prove
+                # whether this was the authorized mutation. Retire the whole
+                # one-shot gate as ambiguous: never release a later request
+                # under authorization that may already have been exercised.
                 if gate is not None:
                     result = {
                         "target": True,
                         "ok": False,
                         "request_released": False,
-                        "dispatch_ambiguous": False,
+                        "dispatch_ambiguous": True,
                         "error": (
-                            "Facebook cross-post mutation was blocked because "
-                            "its POST body could not be read safely"
+                            "An unreadable Facebook GraphQL request was blocked; "
+                            "the authorized cross-post gate was retired because "
+                            "the request identity could not be proven"
                         ),
                     }
                     with self._state_lock:
@@ -1282,6 +1288,7 @@ class CDPSupervisor:
                             self._crosspost_request_gate = None
                         gate.consumed = True
                         gate.result = result
+                    self._taint_and_retire_crosspost_request_gate(gate)
                     gate.completed.set()
                 return
         validation = self._parse_crosspost_graphql_request(

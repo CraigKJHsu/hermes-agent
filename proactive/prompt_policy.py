@@ -41,10 +41,52 @@ _SAVED_EVIDENCE_FINALIZATION_ACTIONS = (
     "resume finalization", "continue finalization",
     "complete finalization",
 )
-_SAVED_EVIDENCE_FINALIZATION_REJECTIONS = (
-    "不要", "不用", "不需", "取消", "停止", "是否", "嗎", "?", "？",
-    "do not", "don't", "cancel", "stop", "whether",
+_SAVED_EVIDENCE_FINALIZATION_QUESTIONS = (
+    "是否", "嗎", "?", "？", "whether",
 )
+_SAVED_EVIDENCE_NEGATORS = (
+    "不要", "不用", "不需", "勿", "請勿", "取消", "停止",
+    "do not", "don't", "cancel", "stop",
+)
+_SAVED_EVIDENCE_ALLOWED_NEGATIVE_FRAGMENT = re.compile(
+    r"(?:(?:但|並且|而且|but|and)\s*)?"
+    r"(?:請\s*)?(?:不要|不用|不需|勿|請勿|停止)\s*(?:再\s*)?"
+    r"(?:開啟?\s*瀏覽器|使用\s*瀏覽器|重新查核|重新檢查|"
+    r"建立(?:新的?)?\s*任務)"
+    r"|(?:(?:but|and)\s*)?"
+    r"(?:do not|don't|stop)\s+"
+    r"(?:open|use)\s+(?:the\s+|a\s+)?browser"
+    r"|(?:(?:but|and)\s*)?"
+    r"(?:do not|don't|stop)\s+"
+    r"(?:inspect\s+facebook|create\s+a\s+new\s+task|"
+    r"call\s+clawops_delegate)",
+    re.IGNORECASE,
+)
+
+
+def _saved_evidence_action_is_negated(message_text: str) -> bool:
+    """Reject refusals, allowing only explicit no-new-I/O constraints."""
+    for clause in re.split(r"[，,。.!！;；\n]+", str(message_text or "").casefold()):
+        action_positions = [
+            clause.find(action.casefold())
+            for action in _SAVED_EVIDENCE_FINALIZATION_ACTIONS
+            if action.casefold() in clause
+        ]
+        allowed_matches = list(
+            _SAVED_EVIDENCE_ALLOWED_NEGATIVE_FRAGMENT.finditer(clause)
+        )
+        if action_positions and any(
+            action_position > match.start()
+            for match in allowed_matches
+            for action_position in action_positions
+        ):
+            # A leading negation may coordinate over both the no-I/O phrase
+            # and the later finalization action ("do not X or finalize").
+            return True
+        remaining = _SAVED_EVIDENCE_ALLOWED_NEGATIVE_FRAGMENT.sub("", clause)
+        if any(negator in remaining for negator in _SAVED_EVIDENCE_NEGATORS):
+            return True
+    return False
 
 
 def _saved_evidence_task_board(task_id: str) -> str | None:
@@ -206,7 +248,8 @@ def saved_evidence_finalization_turn_prompt(message_text: str) -> str:
     normalized = current.casefold()
     if (
         len(task_ids) != 1
-        or any(marker in normalized for marker in _SAVED_EVIDENCE_FINALIZATION_REJECTIONS)
+        or any(marker in normalized for marker in _SAVED_EVIDENCE_FINALIZATION_QUESTIONS)
+        or _saved_evidence_action_is_negated(current)
         or not any(
             hint.casefold() in normalized
             for hint in _SAVED_EVIDENCE_HINTS

@@ -46,7 +46,11 @@ def test_group_join_does_not_invalidate_commerce_reconciliation(tmp_path):
         ).fetchone()
         assert tuple(migration) == (1, 0)
         conn.execute(
-            "DELETE FROM commerce_group_migration_state WHERE singleton_id = 1"
+            "UPDATE commerce_group_migration_state SET reconciled = 0, "
+            "latest_group_effect_at = ?, "
+            "note = 'A Facebook group effect requires commerce-ledger reconciliation.' "
+            "WHERE singleton_id = 1",
+            (now,),
         )
         conn.commit()
 
@@ -57,6 +61,51 @@ def test_group_join_does_not_invalidate_commerce_reconciliation(tmp_path):
             "FROM commerce_group_migration_state WHERE singleton_id = 1"
         ).fetchone()
         assert tuple(migration) == (1, 0)
+
+
+def test_join_watermark_repair_preserves_newer_reconciliation_report(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="Historical group effects")
+        with kb.write_txn(conn):
+            kb._upsert_external_effect(
+                conn,
+                task_id=task_id,
+                platform="facebook",
+                state="created",
+                external_id="123456789",
+                details=None,
+                run_id=None,
+                now=100,
+                effect_key="group:123456789",
+            )
+            kb._upsert_external_effect(
+                conn,
+                task_id=task_id,
+                platform="facebook",
+                state="joined",
+                external_id="987654321",
+                details=None,
+                run_id=None,
+                now=100,
+                effect_key="group:987654321",
+            )
+            conn.execute(
+                "UPDATE commerce_group_migration_state SET reconciled = 0, "
+                "latest_group_effect_at = 100, "
+                "reconciled_report_observed_at = 150, "
+                "note = 'A Facebook group effect requires commerce-ledger reconciliation.' "
+                "WHERE singleton_id = 1"
+            )
+
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        migration = conn.execute(
+            "SELECT reconciled, latest_group_effect_at "
+            "FROM commerce_group_migration_state WHERE singleton_id = 1"
+        ).fetchone()
+        assert tuple(migration) == (1, 100)
 
 
 @pytest.fixture
