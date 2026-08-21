@@ -3096,6 +3096,32 @@ class GatewaySlashCommandsMixin:
             # Set the title
             try:
                 if await self._session_db.set_session_title(session_id, sanitized):
+                    # Keep the Topic's implicit lightweight main-project label
+                    # aligned with the user-selected title.  This is local
+                    # metadata only; a failure must not hide a successful
+                    # session-title update or prevent the Telegram rename.
+                    if (
+                        getattr(getattr(source, "platform", None), "value", "")
+                        == "telegram"
+                        and str(getattr(source, "thread_id", "") or "").strip()
+                    ):
+                        try:
+                            from proactive.thread_context_registry import (
+                                update_thread_context_topic_name,
+                            )
+
+                            await asyncio.to_thread(
+                                update_thread_context_topic_name,
+                                platform="telegram",
+                                chat_id=str(source.chat_id or ""),
+                                thread_id=str(source.thread_id or ""),
+                                topic_name=sanitized,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to synchronize Telegram Topic project label",
+                                exc_info=True,
+                            )
                     # Propagate the user-chosen title to the visible Telegram
                     # forum topic name too. Auto-generated titles already rename
                     # the topic; without this, /title only updated the DB title

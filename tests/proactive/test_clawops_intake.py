@@ -4,14 +4,20 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive.clawops_intake import (
+    _resolve_task_assignee,
     auto_publish_preapproved,
     create_clawops_task,
     infer_clawops_metadata,
+    requires_external_browser_capabilities,
+    requires_facebook_marketplace_group_publish,
+    requires_facebook_page_graph_api,
     resolve_clawops_assignee,
     subscribe_clawops_task,
 )
 from proactive.hubops_routing import (
+    registered_worker_capabilities,
     registered_worker_task_types,
+    route_requires_owner_approval,
     route_clawops_objective,
 )
 
@@ -26,6 +32,35 @@ def test_resolve_clawops_assignee_falls_back_to_default_profile(monkeypatch):
     monkeypatch.delenv("HERMES_CLAWOPS_ASSIGNEE", raising=False)
 
     assert resolve_clawops_assignee({}) == "default"
+
+
+def test_routed_task_assignee_cannot_be_overridden_by_env_or_argument(monkeypatch):
+    monkeypatch.setenv("HERMES_CLAWOPS_ASSIGNEE", "clawops-browser")
+    envelope = route_clawops_objective(
+        "發布已核准貼文至 SoloBizAi 粉專",
+        project="hub_ops",
+        task_type="facebook_page_api_publish",
+        risk_level="medium",
+        approved=True,
+    )
+
+    assert _resolve_task_assignee(
+        hubops_envelope=envelope,
+        assignee="clawops-browser",
+        config={"clawops": {"default_assignee": "another-worker"}},
+    ) == "clawops-ops"
+
+
+@pytest.mark.parametrize(
+    "objective",
+    (
+        "請發布貼文到 Facebook group SoloBizAI",
+        "請發布貼文到 SoloBizAI 社團",
+    ),
+)
+def test_protected_page_identity_wins_over_misleading_group_words(objective):
+    assert requires_facebook_page_graph_api(objective) is True
+    assert requires_external_browser_capabilities(objective) is False
 
 
 def test_raw_clawops_intake_cannot_create_dispatchable_task(tmp_path, monkeypatch):
@@ -65,6 +100,14 @@ def test_hubops_routing_selects_dev_worker_from_yaml():
     assert envelope["approval_checklist"] == "DevOps and Integration"
 
 
+def test_hubops_registry_exposes_worker_capability_vocabulary():
+    capabilities = registered_worker_capabilities()
+
+    assert "memory_read" in capabilities
+    assert "report_generate" in capabilities
+    assert "browser_navigate" not in capabilities
+
+
 def test_hubops_routing_selects_secondhand_agent_and_browser_worker():
     envelope = route_clawops_objective(
         "繼續追加 Facebook 社團群組發佈，再10個",
@@ -84,13 +127,135 @@ def test_hubops_routing_selects_secondhand_agent_and_browser_worker():
     assert envelope["approval_checklist"] == "External Browser Publish"
 
 
+def test_hubops_routes_marketplace_group_publish_to_dedicated_worker():
+    envelope = route_clawops_objective(
+        "將既有 Marketplace listing 刊登到核准 Facebook 社團",
+        project="secondhand_commerce",
+        task_type="facebook_existing_listing_group_distribution",
+        risk_level="medium",
+        approved=True,
+    )
+
+    assert envelope["status"] == "routed"
+    assert envelope["task_type"] == "facebook_marketplace_group_publish"
+    assert envelope["agent_assignment"]["assigned_agent"] == (
+        "secondhand_commerce"
+    )
+    assert envelope["assignment"]["assigned_worker"] == (
+        "clawops.facebook_marketplace_group"
+    )
+    assert envelope["assignment"]["runtime_profile"] == "clawops-browser"
+    assert envelope["assignment"]["approval_required"] is True
+    assert route_requires_owner_approval(envelope) is True
+    assert "browser_click" in envelope["assignment"]["allowed_tools"]
+    assert "browser_cdp" not in envelope["assignment"]["allowed_tools"]
+    assert "browser_type" not in envelope["assignment"]["allowed_tools"]
+    assert "facebook_page_graph_publish" not in (
+        envelope["assignment"]["allowed_tools"]
+    )
+    assert envelope["assignment"]["retry_policy"]["max_attempts"] == 1
+
+
+def test_marketplace_group_route_does_not_authorize_empty_crosspost_binding():
+    contract = {
+        "routing": {"task_type": "facebook_marketplace_group_publish"},
+        "facebook_crosspost": {},
+    }
+
+    assert kb._grace_contract_is_facebook_crosspost_publish(contract) is False
+
+    contract["facebook_crosspost"] = {
+        "transport": "graph_api",
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+    assert kb._grace_contract_is_facebook_crosspost_publish(contract) is False
+
+    contract["facebook_crosspost"]["transport"] = "browser"
+    contract["routing"]["task_type"] = "FACEBOOK_MARKETPLACE_GROUP_PUBLISH"
+    assert kb._grace_contract_is_facebook_crosspost_publish(contract) is False
+
+    contract["routing"]["task_type"] = "facebook_marketplace_group_publish"
+    contract["facebook_crosspost"]["marketplace_listing_id"] = 111
+    assert kb._grace_contract_is_facebook_crosspost_publish(contract) is False
+
+    contract["facebook_crosspost"]["marketplace_listing_id"] = "111"
+    contract["facebook_crosspost"]["group_ids"] = ["٢٢٢"]
+    assert kb._grace_contract_is_facebook_crosspost_publish(contract) is False
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "Share my Marketplace listing to a Facebook group",
+        "Distribute the Marketplace listing to Facebook groups",
+        "Add my Marketplace listing to this Facebook group",
+        "把 Marketplace 刊登分享至 Facebook 社團",
+        "將 Marketplace 商品轉貼到核准群組",
+    ],
+)
+def test_marketplace_group_share_wording_uses_dedicated_route(objective):
+    inferred = infer_clawops_metadata(objective)
+
+    assert inferred["task_type"] == "facebook_marketplace_group_publish"
+
+
+def test_marketplace_group_route_wins_over_overlapping_page_language():
+    inferred = infer_clawops_metadata(
+        "Share the SoloBizAi Page's Marketplace listing to Facebook groups"
+    )
+
+    assert inferred["task_type"] == "facebook_marketplace_group_publish"
+
+
+def test_marketplace_group_readonly_wording_does_not_become_publish():
+    inferred = infer_clawops_metadata(
+        "查看 Facebook Marketplace 社團中的既有刊登互動狀態"
+    )
+
+    assert inferred["task_type"] == "browser_ops"
+
+
+def test_marketplace_group_write_intent_wins_over_status_followup():
+    inferred = infer_clawops_metadata(
+        "Post my Marketplace listing to a Facebook group and check status"
+    )
+
+    assert inferred["task_type"] == "facebook_marketplace_group_publish"
+
+    readonly = infer_clawops_metadata(
+        "Additional status for a Marketplace Facebook group listing"
+    )
+    assert readonly["task_type"] == "browser_ops"
+
+
+def test_hubops_routing_selects_marketplace_readonly_worker_for_group_status():
+    envelope = route_clawops_objective(
+        "Read one Marketplace listing's named group destinations",
+        project="secondhand_commerce",
+        task_type="secondhand_commerce_group_status",
+        risk_level="low",
+        approved=False,
+    )
+
+    assert envelope["status"] == "routed"
+    assert envelope["task_type"] == "facebook_marketplace_readonly"
+    assert envelope["assignment"]["assigned_worker"] == (
+        "clawops.facebook_marketplace_readonly"
+    )
+    assert envelope["assignment"]["runtime_profile"] == "clawops-browser"
+    assert envelope["assignment"]["approval_required"] is False
+    assert "browser_navigate" in envelope["assignment"]["allowed_tools"]
+    assert "browser_click" in envelope["assignment"]["allowed_tools"]
+    assert "browser_type" not in envelope["assignment"]["allowed_tools"]
+
+
 def test_hubops_routing_normalizes_listing_aliases_to_browser_publish():
     aliases = (
         "listing",
         "relisting",
         "cross_platform_listing",
         "secondhand_commerce_cross_platform_listing",
-        "facebook_existing_listing_group_distribution",
     )
 
     for alias in aliases:
@@ -106,6 +271,32 @@ def test_hubops_routing_normalizes_listing_aliases_to_browser_publish():
         assert envelope["requested_task_type"] == alias
         assert envelope["task_type"] == "browser_publish"
         assert envelope["assignment"]["assigned_worker"] == "clawops.browser"
+
+
+def test_hubops_routes_page_api_publish_away_from_browser_worker():
+    envelope = route_clawops_objective(
+        "發布已核准貼文至 SoloBizAi 粉專",
+        project="secondhand_commerce",
+        task_type="facebook_page_publish",
+        risk_level="medium",
+        approved=True,
+    )
+
+    assert envelope["status"] == "routed"
+    assert envelope["task_type"] == "facebook_page_api_publish"
+    assert envelope["assignment"]["assigned_worker"] == (
+        "clawops.facebook_page_api"
+    )
+    assert envelope["assignment"]["runtime_profile"] == "clawops-ops"
+    assert envelope["assignment"]["allowed_tools"] == [
+        "memory_read",
+        "docs_read",
+        "kanban",
+        "status_check",
+        "facebook_page_graph_status",
+        "facebook_page_graph_publish",
+        "report_generate",
+    ]
 
 
 def test_hubops_routing_selects_legal_compliance_agent_and_review_worker():
@@ -401,7 +592,16 @@ def test_infer_clawops_metadata_covers_known_project_agents():
     cases = [
         ("請規劃 Hahow 課程大綱", "hahow_course", "course_design"),
         ("請規劃課程招生行銷活動", "course_marketing", "campaign"),
-        ("二手咖啡機 Facebook 社團發佈", "secondhand_commerce", "browser_publish"),
+        (
+            "二手咖啡機 Marketplace 刊登至 Facebook 社團",
+            "secondhand_commerce",
+            "facebook_marketplace_group_publish",
+        ),
+        (
+            "請發布 Questgen 貼文至 SoloBizAi 粉專",
+            "hub_ops",
+            "facebook_page_api_publish",
+        ),
         ("請列出目前已經有刊登的所有社團群組清單，並顯示狀態", "secondhand_commerce", "browser_ops"),
         ("二手望遠鏡 生成圖片素材", "secondhand_commerce", "content_draft"),
         ("ingrids SEO 內容規劃", "ingrids_marketing", "product_marketing"),
@@ -413,6 +613,20 @@ def test_infer_clawops_metadata_covers_known_project_agents():
         inferred = infer_clawops_metadata(objective, source={})
         assert inferred["project"] == project
         assert inferred["task_type"] == task_type
+
+
+def test_page_publish_classifier_excludes_marketplace_and_browser_fallback():
+    page_request = "請將 Questgen 圖文 po文到 AI BizWeek 粉絲專頁"
+    group_request = "請將 Marketplace 刊登發布到 Facebook 社團"
+
+    assert requires_facebook_page_graph_api(page_request) is True
+    assert requires_external_browser_capabilities(page_request) is False
+    assert requires_facebook_page_graph_api(group_request) is False
+    assert requires_facebook_marketplace_group_publish(group_request) is True
+    assert requires_external_browser_capabilities(group_request) is True
+    assert requires_facebook_page_graph_api(
+        "請將 SoloBizAI Marketplace 刊登發布到 Facebook 社團"
+    ) is False
 
 
 def test_auto_publish_preapproved_requires_explicit_signal():

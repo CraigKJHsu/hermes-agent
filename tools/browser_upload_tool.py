@@ -168,6 +168,358 @@ async function main() {
         `${JSON.stringify(currentPageIdentity)}`
       );
     }
+    if (payload.guardedComposerToken) {
+      const composerBound = await elementHandle.evaluate(
+        (element, binding) => {
+          const composer = element.closest('[role="dialog"]');
+          const normalizeActor = (value) => String(value || "")
+            .replace(/\s+/g, " ").trim();
+          const strictlyVisible = (node) => {
+            if (!node?.isConnected) return false;
+            const view = node.ownerDocument.defaultView;
+            if (!view) return false;
+            const nodeRect = node.getBoundingClientRect();
+            let visibleLeft = Math.max(0, nodeRect.left);
+            let visibleRight = Math.min(view.innerWidth, nodeRect.right);
+            let visibleTop = Math.max(0, nodeRect.top);
+            let visibleBottom = Math.min(view.innerHeight, nodeRect.bottom);
+            for (
+              let current = node;
+              current;
+              current = current.parentElement
+            ) {
+              const style = view.getComputedStyle(current);
+              const clipPath = String(
+                style.clipPath || style.webkitClipPath || "none"
+              ).trim().toLowerCase();
+              const legacyClip = String(
+                style.clip || "auto"
+              ).trim().toLowerCase();
+              if (
+                current.hasAttribute("hidden")
+                || current.hasAttribute("inert")
+                || String(
+                  current.getAttribute("aria-hidden") || ""
+                ).trim().toLowerCase() === "true"
+                || style.display === "none"
+                || style.visibility !== "visible"
+                || Number(style.opacity) === 0
+                || (clipPath && clipPath !== "none")
+                || (legacyClip && legacyClip !== "auto")
+              ) return false;
+              const currentRects = [...current.getClientRects()];
+              if (!currentRects.some((rect) => (
+                rect.width > 0 && rect.height > 0
+              ))) return false;
+              if (current !== node) {
+                const clipsX = style.overflowX !== "visible";
+                const clipsY = style.overflowY !== "visible";
+                const containment = String(
+                  style.contain || ""
+                ).split(/\s+/);
+                const clipsPaint = containment.some((value) => (
+                  value === "paint"
+                  || value === "strict"
+                  || value === "content"
+                ));
+                if (clipsX || clipsY || clipsPaint) {
+                  const borderRect = current.getBoundingClientRect();
+                  const clipLeft = borderRect.left + current.clientLeft;
+                  const clipTop = borderRect.top + current.clientTop;
+                  const clipRight = clipLeft + current.clientWidth;
+                  const clipBottom = clipTop + current.clientHeight;
+                  if (clipsX || clipsPaint) {
+                    visibleLeft = Math.max(visibleLeft, clipLeft);
+                    visibleRight = Math.min(visibleRight, clipRight);
+                  }
+                  if (clipsY || clipsPaint) {
+                    visibleTop = Math.max(visibleTop, clipTop);
+                    visibleBottom = Math.min(visibleBottom, clipBottom);
+                  }
+                }
+              }
+              if (
+                visibleRight <= visibleLeft
+                || visibleBottom <= visibleTop
+              ) return false;
+            }
+            return true;
+          };
+          const directActorTextVisible = (
+            element, expectedActor, includeDescendants = false
+          ) => {
+            if (!strictlyVisible(element) || !expectedActor) return false;
+            const candidateTextNodes = includeDescendants
+              ? (() => {
+                const nodes = [];
+                const walker = element.ownerDocument.createTreeWalker(
+                  element, NodeFilter.SHOW_TEXT
+                );
+                while (walker.nextNode()) nodes.push(walker.currentNode);
+                return nodes;
+              })()
+              : [...element.childNodes];
+            const visibleCandidateTextNodes = candidateTextNodes.filter(
+              child => (
+                child.nodeType === 3
+                && strictlyVisible(child.parentElement)
+              )
+            );
+            const textNodes = visibleCandidateTextNodes.filter(child => (
+              child.nodeType === 3
+              && Boolean(normalizeActor(child.textContent))
+            ));
+            if (
+              !textNodes.length
+              || normalizeActor(visibleCandidateTextNodes.map(
+                child => child.textContent
+              ).join("")) !== expectedActor
+            ) return false;
+            const view = element.ownerDocument.defaultView;
+            const elementRect = element.getBoundingClientRect();
+            const colorPainted = value => {
+              const color = String(value || "").trim().toLowerCase();
+              if (!color || color === "transparent") return false;
+              const slashAlpha = color.match(
+                /\/\s*([0-9.]+)(%)?\s*\)$/
+              );
+              if (slashAlpha) {
+                const alpha = Number(slashAlpha[1]);
+                return Number.isFinite(alpha) && alpha > 0;
+              }
+              const legacyAlpha = color.match(
+                /^rgba\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\s*\)$/
+              );
+              return !legacyAlpha || Number(legacyAlpha[1]) > 0;
+            };
+            const textRectGroups = textNodes.map((textNode) => {
+              const range = element.ownerDocument.createRange();
+              range.selectNodeContents(textNode);
+              return [...range.getClientRects()]
+                .filter((rect) => rect.width > 0 && rect.height > 0)
+                .map((rect) => ({rect, textNode}));
+            });
+            if (textRectGroups.some((rects) => !rects.length)) return false;
+            const textRects = textRectGroups.flat();
+            return textRects.every(({rect: textRect, textNode}) => {
+              let left = Math.max(0, elementRect.left, textRect.left);
+              let right = Math.min(
+                view.innerWidth, elementRect.right, textRect.right
+              );
+              let top = Math.max(0, elementRect.top, textRect.top);
+              let bottom = Math.min(
+                view.innerHeight, elementRect.bottom, textRect.bottom
+              );
+              for (
+                let current = textNode.parentElement;
+                current;
+                current = current.parentElement
+              ) {
+                const style = view.getComputedStyle(current);
+                if (
+                  String(style.filter || "none")
+                    .trim().toLowerCase() !== "none"
+                ) return false;
+                if (
+                  current === textNode.parentElement
+                  && (
+                    !colorPainted(style.color)
+                    || !colorPainted(
+                      style.webkitTextFillColor || style.color
+                    )
+                  )
+                ) return false;
+                const clipsX = style.overflowX !== "visible";
+                const clipsY = style.overflowY !== "visible";
+                const containment = String(
+                  style.contain || ""
+                ).split(/\s+/);
+                const clipsPaint = containment.some((value) => (
+                  value === "paint"
+                  || value === "strict"
+                  || value === "content"
+                ));
+                if (clipsX || clipsY || clipsPaint) {
+                  const borderRect = current.getBoundingClientRect();
+                  const clipLeft = borderRect.left + current.clientLeft;
+                  const clipTop = borderRect.top + current.clientTop;
+                  const clipRight = clipLeft + current.clientWidth;
+                  const clipBottom = clipTop + current.clientHeight;
+                  if (clipsX || clipsPaint) {
+                    left = Math.max(left, clipLeft);
+                    right = Math.min(right, clipRight);
+                  }
+                  if (clipsY || clipsPaint) {
+                    top = Math.max(top, clipTop);
+                    bottom = Math.min(bottom, clipBottom);
+                  }
+                }
+                if (right <= left || bottom <= top) return false;
+              }
+              const epsilon = 0.5;
+              return (
+                left <= textRect.left + epsilon
+                && right >= textRect.right - epsilon
+                && top <= textRect.top + epsilon
+                && bottom >= textRect.bottom - epsilon
+              );
+            });
+          };
+          const hasEditableSurface = element => Boolean(
+            element?.isContentEditable
+            || element?.closest(
+              'input,textarea,select,button,[role="textbox"]'
+            )
+            || [...element?.querySelectorAll('*') || []].some(
+              child => (
+                child.isContentEditable
+                || child.matches(
+                  'input,textarea,select,button,[role="textbox"]'
+                )
+              )
+            )
+          );
+          const canonicalPageUrlOf = (value) => {
+            try {
+              const parsed = new URL(value, location.href);
+              const parts = parsed.pathname.split("/").filter(Boolean);
+              if (
+                parsed.protocol !== "https:"
+                || !["facebook.com", "www.facebook.com"]
+                  .includes(parsed.hostname.toLowerCase())
+                || !["", "443"].includes(parsed.port)
+                || parsed.username || parsed.password
+                || parsed.search || parsed.hash
+                || parts.length !== 1
+              ) return "";
+              return `https://www.facebook.com/${parts[0].toLowerCase()}`;
+            } catch {
+              return "";
+            }
+          };
+          const actorBinding = (() => {
+            if (
+              !strictlyVisible(composer)
+              || canonicalPageUrlOf(binding.pageUrl) !== binding.pageUrl
+              || canonicalPageUrlOf(location.href) !== binding.pageUrl
+            ) return null;
+            const textboxes = [...composer.querySelectorAll(
+              '[role="textbox"], textarea, [contenteditable="true"]'
+            )].filter(strictlyVisible);
+            if (!textboxes.length) return null;
+            const textboxTop = Math.min(...textboxes.map(
+              node => node.getBoundingClientRect().top
+            ));
+            const dialogTop = composer.getBoundingClientRect().top;
+            const bindings = [];
+            const pageComposerFlow = (
+              element.ownerDocument.__hermesPageComposerFlow
+            );
+            const actorProofRequired = Boolean(
+              pageComposerFlow?.composerActorProofRequired
+            );
+            if (
+              pageComposerFlow?.token !== binding.token
+              || pageComposerFlow?.pageUrl !== binding.pageUrl
+              || normalizeActor(pageComposerFlow?.actor) !== binding.actor
+            ) return null;
+            const actorMarkers = [...element.ownerDocument.querySelectorAll(
+              '[data-hermes-page-composer-actor-token]'
+            )];
+            if (!actorProofRequired) {
+              return (
+                actorMarkers.length === 0
+                && !composer.hasAttribute(
+                  "data-hermes-page-composer-actor-proof"
+                )
+              ) ? {url: binding.pageUrl, name: binding.actor} : null;
+            }
+            if (
+              actorMarkers.length !== 1
+              || actorMarkers[0].getAttribute(
+                'data-hermes-page-composer-actor-token'
+              ) !== binding.token
+              || !composer.contains(actorMarkers[0])
+            ) return null;
+            for (const actorElement of actorMarkers) {
+              const rect = actorElement.getBoundingClientRect();
+              const actorUrl = actorElement.matches('a[href]')
+                ? canonicalPageUrlOf(
+                  actorElement.getAttribute("href")
+                )
+                : binding.pageUrl;
+              const actorName = normalizeActor(
+                actorElement.innerText || actorElement.textContent
+              );
+              if (
+                !actorUrl || !actorName
+                || actorElement.getAttribute(
+                  "data-hermes-page-composer-actor-token"
+                ) !== binding.token
+                || !strictlyVisible(actorElement)
+                || textboxes.some(
+                  textbox => textbox.contains(actorElement)
+                )
+                || hasEditableSurface(actorElement)
+                || rect.top < dialogTop
+                || rect.bottom > textboxTop
+                || textboxTop - rect.bottom > 240
+                || !directActorTextVisible(
+                  actorElement, binding.actor,
+                  true
+                )
+              ) continue;
+              bindings.push({
+                url: actorUrl, name: binding.actor
+              });
+            }
+            return bindings.length === 1 ? bindings[0] : null;
+          })();
+          const fileInputBound = Boolean(
+            element instanceof HTMLInputElement
+            && element.type === "file"
+            && !element.matches(":disabled")
+            && element.isConnected
+            && element.closest('[role="dialog"]') === composer
+            // Facebook normally CSS-hides its file input. Validate every
+            // wrapper up through the bound composer without requiring the
+            // input's own box to be visible.
+            && strictlyVisible(element.parentElement || composer)
+          );
+          const tokenDialogs = [
+            ...element.ownerDocument.querySelectorAll(
+              '[data-hermes-page-composer-token]'
+            )
+          ];
+          return Boolean(
+            fileInputBound
+            && strictlyVisible(composer)
+            && tokenDialogs.length === 1
+            && tokenDialogs[0] === composer
+            && tokenDialogs[0].getAttribute(
+              'data-hermes-page-composer-token'
+            ) === binding.token
+            && tokenDialogs[0].getAttribute("role") === "dialog"
+            && composer.getAttribute(
+              "data-hermes-page-composer-token"
+            ) === binding.token
+            && binding.actor
+            && actorBinding?.url === binding.pageUrl
+            && actorBinding?.name === binding.actor
+          );
+        },
+        {
+          token: payload.guardedComposerToken,
+          pageUrl: payload.guardedComposerPageUrl,
+          actor: payload.guardedComposerPageActor,
+        }
+      );
+      if (!composerBound) {
+        throw new Error(
+          "Selected file input is not inside the atomically opened Page composer"
+        );
+      }
+    }
     if (payload.verifyTextContains) {
       const markerAlreadyPresent = await page.evaluate(
         (expected) => (document.body ? document.body.innerText : "").includes(expected),
@@ -349,6 +701,9 @@ def browser_upload_files(
         "inspectOnly": False,
         "guardedTargetUrl": "",
         "guardedPageIdentity": "",
+        "guardedComposerToken": "",
+        "guardedComposerPageUrl": "",
+        "guardedComposerPageActor": "",
     }
 
     kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
@@ -409,6 +764,35 @@ def browser_upload_files(
         try:
             raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
             expected_run_id = int(raw_run_id) if raw_run_id else None
+            from tools import browser_tool as _browser_tool
+
+            with _kanban_db.connect_closing() as _page_scope_conn:
+                page_post_permission = (
+                    _kanban_db.grace_task_facebook_page_post_permission(
+                        _page_scope_conn,
+                        kanban_task_id,
+                    )
+                )
+            if page_post_permission is not None:
+                composer_binding, page_upload_error = (
+                    _browser_tool.facebook_page_post_upload_guard(
+                        actual_target_url,
+                        actual_page_identity,
+                        kanban_task_id=kanban_task_id,
+                        expected_run_id=expected_run_id,
+                    )
+                )
+                if page_upload_error:
+                    return tool_error(page_upload_error)
+                payload["guardedComposerToken"] = str(
+                    (composer_binding or {}).get("composer_token") or ""
+                )
+                payload["guardedComposerPageUrl"] = str(
+                    (composer_binding or {}).get("page_url") or ""
+                )
+                payload["guardedComposerPageActor"] = str(
+                    (composer_binding or {}).get("page_actor") or ""
+                )
             with _kanban_db.connect_closing() as _guard_conn:
                 with _kanban_db.write_txn(_guard_conn):
                     guard_error = _kanban_db.external_create_mutation_guard(

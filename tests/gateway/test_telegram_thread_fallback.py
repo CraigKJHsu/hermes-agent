@@ -255,6 +255,45 @@ async def test_send_omits_general_topic_thread_id():
 
 
 @pytest.mark.asyncio
+async def test_send_omits_internal_general_thread_sentinel():
+    """Internal non-topic callbacks use ``general`` rather than a numeric id."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=43)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="callback message",
+        metadata={"thread_id": "general"},
+    )
+
+    assert result.success is True
+    assert call_log[0]["message_thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_typing_omits_internal_general_thread_sentinel():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_chat_action(**kwargs):
+        call_log.append(dict(kwargs))
+
+    adapter._bot = SimpleNamespace(send_chat_action=mock_send_chat_action)
+
+    await adapter.send_typing("-100123", metadata={"thread_id": "general"})
+
+    assert call_log == [
+        {"chat_id": -100123, "action": "typing", "message_thread_id": None},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_send_typing_preserves_general_topic_thread_id():
     """Typing for forum General must send message_thread_id=1, not None.
 

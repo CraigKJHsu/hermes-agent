@@ -48,13 +48,19 @@ _ensure_telegram_mock()
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
-def _make_adapter(dm_topics_config=None, group_topics_config=None):
+def _make_adapter(
+    dm_topics_config=None,
+    group_topics_config=None,
+    response_profiles_config=None,
+):
     """Create a TelegramAdapter with optional DM/group topics config."""
     extra = {}
     if dm_topics_config is not None:
         extra["dm_topics"] = dm_topics_config
     if group_topics_config is not None:
         extra["group_topics"] = group_topics_config
+    if response_profiles_config is not None:
+        extra["response_profiles"] = response_profiles_config
     config = PlatformConfig(enabled=True, token="***", extra=extra)
     adapter = TelegramAdapter(config)
     return adapter
@@ -599,6 +605,40 @@ def test_build_message_event_sets_auto_skill():
     assert event.source.chat_topic == "My Project"
 
 
+def test_build_message_event_sets_dm_fast_translation():
+    """DM topics receive the same trusted fast-lane config as group topics."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter([
+        {
+            "chat_id": 111,
+            "topics": [
+                {
+                    "name": "Translator",
+                    "thread_id": 100,
+                    "fast_translation": {
+                        "enabled": True,
+                        "delivery_timeout": 8,
+                    },
+                },
+            ],
+        }
+    ])
+    adapter._dm_topics["111:Translator"] = 100
+
+    msg = _make_mock_message(
+        chat_id=111,
+        thread_id=100,
+        text="persistent",
+    )
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.fast_translation == {
+        "enabled": True,
+        "delivery_timeout": 8,
+    }
+
+
 def test_build_message_event_no_auto_skill_without_binding():
     """Topics without skill binding should have auto_skill=None."""
     from gateway.platforms.base import MessageType
@@ -700,6 +740,248 @@ def test_group_topic_skill_binding():
 
     assert event.auto_skill == "software-development"
     assert event.source.chat_topic == "Engineering"
+
+
+def test_group_topic_display_override():
+    """A mapped group topic can override display without affecting siblings."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(group_topics_config=[
+        {
+            "chat_id": -1001234567890,
+            "topics": [
+                {
+                    "name": "Translator",
+                    "thread_id": 5,
+                    "skill": "translator-fast",
+                    "display": {"streaming": True},
+                },
+                {"name": "General", "thread_id": 12},
+            ],
+        }
+    ])
+
+    translator = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        text="hello",
+        is_topic_message=True,
+        is_forum=True,
+    )
+    general = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=12,
+        text="hello",
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    translator_event = adapter._build_message_event(translator, MessageType.TEXT)
+    general_event = adapter._build_message_event(general, MessageType.TEXT)
+
+    assert translator_event.source.display_overrides == {"streaming": True}
+    assert general_event.source.display_overrides is None
+
+
+def test_group_topic_fast_translation_binding():
+    """Only the configured topic receives trusted fast-translation config."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(group_topics_config=[
+        {
+            "chat_id": -1001234567890,
+            "topics": [
+                {
+                    "name": "Translator",
+                    "thread_id": 5,
+                    "fast_translation": {
+                        "enabled": True,
+                        "delivery_timeout": 8,
+                    },
+                },
+                {"name": "General", "thread_id": 12},
+            ],
+        }
+    ])
+
+    translator = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        text="persistent",
+        is_topic_message=True,
+        is_forum=True,
+    )
+    general = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=12,
+        text="persistent",
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    translator_event = adapter._build_message_event(
+        translator,
+        MessageType.TEXT,
+    )
+    general_event = adapter._build_message_event(general, MessageType.TEXT)
+
+    assert translator_event.fast_translation == {
+        "enabled": True,
+        "delivery_timeout": 8,
+    }
+    assert general_event.fast_translation is None
+
+
+def test_group_topic_named_response_profile_binding():
+    """A Topic resolves a named profile; outcome skill is selected later."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(
+        group_topics_config=[
+            {
+                "chat_id": -1001234567890,
+                "topics": [
+                    {
+                        "name": "Translator",
+                        "thread_id": 5,
+                        "response_profile": "translator",
+                    },
+                    {"name": "General", "thread_id": 12},
+                ],
+            }
+        ],
+        response_profiles_config={
+            "translator": {
+                "strategy": "fast_then_default",
+                "fast_lane": {
+                    "handler": "translation",
+                    "provider": "gemini",
+                    "model": "gemini-3.5-flash-lite",
+                    "delivery_timeout": 8,
+                },
+                "detail_lane": {
+                    "on_fast_success": {
+                        "skill": "translator-detail",
+                        "output_contract": "vocabulary_full",
+                    },
+                    "on_fast_failure": {"skill": "translator-fast"},
+                },
+            },
+        },
+    )
+
+    translator = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        text="persistent",
+        is_topic_message=True,
+        is_forum=True,
+    )
+    general = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=12,
+        text="persistent",
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    translator_event = adapter._build_message_event(
+        translator,
+        MessageType.TEXT,
+    )
+    general_event = adapter._build_message_event(general, MessageType.TEXT)
+
+    assert translator_event.response_profile["name"] == "translator"
+    assert translator_event.response_profile["strategy"] == "fast_then_default"
+    assert translator_event.response_profile["fast_lane"]["handler"] == "translation"
+    assert translator_event.response_profile["fast_lane"]["provider"] == "gemini"
+    assert (
+        translator_event.response_profile["fast_lane"]["model"]
+        == "gemini-3.5-flash-lite"
+    )
+    assert translator_event.auto_skill is None
+    assert translator_event.fast_translation is None
+    assert general_event.response_profile is None
+    assert general_event.auto_skill is None
+
+
+def test_group_topic_unknown_named_profile_is_configuration_error():
+    """An explicit typo must not silently fall through to the Default model."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(
+        group_topics_config=[
+            {
+                "chat_id": -1001234567890,
+                "topics": [
+                    {
+                        "name": "Translator",
+                        "thread_id": 5,
+                        "response_profile": "translater",
+                    },
+                ],
+            },
+        ],
+        response_profiles_config={},
+    )
+    message = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        text="persistent",
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.response_profile == {
+        "strategy": "configuration_error",
+        "name": "translater",
+        "error": "response_profile is missing or invalid",
+    }
+
+
+@pytest.mark.parametrize("malformed_name", [None, 42, {"name": "translator"}])
+def test_group_topic_malformed_profile_binding_is_configuration_error(
+    malformed_name,
+):
+    """Explicit malformed bindings must not be mistaken for absent bindings."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(
+        group_topics_config=[
+            {
+                "chat_id": -1001234567890,
+                "topics": [
+                    {
+                        "name": "Translator",
+                        "thread_id": 5,
+                        "response_profile": malformed_name,
+                    },
+                ],
+            },
+        ],
+        response_profiles_config={},
+    )
+    message = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        text="persistent",
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.response_profile["strategy"] == "configuration_error"
 
 
 def test_group_topic_skill_binding_second_topic():

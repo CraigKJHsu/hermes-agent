@@ -140,6 +140,12 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Trusted, process-local display overrides resolved from operator config
+    # for the current channel/topic. Deliberately excluded from wire and
+    # persistence serialization so inbound payloads cannot choose presentation
+    # behavior such as token streaming. Kept last for positional compatibility.
+    display_overrides: Optional[Dict[str, Any]] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -1745,6 +1751,34 @@ class SessionStore:
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
             return []
+
+    def load_recent_user_texts(
+        self,
+        session_id: str,
+        *,
+        limit: int = 3,
+    ) -> List[str]:
+        """Load a bounded newest-first user-text tail for intent continuity.
+
+        This deliberately uses the DB's preview query instead of loading the
+        full transcript so a response fast lane can consult the immediately
+        preceding Topic turns without paying normal history-loading cost.
+        """
+        if not self._db:
+            return []
+        try:
+            rows = self._db.list_recent_user_messages(
+                session_id,
+                limit=max(1, min(int(limit), 5)),
+            )
+        except Exception as e:
+            logger.debug("Could not load recent user texts from DB: %s", e)
+            return []
+        return [
+            str(row.get("preview") or "").strip()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("preview") or "").strip()
+        ]
 
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.

@@ -16,11 +16,32 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
+import threading
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 
-from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.conversation_loop import (
+    _SYSTEM_PROMPT_BUILD_LOCK,
+    _restore_or_build_system_prompt,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_grace_policy():
+    """Keep prompt-cache unit tests independent of ~/.hermes/AGENTS.md."""
+    with (
+        patch(
+            "proactive.prompt_policy.ensure_active_policy_prompt",
+            side_effect=lambda prompt: prompt,
+        ),
+        patch(
+            "proactive.prompt_policy.stored_prompt_matches_active_policy",
+            return_value=True,
+        ),
+    ):
+        yield
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -138,6 +159,70 @@ class TestLegitimateFreshBuild:
         _restore_or_build_system_prompt(agent, None, [])
         agent._build_system_prompt.assert_called_once()
         assert agent._cached_system_prompt == "BUILT_PROMPT"
+
+    def test_timed_out_build_uses_policy_verified_safe_prompt(
+        self, monkeypatch, caplog
+    ):
+        """A wedged prompt builder must not hold the whole gateway turn."""
+        release = threading.Event()
+        started = threading.Event()
+        db = MagicMock()
+        agent = _make_agent(session_db=db)
+        agent._touch_activity = MagicMock()
+
+        def _blocked_build(_system_message):
+            started.set()
+            release.wait(timeout=2)
+            return "LATE_FULL_PROMPT"
+
+        agent._build_system_prompt.side_effect = _blocked_build
+        monkeypatch.setenv("HERMES_SYSTEM_PROMPT_BUILD_TIMEOUT", "0.01")
+
+        with (
+            patch(
+                "proactive.prompt_policy.ensure_active_policy_prompt",
+                side_effect=lambda prompt: prompt + "\n\nVERIFIED_GRACE_POLICY",
+            ),
+            caplog.at_level(logging.ERROR, logger="agent.conversation_loop"),
+        ):
+            _restore_or_build_system_prompt(agent, "TOPIC_CONTEXT", [])
+
+        assert started.is_set()
+        assert agent._system_prompt_fallback_used is True
+        assert "[Runtime recovery mode]" in agent._cached_system_prompt
+        assert "TOPIC_CONTEXT" in agent._cached_system_prompt
+        assert "VERIFIED_GRACE_POLICY" in agent._cached_system_prompt
+        assert any("timed out" in r.getMessage() for r in caplog.records)
+        assert agent._touch_activity.call_args_list[-1].args == (
+            "initial system prompt ready (safe fallback)",
+        )
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, agent._cached_system_prompt
+        )
+
+        # Let the daemon finish and prove it cannot keep the global builder
+        # slot wedged for sibling tests or later sessions.
+        release.set()
+        assert _SYSTEM_PROMPT_BUILD_LOCK.acquire(timeout=1)
+        _SYSTEM_PROMPT_BUILD_LOCK.release()
+
+    def test_persisted_recovery_prompt_is_rebuilt_on_next_turn(self):
+        """A one-turn fallback must not become a permanent cached prefix."""
+        stored = (
+            "[Runtime recovery mode] reduced prompt\n"
+            "Model: test-model\nProvider: openrouter"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="FULL_PROMPT")
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "previous"}]
+        )
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        assert agent._cached_system_prompt != stored
+        assert "FULL_PROMPT" in agent._cached_system_prompt
 
 
 # ---------------------------------------------------------------------------

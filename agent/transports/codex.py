@@ -163,6 +163,12 @@ class ResponsesApiTransport(ProviderTransport):
                 reasoning_effort = reasoning_config["effort"]
 
         _effort_clamp = {"minimal": "low"}
+        if str(model or "").strip().lower() == "gpt-5.3-codex-spark":
+            # Spark has a separate Codex subscription quota, but its live
+            # endpoint rejects the otherwise-valid Codex effort ``none``.
+            # A global ``reasoning_effort: none`` must not make an automatic
+            # Spark fallback fail after the primary model reaches its quota.
+            _effort_clamp["none"] = "low"
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)

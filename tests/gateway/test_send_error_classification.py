@@ -134,3 +134,335 @@ def test_telegram_too_long_sets_too_long_kind():
     assert result.success is False
     assert result.error == "message_too_long"
     assert result.error_kind == "too_long"
+
+
+def test_telegram_ambiguous_timeout_is_not_retried():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import TimedOut
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=TimedOut("read acknowledgement timed out"),
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(
+        adapter.send(
+            "123",
+            "plain",
+            metadata={"plain_text": True, "send_timeout": 2.0},
+        ),
+    )
+
+    assert result.success is False
+    assert result.delivery_ambiguous is True
+    assert bot.send_message.await_count == 1
+    kwargs = bot.send_message.await_args.kwargs
+    assert kwargs["connect_timeout"] == 0.25
+    assert kwargs["pool_timeout"] == 0.25
+    assert kwargs["write_timeout"] == 0.25
+    assert kwargs["read_timeout"] == 1.2
+
+
+def test_telegram_post_write_network_failure_is_ambiguous_and_not_retried():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import NetworkError
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=NetworkError("connection reset while reading response"),
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(
+        adapter.send(
+            "123",
+            "plain",
+            metadata={"plain_text": True, "send_timeout": 2.0},
+        ),
+    )
+
+    assert result.success is False
+    assert result.delivery_ambiguous is True
+    assert bot.send_message.await_count == 1
+
+
+def test_telegram_generic_read_timeout_is_ambiguous_and_not_retried():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import NetworkError
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=NetworkError("read timeout"),
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(adapter.send("123", "plain"))
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.delivery_ambiguous is True
+    assert bot.send_message.await_count == 1
+
+
+def test_telegram_ordinary_send_retries_definite_dns_failure():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from telegram.error import NetworkError
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            NetworkError("temporary failure in name resolution"),
+            SimpleNamespace(message_id=1),
+        ],
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    with patch(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        result = asyncio.run(adapter.send("123", "ordinary"))
+
+    assert result.success is True
+    assert bot.send_message.await_count == 2
+
+
+def test_telegram_ordinary_post_dispatch_network_failure_is_ambiguous():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import NetworkError
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=NetworkError("connection reset while reading response"),
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(adapter.send("123", "ordinary"))
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.delivery_ambiguous is True
+    assert bot.send_message.await_count == 1
+
+
+def test_telegram_bounded_dns_failure_is_definite():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import NetworkError
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=NetworkError("connection refused"),
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(
+        adapter.send(
+            "123",
+            "plain",
+            metadata={"plain_text": True, "send_timeout": 2.0},
+        ),
+    )
+
+    assert result.success is False
+    assert result.delivery_ambiguous is False
+    assert bot.send_message.await_count == 1
+
+
+def test_telegram_delivery_deadline_rejects_too_small_budget_before_dispatch():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+
+    bot.send_message = AsyncMock()
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(
+        adapter.send_with_delivery_deadline(
+            "123",
+            "plain",
+            metadata={"plain_text": True},
+            timeout=0.19,
+        ),
+    )
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.delivery_ambiguous is False
+    assert bot.send_message.await_count == 0
+
+
+def test_telegram_absolute_deadline_without_phase_evidence_is_ambiguous():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+
+    async def _stall_before_request(*args, **kwargs):
+        await asyncio.sleep(1)
+
+    adapter.send = AsyncMock(side_effect=_stall_before_request)
+
+    result = asyncio.run(
+        adapter.send_with_delivery_deadline(
+            "123",
+            "plain",
+            metadata={"plain_text": True},
+            timeout=0.2,
+        ),
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.delivery_ambiguous is True
+
+
+def test_telegram_absolute_deadline_after_request_attempt_is_ambiguous():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+
+    async def _stall_after_request(**kwargs):
+        await asyncio.sleep(1)
+
+    bot.send_message = AsyncMock(side_effect=_stall_after_request)
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(
+        adapter.send_with_delivery_deadline(
+            "123",
+            "plain",
+            metadata={"plain_text": True},
+            timeout=0.2,
+        ),
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.delivery_ambiguous is True
+    assert bot.send_message.await_count == 1
+
+
+def test_telegram_total_delivery_deadline_preserves_typed_ambiguity():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import TimedOut
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={}),
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(
+        side_effect=TimedOut("read acknowledgement timed out"),
+    )
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    adapter._rich_messages_enabled = False
+
+    result = asyncio.run(
+        adapter.send_with_delivery_deadline(
+            "123",
+            "plain",
+            metadata={"plain_text": True},
+            timeout=2.0,
+        ),
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.delivery_ambiguous is True
+    assert bot.send_message.await_count == 1
+    kwargs = bot.send_message.await_args.kwargs
+    assert kwargs["parse_mode"] is None
+    assert kwargs["connect_timeout"] == 0.25
+    assert kwargs["pool_timeout"] == 0.25
+    assert kwargs["write_timeout"] == 0.25
+    assert kwargs["read_timeout"] == 1.2

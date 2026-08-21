@@ -10,8 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import re
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
 from proactive.hubops_routing import (
@@ -19,7 +20,10 @@ from proactive.hubops_routing import (
     route_clawops_objective,
     route_requires_owner_approval,
 )
-from proactive.loop_contract import validate_loop_contract
+from proactive.loop_contract import (
+    facebook_crosspost_inspection_listing_id,
+    validate_loop_contract,
+)
 
 
 DEFAULT_ASSIGNEE = "default"
@@ -57,6 +61,119 @@ EXTERNAL_BROWSER_ACTION_TERMS = (
     "清單",
     "狀態",
 )
+FACEBOOK_PAGE_GRAPH_TARGET_TERMS = (
+    "facebook page",
+    "facebook 粉專",
+    "粉絲專頁",
+    "粉絲專業",
+    "粉專",
+    "solobizai",
+    "solo biz ai",
+    "ai bizweek",
+    "一人公司商業誌",
+)
+FACEBOOK_PROTECTED_PAGE_IDENTITY_TERMS = (
+    "solobizai",
+    "solo biz ai",
+    "ai bizweek",
+    "一人公司商業誌",
+)
+FACEBOOK_PAGE_GRAPH_ACTION_TERMS = (
+    "發布",
+    "發佈",
+    "貼文",
+    "po文",
+    "po 文",
+    "post",
+    "publish",
+)
+FACEBOOK_NON_PAGE_TARGET_TERMS = (
+    "marketplace",
+    "fb marketplace",
+    "社團",
+    "群組",
+    "交流團",
+    "/groups/",
+    "group post",
+    "crosspost",
+    "跨社團",
+)
+FACEBOOK_MARKETPLACE_GROUP_TARGET_TERMS = (
+    "marketplace",
+    "fb marketplace",
+    "市集",
+)
+FACEBOOK_GROUP_DESTINATION_TERMS = (
+    "社團",
+    "群組",
+    "交流團",
+    "facebook group",
+    "facebook groups",
+    "/groups/",
+    "group post",
+    "crosspost",
+    "跨社團",
+)
+FACEBOOK_GROUP_PUBLISH_ACTION_TERMS = (
+    "發布",
+    "發佈",
+    "刊登",
+    "跨貼",
+    "分享",
+    "轉貼",
+    "轉發",
+    "加入",
+    "新增",
+    "加到",
+    "放到",
+    "追加",
+    "list in more places",
+    "post",
+    "publish",
+    "share",
+    "add",
+    "cross-post",
+    "cross post",
+    "distribute",
+    "distribution",
+)
+FACEBOOK_GROUP_READONLY_ACTION_TERMS = (
+    "查看",
+    "查詢",
+    "查核",
+    "清單",
+    "狀態",
+    "互動",
+    "按讚",
+    "留言",
+    "觀看",
+    "read-only",
+    "readonly",
+    "inspect",
+    "audit",
+    "status",
+)
+FACEBOOK_GROUP_READONLY_LISTING_PHRASES = (
+    "既有刊登",
+    "已刊登",
+    "現有刊登",
+    "existing listing",
+    "existing post",
+)
+
+
+def _contains_intent_term(text: str, terms: Iterable[str]) -> bool:
+    """Match English intent as tokens and CJK/control labels as substrings."""
+    for term in terms:
+        if term.isascii() and any(char.isalpha() for char in term):
+            if re.search(
+                rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])",
+                text,
+            ):
+                return True
+        elif term in text:
+            return True
+    return False
 AUTO_PUBLISH_APPROVAL_TERMS = (
     "已確認",
     "已核准",
@@ -165,6 +282,7 @@ def create_clawops_task(
     session_id: Optional[str] = None,
     executor_backend: str = "hermes",
     executor_profile: Optional[str] = None,
+    skills: Optional[Iterable[str]] = None,
 ) -> ClawOpsTask:
     """Create a Hermes-owned ClawOps task in the existing kanban queue."""
     clean_objective = (objective or "").strip()
@@ -222,6 +340,7 @@ def create_clawops_task(
         (
             isinstance(contract, Mapping)
             and list(contract.get("external_targets") or [])
+            and facebook_crosspost_inspection_listing_id(contract) is None
         )
         or (
             hubops_envelope
@@ -262,19 +381,10 @@ def create_clawops_task(
             "contract, route, or approval class."
         )
 
-    assigned_worker = ""
-    runtime_profile = ""
-    if hubops_envelope:
-        assignment = hubops_envelope.get("assignment")
-        if isinstance(assignment, Mapping):
-            assigned_worker = str(assignment.get("assigned_worker") or "").strip()
-            runtime_profile = str(assignment.get("runtime_profile") or "").strip()
-
-    configured_assignee = (assignee or "").strip() or resolve_clawops_assignee(config)
-    resolved_assignee = (
-        configured_assignee
-        if configured_assignee and configured_assignee != DEFAULT_ASSIGNEE
-        else runtime_profile or assigned_worker or configured_assignee
+    resolved_assignee = _resolve_task_assignee(
+        hubops_envelope=hubops_envelope,
+        assignee=assignee,
+        config=config,
     )
     title = _title_from_objective(clean_objective)
     risk_authorization = (
@@ -322,6 +432,7 @@ def create_clawops_task(
             executor_backend=clean_executor_backend,
             executor_profile=executor_profile,
             project_namespace=str(enriched_source.get("project") or "").strip() or None,
+            skills=skills,
         )
         row = kb.get_task(conn, task_id)
         status = str(row.status if row else "ready")
@@ -335,6 +446,28 @@ def create_clawops_task(
         board=board,
         risk_authorization=risk_authorization or None,
     )
+
+
+def _resolve_task_assignee(
+    *,
+    hubops_envelope: Optional[Mapping[str, Any]],
+    assignee: Optional[str],
+    config: Optional[Mapping[str, Any]],
+) -> str:
+    """Keep routed tasks bound to the worker profile authorized by HubOps."""
+    if hubops_envelope:
+        assignment = hubops_envelope.get("assignment")
+        if not isinstance(assignment, Mapping):
+            raise ValueError("HubOps routing did not provide a worker assignment.")
+        assigned_worker = str(assignment.get("assigned_worker") or "").strip()
+        runtime_profile = str(assignment.get("runtime_profile") or "").strip()
+        route_assignee = runtime_profile or assigned_worker
+        if not route_assignee:
+            raise ValueError(
+                "HubOps routing did not provide an executable worker profile."
+            )
+        return route_assignee
+    return (assignee or "").strip() or resolve_clawops_assignee(config)
 
 
 def subscribe_clawops_task(
@@ -380,11 +513,26 @@ def _body_from_objective(
     hubops_envelope: Optional[Mapping[str, Any]] = None,
 ) -> str:
     needs_image_generation = requires_image_generation_capabilities(objective, source=source)
-    needs_external_browser = requires_external_browser_capabilities(objective, source=source) and not needs_image_generation
+    needs_page_graph_api = (
+        requires_facebook_page_graph_api(objective, source=source)
+        and not needs_image_generation
+    )
+    needs_marketplace_group_publish = (
+        requires_facebook_marketplace_group_publish(objective, source=source)
+        and not needs_image_generation
+        and not needs_page_graph_api
+    )
+    needs_external_browser = (
+        requires_external_browser_capabilities(objective, source=source)
+        and not needs_image_generation
+        and not needs_page_graph_api
+    )
     publish_preapproved = auto_publish_preapproved(objective, source=source)
     execution_owner = (
         "Browser-capable Hermes/ClawOps runtime may execute only the delegated browser work in this queued task."
         if needs_external_browser
+        else "ClawOps Page API runtime may execute only the contract-bound Meta Graph API publication."
+        if needs_page_graph_api
         else "ClawOps content runtime may execute only the delegated content and asset work in this queued task."
         if needs_image_generation
         else "ClawOps runtime may execute only delegated work in this queued task."
@@ -408,6 +556,10 @@ def _body_from_objective(
                 auto_publish_preapproved=publish_preapproved,
             )
         )
+    if needs_page_graph_api:
+        lines.extend(_facebook_page_graph_capability_contract())
+    if needs_marketplace_group_publish:
+        lines.extend(_facebook_marketplace_group_capability_contract())
     if needs_image_generation:
         lines.extend(_image_generation_capability_contract())
     if source:
@@ -461,7 +613,16 @@ def infer_clawops_metadata(
     if not str(inferred.get("task_type") or "").strip():
         inferred["task_type"] = _infer_task_type(haystack, str(inferred.get("project") or ""))
     if not str(inferred.get("risk_level") or "").strip():
-        inferred["risk_level"] = "medium" if inferred.get("task_type") == "browser_publish" else "low"
+        inferred["risk_level"] = (
+            "medium"
+            if inferred.get("task_type")
+            in {
+                "browser_publish",
+                "facebook_marketplace_group_publish",
+                "facebook_page_api_publish",
+            }
+            else "low"
+        )
     if auto_publish_preapproved(objective, source=inferred):
         inferred.setdefault("auto_publish_preapproved", "true")
         inferred.setdefault("previous_copy_confirmed", "true")
@@ -488,8 +649,26 @@ def _infer_project(haystack: str) -> str:
 def _infer_task_type(haystack: str, project: str) -> str:
     if any(term in haystack for term in IMAGE_CONTENT_TERMS):
         return "campaign" if project == "course_marketing" else "content_draft"
+    if requires_facebook_marketplace_group_publish(haystack):
+        return "facebook_marketplace_group_publish"
+    if requires_facebook_page_graph_api(haystack):
+        return "facebook_page_api_publish"
     if requires_external_browser_capabilities(haystack):
-        if any(term in haystack for term in ("列出", "清單", "狀態", "已經有刊登", "已刊登", "目前刊登")):
+        if any(
+            term in haystack
+            for term in (
+                "列出",
+                "清單",
+                "狀態",
+                "已經有刊登",
+                "已刊登",
+                "目前刊登",
+                "status",
+                "inspect",
+                "read-only",
+                "readonly",
+            )
+        ):
             return "browser_ops"
         return "browser_publish" if any(term in haystack for term in ("發佈", "發布", "刊登", "post", "publish", "listing")) else "browser_ops"
     if any(term in haystack for term in LEGAL_COMPLIANCE_TERMS):
@@ -574,8 +753,80 @@ def requires_external_browser_capabilities(
     if source:
         haystack_parts.extend(str(v) for v in source.values() if v is not None)
     haystack = " ".join(haystack_parts).lower()
+    if requires_facebook_page_graph_api(haystack):
+        return False
     return any(term in haystack for term in EXTERNAL_BROWSER_TARGET_TERMS) and any(
         term in haystack for term in EXTERNAL_BROWSER_ACTION_TERMS
+    )
+
+
+def requires_facebook_page_graph_api(
+    objective: str,
+    *,
+    source: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Route Facebook Page writes to Graph API before browser classification."""
+    haystack_parts = [objective or ""]
+    if source:
+        haystack_parts.extend(str(v) for v in source.values() if v is not None)
+    haystack = " ".join(haystack_parts).casefold()
+    has_publish_action = any(
+        term in haystack for term in FACEBOOK_PAGE_GRAPH_ACTION_TERMS
+    )
+    has_explicit_non_page_target = any(
+        term in haystack for term in FACEBOOK_NON_PAGE_TARGET_TERMS
+    )
+    if (
+        has_publish_action
+        and not has_explicit_non_page_target
+        and any(
+        term in haystack for term in FACEBOOK_PROTECTED_PAGE_IDENTITY_TERMS
+        )
+    ):
+        return True
+    return (
+        any(term in haystack for term in FACEBOOK_PAGE_GRAPH_TARGET_TERMS)
+        and has_publish_action
+        and not has_explicit_non_page_target
+    )
+
+
+def requires_facebook_marketplace_group_publish(
+    objective: str,
+    *,
+    source: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Route Marketplace-to-group writes to one dedicated browser worker.
+
+    Meta removed the Groups API and ``publish_to_groups`` from every Graph API
+    version in 2024.  This classifier therefore never selects the Page Graph
+    transport; it isolates the only supported controlled-browser workflow.
+    """
+    haystack_parts = [objective or ""]
+    if source:
+        haystack_parts.extend(str(v) for v in source.values() if v is not None)
+    haystack = " ".join(haystack_parts).casefold()
+    write_intent_haystack = haystack
+    for readonly_phrase in FACEBOOK_GROUP_READONLY_LISTING_PHRASES:
+        write_intent_haystack = write_intent_haystack.replace(
+            readonly_phrase,
+            "",
+        )
+    if (
+        _contains_intent_term(haystack, FACEBOOK_GROUP_READONLY_ACTION_TERMS)
+        and not _contains_intent_term(
+            write_intent_haystack,
+            FACEBOOK_GROUP_PUBLISH_ACTION_TERMS,
+        )
+    ):
+        return False
+    return (
+        any(term in haystack for term in FACEBOOK_MARKETPLACE_GROUP_TARGET_TERMS)
+        and any(term in haystack for term in FACEBOOK_GROUP_DESTINATION_TERMS)
+        and _contains_intent_term(
+            haystack,
+            FACEBOOK_GROUP_PUBLISH_ACTION_TERMS,
+        )
     )
 
 
@@ -601,6 +852,45 @@ def _image_generation_capability_contract() -> list[str]:
         "- Do not route this task through any dry-run bridge; it must either produce image files or call kanban_block with block_kind=capability and the concrete missing provider.",
         "- If FAL_KEY, Nous Portal login, or another configured image provider is unavailable, stop and report the missing provider instead of fabricating image completion.",
         "- Generated images for resale listings must be labeled as AI-assisted/reference visuals unless the task explicitly uses actual user-provided photos.",
+    ]
+
+
+def _facebook_page_graph_capability_contract() -> list[str]:
+    return [
+        "",
+        "Facebook Page Graph API capability contract:",
+        "- Use facebook_page_graph_status for preflight and "
+        "facebook_page_graph_publish for the single approved write.",
+        "- Never navigate to Facebook, open a composer, or call browser tools "
+        "for this Page publication.",
+        "- Bind the exact canonical Page URL, UTF-8 message SHA-256, and image "
+        "byte SHA-256 in the one-time Loop Contract before approval.",
+        "- If Graph configuration is unavailable, block once as a capability "
+        "failure. Do not fall back to clawops-browser.",
+        "- Never retry an ambiguous POST or any task with an existing durable "
+        "Facebook create effect; reconcile by post_id or Page feed.",
+    ]
+
+
+def _facebook_marketplace_group_capability_contract() -> list[str]:
+    return [
+        "",
+        "Facebook Marketplace group publication capability contract:",
+        "- Meta removed publish_to_groups and the Groups API from all Graph "
+        "API versions on 2024-04-22; never call Graph API or claim an API "
+        "fallback exists for this workflow.",
+        "- Use only the contract-bound Marketplace listing and the exact "
+        "approved group ID/name set through List in more places.",
+        "- The structured facebook_crosspost contract must explicitly set "
+        "transport=browser; missing or implicit transport is invalid.",
+        "- This worker may navigate, inspect, select exact approved group "
+        "rows, and submit once; it has no browser_type or upload capability.",
+        "- Never Join a group, substitute a similar group, use Share to Group, "
+        "create a duplicate listing, or change listing content/assets.",
+        "- On one guard/capability failure, stop with the exact error. Do not "
+        "retry through a Page Graph worker, generic browser worker, or OpenClaw.",
+        "- Before submit, reserve every exact group effect. After submit, "
+        "reconcile visible status; never repeat an ambiguous or partial POST.",
     ]
 
 

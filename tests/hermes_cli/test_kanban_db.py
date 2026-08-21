@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -38,6 +39,45 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def test_legacy_commerce_coverage_adds_expected_total_label(tmp_path):
+    db_path = tmp_path / "legacy-commerce.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE commerce_group_coverage ("
+            "subject_key TEXT PRIMARY KEY, subject_label TEXT NOT NULL, "
+            "complete INTEGER NOT NULL DEFAULT 0, named_count INTEGER NOT NULL "
+            "DEFAULT 0, gap_count INTEGER, note TEXT NOT NULL, "
+            "source_task_id TEXT NOT NULL, source_run_id INTEGER, "
+            "observed_at INTEGER NOT NULL, created_at INTEGER NOT NULL, "
+            "updated_at INTEGER NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    kb.init_db(db_path)
+
+    with kb.connect_closing(db_path) as migrated:
+        columns = {
+            row["name"]
+            for row in migrated.execute(
+                "PRAGMA table_info(commerce_group_coverage)"
+            )
+        }
+    assert "expected_total_label" in columns
+    assert "listing_click_count" in columns
+    assert "listing_click_window_days" in columns
+    with kb.connect_closing(db_path) as migrated:
+        ledger_columns = {
+            row["name"]
+            for row in migrated.execute(
+                "PRAGMA table_info(commerce_group_ledger)"
+            )
+        }
+    assert "evidence_url" in ledger_columns
+
+
 def _bind_queued_grace_delegation(
     conn: sqlite3.Connection,
     execution_task_id: str,
@@ -69,6 +109,1224 @@ def _bind_queued_grace_delegation(
             now,
         ),
     )
+
+
+def _commerce_execution_body(
+    listing_id: str,
+    objective: str,
+    *,
+    target: str | None = None,
+) -> str:
+    from proactive.loop_contract import canonical_marketplace_readonly_sections
+
+    contract = {
+        **canonical_marketplace_readonly_sections(listing_id),
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "external_targets": [
+            target or f"facebook:marketplace_listing:{listing_id}",
+        ],
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": [listing_id],
+        },
+    }
+    return (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+
+
+def _marketplace_price_execution_body(
+    listing_id: str,
+    price_twd: int,
+) -> str:
+    contract = {
+        "routing": {"task_type": "facebook_marketplace_price_update"},
+        "external_targets": [f"Facebook Marketplace item {listing_id}"],
+        "facebook_marketplace_price_update": {
+            "action": "update_price",
+            "transport": "browser",
+            "marketplace_listing_id": listing_id,
+            "currency": "TWD",
+            "price_twd": price_twd,
+        },
+    }
+    return (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+
+
+def _commerce_report(subject_key: str, *, complete: bool) -> dict:
+    observed_at = int(time.time())
+    return {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": complete,
+        "as_of": "2026-08-05T14:48:56Z",
+        "observed_at": observed_at,
+        "rows": [],
+        "coverage": [{
+            "subject_key": subject_key,
+            "subject_label": subject_key,
+            "complete": complete,
+            "named_count": 0,
+            "gap_count": 0 if complete else None,
+            "expected_total": 0 if complete else None,
+            "note": "Test coverage state.",
+        }],
+    }
+
+
+def test_complete_task_rejects_report_for_another_delivery_subject(tmp_path):
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Carimali audit",
+            body=_commerce_execution_body(
+                "36803832485927906",
+                "Inspect Carimali",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="does not match"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="Wrong product report",
+                metadata={
+                    "user_facing_report": _commerce_report(
+                        "celestron-130eq",
+                        complete=False,
+                    ),
+                },
+            )
+
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_contracted_incomplete_named_report_persists_verified_ledger_evidence(
+    tmp_path,
+):
+    report = _commerce_report("carimali-armonia-soft-plus", complete=False)
+    report["rows"] = [{
+        "subject_key": "carimali-armonia-soft-plus",
+        "subject_label": "Carimali Armonia Soft Plus",
+        # Controlled Facebook UI exposed the readable name but no group ID.
+        "destination_name": "咖啡器材買賣維修社團",
+        "status": "not_posted",
+        "status_label": "未刊登",
+        "observed_at": report["observed_at"],
+        "verified_at": report["as_of"],
+        "evidence": "Visible unchecked row in List in more places.",
+        "source_listing_id": "36803832485927906",
+    }]
+    report["coverage"][0]["named_count"] = 1
+
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Carimali partial named audit",
+            body=_commerce_execution_body(
+                "36803832485927906",
+                "Inspect Carimali",
+            ),
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="clawops-browser")
+        assert claimed is not None
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="27 named rows preserved with visible gaps",
+            metadata={"user_facing_report": report},
+            expected_run_id=claimed.current_run_id,
+        )
+        latest = kb.latest_run(conn, task_id)
+        normalized = latest.metadata["user_facing_report"]
+        assert normalized["rows"][0]["destination_id"].startswith(
+            "visible-name-sha256:"
+        )
+        ledger = kb.list_commerce_group_ledger(
+            conn,
+            subject_key="carimali-armonia-soft-plus",
+        )
+        assert len(ledger) == 1
+        assert ledger[0]["destination_name"] == "咖啡器材買賣維修社團"
+        assert ledger[0]["status"] == "not_posted"
+        aggregate = kb.build_durable_commerce_user_facing_report(conn)
+        assert aggregate is not None
+        assert aggregate["rows"][0]["status"] == "unknown"
+        assert {
+            coverage["subject_key"] for coverage in aggregate["coverage"]
+        } == {
+            "carimali-armonia-soft-plus",
+            "celestron-130eq",
+            "kolin-kd291m06",
+        }
+        events = [event.kind for event in kb.list_events(conn, task_id)]
+        assert "user_facing_report_recorded" in events
+
+
+def test_durable_aggregate_downgrades_candidate_even_with_evidence_url(tmp_path):
+    report = _commerce_report("carimali-armonia-soft-plus", complete=False)
+    report["rows"] = [{
+        "subject_key": "carimali-armonia-soft-plus",
+        "subject_label": "Carimali Armonia Soft Plus",
+        "destination_id": "260697590957215",
+        "destination_name": "二手咖啡器材交流",
+        "status": "not_posted",
+        "status_label": "未刊登",
+        "observed_at": report["observed_at"],
+        "verified_at": report["as_of"],
+        "evidence": "List in more places checkbox checked=false.",
+        "evidence_url": (
+            "https://www.facebook.com/groups/260697590957215/user/123"
+        ),
+        "source_listing_id": "36803832485927906",
+    }]
+    report["coverage"][0]["named_count"] = 1
+
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Historical candidate evidence",
+            body=_commerce_execution_body(
+                "36803832485927906", "Inspect historical candidate",
+            ),
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Candidate saved",
+            metadata={"user_facing_report": report},
+        )
+        aggregate = kb.build_durable_commerce_user_facing_report(conn)
+
+    assert aggregate is not None
+    assert aggregate["rows"][0]["status"] == "unknown"
+
+
+def test_durable_aggregate_empty_ledger_still_lists_every_subject(tmp_path):
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        aggregate = kb.build_durable_commerce_user_facing_report(conn)
+
+    assert aggregate is not None
+    assert aggregate["scope"] == "all_listings"
+    assert aggregate["rows"] == []
+    assert aggregate["observed_at"] == 1
+    assert {
+        coverage["subject_key"] for coverage in aggregate["coverage"]
+    } == {
+        "carimali-armonia-soft-plus",
+        "celestron-130eq",
+        "kolin-kd291m06",
+    }
+
+
+def test_durable_aggregate_excludes_review_pending_execution_rows(tmp_path):
+    listing_id = "36803832485927906"
+    first = _commerce_report("carimali-armonia-soft-plus", complete=False)
+    first["rows"] = [{
+        "subject_key": "carimali-armonia-soft-plus",
+        "subject_label": "Carimali Armonia Soft Plus",
+        "destination_id": "260697590957215",
+        "destination_name": "Accepted group",
+        "status": "unknown",
+        "status_label": "尚未驗證",
+        "observed_at": first["observed_at"],
+        "verified_at": first["as_of"],
+        "evidence": "Accepted review evidence.",
+        "source_listing_id": listing_id,
+    }]
+    first["coverage"][0].update({
+        "named_count": 1,
+        "expected_total": 2,
+        "gap_count": 1,
+    })
+
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution_body = _commerce_execution_body(listing_id, "Audit groups")
+        accepted_execution = kb.create_task(
+            conn, title="Accepted execution", body=execution_body,
+        )
+        claimed = kb.claim_task(conn, accepted_execution, claimer="worker")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            accepted_execution,
+            summary="Accepted evidence candidate",
+            metadata={"user_facing_report": first},
+            expected_run_id=claimed.current_run_id,
+        )
+        accepted_review = kb.create_task(
+            conn,
+            title="Accepted review",
+            body=execution_body.replace(
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "GRACE_LOOP_CONTRACT_STAGE: grace_review",
+                1,
+            ),
+            parents=(accepted_execution,),
+        )
+        review_claim = kb.claim_task(conn, accepted_review, claimer="reviewer")
+        assert review_claim is not None
+        assert kb.complete_task(
+            conn,
+            accepted_review,
+            summary="Accepted",
+            metadata={"review_outcome": "accepted"},
+            expected_run_id=review_claim.current_run_id,
+        )
+
+        pending = json.loads(json.dumps(first))
+        pending["observed_at"] += 1
+        pending["rows"][0]["observed_at"] += 1
+        pending["rows"][0]["source_task_id"] = "legacy-import-task"
+        pending["rows"].append({
+            **pending["rows"][0],
+            "destination_id": "878122105538734",
+            "destination_name": "Pending group",
+        })
+        pending["coverage"][0].update({"named_count": 2, "gap_count": 0})
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL, "
+            "current_run_id = NULL WHERE id = ?",
+            (accepted_execution,),
+        )
+        pending_claim = kb.claim_task(
+            conn, accepted_execution, claimer="worker",
+        )
+        assert pending_claim is not None
+        assert kb.complete_task(
+            conn,
+            accepted_execution,
+            summary="Awaiting review",
+            metadata={"user_facing_report": pending},
+            expected_run_id=pending_claim.current_run_id,
+        )
+
+        aggregate = kb.build_durable_commerce_user_facing_report(conn)
+
+    assert aggregate is not None
+    assert aggregate["scope"] == "all_listings"
+    assert [row["destination_name"] for row in aggregate["rows"]] == [
+        "Accepted group"
+    ]
+    assert {
+        coverage["subject_key"] for coverage in aggregate["coverage"]
+    } == {
+        "carimali-armonia-soft-plus",
+        "celestron-130eq",
+        "kolin-kd291m06",
+    }
+
+
+def test_later_complete_report_chunk_rechecks_reconciliation_generation(
+    tmp_path,
+):
+    report = _commerce_report("carimali-armonia-soft-plus", complete=True)
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Carimali execution",
+            body=_commerce_execution_body(
+                "36803832485927906",
+                "Inspect Carimali",
+            ),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="Complete Carimali report",
+            metadata={"user_facing_report": report},
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="reconciliation-generation",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+            completion_mode="final",
+        )
+        claimed = kb.claim_task(conn, review_id, claimer="reviewer")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="Accepted",
+            metadata={"review_outcome": "accepted"},
+            expected_run_id=claimed.current_run_id,
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        event_id = int(callback["event_id"])
+        lease_owner = "reconciliation-owner"
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner=lease_owner,
+        )
+        conn.execute(
+            """
+            UPDATE commerce_group_migration_state
+               SET reconciled = 1, latest_group_effect_at = 10
+             WHERE singleton_id = 1
+            """
+        )
+        first = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner=lease_owner,
+            report=report,
+            chunk_index=0,
+            total_chunks=2,
+        )
+        assert first["should_send"] is True
+        conn.execute(
+            """
+            UPDATE commerce_group_migration_state
+               SET reconciled = 0, latest_group_effect_at = 11
+             WHERE singleton_id = 1
+            """
+        )
+
+        with pytest.raises(ValueError, match="requires current"):
+            kb.reserve_grace_user_facing_report_chunk(
+                conn,
+                review_task_id=review_id,
+                event_id=event_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner=lease_owner,
+                report=report,
+                chunk_index=1,
+                total_chunks=2,
+            )
+
+
+def test_commerce_browser_circuit_matches_listing_across_contracts(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    observed_at = int(time.time())
+    blocker_evidence = {
+        "blocker_code": "facebook_readonly_backend_unavailable",
+        "component": "controlled_facebook_browser",
+        "operation": "open_more_options",
+        "listing_id": "36803832485927906",
+        "tool": "browser_click",
+        "tool_error_code": "facebook_readonly_backend_unavailable",
+        "exact_error": (
+            "Guarded browser action backend failed closed: "
+            "CDP supervisor is unavailable"
+        ),
+        "observed_at": observed_at,
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    with kb.connect_closing(db_path) as conn:
+        blocked_id = kb.create_task(
+            conn,
+            title="Carimali audit",
+            body=_commerce_execution_body("36803832485927906", "first wording"),
+            initial_status="running",
+        )
+        assert kb.block_task(
+            conn,
+            blocked_id,
+            kind="capability",
+            reason=(
+                "Facebook Marketplace item 36803832485927906 的受控 "
+                "Facebook 瀏覽器仍無法提供可讀 UI；snapshot 與 "
+                "screenshot 全部逾時。"
+            ),
+            blocker=blocker_evidence,
+        )
+        same_listing = kb._grace_compiled_contract(
+            _commerce_execution_body(
+                "36803832485927906",
+                "different wording",
+                target=(
+                    "https://www.facebook.com/marketplace/item/"
+                    "36803832485927906/"
+                ),
+            )
+        )
+        other_listing = kb._grace_compiled_contract(
+            _commerce_execution_body("27909676598721497", "different item")
+        )
+        blocker = kb.find_recent_commerce_browser_blocker(conn, same_listing)
+
+        assert blocker is not None
+        assert blocker["task_id"] == blocked_id
+        assert blocker["capability_key"] == (
+            "facebook:marketplace-group-status:36803832485927906"
+        )
+        assert blocker["retry_after"] > blocker["blocked_at"]
+        assert kb.find_recent_commerce_browser_blocker(
+            conn,
+            other_listing,
+        ) is None
+        malformed_target = kb._grace_compiled_contract(
+            _commerce_execution_body(
+                "36803832485927906",
+                "malformed",
+                target=(
+                    "facebook:marketplace_listing:"
+                    "36803832485927906_backup"
+                ),
+            )
+        )
+        assert kb.commerce_browser_capability_key(malformed_target) is None
+        embedded_target = kb._grace_compiled_contract(
+            _commerce_execution_body(
+                "36803832485927906",
+                "embedded",
+                target=(
+                    "notfacebook:marketplace_listing:"
+                    "36803832485927906"
+                ),
+            )
+        )
+        assert kb.commerce_browser_capability_key(embedded_target) is None
+        events = kb.list_events(conn, blocked_id)
+        assert any(
+            event.kind == "commerce_browser_capability_blocked"
+            for event in events
+        )
+
+
+def test_commerce_browser_capability_key_uses_readonly_delivery_subject():
+    from proactive.loop_contract import canonical_marketplace_readonly_sections
+
+    contract = {
+        **canonical_marketplace_readonly_sections("36803832485927906"),
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "external_targets": [
+            "facebook:marketplace_listing:36803832485927906",
+        ],
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": ["Carimali", "36803832485927906"],
+        },
+    }
+
+    assert kb.commerce_browser_capability_key(contract) == (
+        "facebook:marketplace-group-status:36803832485927906"
+    )
+
+    conflicting_contract = dict(contract)
+    conflicting_contract["external_targets"] = [
+        "facebook:marketplace_listing:27909676598721497",
+    ]
+    assert kb.commerce_browser_capability_key(conflicting_contract) is None
+
+    malformed_contract = dict(contract)
+    malformed_contract["external_targets"] = [
+        "facebook:marketplace_listing:36803832485927906_backup",
+    ]
+    assert kb.commerce_browser_capability_key(malformed_contract) is None
+
+    mixed_contract = dict(contract)
+    mixed_contract["external_targets"] = [
+        "facebook:marketplace_listing:36803832485927906",
+        "facebook:marketplace_listing:36803832485927906_backup",
+    ]
+    assert kb.commerce_browser_capability_key(mixed_contract) is None
+
+    malformed_suffix_contract = dict(contract)
+    malformed_suffix_contract["external_targets"] = [
+        "Facebook Marketplace item 36803832485927906 -> Facebook Group nope",
+    ]
+    assert kb.commerce_browser_capability_key(
+        malformed_suffix_contract
+    ) is None
+
+    extra_subject_contract = dict(contract)
+    extra_subject_contract["user_facing_delivery"] = {
+        **contract["user_facing_delivery"],
+        "subject_keys": ["Carimali", "another-product"],
+    }
+    assert kb.commerce_browser_capability_key(extra_subject_contract) is None
+
+
+def test_marketplace_listing_target_rejects_url_substring_lookalike():
+    target = (
+        "https://evil.example/?next=facebook.com/marketplace/item/"
+        "36803832485927906/"
+    )
+
+    assert not kb._is_exact_facebook_marketplace_listing_url(
+        target,
+        "36803832485927906",
+    )
+    assert kb._is_exact_facebook_marketplace_listing_url(
+        "https://www.facebook.com/marketplace/item/36803832485927906/",
+        "36803832485927906",
+    )
+    assert not kb._is_exact_facebook_marketplace_listing_url(
+        "javascript://www.facebook.com/marketplace/item/36803832485927906",
+        "36803832485927906",
+    )
+    assert not kb._is_exact_facebook_marketplace_listing_url(
+        "https://www.facebook.com:1/marketplace/item/36803832485927906////",
+        "36803832485927906",
+    )
+    assert not kb._is_exact_facebook_marketplace_listing_url(
+        "https://facebook.com/marketplace/item/36803832485927906",
+        "36803832485927906",
+    )
+    assert not kb._is_exact_facebook_marketplace_listing_url(
+        "https://www.facebook.com/marketplace/item/36803832485927906?ref=x",
+        "36803832485927906",
+    )
+
+
+def test_browser_timeout_error_requires_positive_elapsed_timeout():
+    assert kb._is_exact_browser_timeout_error(
+        "Command timed out after 120 seconds"
+    )
+    assert kb._is_exact_browser_timeout_error(
+        "browser_snapshot timed out after 30 seconds."
+    )
+    assert kb._is_exact_browser_timeout_error(
+        "browser_vision timed out after 0.5 seconds"
+    )
+    assert not kb._is_exact_browser_timeout_error(
+        "browser_vision timed out after 0.0 seconds"
+    )
+    assert not kb._is_exact_browser_timeout_error(
+        "navigation was rejected before timeout"
+    )
+    assert not kb._is_exact_browser_timeout_error("timeout was not reached")
+
+
+def test_execution_browser_blocker_records_terminal_callback_outcome(tmp_path):
+    db_path = tmp_path / "capability-callback.db"
+    capability_key = "facebook:marketplace-group-status:36803832485927906"
+    observed_at = int(time.time())
+    blocker = {
+        "blocker_code": "facebook_readonly_backend_unavailable",
+        "component": "controlled_facebook_browser",
+        "operation": "open_more_options",
+        "listing_id": "36803832485927906",
+        "tool": "browser_click",
+        "tool_error_code": "facebook_readonly_backend_unavailable",
+        "exact_error": (
+            "Guarded browser action backend failed closed: "
+            "CDP supervisor is unavailable"
+        ),
+        "observed_at": observed_at,
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Carimali execution",
+            body=_commerce_execution_body("36803832485927906", "audit"),
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="browser-capability",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="c" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            kind="capability",
+            reason=(
+                "Facebook Marketplace item 36803832485927906 的受控 "
+                "Facebook 瀏覽器仍無法提供可讀 UI；snapshot 逾時。"
+            ),
+            blocker=blocker,
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-capability",
+        )
+        with pytest.raises(ValueError, match="event time plus"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-capability",
+                outcome_kind="capability_blocked",
+                payload={
+                    "capability_key": capability_key,
+                    "summary": "invalid retry timestamp",
+                    "retry_after": 0,
+                },
+            )
+        recorded = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-capability",
+            outcome_kind="capability_blocked",
+            payload={
+                "capability_key": capability_key,
+                "summary": "受控 Facebook 瀏覽器逾時，未建立續作。",
+                "retry_after": observed_at + 900,
+            },
+        )
+
+        assert recorded["outcome_kind"] == "capability_blocked"
+        assert kb.grace_loop_callback_has_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-capability",
+        )
+
+
+def test_structured_readonly_guard_blocker_records_callback_outcome(tmp_path):
+    db_path = tmp_path / "guard-mismatch-callback.db"
+    listing_id = "36803832485927906"
+    capability_key = f"facebook:marketplace-group-status:{listing_id}"
+    observed_at = int(time.time())
+    blocker = {
+        "blocker_code": "facebook_readonly_guard_mismatch",
+        "component": "controlled_facebook_browser",
+        "operation": "open_more_options",
+        "listing_id": listing_id,
+        "tool": "browser_click",
+        "tool_error_code": "facebook_readonly_scope_denied",
+        "exact_error": (
+            "Facebook mutation blocked: the current page is neither an "
+            "authorized numeric group destination nor a reserved create route."
+        ),
+        "observed_at": observed_at,
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    popup_semantics_blocker = {
+        **blocker,
+        "tool_error_code": "popup_semantics_changed_before_atomic_action",
+        "exact_error": (
+            "Captured snapshot popup semantics changed before atomic action"
+        ),
+    }
+    assert kb._is_exact_commerce_readonly_guard_blocker(
+        popup_semantics_blocker,
+        listing_id,
+    )
+    stale_ref_blocker = {
+        **blocker,
+        "exact_error": "Snapshot ref @e56 is stale; take a fresh snapshot.",
+    }
+    assert not kb._is_exact_commerce_readonly_guard_blocker(
+        stale_ref_blocker,
+        listing_id,
+    )
+    assert not kb._is_exact_commerce_readonly_guard_blocker(
+        {**blocker, "unexpected_claim": True},
+        listing_id,
+    )
+    assert not kb._is_exact_commerce_readonly_guard_blocker(
+        {**blocker, "observed_at": int(time.time()) + 3600},
+        listing_id,
+    )
+    assert not kb._is_exact_commerce_readonly_guard_blocker(
+        {**blocker, "observed_at": int(time.time() * 1000)},
+        listing_id,
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        stale_ref_blocker,
+        listing_id,
+        "受控 Facebook 瀏覽器仍無法提供可讀 UI；snapshot 逾時。",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        f"Facebook Marketplace item {listing_id} 的受控 Facebook "
+        "瀏覽器仍無法提供可讀 UI；snapshot 逾時。",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        "The controlled Facebook browser has not timed out.",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        "The controlled Facebook browser wasn't unavailable.",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        "受控 Facebook 瀏覽器沒逾時。",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        "受控 Facebook 瀏覽器未發生逾時。",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        "受控 Facebook 瀏覽器逾時並未發生。",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        "The controlled Facebook browser wasn’t unavailable.",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        None,
+        listing_id,
+        f"Controlled Facebook browser timeout did not occur for Facebook "
+        f"Marketplace item {listing_id}.",
+    )
+    assert not kb._commerce_browser_blocker_evidence_matches(
+        {"blocker_code": "facebook_readonly_guard_typo"},
+        listing_id,
+        "The controlled Facebook browser timed out.",
+    )
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Carimali execution",
+            body=_commerce_execution_body(listing_id, "readonly inspection"),
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="structured-guard-blocker",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            kind="capability",
+            reason="Marketplace 唯讀展開遭受控瀏覽器安全政策拒絕。",
+            blocker=blocker,
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        trigger_event = next(
+            event
+            for event in kb.list_events(conn, execution_id)
+            if event.id == callback["event_id"]
+        )
+        trigger_payload = trigger_event.payload
+        assert trigger_payload["blocker"] == blocker
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-guard-mismatch",
+        )
+
+        recorded = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-guard-mismatch",
+            outcome_kind="capability_blocked",
+            payload={
+                "capability_key": capability_key,
+                "summary": "受控瀏覽器唯讀授權規則不一致，未改變外部狀態。",
+                "retry_after": observed_at + 900,
+            },
+        )
+
+        assert recorded["outcome_kind"] == "capability_blocked"
+        execution_contract = kb._grace_compiled_contract(
+            conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (execution_id,),
+            ).fetchone()["body"]
+        )
+        recent = kb.find_recent_commerce_browser_blocker(
+            conn,
+            execution_contract,
+            now=observed_at,
+        )
+        assert recent is not None
+        assert recent["retry_after"] == observed_at + 900
+        assert kb.grace_loop_callback_has_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-guard-mismatch",
+        )
+
+
+def test_marketplace_price_guard_blocker_records_callback_outcome(tmp_path):
+    db_path = tmp_path / "price-guard-mismatch-callback.db"
+    listing_id = "1666446304587399"
+    price_twd = 89000
+    capability_key = f"facebook:marketplace-price-update:{listing_id}"
+    observed_at = int(time.time())
+    blocker = {
+        "blocker_code": "facebook_marketplace_price_guard_mismatch",
+        "component": "controlled_facebook_browser",
+        "operation": "update_price",
+        "listing_id": listing_id,
+        "price_twd": price_twd,
+        "tool": "browser_type",
+        "tool_error_code": "facebook_readonly_scope_denied",
+        "exact_error": (
+            "Facebook mutation blocked: the current page is neither an "
+            "authorized numeric group destination, an approved Page "
+            "composer, nor a reserved create route."
+        ),
+        "observed_at": observed_at,
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    contract = kb._grace_compiled_contract(
+        _marketplace_price_execution_body(listing_id, price_twd)
+    )
+    assert kb.commerce_browser_capability_key(contract) == capability_key
+    assert kb._is_exact_commerce_browser_guard_blocker(
+        blocker,
+        listing_id,
+        contract,
+    )
+    readonly_shape = dict(blocker)
+    readonly_shape.pop("price_twd")
+    readonly_shape.update({
+        "blocker_code": "facebook_readonly_guard_mismatch",
+        "operation": "open_more_options",
+        "tool": "browser_click",
+    })
+    assert not kb._is_exact_commerce_browser_guard_blocker(
+        readonly_shape,
+        listing_id,
+        contract,
+    )
+
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Marketplace price execution",
+            body=_marketplace_price_execution_body(listing_id, price_twd),
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="price-guard-blocker",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="f" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            kind="capability",
+            reason="Marketplace price update guard mismatch.",
+            blocker=blocker,
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-price-guard",
+        )
+
+        recorded = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-price-guard",
+            outcome_kind="capability_blocked",
+            payload={
+                "capability_key": capability_key,
+                "summary": "受控瀏覽器調價 guard 不一致，未改變外部狀態。",
+                "retry_after": observed_at + 900,
+            },
+        )
+
+        assert recorded["outcome_kind"] == "capability_blocked"
+
+
+def test_accepted_review_can_close_preserved_browser_capability_blocker(tmp_path):
+    db_path = tmp_path / "accepted-capability-callback.db"
+    observed_at = int(time.time()) - 60
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-08-05T14:48:56Z",
+        "observed_at": observed_at,
+        "rows": [],
+        "coverage": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "complete": False,
+            "named_count": 0,
+            "gap_count": None,
+            "expected_total": None,
+            "note": "Controlled Facebook UI was unavailable.",
+        }],
+    }
+    from proactive.loop_contract import canonical_marketplace_readonly_sections
+
+    contract = {
+        **canonical_marketplace_readonly_sections("36803832485927906"),
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "external_targets": [
+            "facebook:marketplace_listing:36803832485927906",
+        ],
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": ["Carimali", "36803832485927906"],
+        },
+    }
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+    execution_metadata = {
+        "status": "capability_blocked",
+        "external_state_changed": False,
+        "preserved_capability_blocked": {
+            "observed_at": observed_at,
+            "attempted_readonly_paths": [
+                "https://www.facebook.com/marketplace/item/"
+                "36803832485927906/",
+                "https://www.facebook.com/marketplace/you/selling",
+                "browser_snapshot current page",
+            ],
+            "tool_errors": [{
+                "tool": "browser_navigate",
+                "target": (
+                    "https://www.facebook.com/marketplace/item/"
+                    "36803832485927906/"
+                ),
+                "error": "Command timed out after 120 seconds",
+            }],
+        },
+        "verification": {"raw_cdp_or_dom_used": False},
+        "user_facing_report": report,
+    }
+    review_metadata = {
+        "review_outcome": "accepted",
+        "completion_mode": "intermediate",
+        "no_automatic_retry": True,
+        "subject": {
+            "marketplace_listing_id": "36803832485927906",
+        },
+        "verified_evidence": [{
+            "kind": "capability_blocked",
+            "observed_at": observed_at,
+            "external_state_changed": False,
+        }],
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Carimali execution",
+            body=execution_body,
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="browser capability evidence preserved",
+            metadata=execution_metadata,
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="accepted-browser-capability",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="d" * 64,
+            completion_mode="intermediate",
+        )
+        claimed_review = kb.claim_task(
+            conn,
+            review_id,
+            claimer="accepted-capability-reviewer",
+        )
+        assert claimed_review is not None
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted preserved capability blocker",
+            metadata=review_metadata,
+            expected_run_id=claimed_review.current_run_id,
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        event_id = callback["event_id"]
+        lease_owner = "accepted-capability-owner"
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner=lease_owner,
+        )
+        reservation = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner=lease_owner,
+            report=report,
+            chunk_index=0,
+            total_chunks=1,
+        )
+        assert reservation["should_send"] is True
+        kb.confirm_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            report=report,
+            chunk_index=0,
+            total_chunks=1,
+            message_id="3250",
+        )
+        kb.record_grace_user_facing_report_delivery(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner=lease_owner,
+            report=report,
+            chunk_count=1,
+            chunk_index=0,
+        )
+
+        recorded = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner=lease_owner,
+            outcome_kind="capability_blocked",
+            payload={
+                "capability_key": (
+                    "facebook:marketplace-group-status:36803832485927906"
+                ),
+                "summary": "accepted controlled browser capability blocker",
+                "retry_after": observed_at + 900,
+            },
+        )
+
+        assert recorded["outcome_kind"] == "capability_blocked"
 
 
 def test_delegation_commit_rejects_expired_builder_lease(tmp_path):

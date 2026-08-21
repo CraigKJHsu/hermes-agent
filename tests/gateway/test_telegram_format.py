@@ -866,6 +866,51 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
     assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
 
 
+@pytest.mark.asyncio
+async def test_send_plain_text_metadata_bypasses_markdown(adapter):
+    adapter._bot = MagicMock()
+    message = MagicMock()
+    message.message_id = 1
+    adapter._bot.send_message = AsyncMock(return_value=message)
+    content = "**literal** _symbols_ [stay](unchanged)"
+
+    result = await adapter.send(
+        "123",
+        content,
+        metadata={"plain_text": True},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["text"] == content
+    assert kwargs["parse_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_plain_text_chunks_use_unescaped_indicators(adapter):
+    adapter.MAX_MESSAGE_LENGTH = 80
+    adapter._bot = MagicMock()
+    sent_texts = []
+
+    async def _fake_send_message(**kwargs):
+        sent_texts.append(kwargs["text"])
+        return SimpleNamespace(message_id=len(sent_texts))
+
+    adapter._bot.send_message = AsyncMock(side_effect=_fake_send_message)
+    content = ("literal_*[]() " * 12).strip()
+
+    result = await adapter.send(
+        "123",
+        content,
+        metadata={"plain_text": True},
+    )
+
+    assert result.success is True
+    assert len(sent_texts) > 1
+    assert re.search(r" \([0-9]+/[0-9]+\)$", sent_texts[0])
+    assert not re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[0])
+
+
 # =========================================================================
 # edit_message — streaming Markdown safety
 # =========================================================================

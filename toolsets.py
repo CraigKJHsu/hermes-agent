@@ -53,6 +53,9 @@ _HERMES_CORE_TOOLS = [
     # selected toolsets enable it; tool-search must never defer it after the
     # runtime capability preflight has attested that it is present.
     "browser_upload_files",
+    # Stable Page publishing through Meta Graph API. The write tool is still
+    # task-scoped, approval-bound, and protected by the external-effect ledger.
+    "facebook_page_graph_status", "facebook_page_graph_publish",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -201,6 +204,18 @@ TOOLSETS = {
             "browser_press",
             "browser_dialog",
             "browser_upload_files",
+        ],
+        "includes": [],
+    },
+
+    "facebook-pages-api": {
+        "description": (
+            "Read-only Page-token preflight and approval-bound Facebook Page "
+            "photo publishing through Meta Graph API"
+        ),
+        "tools": [
+            "facebook_page_graph_status",
+            "facebook_page_graph_publish",
         ],
         "includes": [],
     },

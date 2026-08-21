@@ -69,6 +69,9 @@ _SESSION_MESSAGE_TEXT: ContextVar = ContextVar(
 # callbacks deliberately reuse the originating route and user id, so user_id
 # alone cannot prove that the current turn is a fresh human authorization.
 _SESSION_INTERNAL: ContextVar = ContextVar("HERMES_SESSION_INTERNAL", default=_UNSET)
+_SESSION_INTERNAL_KIND: ContextVar = ContextVar(
+    "HERMES_SESSION_INTERNAL_KIND", default=_UNSET
+)
 _SESSION_OWNER_USER_ID: ContextVar = ContextVar(
     "HERMES_SESSION_OWNER_USER_ID", default=_UNSET
 )
@@ -124,6 +127,7 @@ _VAR_MAP = {
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_MESSAGE_TEXT": _SESSION_MESSAGE_TEXT,
     "HERMES_SESSION_INTERNAL": _SESSION_INTERNAL,
+    "HERMES_SESSION_INTERNAL_KIND": _SESSION_INTERNAL_KIND,
     "HERMES_SESSION_OWNER_USER_ID": _SESSION_OWNER_USER_ID,
     "HERMES_GRACE_CALLBACK_BOARD": _GRACE_CALLBACK_BOARD,
     "HERMES_GRACE_CALLBACK_LEASE_OWNER": _GRACE_CALLBACK_LEASE_OWNER,
@@ -161,6 +165,7 @@ def set_session_vars(
     message_id: str = "",
     message_text: str = "",
     internal: bool = False,
+    internal_kind: str = "",
     owner_user_id: str = "",
     grace_callback_board: str = "",
     grace_callback_lease_owner: str = "",
@@ -195,6 +200,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_MESSAGE_TEXT.set(message_text),
         _SESSION_INTERNAL.set("true" if internal else "false"),
+        _SESSION_INTERNAL_KIND.set(internal_kind if internal else ""),
         _SESSION_OWNER_USER_ID.set(owner_user_id),
         _GRACE_CALLBACK_BOARD.set(grace_callback_board),
         _GRACE_CALLBACK_LEASE_OWNER.set(grace_callback_lease_owner),
@@ -260,6 +266,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_MESSAGE_TEXT,
         _SESSION_INTERNAL,
+        _SESSION_INTERNAL_KIND,
         _SESSION_OWNER_USER_ID,
         _GRACE_CALLBACK_BOARD,
         _GRACE_CALLBACK_LEASE_OWNER,

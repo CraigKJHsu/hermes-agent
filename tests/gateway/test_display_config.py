@@ -390,6 +390,38 @@ class TestStreamingPerPlatform:
         }
         assert resolve_display_setting(config, "email", "streaming") is True
 
+    def test_source_override_takes_precedence(self):
+        """A trusted topic override can stream while its platform stays off."""
+        from types import SimpleNamespace
+
+        from gateway.display_config import resolve_source_display_setting
+
+        config = {
+            "display": {
+                "platforms": {"telegram": {"streaming": False}},
+            }
+        }
+        source = SimpleNamespace(display_overrides={"streaming": True})
+        assert resolve_source_display_setting(
+            config, "telegram", "streaming", source
+        ) is True
+
+    def test_source_without_override_uses_platform_setting(self):
+        """Unmapped topics retain the existing platform-level behavior."""
+        from types import SimpleNamespace
+
+        from gateway.display_config import resolve_source_display_setting
+
+        config = {
+            "display": {
+                "platforms": {"telegram": {"streaming": False}},
+            }
+        }
+        source = SimpleNamespace(display_overrides=None)
+        assert resolve_source_display_setting(
+            config, "telegram", "streaming", source
+        ) is False
+
 
 # ---------------------------------------------------------------------------
 # cleanup_progress — opt-in deletion of temporary progress bubbles

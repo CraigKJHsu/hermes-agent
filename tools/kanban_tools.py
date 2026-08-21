@@ -599,7 +599,28 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            promotion_results: list[dict] = []
+            try:
+                from proactive.grace_memory_promotion import (
+                    process_due_promotions,
+                )
+
+                promotion_results = process_due_promotions(
+                    board=board,
+                    task_id=tid,
+                    limit=1,
+                )
+            except Exception:
+                # The transactional outbox already committed with the task.
+                # Heartbeat retry will resume it; completion remains valid.
+                logger.exception(
+                    "immediate Grace memory promotion failed for %s; queued for retry",
+                    tid,
+                )
+            payload = {"task_id": tid, "run_id": run.id if run else None}
+            if promotion_results:
+                payload["memory_promotion"] = promotion_results[0]
+            return _ok(**payload)
         finally:
             conn.close()
     except ValueError as e:
@@ -624,9 +645,38 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    blocker = args.get("blocker")
+    if blocker is not None:
+        if not isinstance(blocker, dict):
+            return tool_error("blocker must be an object when provided")
+        blocker_json = redact_sensitive_text(
+            json.dumps(blocker, ensure_ascii=False),
+            force=True,
+        )
+        try:
+            blocker = json.loads(blocker_json)
+        except json.JSONDecodeError:
+            return tool_error("blocker must be valid JSON data")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        if (
+            isinstance(blocker, dict)
+            and blocker.get("blocker_code")
+            in {
+                "facebook_readonly_guard_mismatch",
+                "facebook_readonly_backend_unavailable",
+            }
+            and not kb._is_exact_commerce_readonly_guard_blocker(
+                blocker,
+                str(blocker.get("listing_id") or "").strip(),
+            )
+        ):
+            conn.close()
+            return tool_error(
+                "recognized Facebook read-only blocker must match the exact "
+                "canonical field set and values"
+            )
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -637,6 +687,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                blocker=blocker,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1274,6 +1325,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "blocker": {
+                "type": "object",
+                "description": (
+                    "Optional structured machine evidence for a runtime or "
+                    "policy blocker. For a Facebook read-only guard mismatch "
+                    "include blocker_code, component, operation, listing_id, "
+                    "tool, tool_error_code, exact_error, observed_at, "
+                    "external_state_changed, and raw_cdp_or_dom_used."
+                ),
+                "additionalProperties": True,
             },
             "board": _board_schema_prop(),
         },

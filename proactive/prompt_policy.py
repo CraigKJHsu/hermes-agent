@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from pathlib import Path
 
 
@@ -11,9 +12,31 @@ _PATTERN = re.compile(r"GRACE_CLAWOPS_POLICY_VERSION:\s*([A-Za-z0-9._-]+)")
 _SECTION = re.compile(
     r"(?ms)^## Grace to ClawOps Delegation Contract\s*$.*?(?=^##\s|\Z)"
 )
-_APPROVAL_TOKEN = re.compile(r"核准[ \t\u3000]+")
-_VALID_APPROVAL_TOKEN = re.compile(
-    r"核准[ \t\u3000]+([0-9a-f]{16})(?=$|[ \t\u3000，,。.!！？?、:：;；])"
+_HORIZONTAL_SPACE = r"[ \t\u3000]"
+_OPTIONAL_SPACE = _HORIZONTAL_SPACE + "*"
+_APPROVAL_ATTEMPT = re.compile(
+    r"^(?:(?:好吧|好的?|可以|沒問題|收到)"
+    + _OPTIONAL_SPACE
+    + r"(?:[，,、:：]"
+    + _OPTIONAL_SPACE
+    + r")?)?核准"
+    + _HORIZONTAL_SPACE
+    + r"+([^ \t\u3000，,。.!！？?、:：;；]+)"
+    + r"(?:"
+    + _OPTIONAL_SPACE
+    + r"(?:[，,、]"
+    + _OPTIONAL_SPACE
+    + r")?(?:謝謝|麻煩了))?"
+    + _OPTIONAL_SPACE
+    + r"[。.!！]?$"
+)
+_VALID_APPROVAL_TOKEN = re.compile(r"^[0-9a-f]{16}$")
+_KANBAN_TASK_ID = re.compile(r"(?<![A-Za-z0-9_])(t_[0-9a-f]{8})(?![A-Za-z0-9_])")
+_SAVED_EVIDENCE_FINALIZATION_HINTS = (
+    "已保存", "保存紀錄", "既有證據", "耐久證據", "durable evidence",
+    "重新讀取該任務", "讀取該任務", "接續原任務", "完成原任務",
+    "resume finalization", "continue finalization",
+    "complete finalization",
 )
 
 
@@ -77,7 +100,7 @@ def ensure_active_policy_prompt(prompt: str) -> str:
 
 def approval_turn_prompt(message_text: str) -> str:
     """Force token-shaped approval turns through the authoritative tool."""
-    match = _APPROVAL_TOKEN.search(str(message_text or ""))
+    match = _APPROVAL_ATTEMPT.fullmatch(str(message_text or "").strip())
     if match is None:
         return ""
     return (
@@ -97,5 +120,70 @@ def approval_turn_prompt(message_text: str) -> str:
 
 def approval_token_candidate(message_text: str) -> str:
     """Return a syntactically valid challenge token from an approval turn."""
-    match = _VALID_APPROVAL_TOKEN.search(str(message_text or ""))
-    return match.group(1) if match else ""
+    match = _APPROVAL_ATTEMPT.fullmatch(str(message_text or "").strip())
+    if match is None:
+        return ""
+    candidate = match.group(1)
+    return candidate if _VALID_APPROVAL_TOKEN.fullmatch(candidate) else ""
+
+
+def approval_attempt_candidate(message_text: str) -> str:
+    """Return a candidate only when the whole message is an approval turn.
+
+    Natural requests may discuss approval or tokens. They must not be routed
+    as approval replies unless the entire authenticated message has the narrow
+    approval-command shape.
+    """
+    match = _APPROVAL_ATTEMPT.fullmatch(str(message_text or "").strip())
+    return match.group(1) if match is not None else ""
+
+
+def marketplace_readonly_turn_prompt(message_text: str) -> str:
+    """Force one exact Marketplace group-status audit through the safe route."""
+    from proactive.loop_contract import (
+        canonical_marketplace_readonly_delegate_args,
+        marketplace_readonly_user_request_listing_id,
+    )
+
+    listing_id = marketplace_readonly_user_request_listing_id(message_text)
+    if listing_id is None:
+        return ""
+    fixed_args = canonical_marketplace_readonly_delegate_args(listing_id)
+    return (
+        "[Trusted exact Marketplace read-only routing]\n"
+        "The current authenticated message is one exact read-only inspection, "
+        "not an approval turn and not a publishing request. Do not answer from "
+        "conversation history and do not create, request, or consume an approval "
+        "token. You MUST call clawops_delegate now. Set original_request to the "
+        "current authenticated user message verbatim, omit approval_token and "
+        "facebook_crosspost, and use these exact remaining arguments:\n"
+        + json.dumps(fixed_args, ensure_ascii=False, sort_keys=True)
+        + "\nThe clawops_delegate result is authoritative."
+    )
+
+
+def saved_evidence_finalization_turn_prompt(message_text: str) -> str:
+    """Route an exact saved-evidence continuation to its original task.
+
+    The task id plus an explicit evidence/finalization hint are both required,
+    so ordinary progress questions mentioning a Kanban id stay read-only.
+    """
+    current = str(message_text or "")
+    task_ids = {match.group(1) for match in _KANBAN_TASK_ID.finditer(current)}
+    normalized = current.casefold()
+    if len(task_ids) != 1 or not any(
+        hint.casefold() in normalized
+        for hint in _SAVED_EVIDENCE_FINALIZATION_HINTS
+    ):
+        return ""
+    task_id = next(iter(task_ids))
+    return (
+        "[Trusted saved-evidence finalization routing]\n"
+        "The authenticated user is referring to one existing blocked commerce "
+        "execution and its already-saved evidence. This is not a new Facebook "
+        "audit and not a callback continuation. You MUST call "
+        "clawops_finalize_saved_evidence now with exactly "
+        f'{json.dumps({"execution_task_id": task_id, "board": "default"}, sort_keys=True)}. '
+        "Do not call clawops_delegate, do not construct a new Loop Contract, "
+        "and do not open any browser. The tool result is authoritative."
+    )

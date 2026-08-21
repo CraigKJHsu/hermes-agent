@@ -950,6 +950,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True
+    assert event.internal_context == {"internal_kind": "restart_resume"}
     assert event.message_type == MessageType.TEXT
     assert event.source == source
     # Text is empty — the existing _is_resume_pending branch in

@@ -43,8 +43,49 @@ class TestResolveCdpOverride:
     def test_falls_back_to_raw_url_when_discovery_fails(self):
         from tools.browser_tool import _resolve_cdp_override
 
-        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
+        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")), \
+                patch(
+                    "hermes_cli.browser_connect.recover_default_local_browser_debug",
+                    return_value=False,
+                ):
             assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
+
+    def test_recovers_default_local_cdp_and_retries_discovery(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        local = "http://127.0.0.1:9222"
+        local_ws = "ws://127.0.0.1:9222/devtools/browser/recovered"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": local_ws}
+
+        with patch(
+            "tools.browser_tool.requests.get",
+            side_effect=[RuntimeError("connection refused"), response],
+        ) as mock_get, patch(
+            "hermes_cli.browser_connect.recover_default_local_browser_debug",
+            return_value=True,
+        ) as recover:
+            resolved = _resolve_cdp_override(local)
+
+        assert resolved == local_ws
+        assert mock_get.call_count == 2
+        recover.assert_called_once_with(local)
+
+    def test_noncanonical_local_input_cannot_trigger_recovery(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        custom = " http://127.0.0.1:9222"
+        with patch(
+            "tools.browser_tool.requests.get",
+            side_effect=RuntimeError("connection refused"),
+        ), patch(
+            "hermes_cli.browser_connect.recover_default_local_browser_debug",
+            return_value=False,
+        ) as recover:
+            assert _resolve_cdp_override(custom) == custom.strip()
+
+        recover.assert_called_once_with(custom)
 
     def test_redacts_secret_query_params_in_success_log(self):
         from tools.browser_tool import _resolve_cdp_override
@@ -161,4 +202,3 @@ class TestGetCdpOverride:
 
         assert resolved == WS_URL
         mock_get.assert_called_once_with(VERSION_URL, timeout=10)
-

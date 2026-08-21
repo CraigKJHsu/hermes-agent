@@ -167,6 +167,34 @@ def finalize_turn(
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
+        # A cancelled/failed Translator contract-repair turn can leave its
+        # private draft, correction nudge, and tool exchange in the live
+        # message list before the normal valid-response cleanup runs. Remove
+        # everything from the recorded repair boundary before any transcript
+        # persistence so private validation state never becomes conversation
+        # history.
+        _repair_start = getattr(
+            agent,
+            "_response_contract_repair_start_index",
+            None,
+        )
+        if isinstance(_repair_start, int):
+            del messages[max(0, _repair_start):]
+            agent._response_contract_repair_start_index = None
+            final_response = str(
+                getattr(
+                    agent,
+                    "final_response_validation_failure_message",
+                    "",
+                )
+                or "⚠️ 回覆未通過完整性檢查，請再試一次。"
+            )
+            messages.append({
+                "role": "assistant",
+                "content": final_response,
+                "finish_reason": "contract_repair_interrupted",
+            })
+
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
         # tool-call sequence. Without this, the session persists a

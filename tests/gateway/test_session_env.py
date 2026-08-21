@@ -324,12 +324,14 @@ def test_set_session_env_marks_internal_turn_and_owner():
     tokens = runner._set_session_env(
         context,
         internal=True,
+        internal_kind="grace_callback",
         owner_user_id="kj-owner",
         message_text="[SYSTEM: callback]",
         grace_callback_board="secondhand",
         grace_callback_lease_owner="gateway:test",
     )
     assert get_session_env("HERMES_SESSION_INTERNAL") == "true"
+    assert get_session_env("HERMES_SESSION_INTERNAL_KIND") == "grace_callback"
     assert get_session_env("HERMES_SESSION_OWNER_USER_ID") == "kj-owner"
     assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == "[SYSTEM: callback]"
     assert get_session_env("HERMES_GRACE_CALLBACK_BOARD") == "secondhand"
@@ -340,6 +342,7 @@ def test_set_session_env_marks_internal_turn_and_owner():
 
     runner._clear_session_env(tokens)
     assert get_session_env("HERMES_SESSION_INTERNAL") == ""
+    assert get_session_env("HERMES_SESSION_INTERNAL_KIND") == ""
     assert get_session_env("HERMES_SESSION_OWNER_USER_ID") == ""
     assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == ""
     assert get_session_env("HERMES_GRACE_CALLBACK_BOARD") == ""

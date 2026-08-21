@@ -1,5 +1,6 @@
 """Tests for browser first-open timeout and timeout diagnostics."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -76,6 +77,39 @@ class TestTimeoutErrorFormatting:
         monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
         err = bt._format_browser_timeout_error("open", 60, "", "")
         assert "agent-browser install --with-deps" in err
+
+
+class TestTimeoutProcessCleanup:
+    def test_windows_uses_taskkill_tree(self, monkeypatch):
+        calls = []
+        proc = SimpleNamespace(pid=321, kill=lambda: pytest.fail("fallback"))
+        monkeypatch.setattr(bt.os, "name", "nt")
+        monkeypatch.setattr(
+            bt.subprocess,
+            "run",
+            lambda args, **kwargs: (
+                calls.append((args, kwargs))
+                or SimpleNamespace(returncode=0)
+            ),
+        )
+
+        bt._terminate_browser_command_process(proc)
+
+        assert calls[0][0] == ["taskkill", "/PID", "321", "/T", "/F"]
+
+    def test_windows_taskkill_failure_uses_process_fallback(self, monkeypatch):
+        killed = []
+        proc = SimpleNamespace(pid=654, kill=lambda: killed.append(True))
+        monkeypatch.setattr(bt.os, "name", "nt")
+        monkeypatch.setattr(
+            bt.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=5),
+        )
+
+        bt._terminate_browser_command_process(proc)
+
+        assert killed == [True]
 
 
 class TestReadCommandOutputFiles:

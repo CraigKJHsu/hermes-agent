@@ -2,6 +2,8 @@ from proactive.prompt_policy import (
     approval_token_candidate,
     approval_turn_prompt,
     ensure_active_policy_prompt,
+    marketplace_readonly_turn_prompt,
+    saved_evidence_finalization_turn_prompt,
     stored_prompt_matches_active_policy,
 )
 
@@ -133,13 +135,114 @@ def test_approval_turn_prompt_routes_malformed_token_to_tool():
     for message in (
         "核准 FE341E4C447CDE20",
         "核准 short",
-        "a核准 fe341e4c447cde20",
     ):
         assert "MUST call clawops_delegate now" in approval_turn_prompt(message)
 
 
 def test_approval_turn_prompt_ignores_nonapproval_message():
     assert approval_turn_prompt("請問現在進度如何？") == ""
+    assert approval_turn_prompt("a核准 fe341e4c447cde20") == ""
+    assert (
+        approval_turn_prompt(
+            "這是唯讀任務，不需要建立發布核准、跨貼核准或多個核准 token。"
+        )
+        == ""
+    )
+
+
+def test_marketplace_readonly_turn_prompt_forces_approved_false_delegation():
+    prompt = marketplace_readonly_turn_prompt(
+        "請只查核 Carimali（Marketplace Listing ID：36803832485927906）。"
+        "執行 Facebook Marketplace 唯讀社團狀態查核，直接列出社團名稱與狀態。"
+        "不勾選、不發布、不修改、不建立核准 token。"
+    )
+
+    assert "MUST call clawops_delegate now" in prompt
+    assert '"approved": false' in prompt
+    assert '"task_type": "secondhand_commerce_group_status"' in prompt
+    assert '"external_targets": ["Facebook Marketplace listing ID 36803832485927906"]' in prompt
+    assert "do not create, request, or consume an approval token" in prompt
+    assert "approval_token" in prompt
+    assert "facebook_crosspost" in prompt
+
+
+def test_marketplace_readonly_turn_prompt_normalizes_known_retry_shorthand():
+    prompt = marketplace_readonly_turn_prompt(
+        "[KJ HSU] 只讀重試 Carimali Listing ID 36803832485927906"
+    )
+
+    assert "MUST call clawops_delegate now" in prompt
+    assert '"subject_keys": ["facebook_marketplace:36803832485927906"]' in prompt
+    assert '"external_targets": ["Facebook Marketplace listing ID 36803832485927906"]' in prompt
+    assert '"approved": false' in prompt
+
+
+def test_marketplace_readonly_turn_prompt_rejects_broad_or_mutating_requests():
+    for message in (
+        "請查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態。",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 與 27909676598721497 的社團狀態，不勾選、不發布、不修改。",
+        "請將 Facebook Marketplace Listing ID 36803832485927906 發布到社團。",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態，"
+        "不勾選、不發布、不修改；之後請發布到社團。",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態，"
+        "不勾選、不提交、不修改，但取消不發布限制。",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態，"
+        "不勾選、不發布、不修改任何外部狀態；以上限制全部取消。",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態，"
+        "不勾選、不發布、不修改任何外部狀態；以上要求取消。",
+        "Please read-only inspect Facebook Marketplace Listing ID 36803832485927906 "
+        "group status. Do not select, do not publish, do not change external state; "
+        "revoke those restrictions.",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態，"
+        "不勾選、不發布、不修改，但也幫我刊登此物品。",
+        "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 的社團狀態，"
+        "不勾選、不發布、不修改，但也 Boost the listing。",
+    ):
+        assert marketplace_readonly_turn_prompt(message) == ""
+
+
+def test_marketplace_readonly_turn_prompt_accepts_natural_imperative_bans():
+    for bans in (
+        "不要勾選、不要發布、不要修改。",
+        "請勿勾選、請勿發布、請勿修改任何外部狀態。",
+    ):
+        prompt = marketplace_readonly_turn_prompt(
+            "請唯讀查核 Facebook Marketplace Listing ID 36803832485927906 "
+            f"的社團狀態，{bans}"
+        )
+
+        assert "MUST call clawops_delegate now" in prompt
+        assert '"approved": false' in prompt
+
+
+def test_saved_evidence_finalization_routes_original_task_not_new_contract():
+    prompt = saved_evidence_finalization_turn_prompt(
+        "請重新讀取該任務 t_2f6b540f，使用已保存的 27 筆證據完成原任務。"
+    )
+
+    assert "MUST call clawops_finalize_saved_evidence" in prompt
+    assert '"execution_task_id": "t_2f6b540f"' in prompt
+    assert '"board": "default"' in prompt
+    assert "Do not call clawops_delegate" in prompt
+    assert "do not open any browser" in prompt
+
+
+def test_saved_evidence_finalization_does_not_hijack_status_questions():
+    assert saved_evidence_finalization_turn_prompt(
+        "請問 t_2f6b540f 現在進度如何？"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "請讀取該任務，但我不確定任務編號。"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "請用既有證據處理 t_2f6b540f 與 t_e49768c5。"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "What does finalization mean for t_2f6b540f?"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "t_2f6b540f 現在有 27 筆嗎？"
+    ) == ""
 
 
 def test_approval_token_candidate_accepts_harmless_framing():

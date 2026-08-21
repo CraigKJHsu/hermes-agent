@@ -51,3 +51,26 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     if agent_result.get("failed"):
         return False
     return is_intentional_silence_response(response)
+
+
+def should_suppress_successful_internal_response(
+    *,
+    internal: bool,
+    internal_context: Any,
+    agent_result: dict | None,
+) -> bool:
+    """Honor a trusted internal event's structural no-second-reply flag.
+
+    This is used after a deterministic payload has already been delivered.
+    The internal agent turn may still perform durable orchestration, but its
+    free-form final text must not become a competing user-facing answer.
+    Failed turns are never suppressed so recovery and operator diagnostics
+    remain visible.
+    """
+    return bool(
+        internal
+        and isinstance(internal_context, dict)
+        and internal_context.get("suppress_successful_response") is True
+        and isinstance(agent_result, dict)
+        and agent_result.get("failed") is not True
+    )

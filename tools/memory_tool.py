@@ -121,11 +121,19 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        adjudicator=None,
+        session_id: str = "",
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self._adjudicator = adjudicator
+        self._adjudication_session_id = session_id
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
@@ -161,6 +169,28 @@ class MemoryStore:
         # can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+
+        # Mutable memory is evidence, not unconditional truth.  Build an
+        # effective snapshot before prompt injection while preserving the raw
+        # source files and live tool-visible entries unchanged.
+        if self._adjudicator is not None:
+            try:
+                sanitized_memory = self._adjudicator.adjudicate_entries(
+                    sanitized_memory,
+                    source="prompt_memory",
+                    session_id=self._adjudication_session_id,
+                )
+                sanitized_user = self._adjudicator.adjudicate_entries(
+                    sanitized_user,
+                    source="user_profile",
+                    session_id=self._adjudication_session_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Memory adjudication failed before snapshot; keeping the "
+                    "sanitized source snapshot: %s",
+                    type(exc).__name__,
+                )
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
@@ -1087,7 +1117,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

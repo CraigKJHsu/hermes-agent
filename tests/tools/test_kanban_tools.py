@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import pytest
 
@@ -614,6 +615,65 @@ def test_block_rejects_empty_reason(worker_env):
     for bad in ["", "   ", None]:
         out = kt._handle_block({"reason": bad})
         assert json.loads(out).get("error")
+
+
+def test_block_rejects_noncanonical_facebook_readonly_blocker(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({
+        "reason": "controlled browser guard mismatch",
+        "kind": "capability",
+        "blocker": {
+            "blocker_code": "facebook_readonly_guard_mismatch",
+            "component": "controlled_facebook_browser",
+            "operation": "open_more_options",
+            "listing_id": "36803832485927906",
+            "tool": "browser_click",
+            "tool_error_code": "facebook_readonly_scope_denied",
+            "exact_error": (
+                "Facebook mutation blocked: the current page is neither an "
+                "authorized numeric group destination nor a reserved create route."
+            ),
+            "observed_at": 1,
+            "external_state_changed": False,
+            "raw_cdp_or_dom_used": False,
+            "debug": "must not be persisted",
+        },
+    })
+
+    assert "exact canonical field set" in json.loads(out)["error"]
+
+
+def test_block_accepts_canonical_crosspost_listing_mismatch(worker_env):
+    from tools import kanban_tools as kt
+
+    blocker = {
+        "blocker_code": "facebook_readonly_guard_mismatch",
+        "component": "controlled_facebook_browser",
+        "operation": "open_more_options",
+        "listing_id": "915975414881937",
+        "tool": "browser_click",
+        "tool_error_code": "facebook_crosspost_control_different_listing",
+        "exact_error": "Cross-post control belongs to a different listing",
+        "observed_at": int(time.time()),
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    out = kt._handle_block({
+        "reason": "controlled browser source binding mismatch",
+        "kind": "capability",
+        "blocker": blocker,
+    })
+
+    assert json.loads(out)["ok"] is True
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        blocked_event = next(
+            event
+            for event in reversed(kb.list_events(conn, worker_env))
+            if event.kind == "blocked"
+        )
+    assert blocked_event.payload["blocker"] == blocker
 
 
 def test_heartbeat_happy_path(worker_env):

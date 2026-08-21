@@ -3727,6 +3727,12 @@ def generate_launchd_plist() -> str:
         <string>Aqua</string>
         <string>Background</string>
     </array>
+
+    <!-- The gateway serves interactive chat callbacks.  Without this hint,
+         launchd may classify it as an inefficient background job and heavily
+         throttle Python/tool imports during startup. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     
     <key>RunAtLoad</key>
     <true/>

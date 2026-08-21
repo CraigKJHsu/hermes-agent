@@ -2417,6 +2417,13 @@ class TestProfileArg:
         assert "<string>Aqua</string>" in plist
         assert "<string>Background</string>" in plist
 
+    def test_launchd_plist_marks_gateway_as_interactive(self):
+        # Gateway callbacks are user-facing and must not spend minutes under
+        # launchd's background I/O throttling while importing runtime tools.
+        plist = gateway_cli.generate_launchd_plist()
+        assert "<key>ProcessType</key>" in plist
+        assert "<string>Interactive</string>" in plist
+
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
         profile_dir.mkdir(parents=True)

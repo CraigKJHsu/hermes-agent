@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from gateway.session_context import (
     get_session_env,
@@ -16,12 +17,26 @@ from gateway.session_context import (
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import compile_and_delegate
 from proactive.hubops_routing import (
+    normalize_clawops_task_type,
     registered_worker_task_types,
     resolved_route_binding,
     route_requires_owner_approval,
     route_clawops_objective,
 )
-from proactive.loop_contract import contract_fingerprint, validate_loop_contract
+from proactive.loop_contract import (
+    browser_readonly_marketplace_fallback_listing_id,
+    canonicalize_name_bound_facebook_crosspost_targets,
+    canonical_marketplace_readonly_delegate_args,
+    canonical_marketplace_readonly_sections,
+    contract_fingerprint,
+    exact_facebook_marketplace_listing_target_id,
+    facebook_crosspost_inspection_listing_id,
+    facebook_crosspost_target_ids,
+    facebook_crosspost_target_names,
+    marketplace_readonly_user_request_listing_id,
+    validate_loop_contract,
+)
+from proactive.prompt_policy import approval_attempt_candidate
 from proactive.thread_context_registry import (
     resolve_thread_context,
     resolve_thread_context_alias,
@@ -29,8 +44,16 @@ from proactive.thread_context_registry import (
 
 
 _LIST = {"type": "array", "items": {"type": "string"}, "minItems": 1}
-_TASK_TYPES = list(registered_worker_task_types())
-_APPROVAL_ATTEMPT = re.compile(r"核准[ \t\u3000]+([^ \t\u3000，,。.!！？?、:：;；]+)")
+_TASK_TYPES = [
+    *registered_worker_task_types(),
+    "secondhand_commerce_group_status",
+]
+_PROTECTED_FACEBOOK_PAGE_NAME_MARKERS = (
+    "solobizai",
+    "aibizweek",
+    "一人公司商業誌",
+)
+_VALID_APPROVAL_TOKEN = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _is_safe_approval_message(message_text: str, approval_token: str) -> bool:
@@ -70,14 +93,224 @@ def _is_safe_approval_message(message_text: str, approval_token: str) -> bool:
 
 
 def _approval_token_candidate(message_text: str) -> str:
-    match = _APPROVAL_ATTEMPT.search(str(message_text or ""))
-    return match.group(1) if match is not None else ""
+    return approval_attempt_candidate(message_text)
+
+
+def _approval_child_request_instance_id(
+    parent_request_instance_id: str,
+    parent_contract_fingerprint: str,
+) -> str:
+    """Derive one immutable approval child from trusted parent provenance.
+
+    The parent is gateway-derived from the authenticated inbound message and
+    the fingerprint binds the exact compiled sub-contract.  Model input cannot
+    choose either value, so one user message may safely request multiple
+    independently approved contracts without sharing a delegation reservation.
+    """
+    return "gri_" + hashlib.sha256(
+        (
+            "approval-child:"
+            f"{parent_request_instance_id.strip()}:"
+            f"{parent_contract_fingerprint.strip()}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _requires_structured_facebook_crosspost(
+    task_type: str,
+    external_targets: list[str],
+) -> bool:
+    """Identify Marketplace-to-group publishing before issuing approval."""
+    if normalize_clawops_task_type(str(task_type or "")) not in {
+        "browser_publish",
+        "facebook_marketplace_group_publish",
+    }:
+        return False
+    target_text = " ".join(external_targets).casefold()
+    has_marketplace_source = (
+        "marketplace" in target_text
+        or "市集" in target_text
+        or "/marketplace/item/" in target_text
+    )
+    has_group_destination = (
+        "group" in target_text
+        or "社團" in target_text
+        or "/groups/" in target_text
+    )
+    return (
+        "facebook" in target_text
+        and has_marketplace_source
+        and has_group_destination
+    )
+
+
+def _requires_structured_facebook_page_post(
+    task_type: str,
+    external_targets: list[str],
+) -> bool:
+    """Identify one direct Facebook Page publication before approval."""
+    normalized_task_type = normalize_clawops_task_type(str(task_type or ""))
+    if normalized_task_type == "facebook_page_api_publish":
+        return True
+    if normalized_task_type != "browser_publish":
+        return False
+    for target in external_targets:
+        text = str(target or "").strip()
+        normalized = text.casefold()
+        urls = [
+            token
+            for token in re.findall(
+                r"https?://[^\s]+|"
+                r"(?<![0-9A-Za-z.-])(?:[0-9A-Za-z-]+\.)*"
+                r"facebook\.com\.?(?::[0-9]{1,5})?(?:/[^\s]*)?",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if "facebook.com" in token.casefold()
+        ]
+        surrounding_text = text
+        for raw_url in urls:
+            surrounding_text = surrounding_text.replace(raw_url, " ")
+        compact_surrounding = re.sub(
+            r"[^0-9a-z]+",
+            "",
+            surrounding_text.casefold(),
+        )
+        if any(
+            marker in compact_surrounding or marker in surrounding_text.casefold()
+            for marker in _PROTECTED_FACEBOOK_PAGE_NAME_MARKERS
+        ):
+            return True
+        if not urls:
+            listing_ids, group_ids = facebook_crosspost_target_ids([text])
+            group_names = facebook_crosspost_target_names([text])
+            if listing_ids or group_ids or group_names:
+                continue
+        saw_facebook_url = False
+        for raw_url in urls:
+            candidate = raw_url
+            try:
+                parsed = urlsplit(
+                    candidate
+                    if "://" in candidate
+                    else f"https://{candidate}"
+                )
+                parsed.port
+            except ValueError:
+                return True
+            hostname = str(parsed.hostname or "").rstrip(".").casefold()
+            parts = [part for part in parsed.path.split("/") if part]
+            if not (
+                hostname == "facebook.com"
+                or hostname.endswith(".facebook.com")
+            ):
+                continue
+            saw_facebook_url = True
+            decoded_parts = [unquote(part).casefold() for part in parts]
+            safe_path_parts = bool(
+                decoded_parts
+                and all(
+                    part not in {".", ".."}
+                    and re.fullmatch(r"[0-9a-z._-]+", part) is not None
+                    for part in decoded_parts
+                )
+            )
+            exact_group_route = bool(
+                len(decoded_parts) >= 2
+                and decoded_parts[0] == "groups"
+                and safe_path_parts
+            )
+            exact_marketplace_route = bool(
+                decoded_parts
+                and decoded_parts[0] == "marketplace"
+                and safe_path_parts
+            )
+            if exact_group_route or exact_marketplace_route:
+                continue
+            # Every other Facebook URL in a browser_publish target is Page-like
+            # or ambiguous. It must fail closed through the structured Page
+            # action validator rather than receive a generic approval.
+            return True
+        if saw_facebook_url:
+            continue
+        if urls:
+            return True
+        if any(
+            marker in normalized
+            for marker in ("粉專", "粉絲專頁", "粉絲頁")
+        ):
+            return True
+        if "facebook" in normalized and re.search(
+            r"(?:^|[\s/:：])(?:page|fan\s?page)(?:\s|$)", normalized
+        ):
+            return True
+    return False
+
+
+def _requires_structured_facebook_marketplace_price_update(
+    task_type: str,
+    external_targets: list[str],
+    goal: dict[str, Any],
+    scope: dict[str, Any],
+) -> bool:
+    """Fail closed when a generic browser contract describes a price update.
+
+    This detector never creates mutation authority from prose.  It only stops
+    a legacy/generic contract before approval so Grace must supply the exact
+    listing, currency, and amount in the dedicated structured capability.
+    """
+    normalized_task_type = normalize_clawops_task_type(str(task_type or ""))
+    if normalized_task_type == "facebook_marketplace_price_update":
+        return True
+    if normalized_task_type not in {"browser_ops", "browser_publish"}:
+        return False
+    target_text = " ".join(external_targets).casefold()
+    has_marketplace_target = bool(
+        any(
+            exact_facebook_marketplace_listing_target_id(target) is not None
+            for target in external_targets
+        )
+        or (
+            ("facebook" in target_text or "臉書" in target_text)
+            and ("marketplace" in target_text or "市集" in target_text)
+        )
+    )
+    if not has_marketplace_target:
+        return False
+    intent_values = [
+        goal.get("objective"),
+        goal.get("deliverables"),
+        scope.get("allowed"),
+    ]
+    intent_parts: list[str] = []
+    for value in intent_values:
+        if isinstance(value, list):
+            intent_parts.extend(str(item or "") for item in value)
+        elif value is not None:
+            intent_parts.append(str(value))
+    intent_text = " ".join(intent_parts).casefold()
+    has_price = any(marker in intent_text for marker in ("price", "價格", "售價"))
+    has_update = bool(
+        re.search(r"\b(?:update|change|set)\b", intent_text)
+        or any(
+            marker in intent_text
+            for marker in ("更新", "調整", "改為", "改成", "修改")
+        )
+    )
+    return has_price and has_update
 
 
 _GOAL = {
     "type": "object",
     "properties": {
-        "objective": {"type": "string"},
+        "objective": {
+            "type": "string",
+            "description": (
+                "Post-approval task outcome for the delegated worker. Never "
+                "use approval challenge, checkpoint, or token creation as the "
+                "worker objective; clawops_delegate creates that artifact."
+            ),
+        },
         "deliverables": _LIST,
         "non_goals": _LIST,
     },
@@ -121,6 +354,17 @@ _MEMORY = {
     "required": ["working", "promote_on_acceptance"],
     "additionalProperties": False,
 }
+_USER_FACING_DELIVERY = {
+    "type": "object",
+    "properties": {
+        "required": {"type": "boolean", "const": True},
+        "kind": {"type": "string", "enum": ["commerce_group_status"]},
+        "delivery": {"type": "string", "enum": ["inline_only"]},
+        "subject_keys": _LIST,
+    },
+    "required": ["required", "kind", "delivery", "subject_keys"],
+    "additionalProperties": False,
+}
 
 CLAWOPS_DELEGATE_PARAMETERS = {
     "type": "object",
@@ -133,6 +377,7 @@ CLAWOPS_DELEGATE_PARAMETERS = {
         "verification": _VERIFICATION,
         "stop_rules": _STOP_RULES,
         "memory": _MEMORY,
+        "user_facing_delivery": _USER_FACING_DELIVERY,
         "task_type": {
             "type": "string",
             "enum": _TASK_TYPES,
@@ -163,6 +408,116 @@ CLAWOPS_DELEGATE_PARAMETERS = {
             "description": (
                 "Exact external platforms or destinations affected by a "
                 "controlled external action; required when approval is needed."
+            ),
+        },
+        "facebook_crosspost": {
+            "type": "object",
+            "properties": {
+                "transport": {
+                    "type": "string",
+                    "const": "browser",
+                    "description": (
+                        "Facebook Groups API was removed; Marketplace group "
+                        "distribution is controlled-browser only."
+                    ),
+                },
+                "marketplace_listing_id": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$",
+                    "description": (
+                        "Exact existing Facebook Marketplace listing id."
+                    ),
+                },
+                "group_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[0-9]+$"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": (
+                        "Exact Facebook group ids selected through List in "
+                        "more places."
+                    ),
+                },
+                "group_names": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "uniqueItems": True,
+                    "description": (
+                        "Exact full Facebook group display names when saved "
+                        "read-only evidence does not expose numeric group ids."
+                    ),
+                },
+            },
+            "required": ["marketplace_listing_id"],
+            "oneOf": [
+                {
+                    "required": ["group_ids"],
+                    "not": {"required": ["group_names"]},
+                },
+                {
+                    "required": ["group_names"],
+                    "not": {"required": ["group_ids"]},
+                },
+            ],
+            "additionalProperties": False,
+            "description": (
+                "Required for an existing Marketplace listing cross-post to "
+                "Facebook groups. The approval fingerprint binds both the "
+                "source listing and every destination group id or exact name. "
+                "transport may only be browser; Graph API is unavailable."
+            ),
+        },
+        "facebook_page_post": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "const": "create_post"},
+                "page_url": {
+                    "type": "string",
+                    "pattern": "^https://www\\.facebook\\.com/[A-Za-z0-9.]+$",
+                },
+                "transport": {"type": "string", "const": "graph_api"},
+                "message_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+                "image_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+            },
+            "required": ["action", "page_url"],
+            "additionalProperties": False,
+            "description": (
+                "Required for creating one post on one exact Facebook Page. "
+                "For facebook_page_api_publish, transport must be graph_api "
+                "and both exact payload SHA-256 values are required. The "
+                "approval fingerprint binds the destination and payload."
+            ),
+        },
+        "facebook_marketplace_price_update": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "const": "update_price"},
+                "transport": {"type": "string", "const": "browser"},
+                "marketplace_listing_id": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$",
+                },
+                "currency": {"type": "string", "const": "TWD"},
+                "price_twd": {"type": "integer", "minimum": 1},
+            },
+            "required": [
+                "action", "transport", "marketplace_listing_id",
+                "currency", "price_twd",
+            ],
+            "additionalProperties": False,
+            "description": (
+                "Required for changing only the price of one existing "
+                "Facebook Marketplace listing. Supplying this exact object "
+                "canonicalizes task_type and external_targets before the "
+                "approval fingerprint is computed."
             ),
         },
         "request_instance_id": {
@@ -204,7 +559,11 @@ CLAWOPS_DELEGATE_PARAMETERS = {
 CLAWOPS_DELEGATE_SCHEMA = {
     "description": (
         "After Grace has fully understood an execution request, delegate one complete "
-        "canonical nested Loop Contract to ClawOps. Never call with an empty object."
+        "canonical nested Loop Contract to ClawOps. Never call with an empty object. "
+        "For every fresh authenticated execution request, call this tool again even "
+        "when an equivalent contract was rejected in an earlier message: prior "
+        "validation output is historical and cannot establish the current route or "
+        "schema result."
     ),
     "parameters": CLAWOPS_DELEGATE_PARAMETERS,
 }
@@ -216,13 +575,20 @@ GRACE_CALLBACK_OUTCOME_PARAMETERS = {
         "event_id": {"type": "integer", "minimum": 1},
         "outcome_kind": {
             "type": "string",
-            "enum": ["closed", "continued", "approval_blocked"],
+            "enum": [
+                "closed", "continued", "approval_blocked",
+                "decision_blocked", "capability_blocked",
+                "evidence_delivered",
+            ],
         },
         "payload": {
             "type": "object",
             "description": (
                 "closed: summary; continued: delegation_id, execution_task_id, "
-                "review_task_id; approval_blocked: action, platform, scope, exact_question"
+                "review_task_id; approval_blocked: action, platform, scope, "
+                "exact_question; decision_blocked: decision, exact_question, "
+                "and optional options; capability_blocked: capability_key, "
+                "summary, retry_after; evidence_delivered: summary"
             ),
         },
     },
@@ -238,9 +604,111 @@ GRACE_CALLBACK_OUTCOME_SCHEMA = {
     "parameters": GRACE_CALLBACK_OUTCOME_PARAMETERS,
 }
 
+CLAWOPS_FINALIZE_SAVED_EVIDENCE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "execution_task_id": {
+            "type": "string",
+            "pattern": "^t_[0-9a-f]{8}$",
+            "description": (
+                "Exact existing blocked ClawOps execution task whose durable "
+                "commerce evidence must be finalized without browser access."
+            ),
+        },
+        "board": {
+            "type": "string",
+            "description": "Exact durable board; defaults to default.",
+        },
+    },
+    "required": ["execution_task_id"],
+    "additionalProperties": False,
+}
+
+CLAWOPS_FINALIZE_SAVED_EVIDENCE_SCHEMA = {
+    "description": (
+        "Resume the same schema-blocked commerce execution/review pair from "
+        "its saved evidence only. This never creates a new task or opens a browser."
+    ),
+    "parameters": CLAWOPS_FINALIZE_SAVED_EVIDENCE_PARAMETERS,
+}
+
 
 def _canonical_sections(args: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     """Accept the canonical nested contract and preserve legacy callers during rollout."""
+    targets = args.get("external_targets")
+    delivery = args.get("user_facing_delivery")
+    requested_task_type = str(args.get("task_type") or "").strip()
+    legacy_readonly_listing_id = (
+        browser_readonly_marketplace_fallback_listing_id(args)
+        if requested_task_type == "browser_readonly"
+        else None
+    )
+    if (
+        (
+            requested_task_type in {
+                "secondhand_commerce_group_status",
+                "facebook_marketplace_readonly",
+            }
+            or legacy_readonly_listing_id is not None
+        )
+        and isinstance(targets, list)
+        and len(targets) == 1
+        and (
+            delivery is None
+            or (
+                isinstance(delivery, dict)
+                and delivery.get("required") is True
+                and delivery.get("kind") == "commerce_group_status"
+                and delivery.get("delivery") == "inline_only"
+            )
+        )
+    ):
+        listing_id = (
+            exact_facebook_marketplace_listing_target_id(targets[0])
+            or legacy_readonly_listing_id
+            or browser_readonly_marketplace_fallback_listing_id(args)
+        )
+        if listing_id is not None:
+            canonical = canonical_marketplace_readonly_sections(listing_id)
+            args.update(canonical)
+            # Keep the semantic task type in the Loop Contract. HubOps will
+            # still resolve it to the dedicated facebook_marketplace_readonly
+            # worker profile, but the contract validator, browser guard, and
+            # callback layer now share one canonical authority vocabulary.
+            args["task_type"] = "secondhand_commerce_group_status"
+            args["external_targets"] = [
+                f"Facebook Marketplace listing ID {listing_id}",
+            ]
+            if delivery is None:
+                args["user_facing_delivery"] = {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": [f"facebook_marketplace:{listing_id}"],
+                }
+            else:
+                supplied_subjects = delivery.get("subject_keys")
+                canonical_subject = f"facebook_marketplace:{listing_id}"
+                if (
+                    isinstance(supplied_subjects, list)
+                    and len(supplied_subjects) == 1
+                    and (
+                        supplied_subjects[0] == canonical_subject
+                        or exact_facebook_marketplace_listing_target_id(
+                            supplied_subjects[0]
+                        ) == listing_id
+                    )
+                ):
+                    # Grace callback turns may copy the canonical, human-
+                    # readable external target into subject_keys.  Both
+                    # fields prove the same exact listing, but the durable
+                    # delivery ledger requires its namespaced subject key.
+                    # Normalize only an exact same-listing alias; preserve a
+                    # conflicting subject so Loop Contract validation still
+                    # rejects it instead of silently broadening authority.
+                    normalized_delivery = dict(delivery)
+                    normalized_delivery["subject_keys"] = [canonical_subject]
+                    args["user_facing_delivery"] = normalized_delivery
     scope = args.get("scope")
     if isinstance(scope, dict):
         # Some providers occasionally place the following canonical siblings
@@ -289,7 +757,46 @@ def _canonical_sections(args: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _resolve_completed_callback_board(
+def _saved_commerce_candidate_request(
+    args: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return listing/category for an internal saved-evidence shortlist."""
+    if str(args.get("task_type") or "").strip() != (
+        "secondhand_commerce_group_status"
+    ):
+        return None
+    text = json.dumps(args, ensure_ascii=False, sort_keys=True).casefold()
+    if not any(
+        marker in text
+        for marker in ("候選", "篩選", "排除", "shortlist", "candidate")
+    ) or not any(
+        marker in text
+        for marker in (
+            "保存證據", "已保存", "preserved", "saved evidence",
+            "27 named", "27 筆", "已核實",
+        )
+    ):
+        return None
+    targets = args.get("external_targets")
+    if not isinstance(targets, list) or len(targets) != 1:
+        return None
+    listing_id = exact_facebook_marketplace_listing_target_id(targets[0])
+    if listing_id is None:
+        return None
+    if "carimali" in text or "咖啡" in text:
+        category = "coffee_equipment"
+    elif "celestron" in text or "望遠鏡" in text or "天文" in text:
+        category = "telescope"
+    elif "冷氣" in text or "air conditioner" in text:
+        category = "air_conditioner"
+    elif "kolin" in text or "家電" in text:
+        category = "home_appliance"
+    else:
+        return None
+    return listing_id, category
+
+
+def _resolve_callback_approval_board(
     *,
     review_task_id: str,
     event_id: int,
@@ -304,7 +811,7 @@ def _resolve_completed_callback_board(
         slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
         try:
             with kb.connect_closing(board=slug) as conn:
-                kb.validate_completed_approval_blocker(
+                kb.validate_delivered_grace_callback_approval_origin(
                     conn,
                     review_task_id=review_task_id,
                     event_id=event_id,
@@ -316,15 +823,23 @@ def _resolve_completed_callback_board(
         except (ValueError, OSError):
             continue
         matches.append(slug)
-    if len(matches) != 1:
+    if not matches:
         raise ValueError(
-            "Fresh callback approval must resolve to exactly one durable board."
+            "Fresh callback approval origin is not valid on any durable board."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Fresh callback approval origin resolved to multiple durable boards."
         )
     return matches[0]
 
 
 def _resolve_approval_challenge(token: str) -> tuple[str, dict[str, Any]]:
     """Resolve a one-time token to exactly one durable board and challenge."""
+    if _VALID_APPROVAL_TOKEN.fullmatch(str(token or "").strip()) is None:
+        raise ValueError(
+            "Approval token must be exactly 16 lowercase hexadecimal characters."
+        )
     matches: list[tuple[str, dict[str, Any]]] = []
     for metadata in kb.list_boards(include_archived=False):
         slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
@@ -423,9 +938,30 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     trusted_cron_session_id = session_id if session_source == "cron" else ""
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
-    internal_turn = (
+    session_internal = (
         get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower() == "true"
     )
+    internal_kind = get_session_env(
+        "HERMES_SESSION_INTERNAL_KIND", ""
+    ).strip().lower()
+    # Restart recovery travels through the gateway as an internal event so it
+    # can resume silently.  It still represents the authenticated user message
+    # that was interrupted; it is not a Grace review callback.
+    restart_resume_turn = session_internal and internal_kind == "restart_resume"
+    internal_turn = session_internal and not restart_resume_turn
+    trusted_readonly_listing_id = (
+        None
+        if internal_turn
+        else marketplace_readonly_user_request_listing_id(message_text)
+    )
+    if trusted_readonly_listing_id is not None:
+        args = {
+            "original_request": message_text.strip(),
+            **canonical_marketplace_readonly_delegate_args(
+                trusted_readonly_listing_id
+            ),
+        }
+        approval_refresh_token = ""
     callback_lease_owner = get_session_env(
         "HERMES_GRACE_CALLBACK_LEASE_OWNER", "",
     ).strip()
@@ -471,9 +1007,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         notifier_profile = "default"
     try:
         approval_candidate = _approval_token_candidate(message_text)
-        if internal_turn and (approval_token or approval_refresh_token):
+        if session_internal and (approval_token or approval_refresh_token):
             raise ValueError(
-                "An internal callback cannot consume an approval token."
+                "An internal gateway continuation cannot consume an approval token."
             )
         if (
             approval_candidate
@@ -538,8 +1074,26 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 None if approval_board == kb.DEFAULT_BOARD else approval_board
             )
         if platform and platform not in {"cron"}:
+            raw_goal = args.get("goal")
+            goal_objective = (
+                str(raw_goal.get("objective") or "")
+                if isinstance(raw_goal, dict)
+                else ""
+            )
             context = resolve_thread_context(
-                platform=platform, chat_id=chat_id, thread_id=thread_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                auto_create=True,
+                work_hint=" ".join(
+                    value
+                    for value in (
+                        goal_objective,
+                        str(args.get("grace_interpretation") or ""),
+                        str(args.get("trigger") or ""),
+                    )
+                    if value.strip()
+                ),
             )
         else:
             context = resolve_thread_context_alias(str(args.get("context_alias") or ""))
@@ -549,6 +1103,71 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         project = str(context["project"])
         topic_name = str(context["topic_name"])
         namespace = str(context.get("memory_namespace") or f"topic:{chat_id}:{thread_id}/{project}")
+        if not internal_turn and not scheduled_turn:
+            from proactive.topic_placement_guard import (
+                detect_topic_mismatch,
+                mismatch_warning,
+                register_pending_topic_override,
+                topic_override_confirmed,
+            )
+
+            raw_goal = args.get("goal")
+            goal_objective = (
+                str(raw_goal.get("objective") or "")
+                if isinstance(raw_goal, dict)
+                else str(args.get("objective") or "")
+            )
+            placement_text = " ".join(
+                value
+                for value in (
+                    str(args.get("original_request") or ""),
+                    str(args.get("grace_interpretation") or ""),
+                    goal_objective,
+                )
+                if value.strip()
+            )
+            mismatch = detect_topic_mismatch(
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                text=placement_text,
+            )
+            if mismatch is not None and not topic_override_confirmed(
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                message_id=message_id,
+            ):
+                override_registered = register_pending_topic_override(
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    original_text=message_text,
+                    mismatch=mismatch,
+                )
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "reason": "topic_mismatch",
+                        "task_created": False,
+                        "current_topic": {
+                            "name": mismatch.current_topic_name,
+                            "thread_id": mismatch.current_thread_id,
+                        },
+                        "suggested_topic": {
+                            "name": mismatch.suggested_topic_name,
+                            "thread_id": mismatch.suggested_thread_id,
+                        },
+                        "message": mismatch_warning(
+                            mismatch,
+                            override_available=override_registered,
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         scheduled_identity = (
             {
                 "platform": platform,
@@ -568,7 +1187,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         ):
             resolved_board = approval_board
             if approval_challenge is None:
-                resolved_board = _resolve_completed_callback_board(
+                resolved_board = _resolve_callback_approval_board(
                     review_task_id=origin_review_id,
                     event_id=origin_event_id,
                     platform=platform,
@@ -589,17 +1208,183 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         if scheduled_turn:
             session_key = session_key or f"cron:{project}"
             session_id = session_id or f"cron:{project}"
+        candidate_request = (
+            None
+            if internal_turn or scheduled_turn
+            else _saved_commerce_candidate_request(args)
+        )
+        if candidate_request is not None:
+            candidate_listing_id, product_category = candidate_request
+            with kb.connect_closing(board=board) as conn:
+                candidate_result = kb.filter_saved_commerce_candidates(
+                    conn,
+                    listing_id=candidate_listing_id,
+                    product_category=product_category,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+            return json.dumps(
+                {
+                    "status": "saved_candidates_ready",
+                    **candidate_result,
+                    "instruction": (
+                        "Present recommended and optional destinations inline "
+                        "by name and current status. Do not delegate, open a "
+                        "browser, request approval, or publish."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         goal, scope, verification, stop_rules, memory = _canonical_sections(args)
-        task_type = str(args.get("task_type") or "")
+        task_type = normalize_clawops_task_type(
+            str(args.get("task_type") or "")
+        )
+        if (
+            task_type == "secondhand_commerce_group_status"
+            and not isinstance(args.get("user_facing_delivery"), dict)
+        ):
+            raise ValueError(
+                "secondhand_commerce_group_status requires "
+                "user_facing_delivery"
+            )
         risk_level = str(args.get("risk_level") or "")
         external_targets = [
             str(item).strip()
             for item in list(args.get("external_targets") or [])
             if str(item).strip()
         ]
+        raw_facebook_crosspost = args.get("facebook_crosspost")
+        facebook_crosspost = (
+            json.loads(json.dumps(raw_facebook_crosspost))
+            if isinstance(raw_facebook_crosspost, dict)
+            else None
+        )
+        raw_facebook_page_post = args.get("facebook_page_post")
+        facebook_page_post = (
+            json.loads(json.dumps(raw_facebook_page_post))
+            if isinstance(raw_facebook_page_post, dict)
+            else None
+        )
+        raw_marketplace_price_update = args.get(
+            "facebook_marketplace_price_update"
+        )
+        marketplace_price_update = (
+            json.loads(json.dumps(raw_marketplace_price_update))
+            if isinstance(raw_marketplace_price_update, dict)
+            else None
+        )
+        if marketplace_price_update is not None:
+            listing_id = str(
+                marketplace_price_update.get("marketplace_listing_id") or ""
+            ).strip()
+            expected_target = f"Facebook Marketplace item {listing_id}"
+            if external_targets and (
+                len(external_targets) != 1
+                or exact_facebook_marketplace_listing_target_id(
+                    external_targets[0]
+                ) != listing_id
+            ):
+                raise ValueError(
+                    "facebook_marketplace_price_update conflicts with "
+                    "external_targets; provide only its exact Marketplace item."
+                )
+            task_type = "facebook_marketplace_price_update"
+            external_targets = [expected_target]
+        external_targets = canonicalize_name_bound_facebook_crosspost_targets(
+            external_targets,
+            facebook_crosspost,
+        )
+        if _requires_structured_facebook_crosspost(
+            task_type,
+            external_targets,
+        ) and facebook_crosspost is None:
+            raise ValueError(
+                "Facebook Marketplace group cross-post approval requires "
+                "facebook_crosspost.marketplace_listing_id and exactly one "
+                "of facebook_crosspost.group_ids or exact group_names before "
+                "an approval token can be issued."
+            )
+        if _requires_structured_facebook_marketplace_price_update(
+            task_type,
+            external_targets,
+            goal,
+            scope,
+        ) and marketplace_price_update is None:
+            raise ValueError(
+                "Facebook Marketplace price updates require "
+                "facebook_marketplace_price_update with action=update_price, "
+                "transport=browser, the exact marketplace_listing_id, "
+                "currency=TWD, and positive integer price_twd before an "
+                "approval token can be issued."
+            )
+        if (
+            task_type == "facebook_marketplace_group_publish"
+            and (
+                not isinstance(facebook_crosspost, dict)
+                or not facebook_crosspost
+            )
+        ):
+            raise ValueError(
+                "facebook_marketplace_group_publish requires a nonempty "
+                "facebook_crosspost contract."
+            )
+        if _requires_structured_facebook_page_post(
+            task_type,
+            external_targets,
+        ) and facebook_page_post is None:
+            raise ValueError(
+                "Direct Facebook Page publication requires "
+                "facebook_page_post.action=create_post, the exact canonical "
+                "facebook_page_post.page_url, transport=graph_api, and immutable "
+                "message_sha256/image_sha256 bindings before an approval token "
+                "can be issued."
+            )
+        if (
+            facebook_crosspost is not None
+            and task_type != "facebook_marketplace_group_publish"
+        ):
+            raise ValueError(
+                "facebook_crosspost is only valid for task_type="
+                "facebook_marketplace_group_publish."
+            )
+        if (
+            facebook_crosspost is not None
+            and facebook_crosspost.get("transport") != "browser"
+        ):
+            raise ValueError(
+                "facebook_crosspost transport must be browser because Meta "
+                "removed publish_to_groups and the Groups API from all Graph "
+                "API versions."
+            )
+        if facebook_page_post is not None:
+            page_transport = str(
+                facebook_page_post.get("transport") or "browser"
+            ).strip()
+            expected_page_task_type = (
+                "facebook_page_api_publish"
+                if page_transport == "graph_api"
+                else "browser_publish"
+            )
+            if task_type != expected_page_task_type:
+                raise ValueError(
+                    "facebook_page_post transport="
+                    f"{page_transport} requires task_type="
+                    f"{expected_page_task_type}."
+                )
+        if (
+            marketplace_price_update is not None
+            and task_type != "facebook_marketplace_price_update"
+        ):
+            raise ValueError(
+                "facebook_marketplace_price_update requires task_type="
+                "facebook_marketplace_price_update."
+            )
         supplied_request_instance = str(
             args.get("request_instance_id") or ""
         ).strip()
+        chat_parent_request_instance_id = ""
         if approval_token or approval_refresh_token:
             if approval_challenge is None:
                 with kb.connect_closing(board=board) as conn:
@@ -636,14 +1421,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     f"message:{session_platform}:{session_key}:{message_id}"
                 ).encode("utf-8")
             ).hexdigest()[:32]
-            if (
-                supplied_request_instance
-                and supplied_request_instance != request_instance_id
-            ):
-                raise ValueError(
-                    "Chat request_instance_id must match the authenticated "
-                    "message-derived instance."
-                )
+            chat_parent_request_instance_id = request_instance_id
         elif scheduled_turn and trusted_cron_session_id:
             scheduled_contract_discriminator = hashlib.sha256(
                 json.dumps(
@@ -667,7 +1445,15 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         "completion_mode": str(
                             args.get("completion_mode") or ""
                         ).strip(),
+                        "user_facing_delivery": args.get(
+                            "user_facing_delivery"
+                        ),
                         "external_targets": external_targets,
+                        "facebook_crosspost": facebook_crosspost,
+                        "facebook_page_post": facebook_page_post,
+                        "facebook_marketplace_price_update": (
+                            marketplace_price_update
+                        ),
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -731,8 +1517,20 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             },
             "completion_mode": str(args.get("completion_mode") or "").strip(),
         }
+        if isinstance(args.get("user_facing_delivery"), dict):
+            contract["user_facing_delivery"] = dict(
+                args["user_facing_delivery"]
+            )
         if external_targets:
             contract["external_targets"] = external_targets
+        if facebook_crosspost is not None:
+            contract["facebook_crosspost"] = facebook_crosspost
+        if facebook_page_post is not None:
+            contract["facebook_page_post"] = facebook_page_post
+        if marketplace_price_update is not None:
+            contract["facebook_marketplace_price_update"] = (
+                marketplace_price_update
+            )
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -753,10 +1551,74 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         contract["routing"]["resolved"] = resolved_route_binding(routing_preview)
         normalized_contract = validate_loop_contract(contract)
         exact_fingerprint = contract_fingerprint(normalized_contract)
+        readonly_marketplace_inspection = (
+            facebook_crosspost_inspection_listing_id(normalized_contract)
+            is not None
+        )
         approval_needed = (
-            bool(external_targets)
+            (bool(external_targets) and not readonly_marketplace_inspection)
             or route_requires_owner_approval(routing_preview)
         )
+        if (
+            approval_needed
+            and chat_parent_request_instance_id
+            and not approval_token
+            and not approval_refresh_token
+        ):
+            # A fresh authenticated message may explicitly contain multiple
+            # independently approved sub-contracts.  Derive each child from
+            # the gateway-owned message instance plus the exact parent-bound
+            # contract.  Preserve a matching legacy root binding only so
+            # pre-rollout challenges/delegations remain replayable.
+            with kb.connect_closing(board=board) as conn:
+                legacy_delegation = kb.get_grace_delegation(
+                    conn,
+                    contract_fingerprint=exact_fingerprint,
+                )
+                root_delegation = kb.get_grace_delegation_for_request_instance(
+                    conn,
+                    platform=platform,
+                    session_key=session_key,
+                    request_instance_id=chat_parent_request_instance_id,
+                )
+                legacy_challenge = (
+                    kb.get_grace_approval_challenge_for_contract_instance(
+                        conn,
+                        contract_fingerprint=exact_fingerprint,
+                        request_instance_id=chat_parent_request_instance_id,
+                        platform=platform,
+                        session_key=session_key,
+                    )
+                )
+            keep_legacy_root = bool(
+                legacy_delegation is not None
+                or (
+                    legacy_challenge is not None
+                    and root_delegation is None
+                )
+            )
+            if not keep_legacy_root:
+                request_instance_id = _approval_child_request_instance_id(
+                    chat_parent_request_instance_id,
+                    exact_fingerprint,
+                )
+                contract["identity"]["request_instance_id"] = (
+                    request_instance_id
+                )
+                normalized_contract = validate_loop_contract(contract)
+                exact_fingerprint = contract_fingerprint(normalized_contract)
+        if (
+            supplied_request_instance
+            and supplied_request_instance != request_instance_id
+        ):
+            if approval_token or approval_refresh_token:
+                raise ValueError(
+                    "Approval token is bound to another request instance."
+                )
+            raise ValueError(
+                "Chat request_instance_id must match the authenticated "
+                "message-derived instance."
+            )
         approval_scope = list(scope.get("allowed") or [])
         approval_platform = "、".join(external_targets)
         approval_scope_json = json.dumps(
@@ -941,6 +1803,44 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_id=session_id,
                         lease_owner=callback_lease_owner,
                     )
+                    (
+                        source_crosspost_listing_id,
+                        source_crosspost_group_ids,
+                        source_crosspost_group_names,
+                    ) = kb.grace_callback_facebook_crosspost_scopes(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                    )
+                    if (
+                        source_crosspost_listing_id is not None
+                        and (
+                            source_crosspost_group_ids
+                            or source_crosspost_group_names
+                        )
+                        and facebook_crosspost is None
+                    ):
+                        raise ValueError(
+                            "Origin callback locks an exact Facebook cross-post "
+                            "scope; facebook_crosspost cannot be omitted."
+                        )
+                    if facebook_crosspost is not None:
+                        kb.validate_grace_callback_facebook_crosspost_scope(
+                            conn,
+                            review_task_id=origin_review_id,
+                            event_id=origin_event_id,
+                            listing_id=str(
+                                facebook_crosspost.get(
+                                    "marketplace_listing_id"
+                                ) or ""
+                            ),
+                            group_ids=list(
+                                facebook_crosspost.get("group_ids") or []
+                            ),
+                            group_names=list(
+                                facebook_crosspost.get("group_names") or []
+                            ),
+                        )
                 else:
                     kb.validate_accepted_grace_callback_origin(
                         conn,
@@ -967,7 +1867,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             if approval_challenge is None:
                 with kb.connect_closing(board=board) as conn:
-                    kb.validate_completed_approval_blocker(
+                    kb.validate_delivered_grace_callback_approval_origin(
                         conn,
                         review_task_id=origin_review_id,
                         event_id=origin_event_id,
@@ -986,6 +1886,34 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         if approval_needed and not external_targets:
             raise ValueError(
                 "External-action delegation requires explicit external_targets."
+            )
+        with kb.connect_closing(board=board) as conn:
+            existing_delegation = kb.get_grace_delegation(
+                conn,
+                contract_fingerprint=exact_fingerprint,
+            )
+            browser_blocker = kb.find_recent_commerce_browser_blocker(
+                conn,
+                normalized_contract,
+            )
+        existing_replay = _queued_delegation_replay(
+            existing_delegation,
+            project=project,
+            topic_name=topic_name,
+            board=board,
+        )
+        if browser_blocker is not None and existing_replay is None:
+            return json.dumps(
+                {
+                    "status": "capability_blocked",
+                    "task_created": False,
+                    **browser_blocker,
+                    "reason": (
+                        "同一拍品最近已因受控 Facebook 瀏覽器不可讀而阻塞；"
+                        "冷卻期間不再建立重複任務。"
+                    ),
+                },
+                ensure_ascii=False,
             )
         if not scheduled_turn and approval_needed:
             approval_request_message_id = message_id
@@ -1233,6 +2161,94 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             "grace_review_task_id": result.review_task_id,
             "progress_subscription": result.subscribed,
             "routing": "KJ -> Grace understanding -> Loop Contract -> ClawOps -> Grace review -> KJ",
+        },
+        ensure_ascii=False,
+    )
+
+
+def handle_clawops_finalize_saved_evidence(
+    args: dict[str, Any] | None = None,
+    **_kwargs: Any,
+) -> str:
+    """Requeue one exact blocked commerce execution for evidence-only close."""
+    values = dict(args or {})
+    execution_task_id = str(values.get("execution_task_id") or "").strip()
+    board = str(values.get("board") or kb.DEFAULT_BOARD).strip()
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    session_key = get_session_env("HERMES_SESSION_KEY", "").strip()
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    owner_user_id = get_session_env(
+        "HERMES_SESSION_OWNER_USER_ID", "",
+    ).strip()
+    session_internal = (
+        get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower()
+        == "true"
+    )
+    try:
+        if set(values) - {"execution_task_id", "board"}:
+            raise ValueError(
+                "Saved-evidence finalization accepts only execution_task_id "
+                "and board."
+            )
+        if not re.fullmatch(r"t_[0-9a-f]{8}", execution_task_id):
+            raise ValueError(
+                "Saved-evidence finalization requires one exact execution task id."
+            )
+        if session_internal:
+            raise ValueError(
+                "Saved-evidence finalization must originate from a fresh "
+                "authenticated user turn, not a callback continuation."
+            )
+        if not platform or not chat_id:
+            raise ValueError(
+                "Saved-evidence finalization requires an authenticated chat lane."
+            )
+        if not owner_user_id:
+            raise ValueError(
+                "Saved-evidence finalization requires one explicitly "
+                "configured owner."
+            )
+        if user_id != owner_user_id:
+            raise ValueError(
+                "Saved-evidence finalization requires the authenticated "
+                "configured owner."
+            )
+        with kb.connect_closing(board=board) as conn:
+            result = kb.resume_blocked_commerce_finalization_from_saved_evidence(
+                conn,
+                execution_task_id=execution_task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                session_key=session_key,
+                session_id=session_id,
+                message_id=message_id,
+            )
+    except (ValueError, TypeError, RuntimeError) as exc:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason": str(exc).strip() or type(exc).__name__,
+                "task_created": False,
+                "browser_opened": False,
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "status": "finalization_queued",
+            **result,
+            "board": board,
+            "task_created": False,
+            "browser_opened": False,
+            "instruction": (
+                "The original execution task will finalize from durable "
+                "evidence only; do not create another delegation."
+            ),
         },
         ensure_ascii=False,
     )

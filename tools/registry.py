@@ -54,15 +54,60 @@ def _module_registers_tools(module_path: Path) -> bool:
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
 
-def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
-    """Import built-in self-registering tool modules and return their module names."""
+def _module_literal_tool_names(module_path: Path) -> Set[str]:
+    """Return literal names registered by one built-in tool module.
+
+    This intentionally recognizes only top-level ``registry.register`` calls
+    whose ``name=`` value is a string literal.  Targeted capability probes can
+    therefore import the exact built-in modules they need without executing
+    every unrelated tool module.  Dynamic registrations remain available via
+    the ordinary unfiltered discovery path.
+    """
+    try:
+        source = module_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(module_path))
+    except (OSError, SyntaxError):
+        return set()
+
+    names: Set[str] = set()
+    for stmt in tree.body:
+        if not _is_registry_register_call(stmt):
+            continue
+        call = stmt.value
+        for keyword in call.keywords:
+            if (
+                keyword.arg == "name"
+                and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str)
+            ):
+                names.add(keyword.value.value)
+                break
+    return names
+
+
+def discover_builtin_tools(
+    tools_dir: Optional[Path] = None,
+    *,
+    tool_names: Optional[Set[str]] = None,
+) -> List[str]:
+    """Import built-in self-registering tool modules.
+
+    When ``tool_names`` is provided, import only modules with a literal
+    top-level registration for at least one requested name.  The default path
+    remains the existing complete discovery used by normal agent startup.
+    """
     tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
-    module_names = [
-        f"tools.{path.stem}"
-        for path in sorted(tools_path.glob("*.py"))
-        if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
-        and _module_registers_tools(path)
-    ]
+    requested = set(tool_names) if tool_names is not None else None
+    module_names = []
+    for path in sorted(tools_path.glob("*.py")):
+        if path.name in {"__init__.py", "registry.py", "mcp_tool.py"}:
+            continue
+        if requested is None:
+            if _module_registers_tools(path):
+                module_names.append(f"tools.{path.stem}")
+            continue
+        if requested.intersection(_module_literal_tool_names(path)):
+            module_names.append(f"tools.{path.stem}")
 
     imported: List[str] = []
     for mod_name in module_names:

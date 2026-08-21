@@ -8,8 +8,10 @@ from plugins.openclaw_bridge.tools import (
 )
 from plugins.openclaw_bridge.clawops_delegate import (
     CLAWOPS_DELEGATE_SCHEMA,
+    CLAWOPS_FINALIZE_SAVED_EVIDENCE_SCHEMA,
     GRACE_CALLBACK_OUTCOME_SCHEMA,
     handle_clawops_delegate,
+    handle_clawops_finalize_saved_evidence,
     handle_grace_callback_outcome,
 )
 from proactive.grace_execution_policy import enforce_grace_execution_boundary
@@ -30,6 +32,19 @@ def register(ctx) -> None:
         emoji="GC",
     )
     ctx.register_tool(
+        name="clawops_finalize_saved_evidence",
+        toolset="openclaw",
+        schema=CLAWOPS_FINALIZE_SAVED_EVIDENCE_SCHEMA,
+        handler=handle_clawops_finalize_saved_evidence,
+        description=(
+            "Resume one exact schema-blocked commerce execution from its "
+            "durable evidence only. This preserves the original execution, "
+            "review, board, and callback lineage and never opens Facebook or "
+            "creates a new task."
+        ),
+        emoji="GF",
+    )
+    ctx.register_tool(
         name="grace_callback_outcome",
         toolset="openclaw",
         schema=GRACE_CALLBACK_OUTCOME_SCHEMA,
@@ -37,7 +52,8 @@ def register(ctx) -> None:
         description=(
             "Inside a Grace Loop callback, record whether the originating "
             "outcome closed, continued through a queued delegation, or is "
-            "blocked on one exact approval question."
+            "blocked on one exact approval question, user decision, or "
+            "verified runtime capability fault."
         ),
         emoji="GO",
     )

@@ -12,6 +12,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import html as _html
 import re
@@ -816,7 +817,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @classmethod
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
-        if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
+        if not thread_id or str(thread_id) in {
+            cls._GENERAL_TOPIC_THREAD_ID,
+            "general",
+        }:
             return None
         return int(thread_id)
 
@@ -829,7 +833,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # bubble in the General topic (omitting it hides the bubble entirely
         # from the client's view of that topic). Preserve the real id here —
         # sends still map "1" → None via _message_thread_id_for_send.
-        if not thread_id:
+        if not thread_id or str(thread_id) == "general":
             return None
         return int(thread_id)
 
@@ -1051,6 +1055,40 @@ class TelegramAdapter(BasePlatformAdapter):
             if "pooltimeout" in name or "pool timeout" in text or (
                 "connection pool" in text and "occupied" in text
             ):
+                return True
+            cause = getattr(cur, "__cause__", None)
+            context = getattr(cur, "__context__", None)
+            if cause is not None:
+                stack.append(cause)
+            if context is not None:
+                stack.append(context)
+        return False
+
+    @staticmethod
+    def _looks_like_pre_dispatch_network_error(error: Exception) -> bool:
+        """Return True when evidence shows no request could reach Telegram."""
+        markers = (
+            "name or service not known",
+            "temporary failure in name resolution",
+            "nodename nor servname provided",
+            "dns",
+            "connection refused",
+            "network is unreachable",
+            "no route to host",
+            "connecterror",
+            "connect error",
+        )
+        seen: set[int] = set()
+        stack: list[BaseException] = [error]
+        while stack:
+            cur = stack.pop()
+            ident = id(cur)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            name = cur.__class__.__name__.lower()
+            text = str(cur).lower()
+            if any(marker in name or marker in text for marker in markers):
                 return True
             cause = getattr(cur, "__cause__", None)
             context = getattr(cur, "__context__", None)
@@ -2455,13 +2493,12 @@ class TelegramAdapter(BasePlatformAdapter):
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
 
-        ``is_reconnect`` distinguishes a cold first boot (False — drop any
-        stale Bot API queue) from a watcher reconnect after a prolonged
-        outage (True — preserve the updates Telegram queued while the bot
-        was offline, otherwise every message sent during the outage is
-        silently lost). The in-process network-error ladder and the
-        409-conflict handler already pass ``drop_pending_updates=False``
-        for the same reason; bootstrap follows suit on the reconnect path.
+        ``is_reconnect`` is retained for the shared adapter contract, but
+        Telegram preserves the Bot API update queue on both cold starts and
+        watcher reconnects. Process restarts are normal lifecycle events, so
+        dropping the whole queue would silently lose user messages sent while
+        the gateway was offline. ``/restart`` redelivery is handled separately
+        by the durable update-id marker.
 
         Env vars for webhook mode::
 
@@ -2701,9 +2738,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     allowed_updates=Update.ALL_TYPES,
                     # Webhooks are push-based — Telegram does not hold a
                     # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    # in practice. Keep it aligned with polling bootstrap.
+                    drop_pending_updates=False,
                 )
                 self._webhook_mode = True
                 logger.info(
@@ -2744,10 +2780,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve updates across both cold process starts and
+                    # watcher reconnects. launchd/container restarts are normal
+                    # lifecycle events, not authorization to discard user input.
+                    drop_pending_updates=False,
                     error_callback=_polling_error_callback,
                 )
             
@@ -2951,6 +2987,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Interaction labels are supplied by trusted gateway/Kanban metadata.
+        # Keep this at the Telegram boundary so normal sends, rich sends and
+        # chunked sends all render the same actor/path header.
+        from gateway.telegram_interaction_labels import (
+            decorate_telegram_message,
+        )
+
+        content = decorate_telegram_message(content, metadata)
+
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
@@ -2960,12 +3005,40 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            plain_text = bool((metadata or {}).get("plain_text"))
+            send_timeout = 0.0
+            try:
+                send_timeout = float((metadata or {}).get("send_timeout") or 0)
+            except (TypeError, ValueError, OverflowError):
+                send_timeout = 0.0
+            if not math.isfinite(send_timeout) or send_timeout <= 0:
+                send_timeout = 0.0
+            request_timeout_kwargs = {}
+            if send_timeout:
+                # Pool/connect/write timeouts are kept below the absolute
+                # delivery deadline so pre-dispatch failures return a typed
+                # result before the total watchdog fires. Most of the budget
+                # remains available for Telegram's acknowledgement.
+                pre_read_timeout = max(
+                    0.05,
+                    min(0.5, send_timeout / 8.0),
+                )
+                read_timeout = max(
+                    0.05,
+                    send_timeout - (3 * pre_read_timeout) - 0.05,
+                )
+                request_timeout_kwargs = {
+                    "connect_timeout": pre_read_timeout,
+                    "pool_timeout": pre_read_timeout,
+                    "write_timeout": pre_read_timeout,
+                    "read_timeout": read_timeout,
+                }
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if not plain_text and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -2983,11 +3056,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     return rich_result
 
             # Format and split message if needed
-            formatted = self.format_message(content)
+            formatted = content if plain_text else self.format_message(content)
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
-            if len(chunks) > 1:
+            if len(chunks) > 1 and not plain_text:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
                 # chunk and fall back to plain text.
@@ -3062,35 +3135,53 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
-                for _send_attempt in range(3):
+                send_attempts = 1 if send_timeout else 3
+                for _send_attempt in range(send_attempts):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
-                        try:
+                        # Fast-translation payloads are arbitrary copyable text;
+                        # bypass Markdown parsing so provider-preserved symbols
+                        # cannot alter rendering or reject delivery.
+                        if plain_text:
                             msg = await self._bot.send_message(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
+                                parse_mode=None,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **request_timeout_kwargs,
                             )
-                        except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                        else:
+                            # Try Markdown first, fall back to plain text if it fails
+                            try:
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
-                                    text=plain_chunk,
-                                    parse_mode=None,
+                                    text=chunk,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **request_timeout_kwargs,
                                 )
-                            else:
-                                raise
+                            except Exception as md_error:
+                                # Markdown parsing failed, try plain text
+                                if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                                    logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                                    plain_chunk = _strip_mdv2(chunk)
+                                    msg = await self._bot.send_message(
+                                        chat_id=normalize_telegram_chat_id(chat_id),
+                                        text=plain_chunk,
+                                        parse_mode=None,
+                                        reply_to_message_id=reply_to_id,
+                                        **thread_kwargs,
+                                        **self._link_preview_kwargs(),
+                                        **self._notification_kwargs(metadata),
+                                        **request_timeout_kwargs,
+                                    )
+                                else:
+                                    raise
                         break  # success
                     except _NetErr as send_err:
                         # BadRequest is a subclass of NetworkError in
@@ -3175,16 +3266,26 @@ class TelegramAdapter(BasePlatformAdapter):
                         # Telegram" -- retrying through the loop is safe and
                         # prevents silent drops when the pool frees up.
                         is_pool_timeout = self._looks_like_pool_timeout(send_err)
-                        if (
-                            _TimedOut
-                            and isinstance(send_err, _TimedOut)
-                            and not self._looks_like_connect_timeout(send_err)
-                            and not is_pool_timeout
-                        ):
+                        is_connect_timeout = self._looks_like_connect_timeout(
+                            send_err,
+                        )
+                        is_pre_dispatch_error = (
+                            is_connect_timeout
+                            or is_pool_timeout
+                            or self._looks_like_pre_dispatch_network_error(
+                                send_err,
+                            )
+                        )
+                        is_timeout = bool(
+                            (_TimedOut and isinstance(send_err, _TimedOut))
+                            or "timed out" in str(send_err).lower()
+                            or "timeout" in str(send_err).lower()
+                        )
+                        if not is_pre_dispatch_error:
                             raise
                         if is_pool_timeout:
                             await self._drain_general_connections_after_pool_timeout()
-                        if _send_attempt < 2:
+                        if _send_attempt < send_attempts - 1:
                             wait = 2 ** _send_attempt
                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
                                            self.name, _send_attempt + 1, wait, send_err)
@@ -3194,7 +3295,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
-                            if _send_attempt < 2:
+                            if _send_attempt < send_attempts - 1:
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
@@ -3264,14 +3365,98 @@ class TelegramAdapter(BasePlatformAdapter):
             # and an httpx pool timeout (request explicitly not sent) -- both
             # are safe to re-send and must not be silently dropped.
             _to = locals().get("_TimedOut")
-            is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
+            is_timeout = bool(
+                (_to and isinstance(e, _to))
+                or "timed out" in err_str
+                or "timeout" in err_str
+            )
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
+            is_pre_dispatch_error = (
+                is_connect_timeout
+                or is_pool_timeout
+                or self._looks_like_pre_dispatch_network_error(e)
+            )
+            _net = locals().get("_NetErr")
+            _bad = locals().get("_BadReq")
+            is_network_failure = bool(
+                _net
+                and isinstance(e, _net)
+                and not (_bad and isinstance(e, _bad))
+            )
+            partial_delivery = bool(locals().get("message_ids"))
+            delivery_ambiguous = bool(
+                partial_delivery
+                or (
+                    (is_timeout or is_network_failure)
+                    and not is_pre_dispatch_error
+                )
+            )
             return SendResult(
                 success=False,
                 error=str(e),
-                retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
+                retryable=bool(
+                    not delivery_ambiguous
+                    and (is_pre_dispatch_error or not is_timeout)
+                ),
                 error_kind=error_kind,
+                delivery_ambiguous=delivery_ambiguous,
+            )
+
+    async def send_with_delivery_deadline(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        timeout: float,
+    ) -> SendResult:
+        """Send one plain-text request within an absolute total deadline.
+
+        Pool/connect/write phase limits are shorter than the total watchdog, so
+        typed pre-dispatch failures normally win that race. If the absolute
+        watchdog itself expires, PTB exposes no transport-phase evidence; use
+        conservative at-most-once semantics and classify delivery as ambiguous.
+        """
+        try:
+            total_budget = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            total_budget = 0.0
+        if not math.isfinite(total_budget) or total_budget < 0.2:
+            return SendResult(
+                success=False,
+                error="telegram delivery budget exhausted before dispatch",
+                retryable=True,
+                error_kind="transient",
+                delivery_ambiguous=False,
+            )
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error="message_too_long",
+                retryable=False,
+                error_kind="too_long",
+                delivery_ambiguous=False,
+            )
+        bounded_metadata = dict(metadata or {})
+        bounded_metadata["plain_text"] = True
+        bounded_metadata["send_timeout"] = total_budget
+        try:
+            return await asyncio.wait_for(
+                self.send(
+                    chat_id,
+                    content,
+                    metadata=bounded_metadata,
+                ),
+                timeout=total_budget,
+            )
+        except asyncio.TimeoutError:
+            return SendResult(
+                success=False,
+                error="telegram absolute delivery deadline exceeded",
+                retryable=False,
+                error_kind="transient",
+                delivery_ambiguous=True,
             )
 
     async def send_or_update_status(
@@ -3329,6 +3514,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        from gateway.telegram_interaction_labels import (
+            decorate_telegram_message,
+        )
+
+        content = decorate_telegram_message(content, metadata)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -3764,6 +3955,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+
+        from gateway.telegram_interaction_labels import (
+            decorate_telegram_message,
+        )
+
+        content = decorate_telegram_message(content, metadata)
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final
@@ -7559,12 +7756,25 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
         chat_topic = None
         topic_skill = None
+        topic_display = None
+        topic_fast_translation = None
+        topic_response_profile_name = None
+        topic_response_profile_bound = False
 
         if chat_type == "dm" and thread_id_str:
             topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
             if topic_info:
                 chat_topic = topic_info.get("name")
                 topic_skill = topic_info.get("skill")
+                raw_display = topic_info.get("display")
+                if isinstance(raw_display, dict):
+                    topic_display = raw_display
+                raw_fast_translation = topic_info.get("fast_translation")
+                if isinstance(raw_fast_translation, dict):
+                    topic_fast_translation = raw_fast_translation
+                if "response_profile" in topic_info:
+                    topic_response_profile_bound = True
+                    topic_response_profile_name = topic_info.get("response_profile")
 
             # Also check forum_topic_created service message for topic discovery
             if hasattr(message, "forum_topic_created") and message.forum_topic_created:
@@ -7584,8 +7794,25 @@ class TelegramAdapter(BasePlatformAdapter):
                         if tid is not None and str(tid) == thread_id_str:
                             chat_topic = topic.get("name")
                             topic_skill = topic.get("skill")
+                            raw_display = topic.get("display")
+                            if isinstance(raw_display, dict):
+                                topic_display = raw_display
+                            raw_fast_translation = topic.get("fast_translation")
+                            if isinstance(raw_fast_translation, dict):
+                                topic_fast_translation = raw_fast_translation
+                            if "response_profile" in topic:
+                                topic_response_profile_bound = True
+                                topic_response_profile_name = topic.get("response_profile")
                             break
                     break
+
+        from gateway.response_profiles import resolve_response_profile
+
+        topic_response_profile = resolve_response_profile(
+            self.config.extra.get("response_profiles"),
+            topic_response_profile_name,
+            explicitly_bound=topic_response_profile_bound,
+        )
 
         # Build source
         source = self.build_source(
@@ -7610,6 +7837,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
+            display_overrides=topic_display,
         )
         
         # Extract reply context if this message is a reply.
@@ -7668,6 +7896,8 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            fast_translation=topic_fast_translation,
+            response_profile=topic_response_profile,
             timestamp=message.date,
         )
 

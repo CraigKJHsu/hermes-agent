@@ -159,6 +159,20 @@ def test_rejected_grace_review_reopens_execution_for_correction(tmp_path):
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
         execution_id, review_id = _grace_loop_pair(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET max_runtime_seconds = 120 WHERE id = ?",
+                (execution_id,),
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "runtime_finalization_requested",
+                {
+                    "original_limit_seconds": 1200,
+                    "finalization_budget_seconds": 120,
+                },
+            )
         assert kb.complete_task(
             conn,
             execution_id,
@@ -199,6 +213,7 @@ def test_rejected_grace_review_reopens_execution_for_correction(tmp_path):
         assert execution.status == "ready"
         assert execution.completed_at is None
         assert execution.result == "stale result"
+        assert execution.max_runtime_seconds == 1200
         assert review.status == "todo"
         assert review.block_kind == "dependency"
         assert correction_comment["author"] == "Grace review"
@@ -209,6 +224,15 @@ def test_rejected_grace_review_reopens_execution_for_correction(tmp_path):
         assert correction_event is not None
         assert review_id in correction_event["payload"]
         assert "reconciliation_first" in correction_event["payload"]
+        assert (
+            conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "AND kind = 'runtime_finalization_cleared' "
+                "ORDER BY id DESC LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+            is not None
+        )
         assert kb.check_respawn_guard(conn, execution_id) is None
 
         # A dispatcher promotion pass must not immediately re-run the review:
@@ -223,6 +247,70 @@ def test_rejected_grace_review_reopens_execution_for_correction(tmp_path):
         )
         assert kb.get_task(conn, review_id).status == "ready"
         assert kb.check_respawn_guard(conn, execution_id) == "recent_success"
+
+
+def test_rejected_saved_evidence_review_never_reopens_browser_mode(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _grace_loop_pair(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET max_runtime_seconds = 600 WHERE id = ?",
+                (execution_id,),
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "runtime_finalization_requested",
+                {
+                    "source": "saved_commerce_evidence_schema_resume",
+                    "finalization_budget_seconds": 600,
+                    "browser_allowed": False,
+                },
+            )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="validated saved-evidence report",
+        )
+        review = kb.claim_task(conn, review_id)
+        assert review is not None
+
+        assert kb.block_task(
+            conn,
+            review_id,
+            reason="review needs the complete structured parent report",
+            kind="dependency",
+            expected_run_id=review.current_run_id,
+        )
+
+        execution = kb.get_task(conn, execution_id)
+        correction_comment = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (execution_id,),
+        ).fetchone()
+        correction_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'grace_correction_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (execution_id,),
+        ).fetchone()
+
+        assert execution.status == "ready"
+        assert execution.max_runtime_seconds == 600
+        assert "CORRECTION_MODE: saved_evidence_only" in (
+            correction_comment["body"]
+        )
+        assert "Do not navigate, click, search" in correction_comment["body"]
+        assert "saved_evidence_only" in correction_event["payload"]
+        assert kb._runtime_finalization_state(conn, execution_id) is not None
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'runtime_finalization_cleared'",
+            (execution_id,),
+        ).fetchone() is None
 
 
 def test_grace_review_context_includes_cumulative_parent_evidence(tmp_path):

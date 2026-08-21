@@ -150,8 +150,19 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATEWAY_EXPLICIT_CREDENTIAL_ERROR_RE = re.compile(
+    r"(incorrect\s+api\s+key|invalid\s+api\s+key|\b401\b)",
+    re.IGNORECASE,
+)
+
 _GATEWAY_RATE_LIMIT_RE = re.compile(
-    r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)",
+    r"(rate\s+limit|rate-limited|\b429\b)",
+    re.IGNORECASE,
+)
+
+_GATEWAY_QUOTA_LIMIT_RE = re.compile(
+    r"(quota|usage\s+limit|insufficient[_\s-]*quota|billing\s+(?:hard\s+)?limit|"
+    r"credits?\s+(?:are\s+)?(?:exhausted|depleted))",
     re.IGNORECASE,
 )
 
@@ -363,18 +374,31 @@ def _redact_approval_command(cmd: "str | None") -> str:
 
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
+    if _GATEWAY_EXPLICIT_CREDENTIAL_ERROR_RE.search(text):
+        return (
+            "⚠️ Provider authentication failed. Check the configured credentials; "
+            "raw provider details are in the gateway logs."
+        )
+    # Quota errors can arrive wrapped in a generic "provider authentication
+    # failed" envelope.  Classify the specific 429 signal first so valid
+    # credentials are never mislabeled as expired or revoked.
+    if _GATEWAY_QUOTA_LIMIT_RE.search(text):
+        return "⏱️ The model provider quota is exhausted. Credentials are still valid; wait for the usage limit to reset or configure a fallback provider."
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
             "⚠️ Provider authentication failed. Check the configured credentials; "
             "raw provider details are in the gateway logs."
+        )
+    if _GATEWAY_RATE_LIMIT_RE.search(text):
+        return (
+            "⏱️ The model provider is temporarily rate-limited. Credentials "
+            "are still valid; retry shortly or configure a fallback provider."
         )
     if _GATEWAY_PROVIDER_POLICY_RE.search(text):
         return (
             "⚠️ The model provider rejected the request. I kept the raw provider "
             "error out of chat; check gateway logs for details or try rephrasing."
         )
-    if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
@@ -1759,6 +1783,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _reply_anchor_for_event,
     merge_pending_message_event,
 )
@@ -1814,13 +1839,29 @@ def _resolve_runtime_agent_kwargs() -> dict:
         # re-auth cannot help) from a genuine auth failure (expired/revoked
         # token). Both fall through to the fallback chain, but the log message
         # must not mislabel a quota exhaustion as an auth failure (#32790).
-        if is_rate_limited_auth_error(auth_exc):
-            logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
-        else:
-            logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
+            if is_rate_limited_auth_error(auth_exc):
+                logger.warning(
+                    "Primary provider rate-limited (429): %s — using configured fallback",
+                    auth_exc,
+                )
+            else:
+                logger.warning(
+                    "Primary provider auth failed: %s — using configured fallback",
+                    auth_exc,
+                )
             return fb_config
+        if is_rate_limited_auth_error(auth_exc):
+            logger.warning(
+                "Primary provider rate-limited (429): %s — no fallback configured",
+                auth_exc,
+            )
+        else:
+            logger.warning(
+                "Primary provider auth failed: %s — no fallback configured",
+                auth_exc,
+            )
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
@@ -6023,6 +6064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                internal_context={"internal_kind": "restart_resume"},
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -8156,6 +8198,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Every authenticated Telegram Topic owns one lightweight main
+        # project.  Materialize only the stable lane + memory namespace here;
+        # ordinary Q&A and native Topic commands do not create Kanban cards,
+        # workspaces, or subprojects.  Registry failures must not block chat.
+        if (
+            getattr(getattr(source, "platform", None), "value", "") == "telegram"
+            and str(getattr(source, "thread_id", "") or "").strip()
+            not in {"", "general"}
+        ):
+            try:
+                from proactive.thread_context_registry import (
+                    ensure_thread_context,
+                    is_generated_topic_placeholder,
+                    seed_thread_context_topic_name,
+                )
+
+                _topic_context = ensure_thread_context(
+                    platform="telegram",
+                    chat_id=str(source.chat_id or ""),
+                    thread_id=str(source.thread_id or ""),
+                )
+                if str(source.chat_topic or "").strip():
+                    _topic_context = seed_thread_context_topic_name(
+                        platform="telegram",
+                        chat_id=str(source.chat_id or ""),
+                        thread_id=str(source.thread_id or ""),
+                        topic_name=str(source.chat_topic),
+                    )
+                _registered_topic_name = str(
+                    _topic_context.get("topic_name") or ""
+                ).strip()
+                if (
+                    _registered_topic_name
+                    and not is_generated_topic_placeholder(
+                        _registered_topic_name,
+                        source.thread_id,
+                    )
+                    and _registered_topic_name != str(source.chat_topic or "").strip()
+                ):
+                    source = dataclasses.replace(
+                        source,
+                        chat_topic=_registered_topic_name,
+                    )
+                    event = dataclasses.replace(event, source=source)
+            except Exception as _topic_context_exc:
+                logger.warning(
+                    "Telegram Topic lightweight project materialization failed "
+                    "without blocking the message: chat=%s thread=%s error=%s",
+                    source.chat_id,
+                    source.thread_id,
+                    _topic_context_exc,
+                )
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -9332,6 +9427,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        # Catch a high-confidence Topic mismatch before the message reaches
+        # the agent, session history, delegation queue, or durable memory.
+        # This compares registry metadata only; it never reads sibling Topic
+        # transcripts. Slash commands and trusted internal events keep their
+        # existing control-plane routing.
+        if not is_internal and not command and str(event.text or "").strip():
+            try:
+                from proactive.topic_placement_guard import (
+                    evaluate_inbound_topic_placement,
+                )
+
+                _placement = evaluate_inbound_topic_placement(
+                    platform=getattr(source.platform, "value", ""),
+                    chat_id=str(source.chat_id or ""),
+                    thread_id=str(source.thread_id or ""),
+                    user_id=str(source.user_id or ""),
+                    message_id=str(event.message_id or ""),
+                    text=str(event.text or ""),
+                    original_payload=event,
+                )
+                if _placement.action in {"warn", "cancel"}:
+                    logger.info(
+                        "Topic placement guard %s: chat=%s thread=%s suggested=%s",
+                        _placement.action,
+                        source.chat_id,
+                        source.thread_id,
+                        getattr(_placement.mismatch, "suggested_thread_id", ""),
+                    )
+                    return _placement.message
+                if _placement.replacement_payload is not None:
+                    event = dataclasses.replace(
+                        _placement.replacement_payload,
+                        message_id=event.message_id,
+                        source=source,
+                    )
+                elif _placement.replacement_text:
+                    event = dataclasses.replace(
+                        event,
+                        text=_placement.replacement_text,
+                    )
+            except Exception as _placement_exc:
+                logger.warning(
+                    "Topic placement guard failed open: chat=%s thread=%s error=%s",
+                    source.chat_id,
+                    source.thread_id,
+                    _placement_exc,
+                )
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -9768,6 +9911,404 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _start_response_fast_lane(
+        self,
+        event: MessageEvent,
+        *,
+        recent_user_messages: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Start a configured stateless response lane outside the agent session."""
+        event_text = getattr(event, "text", None)
+        if bool(event.is_command()):
+            return None
+
+        # Approval tokens are protocol messages, not translation content. They
+        # must bypass response-profile validation so a broken Topic binding
+        # cannot block the authorization protocol itself.
+        try:
+            from proactive.prompt_policy import approval_token_candidate
+
+            if approval_token_candidate(str(event_text or "").strip()):
+                return None
+        except Exception:
+            logger.debug(
+                "Fast translation approval-token check failed; skipping lane",
+                exc_info=True,
+            )
+            return None
+
+        from gateway.response_profiles import (
+            ResponseProfileConfigurationError,
+            eligible_fast_lane_text,
+            legacy_fast_translation_profile,
+            normalized_fast_lane_source,
+            normalize_response_profile,
+            prepare_fast_lane,
+            response_profile_intent,
+        )
+
+        raw_profile = getattr(event, "response_profile", None)
+        if (
+            isinstance(raw_profile, dict)
+            and raw_profile.get("strategy") == "configuration_error"
+        ):
+            profile_name = str(raw_profile.get("name") or "unknown")
+            error = str(raw_profile.get("error") or "invalid configuration")
+            raise ResponseProfileConfigurationError(
+                f"{profile_name}: {error}",
+            )
+        profile = normalize_response_profile(
+            raw_profile,
+        )
+        if raw_profile is not None and profile is None:
+            raise ResponseProfileConfigurationError(
+                "explicit response_profile is invalid",
+            )
+        if raw_profile is None:
+            profile = legacy_fast_translation_profile(
+                getattr(event, "fast_translation", None),
+            )
+        if profile is None or profile["strategy"] != "fast_then_default":
+            return None
+
+        if response_profile_intent(
+            profile,
+            event_text,
+            recent_user_messages=recent_user_messages,
+        ) == "conversation":
+            logger.info(
+                "Response profile routed question to Grace conversation: "
+                "profile=%s platform=%s chat=%s thread=%s chars=%d",
+                profile.get("name", "legacy"),
+                getattr(getattr(event.source, "platform", None), "value", ""),
+                getattr(event.source, "chat_id", ""),
+                getattr(event.source, "thread_id", ""),
+                len(str(event_text or "").strip()),
+            )
+            return None
+
+        text = eligible_fast_lane_text(
+            profile,
+            event_text,
+            is_command=bool(event.is_command()),
+            has_media=bool(getattr(event, "media_urls", None)),
+        )
+        started_at = time.monotonic()
+        fallback_text = str(event_text or "").strip()
+        if not fallback_text:
+            return None
+        runner, config, failed_lane_prompt = prepare_fast_lane(
+            profile,
+            text or fallback_text,
+        )
+        source_text = normalized_fast_lane_source(
+            profile,
+            text or fallback_text,
+        )
+        if text is None:
+            logger.info(
+                "Response fast lane ineligible; routing configured fallback: "
+                "profile=%s platform=%s chat=%s thread=%s chars=%d",
+                profile.get("name", "legacy"),
+                getattr(getattr(event.source, "platform", None), "value", ""),
+                getattr(event.source, "chat_id", ""),
+                getattr(event.source, "thread_id", ""),
+                len(fallback_text),
+            )
+            return {
+                "task": None,
+                "started_at": started_at,
+                "delivery_timeout": config["delivery_timeout"],
+                "failed_lane_prompt": failed_lane_prompt,
+                "profile": profile,
+                "source_text": source_text,
+            }
+        task = asyncio.create_task(
+            runner(text, config),
+        )
+        logger.info(
+            "Response fast lane started: profile=%s handler=%s "
+            "platform=%s chat=%s thread=%s chars=%d",
+            profile.get("name", "legacy"),
+            config["handler"],
+            getattr(getattr(event.source, "platform", None), "value", ""),
+            getattr(event.source, "chat_id", ""),
+            getattr(event.source, "thread_id", ""),
+            len(text),
+        )
+        return {
+            "task": task,
+            "started_at": started_at,
+            "delivery_timeout": config["delivery_timeout"],
+            "failed_lane_prompt": failed_lane_prompt,
+            "profile": profile,
+            "source_text": source_text,
+        }
+
+    def _start_fast_translation(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Backward-compatible alias for tests and third-party extensions."""
+        return self._start_response_fast_lane(event)
+
+    def _load_response_detail_skill_prompt(
+        self,
+        profile: Dict[str, Any],
+        delivery_status: Optional[str],
+        *,
+        task_id: str,
+    ) -> Optional[str]:
+        """Load the outcome-selected detail skill as an ephemeral system prompt."""
+        from gateway.response_profiles import (
+            ResponseProfileConfigurationError,
+            detail_lane_skill,
+        )
+
+        skill_name = detail_lane_skill(profile, delivery_status)
+        if not skill_name:
+            return None
+        try:
+            from agent.skill_commands import (
+                _build_skill_message,
+                _load_skill_payload,
+            )
+
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                raise ResponseProfileConfigurationError(
+                    f"required detail-lane skill not found: {skill_name}",
+                )
+            loaded_skill, skill_dir, display_name = loaded
+            note = (
+                f'[IMPORTANT: The "{display_name}" skill is selected '
+                "ephemerally by the trusted Topic response profile for this "
+                "turn. Follow it without changing the durable session skill.]"
+            )
+            prompt = _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                note,
+            )
+            logger.info(
+                "Response detail lane selected ephemeral skill: "
+                "profile=%s status=%s skill=%s",
+                profile.get("name", "legacy"),
+                delivery_status or "failed",
+                skill_name,
+            )
+            if not prompt:
+                raise ResponseProfileConfigurationError(
+                    f"required detail-lane skill is empty: {skill_name}",
+                )
+            return prompt
+        except ResponseProfileConfigurationError:
+            raise
+        except Exception as exc:
+            raise ResponseProfileConfigurationError(
+                f"failed to load required detail-lane skill {skill_name}: {exc}",
+            ) from exc
+
+    async def _deliver_response_fast_lane(
+        self,
+        job: Optional[Dict[str, Any]],
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Return delivery evidence, or ``None`` when no usable output exists.
+
+        ``delivery_failed`` means the fast translation was generated but its
+        standalone platform send definitely failed.  That distinction lets the
+        detail lane remain complete instead of falling back to a short second
+        translation that discards pronunciation and teaching fields.
+        """
+        if not job:
+            return None
+
+        task = job["task"]
+        if task is None:
+            return None
+        elapsed = time.monotonic() - float(job["started_at"])
+        remaining = max(0.05, float(job["delivery_timeout"]) - elapsed)
+        try:
+            raw_output = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            task.cancel()
+            # Do not await provider teardown here. Native Gemini executes its
+            # HTTP request in a bounded worker thread, which cannot be stopped
+            # by awaiting Task cancellation and previously held the user's
+            # fallback response behind cleanup. Let cancellation propagate for
+            # one loop turn, then consume any eventual result out of band.
+            task.add_done_callback(self._consume_fast_lane_task_result)
+            await asyncio.sleep(0)
+            logger.warning(
+                "Fast translation exceeded %.1fs delivery budget; "
+                "continuing with configured failure detail lane",
+                float(job["delivery_timeout"]),
+            )
+            return None
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Fast translation failed; continuing with conversational lane: %s",
+                exc,
+            )
+            return None
+
+        from gateway.response_profiles import (
+            clean_fast_lane_output,
+            format_fast_lane_output,
+        )
+
+        profile = job["profile"]
+        fast_output = clean_fast_lane_output(profile, raw_output)
+        if fast_output is None:
+            logger.warning(
+                "Response fast lane returned unusable output; "
+                "continuing with conversational lane",
+            )
+            return None
+        formatted_fast_output = format_fast_lane_output(
+            profile,
+            fast_output,
+        )
+        job["formatted_output"] = formatted_fast_output
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            logger.warning(
+                "Fast translation adapter unavailable; "
+                "continuing with self-contained detail lane",
+            )
+            return "delivery_failed"
+
+        metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        )
+        metadata = dict(metadata or {})
+        metadata["plain_text"] = True
+        send_remaining = (
+            float(job["delivery_timeout"])
+            - (time.monotonic() - float(job["started_at"]))
+        )
+        if send_remaining <= 0:
+            logger.warning(
+                "Fast translation exhausted its delivery budget before send; "
+                "continuing with self-contained detail lane",
+            )
+            return "delivery_failed"
+        metadata["send_timeout"] = send_remaining
+        bounded_send = getattr(
+            adapter,
+            "send_with_delivery_deadline",
+            None,
+        )
+        if not callable(bounded_send):
+            logger.warning(
+                "Response fast-lane adapter has no classified delivery "
+                "deadline capability; continuing with self-contained detail lane",
+            )
+            return "delivery_failed"
+        try:
+            send_result = await bounded_send(
+                source.chat_id,
+                formatted_fast_output,
+                metadata=metadata,
+                timeout=send_remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Response fast-lane classified adapter unexpectedly raised a "
+                "timeout; treating delivery as ambiguous",
+            )
+            return "ambiguous"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Response fast-lane classified adapter raised instead of "
+                "returning delivery evidence; "
+                "treating delivery as ambiguous: %s",
+                exc,
+            )
+            return "ambiguous"
+        if (
+            not isinstance(send_result, SendResult)
+            or not isinstance(send_result.success, bool)
+            or not isinstance(send_result.delivery_ambiguous, bool)
+        ):
+            logger.warning(
+                "Fast translation adapter returned malformed delivery "
+                "evidence; treating delivery as ambiguous"
+            )
+            return "ambiguous"
+        if send_result.delivery_ambiguous:
+            logger.warning(
+                "Fast translation adapter reported ambiguous delivery; "
+                "continuing without a duplicate standalone translation: %s",
+                send_result.error or "unknown error",
+            )
+            return "ambiguous"
+        if not send_result.success:
+            logger.warning(
+                "Fast translation delivery rejected; "
+                "continuing with self-contained detail lane: %s",
+                send_result.error or "unknown error",
+            )
+            return "delivery_failed"
+
+        logger.info(
+            "Response fast lane delivered: profile=%s handler=%s "
+            "platform=%s chat=%s thread=%s "
+            "time=%.1fs chars=%d",
+            profile.get("name", "legacy"),
+            profile["fast_lane"]["handler"],
+            getattr(source.platform, "value", ""),
+            source.chat_id,
+            getattr(source, "thread_id", ""),
+            time.monotonic() - float(job["started_at"]),
+            len(fast_output),
+        )
+        return "delivered"
+
+    @staticmethod
+    def _consume_fast_lane_task_result(task: "asyncio.Task[Any]") -> None:
+        """Consume a cancelled fast-lane task without blocking user fallback."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            logger.debug(
+                "Fast translation background cleanup completed with an error",
+                exc_info=True,
+            )
+
+    async def _deliver_fast_translation(
+        self,
+        job: Optional[Dict[str, Any]],
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Backward-compatible alias for the generic response fast lane."""
+        if job and "profile" not in job:
+            from gateway.response_profiles import legacy_fast_translation_profile
+
+            legacy_profile = legacy_fast_translation_profile({"enabled": True})
+            if legacy_profile is None:
+                return None
+            job = {**job, "profile": legacy_profile}
+        return await self._deliver_response_fast_lane(
+            job,
+            event=event,
+            source=source,
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -9780,6 +10321,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+        _response_profile_user_text = str(getattr(event, "text", None) or "")
+
+        # Telegram labels are provenance-backed and opt-in.  Seed the event
+        # with the known inbound class now; delegation/tool callbacks may
+        # refine the path later in this same turn before final delivery.
+        if source.platform == Platform.TELEGRAM:
+            try:
+                from gateway.display_config import resolve_display_setting
+                from gateway.telegram_interaction_labels import (
+                    METADATA_KEY as _INTERACTION_METADATA_KEY,
+                    interaction_metadata,
+                )
+
+                _labels_enabled = bool(
+                    resolve_display_setting(
+                        _load_gateway_config(),
+                        "telegram",
+                        "interaction_labels",
+                        False,
+                    )
+                )
+                if _labels_enabled:
+                    _event_context = dict(
+                        getattr(event, "internal_context", None) or {}
+                    )
+                    if _event_context.get("internal_kind") == "grace_callback":
+                        _assigned = str(
+                            _event_context.get("execution_assignee") or "執行 Agent"
+                        )
+                        _seed = interaction_metadata(
+                            "callback",
+                            [_assigned, "ClawOps", "Grace", "你"],
+                        )
+                    else:
+                        _seed = interaction_metadata(
+                            "direct", ["你", "Grace"],
+                        )
+                    _event_context[_INTERACTION_METADATA_KEY] = _seed[
+                        _INTERACTION_METADATA_KEY
+                    ]
+                    event.internal_context = _event_context
+            except Exception:
+                logger.debug(
+                    "Telegram interaction label initialization failed",
+                    exc_info=True,
+                )
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -9797,7 +10384,151 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = self.session_store.get_or_create_session(source)
+        # Read only a bounded user-text tail before the isolated first pass.
+        # Full transcript/history construction remains below and cannot delay
+        # the fast lane; this tiny lookup exists solely so a continuation
+        # statement can inherit the previous turn's intent within this Topic.
+        _response_profile_session_entry = None
+        _response_profile_recent_user_texts: List[str] = []
+        try:
+            _response_profile_session_entry = (
+                self.session_store.get_or_create_session(source)
+            )
+            _response_profile_recent_user_texts = await asyncio.to_thread(
+                self.session_store.load_recent_user_texts,
+                _response_profile_session_entry.session_id,
+                limit=3,
+            )
+        except Exception:
+            logger.debug(
+                "Response profile recent Topic context unavailable",
+                exc_info=True,
+            )
+
+        # Deliver the isolated first pass before constructing the full Grace
+        # prompt. This keeps normal history hygiene/compression work from
+        # delaying a directly usable translation.
+        from gateway.response_profiles import ResponseProfileConfigurationError
+
+        try:
+            _response_fast_lane_job = self._start_response_fast_lane(
+                event,
+                recent_user_messages=_response_profile_recent_user_texts,
+            )
+        except ResponseProfileConfigurationError as exc:
+            logger.error(
+                "Rejecting message with invalid Topic response profile: %s",
+                exc,
+            )
+            adapter = self.adapters.get(source.platform)
+            if adapter is not None:
+                metadata = self._thread_metadata_for_source(
+                    source,
+                    self._reply_anchor_for_event(event),
+                )
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        (
+                            "這個 Topic 的回覆設定目前無法使用。"
+                            "請檢查 response_profile 設定後再試一次。"
+                        ),
+                        metadata=metadata,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to report invalid Topic response profile",
+                    )
+            return
+        _response_fast_lane_status = await self._deliver_response_fast_lane(
+            _response_fast_lane_job,
+            event=event,
+            source=source,
+        )
+        if _response_fast_lane_job:
+            _response_profile_user_text = str(
+                _response_fast_lane_job.get("source_text")
+                or _response_profile_user_text
+            )
+        _detail_contract_name = None
+        _learning_history_note = ""
+        if _response_fast_lane_job:
+            from gateway.response_profiles import (
+                detail_lane_contract_prompt,
+                detail_lane_prompt,
+            )
+
+            if _response_fast_lane_status:
+                _detail_prompt = detail_lane_prompt(
+                    _response_fast_lane_job["profile"],
+                    delivery_ambiguous=(
+                        _response_fast_lane_status == "ambiguous"
+                    ),
+                    delivery_failed=(
+                        _response_fast_lane_status == "delivery_failed"
+                    ),
+                )
+            else:
+                _detail_prompt = str(
+                    _response_fast_lane_job["failed_lane_prompt"],
+                )
+            try:
+                _detail_skill_prompt = self._load_response_detail_skill_prompt(
+                    _response_fast_lane_job["profile"],
+                    _response_fast_lane_status,
+                    task_id=_quick_key,
+                )
+            except ResponseProfileConfigurationError as exc:
+                logger.error(
+                    "Rejecting detail turn with invalid response profile: %s",
+                    exc,
+                )
+                adapter = self.adapters.get(source.platform)
+                if adapter is not None:
+                    metadata = self._thread_metadata_for_source(
+                        source,
+                        self._reply_anchor_for_event(event),
+                    )
+                    if _response_fast_lane_status:
+                        error_message = (
+                            "快速翻譯已處理，但詳細解說設定目前無法載入。"
+                            "請檢查 response_profile 的 detail skill。"
+                        )
+                    else:
+                        error_message = (
+                            "這個 Topic 的翻譯設定目前無法使用。"
+                            "請檢查 response_profile 的 detail skill。"
+                        )
+                    try:
+                        await adapter.send(
+                            source.chat_id,
+                            error_message,
+                            metadata=metadata,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to report invalid detail-lane skill",
+                        )
+                return
+            _detail_contract_prompt = detail_lane_contract_prompt(
+                _response_fast_lane_job["profile"],
+                _response_fast_lane_status,
+            )
+            event.channel_prompt = "\n\n".join(
+                part
+                for part in (
+                    event.channel_prompt,
+                    _detail_prompt,
+                    _detail_skill_prompt,
+                    _detail_contract_prompt,
+                )
+                if part
+            )
+
+        session_entry = (
+            _response_profile_session_entry
+            or self.session_store.get_or_create_session(source)
+        )
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
@@ -9904,6 +10635,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _session_env_tokens = self._set_session_env(
             context,
             internal=bool(getattr(event, "internal", False)),
+            internal_kind=str(
+                (
+                    getattr(event, "internal_context", None) or {}
+                ).get("internal_kind")
+                or ""
+            ),
             owner_user_id=self._configured_external_action_owner(source),
             message_text=str(event.text or ""),
             grace_callback_board=str(
@@ -9933,14 +10670,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         try:
-            from proactive.prompt_policy import approval_turn_prompt
+            from proactive.prompt_policy import (
+                approval_turn_prompt,
+                marketplace_readonly_turn_prompt,
+                saved_evidence_finalization_turn_prompt,
+            )
 
             approval_prompt = approval_turn_prompt(str(event.text or ""))
             if approval_prompt:
                 context_prompt = f"{context_prompt}\n\n{approval_prompt}"
+            finalization_prompt = saved_evidence_finalization_turn_prompt(
+                str(event.text or "")
+            )
+            marketplace_prompt = marketplace_readonly_turn_prompt(
+                str(event.text or "")
+            ) if not finalization_prompt else ""
+            if finalization_prompt:
+                context_prompt = f"{context_prompt}\n\n{finalization_prompt}"
+            elif marketplace_prompt:
+                context_prompt = f"{context_prompt}\n\n{marketplace_prompt}"
         except Exception:
             logger.warning(
-                "Failed to inject approval-turn routing prompt",
+                "Failed to inject trusted deterministic routing prompt",
                 exc_info=True,
             )
             adapter = self.adapters.get(source.platform)
@@ -10074,6 +10825,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "(session=%s)",
                 session_entry.session_id,
             )
+
+        if _response_fast_lane_job:
+            from gateway.response_profiles import (
+                build_learning_history_note,
+                detail_lane_output_contract,
+            )
+
+            _detail_contract_name = detail_lane_output_contract(
+                _response_fast_lane_job["profile"],
+                _response_fast_lane_status,
+            )
+            if _detail_contract_name in {
+                "translator_mastery",
+                "translator_mastery_after_fast",
+                "translator_mastery_self_contained",
+            }:
+                _learning_history_note = build_learning_history_note(
+                    _response_profile_user_text,
+                    history,
+                )
+                event.channel_prompt = "\n\n".join(
+                    part
+                    for part in (
+                        event.channel_prompt,
+                        _learning_history_note,
+                    )
+                    if part
+                )
+                logger.info(
+                    "Translator learning-history precheck: profile=%s "
+                    "status=%s result=%s",
+                    _response_fast_lane_job["profile"].get("name", "legacy"),
+                    _response_fast_lane_status or "failed",
+                    (
+                        "verified_match"
+                        if "result=verified_match" in _learning_history_note
+                        else "no_match"
+                    ),
+                )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -10728,10 +11518,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Approval result could not be delivered: platform adapter "
                     "is unavailable."
                 )
+            _approval_metadata = self._thread_metadata_for_source(source)
+            if source.platform == Platform.TELEGRAM and isinstance(
+                getattr(event, "internal_context", None), dict,
+            ):
+                from gateway.telegram_interaction_labels import (
+                    METADATA_KEY as _INTERACTION_METADATA_KEY,
+                    interaction_metadata,
+                    merge_interaction_metadata,
+                )
+
+                _approval_route_result = (
+                    _approval_records[-1][1] if _approval_records else {}
+                )
+                _assigned = str(
+                    _approval_route_result.get("assigned_agent") or ""
+                )
+                _path = ["你", "Grace", "ClawOps"]
+                if _assigned:
+                    _path.append(_assigned)
+                _approval_interaction = interaction_metadata(
+                    "handoff",
+                    _path,
+                    assigned_agent=_assigned,
+                )[_INTERACTION_METADATA_KEY]
+                event.internal_context[_INTERACTION_METADATA_KEY] = (
+                    _approval_interaction
+                )
+                _approval_metadata = merge_interaction_metadata(
+                    _approval_metadata,
+                    _approval_interaction,
+                )
             send_result = await adapter.send(
                 source.chat_id,
                 response,
-                metadata=self._thread_metadata_for_source(source),
+                metadata=_approval_metadata,
             )
             if not getattr(send_result, "success", False):
                 logger.warning(
@@ -10743,7 +11564,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 send_result = await adapter.send(
                     source.chat_id,
                     response,
-                    metadata=self._thread_metadata_for_source(source),
+                    metadata=_approval_metadata,
                 )
             if not getattr(send_result, "success", False):
                 self.session_store.append_to_transcript(
@@ -10814,6 +11635,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                response_fast_lane_job=_response_fast_lane_job,
+                response_fast_lane_status=_response_fast_lane_status,
+                response_profile_user_text=_response_profile_user_text,
+                detail_contract_name=_detail_contract_name,
+                learning_history_note=_learning_history_note,
+                interaction_context=getattr(event, "internal_context", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -10841,13 +11668,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            if source.platform == Platform.TELEGRAM:
+                try:
+                    from gateway.telegram_interaction_labels import (
+                        METADATA_KEY as _INTERACTION_METADATA_KEY,
+                        delegation_result_from_messages,
+                        interaction_metadata,
+                    )
+
+                    _delegation = delegation_result_from_messages(
+                        agent_result.get("messages") or [],
+                    )
+                    _event_context = getattr(event, "internal_context", None)
+                    if _delegation and isinstance(_event_context, dict):
+                        _assigned = str(
+                            _delegation.get("assigned_agent") or ""
+                        )
+                        _path = ["你", "Grace", "ClawOps"]
+                        if _assigned:
+                            _path.append(_assigned)
+                        _event_context[_INTERACTION_METADATA_KEY] = (
+                            interaction_metadata(
+                                "handoff",
+                                _path,
+                                assigned_agent=_assigned,
+                            )[_INTERACTION_METADATA_KEY]
+                        )
+                except Exception:
+                    logger.debug(
+                        "Telegram final delegation route extraction failed",
+                        exc_info=True,
+                    )
             try:
-                from gateway.response_filters import is_intentional_silence_agent_result
+                from gateway.response_filters import (
+                    is_intentional_silence_agent_result,
+                    should_suppress_successful_internal_response,
+                )
                 _intentional_silence = is_intentional_silence_agent_result(
                     agent_result, response,
                 )
+                _suppress_successful_internal_response = (
+                    should_suppress_successful_internal_response(
+                        internal=bool(event.internal),
+                        internal_context=event.internal_context,
+                        agent_result=agent_result,
+                    )
+                )
             except Exception:
                 _intentional_silence = False
+                _suppress_successful_internal_response = False
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -11281,6 +12150,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _intentional_silence:
                 logger.info(
                     "Suppressing intentional silence marker for session %s",
+                    session_entry.session_id,
+                )
+                response = ""
+            elif _suppress_successful_internal_response:
+                logger.info(
+                    "Suppressing successful internal callback response for "
+                    "session %s after deterministic delivery",
                     session_entry.session_id,
                 )
                 response = ""
@@ -13983,6 +14859,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context: SessionContext,
         *,
         internal: bool = False,
+        internal_kind: str = "",
         owner_user_id: str = "",
         message_text: str = "",
         grace_callback_board: str = "",
@@ -14019,6 +14896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             message_text=message_text,
             internal=internal,
+            internal_kind=internal_kind,
             owner_user_id=owner_user_id,
             grace_callback_board=grace_callback_board,
             grace_callback_lease_owner=grace_callback_lease_owner,
@@ -15516,9 +16394,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         platform_key = _platform_config_key(source.platform)
         user_config = _load_gateway_config()
-        from gateway.display_config import resolve_display_setting
-        _plat_streaming = resolve_display_setting(
-            user_config, platform_key, "streaming"
+        from gateway.display_config import resolve_source_display_setting
+        _plat_streaming = resolve_source_display_setting(
+            user_config, platform_key, "streaming", source
         )
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off"
@@ -15730,6 +16608,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        response_fast_lane_job: Optional[dict] = None,
+        response_fast_lane_status: Optional[str] = None,
+        response_profile_user_text: str = "",
+        detail_contract_name: Optional[str] = None,
+        learning_history_note: str = "",
+        interaction_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -15748,6 +16632,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                response_fast_lane_job=response_fast_lane_job,
+                response_fast_lane_status=response_fast_lane_status,
+                response_profile_user_text=response_profile_user_text,
+                detail_contract_name=detail_contract_name,
+                learning_history_note=learning_history_note,
+                interaction_context=interaction_context,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -15759,6 +16649,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                response_fast_lane_job=response_fast_lane_job,
+                response_fast_lane_status=response_fast_lane_status,
+                response_profile_user_text=response_profile_user_text,
+                detail_contract_name=detail_contract_name,
+                learning_history_note=learning_history_note,
+                interaction_context=interaction_context,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -15791,6 +16687,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        response_fast_lane_job: Optional[dict] = None,
+        response_fast_lane_status: Optional[str] = None,
+        response_profile_user_text: str = "",
+        detail_contract_name: Optional[str] = None,
+        learning_history_note: str = "",
+        interaction_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -16616,6 +17518,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        _interaction_labels_enabled = bool(
+            source.platform == Platform.TELEGRAM
+            and resolve_display_setting(
+                user_config,
+                platform_key,
+                "interaction_labels",
+                False,
+            )
+        )
+        if _interaction_labels_enabled and isinstance(interaction_context, dict):
+            from gateway.telegram_interaction_labels import (
+                METADATA_KEY as _INTERACTION_METADATA_KEY,
+                merge_interaction_metadata,
+            )
+
+            _status_thread_metadata = merge_interaction_metadata(
+                _status_thread_metadata,
+                interaction_context.get(_INTERACTION_METADATA_KEY),
+            )
+
         # Once Grace has compiled the canonical Loop Contract, show the user
         # that exact understanding before ClawOps begins. This replaces the
         # generic timer acknowledgement for delegated Telegram tasks and is
@@ -16626,8 +17548,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         _delegation_confirmation_fired = threading.Event()
 
+        def _set_telegram_interaction(
+            kind: str,
+            path: List[str],
+            *,
+            assigned_agent: str = "",
+        ) -> None:
+            if not _interaction_labels_enabled or not isinstance(
+                interaction_context, dict,
+            ):
+                return
+            from gateway.telegram_interaction_labels import (
+                METADATA_KEY as _INTERACTION_METADATA_KEY,
+                interaction_metadata,
+            )
+
+            descriptor = interaction_metadata(
+                kind,
+                path,
+                assigned_agent=assigned_agent,
+            )[_INTERACTION_METADATA_KEY]
+            interaction_context[_INTERACTION_METADATA_KEY] = descriptor
+            if isinstance(_status_thread_metadata, dict):
+                _status_thread_metadata[_INTERACTION_METADATA_KEY] = descriptor
+
         def tool_start_ack_callback(call_id, tool_name, args):
             voice_ack_callback(call_id, tool_name, args)
+            if tool_name == "clawops_delegate":
+                _set_telegram_interaction(
+                    "handoff", ["你", "Grace", "ClawOps"],
+                )
             if (
                 not _delegation_confirmation_enabled
                 or _delegation_confirmation_fired.is_set()
@@ -16684,6 +17634,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
                 confirmation_future.add_done_callback(_log_delegation_confirmation)
+
+        def tool_complete_route_callback(
+            _call_id: str,
+            tool_name: str,
+            _args: Any,
+            function_result: Any,
+        ) -> None:
+            if tool_name != "clawops_delegate":
+                return
+            try:
+                from gateway.telegram_interaction_labels import (
+                    delegation_result_from_messages,
+                )
+
+                result = delegation_result_from_messages([
+                    {
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "content": function_result,
+                    }
+                ])
+                assigned = str((result or {}).get("assigned_agent") or "")
+                path = ["你", "Grace", "ClawOps"]
+                if assigned:
+                    path.append(assigned)
+                _set_telegram_interaction(
+                    "handoff",
+                    path,
+                    assigned_agent=assigned,
+                )
+            except Exception:
+                logger.debug(
+                    "Telegram delegation route extraction failed",
+                    exc_info=True,
+                )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -16795,8 +17780,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Per-platform streaming gate: display.platforms.<plat>.streaming
             # can disable streaming for specific platforms even when the global
             # streaming config is enabled.
-            _plat_streaming = resolve_display_setting(
-                user_config, platform_key, "streaming"
+            from gateway.display_config import resolve_source_display_setting
+            _plat_streaming = resolve_source_display_setting(
+                user_config, platform_key, "streaming", source
             )
             # None = no per-platform override → follow global config
             _streaming_enabled = (
@@ -16804,8 +17790,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            _buffer_validated_detail = detail_contract_name in {
+                "translator_mastery",
+                "translator_mastery_after_fast",
+                "translator_mastery_self_contained",
+            }
+            if _buffer_validated_detail and _streaming_enabled:
+                logger.info(
+                    "Buffering validated Translator detail response despite "
+                    "display streaming configuration: contract=%s",
+                    detail_contract_name,
+                )
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            # Interim assistant bubbles can expose a rejected draft just as
+            # token streaming can. Keep the entire validated detail turn
+            # buffered until the contract checker accepts the final answer.
+            _want_interim_messages = (
+                interim_assistant_messages_enabled
+                and not _buffer_validated_detail
+            )
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -17065,6 +18069,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _voice_ack_guild[0] is not None or _delegation_confirmation_enabled
                 else None
             )
+            agent.tool_complete_callback = (
+                tool_complete_route_callback
+                if _interaction_labels_enabled
+                else None
+            )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -17101,6 +18110,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_callback = _notice_callback_sync
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
+            agent.final_response_validator = None
+            # A first repair usually restores the canonical Translator
+            # template. Keep one additional bounded attempt for a residual
+            # field-level omission before any terminal recovery message asks
+            # the user to retry a turn whose translation was not delivered.
+            agent.final_response_repair_limit = 2
+            agent._response_contract_repair_attempts = 0
+            agent._response_contract_repair_start_index = None
+            if response_fast_lane_status == "ambiguous":
+                agent.final_response_validation_failure_message = (
+                    "⚠️ Telegram 未能確認第一則快速翻譯是否送達，"
+                    "而詳細教學回覆經內部修復後仍未通過完整性檢查。"
+                    "請重傳這則內容，我會重新提供完整翻譯與解析。"
+                )
+            elif response_fast_lane_status == "delivery_failed":
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 第一則快速翻譯未能送達，而且備援的完整教學回覆"
+                    "經內部修復後仍未通過完整性檢查。"
+                    "請重傳這則內容，我會重新提供完整翻譯與解析。"
+                )
+            elif response_fast_lane_status is None and response_fast_lane_job:
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 第一則快速翻譯逾時，而且備援的完整教學回覆未通過"
+                    "完整性檢查。請重傳這則內容，我會重新提供完整翻譯與解析。"
+                )
+            else:
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 快速翻譯已完成；詳細教學回覆經內部修復後"
+                    "仍未通過完整性檢查。你不需要重傳，下一則可直接繼續。"
+                )
+            if detail_contract_name in {
+                "translator_mastery",
+                "translator_mastery_after_fast",
+                "translator_mastery_self_contained",
+            }:
+                from gateway.response_profiles import (
+                    build_translator_detail_repair_prompt,
+                    translator_detail_validation_errors,
+                )
+
+                def _translator_detail_validator(
+                    draft: str,
+                    *,
+                    _contract_name=detail_contract_name,
+                    _current_text=response_profile_user_text,
+                    _history_note=learning_history_note,
+                    _fast_output=str(
+                        (response_fast_lane_job or {}).get("formatted_output")
+                        or ""
+                    ),
+                ) -> Optional[str]:
+                    errors = translator_detail_validation_errors(
+                        _contract_name,
+                        _current_text,
+                        draft,
+                        _history_note,
+                        fast_output=_fast_output,
+                    )
+                    if not errors:
+                        return None
+                    logger.warning(
+                        "Translator detail response rejected before delivery: "
+                        "contract=%s errors=%s",
+                        _contract_name,
+                        errors,
+                    )
+                    return build_translator_detail_repair_prompt(errors)
+
+                agent.final_response_validator = _translator_detail_validator
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
@@ -18490,6 +19568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_interaction_context = interaction_context
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -18507,6 +19586,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_interaction_context = getattr(
+                        pending_event, "internal_context", None,
+                    )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -18532,6 +19614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    interaction_context=next_interaction_context,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

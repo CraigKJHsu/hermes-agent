@@ -55,6 +55,200 @@ class TestChromeDebugLaunch:
         with patch("urllib.request.urlopen", side_effect=OSError("not cdp")):
             assert is_browser_debug_ready("http://127.0.0.1:9222", timeout=0.1) is False
 
+    def test_recovery_launches_default_local_browser_and_waits(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        readiness = iter([False, False, False, True])
+        monkeypatch.setattr(
+            browser_connect,
+            "is_browser_debug_ready",
+            lambda *args, **kwargs: next(readiness),
+        )
+        launches = []
+        monkeypatch.setattr(
+            browser_connect,
+            "try_launch_chrome_debug",
+            lambda port, **_kwargs: launches.append(port) or True,
+        )
+        monkeypatch.setattr(browser_connect.time, "sleep", lambda _seconds: None)
+
+        assert browser_connect.recover_default_local_browser_debug(
+            "http://localhost:9222",
+            timeout=2.0,
+            poll_interval=0.1,
+        ) is True
+        assert launches == [9222]
+
+    def test_recovery_rejects_remote_endpoint(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        launches = []
+        monkeypatch.setattr(
+            browser_connect,
+            "try_launch_chrome_debug",
+            lambda port, **_kwargs: launches.append(port) or True,
+        )
+
+        assert browser_connect.recover_default_local_browser_debug(
+            "http://remote.example:9222",
+        ) is False
+        assert launches == []
+
+    def test_recovery_rejects_custom_local_endpoint_variants(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        launches = []
+        monkeypatch.setattr(
+            browser_connect,
+            "try_launch_chrome_debug",
+            lambda port, **_kwargs: launches.append(port) or True,
+        )
+
+        custom_urls = (
+            "ws://localhost:9222",
+            "http://custom-user@localhost:9222",
+            "http://localhost:9222/json/version?view=custom",
+            "http://localhost:9222/json/version?",
+            "http://localhost:9222/json/version#custom",
+            "http://localhost:9222/json/version#",
+            "http://localhost:9222/json/version;",
+            "http://localhost:9222/;",
+            " http://localhost:9222",
+            "http://localhost:9222\n",
+            "http://localhost:9333",
+        )
+        assert all(
+            not browser_connect.recover_default_local_browser_debug(url)
+            for url in custom_urls
+        )
+        assert launches == []
+
+    def test_recovery_waiter_consumes_shared_result_without_relaunch(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        probes = []
+        monkeypatch.setattr(
+            browser_connect,
+            "is_browser_debug_ready",
+            lambda *args, **kwargs: probes.append((args, kwargs)) or False,
+        )
+        attempt = browser_connect._LocalBrowserRecoveryAttempt()
+        attempt.result = True
+        attempt.done.set()
+        monkeypatch.setattr(browser_connect, "_LOCAL_BROWSER_RECOVERY_ACTIVE", attempt)
+        monkeypatch.setattr(
+            browser_connect,
+            "try_launch_chrome_debug",
+            lambda _port, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("waiter must not launch")
+            ),
+        )
+
+        assert browser_connect.recover_default_local_browser_debug(
+            "http://127.0.0.1:9222",
+            timeout=0.25,
+        ) is True
+        assert probes == []
+
+    def test_recovery_waiter_does_no_probe_after_deadline(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        probes = []
+        monkeypatch.setattr(browser_connect.time, "monotonic", lambda: 100.0)
+        attempt = browser_connect._LocalBrowserRecoveryAttempt()
+        monkeypatch.setattr(browser_connect, "_LOCAL_BROWSER_RECOVERY_ACTIVE", attempt)
+        monkeypatch.setattr(
+            browser_connect,
+            "is_browser_debug_ready",
+            lambda *args, **kwargs: probes.append((args, kwargs)) or False,
+        )
+
+        assert browser_connect.recover_default_local_browser_debug(
+            "http://127.0.0.1:9222",
+            timeout=0,
+        ) is False
+        assert probes == []
+
+    def test_timed_out_caller_leaves_single_attempt_active(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        monkeypatch.setattr(browser_connect, "_LOCAL_BROWSER_RECOVERY_ACTIVE", None)
+        monkeypatch.setattr(
+            browser_connect,
+            "is_browser_debug_ready",
+            lambda *args, **kwargs: False,
+        )
+        launch_started = browser_connect.threading.Event()
+        allow_launch_to_finish = browser_connect.threading.Event()
+        launches = []
+
+        def slow_launch(_port, **_kwargs):
+            launches.append(1)
+            launch_started.set()
+            allow_launch_to_finish.wait(timeout=1)
+            return False
+
+        monkeypatch.setattr(
+            browser_connect,
+            "try_launch_chrome_debug",
+            slow_launch,
+        )
+
+        assert not browser_connect.recover_default_local_browser_debug(
+            "http://127.0.0.1:9222",
+            timeout=0.05,
+        )
+        assert launch_started.wait(timeout=0.2)
+        attempt = browser_connect._LOCAL_BROWSER_RECOVERY_ACTIVE
+        assert attempt is not None
+
+        assert not browser_connect.recover_default_local_browser_debug(
+            "http://127.0.0.1:9222",
+            timeout=0.01,
+        )
+        assert launches == [1]
+
+        allow_launch_to_finish.set()
+        assert attempt.done.wait(timeout=0.5)
+        assert browser_connect._LOCAL_BROWSER_RECOVERY_ACTIVE is None
+
+    def test_recovery_thread_start_failure_clears_singleton(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        monkeypatch.setattr(browser_connect, "_LOCAL_BROWSER_RECOVERY_ACTIVE", None)
+        monkeypatch.setattr(
+            browser_connect.threading.Thread,
+            "start",
+            lambda _thread: (_ for _ in ()).throw(RuntimeError("thread unavailable")),
+        )
+
+        assert not browser_connect.recover_default_local_browser_debug(
+            "http://127.0.0.1:9222",
+            timeout=0.2,
+        )
+        assert browser_connect._LOCAL_BROWSER_RECOVERY_ACTIVE is None
+
+    def test_recovery_lock_wait_is_bounded_by_caller_deadline(self, monkeypatch):
+        import hermes_cli.browser_connect as browser_connect
+
+        class BusyLock:
+            def __init__(self):
+                self.timeouts = []
+
+            def acquire(self, *, timeout):
+                self.timeouts.append(timeout)
+                return False
+
+        lock = BusyLock()
+        monkeypatch.setattr(browser_connect, "_LOCAL_BROWSER_RECOVERY_LOCK", lock)
+
+        assert not browser_connect.recover_default_local_browser_debug(
+            "http://127.0.0.1:9222",
+            timeout=0.25,
+        )
+        assert len(lock.timeouts) == 1
+        assert 0 < lock.timeouts[0] <= 0.25
+
     def test_windows_launch_uses_browser_found_on_path(self):
         captured = {}
 

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -15,12 +16,13 @@ from gateway.session import SessionSource
 
 
 def _make_event(text="/title", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", thread_id=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
+        thread_id=thread_id,
         user_name="testuser",
     )
     return MessageEvent(text=text, source=source)
@@ -186,6 +188,36 @@ class TestHandleTitleCommand:
         runner._schedule_telegram_topic_title_rename.assert_called_once_with(
             event.source, "test_session_123", "My Topic Name"
         )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_updates_lightweight_topic_project_label(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_state import SessionDB
+
+        registry = tmp_path / "thread_context_registry.yaml"
+        registry.write_text("version: 1\ncontexts: []\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "telegram")
+        runner = _make_runner(session_db=db)
+        runner._schedule_telegram_topic_title_rename = MagicMock()
+
+        event = _make_event(
+            text="/title 失智患者的照護",
+            thread_id="2680",
+        )
+        result = await runner._handle_title_command(event)
+
+        assert "失智患者的照護" in result
+        persisted = yaml.safe_load(registry.read_text(encoding="utf-8"))
+        context = persisted["contexts"][0]
+        assert context["topic_name"] == "失智患者的照護"
+        assert context["project_name"] == "失智患者的照護"
+        assert context["project"].startswith("telegram_67890_2680_")
         db.close()
 
     @pytest.mark.asyncio

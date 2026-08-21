@@ -1,6 +1,7 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
+import threading
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -384,6 +385,67 @@ class TestMemoryManager:
         assert p2.initialized
         assert p1._init_kwargs["session_id"] == "test-123"
         assert p1._init_kwargs["platform"] == "cli"
+
+    def test_initialize_all_bounded_times_out_without_blocking(self):
+        """A wedged optional provider cannot block first-turn startup."""
+        release = threading.Event()
+        started = threading.Event()
+
+        class BlockingProvider(FakeMemoryProvider):
+            def initialize(self, session_id, **kwargs):
+                started.set()
+                release.wait(timeout=2)
+                super().initialize(session_id, **kwargs)
+
+        mgr = MemoryManager()
+        provider = BlockingProvider("blocking")
+        mgr.add_provider(provider)
+
+        completed = mgr.initialize_all_bounded(
+            session_id="slow-session",
+            platform="telegram",
+            timeout_seconds=0.01,
+        )
+
+        assert started.is_set()
+        assert completed is False
+        assert provider.initialized is False
+        release.set()
+
+    def test_bounded_initialization_allows_only_one_in_flight_worker(self):
+        import agent.memory_manager as memory_manager_module
+
+        release = threading.Event()
+        started = threading.Event()
+
+        class BlockingProvider(FakeMemoryProvider):
+            def initialize(self, session_id, **kwargs):
+                started.set()
+                release.wait(timeout=2)
+                super().initialize(session_id, **kwargs)
+
+        first = MemoryManager()
+        first.add_provider(BlockingProvider("first"))
+        second = MemoryManager()
+        second_provider = FakeMemoryProvider("second")
+        second.add_provider(second_provider)
+
+        assert first.initialize_all_bounded(
+            "first-session", timeout_seconds=0.01,
+        ) is False
+        assert started.is_set()
+        assert second.initialize_all_bounded(
+            "second-session", timeout_seconds=0.01,
+        ) is False
+        assert second_provider.initialized is False
+        release.set()
+        for _ in range(100):
+            with memory_manager_module._BOUNDED_INIT_LOCK:
+                if not memory_manager_module._BOUNDED_INIT_IN_FLIGHT:
+                    break
+            threading.Event().wait(0.01)
+        with memory_manager_module._BOUNDED_INIT_LOCK:
+            assert memory_manager_module._BOUNDED_INIT_IN_FLIGHT is False
 
     # -- Error resilience ---------------------------------------------------
 

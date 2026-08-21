@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import uuid
 from dataclasses import dataclass
@@ -18,6 +19,12 @@ from proactive.tool_policy import PolicyLevel, decide_action, load_tool_policy
 DEFAULT_OPENCLAW_BRIDGE_PATH = "/api/plugins/hermes-bridge/tasks"
 DEFAULT_OPENCLAW_TEMPLATE = "agents.ask_team"
 _ZERO_EFFECT_ASYNC_CAPABILITY = object()
+_READONLY_BROWSER_ALLOWED_URLS = frozenset(
+    {
+        "https://example.com/",
+        "https://www.linkedin.com/in/craig-k-j-hsu-6012b815",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -449,7 +456,8 @@ def _openclaw_payload(
         and task.get("credential_refs") == []
         and task.get("requires_confirmation") is False
         and task.get("allowed_tools") == ["browser.read"]
-        and str(task.get("target_url") or "").strip() == "https://example.com/"
+        and str(task.get("target_url") or "").strip()
+        in _READONLY_BROWSER_ALLOWED_URLS
         and bool(str(task.get("project") or "").strip())
         and bool(str(task.get("topic_id") or "").strip())
         and bool(str(task.get("idempotency_key") or "").strip())
@@ -1006,11 +1014,114 @@ def handle_openclaw_dry_run(raw_args: str) -> str:
     return response
 
 
+_TOPIC_POLITE_PREFIX = r"(?:請\s*)?(?:(?:幫我|麻煩你?|可以(?:請你)?)\s*)*"
+_CURRENT_TOPIC_TARGET = (
+    r"(?:(?:這個|目前|當前|本|this|current)\s*)?"
+    r"(?:telegram\s*)?(?:topic|主題|話題)(?:\s*(?:名稱|名字|標題))?"
+)
+_TOPIC_POLITE_SUFFIX = (
+    r"(?:，?\s*(?:嗎|好嗎|可以嗎|麻煩你了|謝謝你?|謝謝))?"
+    r"[？?！!。．.]*"
+)
+_DIRECT_TOPIC_RENAME_PATTERNS = (
+    re.compile(
+        rf"^{_TOPIC_POLITE_PREFIX}"
+        rf"(?:更改|修改|重新命名|更名|命名)\s*{_CURRENT_TOPIC_TARGET}"
+        rf"\s*(?:為|成|叫做)\s*[:：]?\s*(?P<title>.+?)"
+        rf"{_TOPIC_POLITE_SUFFIX}$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_TOPIC_POLITE_PREFIX}(?:把\s*)?{_CURRENT_TOPIC_TARGET}\s*"
+        rf"(?:改成|改為|更名為|命名為|設定為|設為|叫做)\s*[:：]?\s*"
+        rf"(?P<title>.+?){_TOPIC_POLITE_SUFFIX}$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:please\s+|can\s+you\s+)*rename\s+"
+        r"(?:this|current)\s+(?:telegram\s*)?topic(?:\s+(?:name|title))?\s+to\s+"
+        r"(?P<title>.+?)(?:\s+please)?[?!.]*$",
+        re.IGNORECASE,
+    ),
+)
+_FULL_QUOTED_TITLE_RE = re.compile(
+    r"^(?:「(?P<corner>[^「」『』\"“”]+)」|"
+    r"『(?P<double_corner>[^「」『』\"“”]+)』|"
+    r'"(?P<ascii>[^「」『』\"“”]+)"|'
+    r"“(?P<curly>[^「」『』\"“”]+)”)$"
+)
+_NON_IMPERATIVE_TOPIC_RE = re.compile(
+    r"(?:為什麼|為何|如何|怎麼(?:樣)?|教我|說明|"
+    r"how\s+(?:do|can|should|would)\b|why\b|what\s+if\b)",
+    re.IGNORECASE,
+)
+_UNQUOTED_COMPOUND_TITLE_RE = re.compile(
+    r"(?:並且|然後|同時|以及|順便|再幫我|接著|"
+    r"並(?=(?:告訴|幫|列|回|整理|摘要|刪|新增|查|說明))|"
+    r"\b(?:and|then|also|while|because|after|before|when)\b)",
+    re.IGNORECASE,
+)
+_TITLE_QUOTE_DELIMITER_RE = re.compile(r"[「」『』\"“”]")
+_UNQUOTED_TITLE_ATOM_RE = re.compile(r"^[\w\s'’\-]+$", re.UNICODE)
+_LINE_BOUNDARY_RE = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
+def _native_topic_title_rewrite(event: Any) -> str | None:
+    """Translate an unambiguous current-Topic rename request to ``/title``.
+
+    The gateway still performs its normal sender authorization after this
+    rewrite.  Explanations, hypothetical questions and compound requests stay
+    with Grace so this narrow convenience path cannot silently drop intent.
+    """
+    source = getattr(event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", "")
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    original_text = str(getattr(event, "text", "") or "")
+    if platform != "telegram" or not thread_id or thread_id == "general":
+        return None
+    if _LINE_BOUNDARY_RE.search(original_text):
+        return None
+    raw_text = original_text.strip()
+    if not raw_text or raw_text.startswith("/"):
+        return None
+    if _NON_IMPERATIVE_TOPIC_RE.search(raw_text):
+        return None
+    text = raw_text
+    match = next(
+        (candidate for pattern in _DIRECT_TOPIC_RENAME_PATTERNS if (candidate := pattern.fullmatch(text))),
+        None,
+    )
+    if match is None:
+        return None
+
+    title_segment = match.group("title").strip()
+    quoted_title = _FULL_QUOTED_TITLE_RE.fullmatch(title_segment)
+    title = (
+        next(value for value in quoted_title.groups() if value is not None).strip()
+        if quoted_title
+        else title_segment
+    )
+    if not title or (
+        not quoted_title
+        and (
+            _TITLE_QUOTE_DELIMITER_RE.search(title)
+            or not _UNQUOTED_TITLE_ATOM_RE.fullmatch(title)
+            or _UNQUOTED_COMPOUND_TITLE_RE.search(title)
+        )
+    ):
+        return None
+    return f"/title {title}"
+
+
 def pre_gateway_dispatch(*, event: Any, **_kwargs: Any) -> dict[str, str] | None:
-    """Keep only explicit diagnostic commands; natural language always reaches Grace."""
+    """Route narrow native commands; other natural language reaches Grace."""
     text = str(getattr(event, "text", "") or "").strip()
     if not text or text.startswith("/"):
         return None
+
+    native_title = _native_topic_title_rewrite(event)
+    if native_title:
+        return {"action": "rewrite", "text": native_title}
 
     lowered = text.lower()
     openclaw_prefixes = ("openclaw:", "openclaw ")

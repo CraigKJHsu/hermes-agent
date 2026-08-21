@@ -7,12 +7,25 @@ import platform
 import shlex
 import shutil
 import subprocess
+import threading
+import time
 
 from hermes_constants import get_hermes_home
 
 
 DEFAULT_BROWSER_CDP_PORT = 9222
 DEFAULT_BROWSER_CDP_URL = f"http://127.0.0.1:{DEFAULT_BROWSER_CDP_PORT}"
+DEFAULT_LOCAL_BROWSER_RECOVERY_TIMEOUT = 12.0
+
+
+class _LocalBrowserRecoveryAttempt:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result = False
+
+
+_LOCAL_BROWSER_RECOVERY_LOCK = threading.Lock()
+_LOCAL_BROWSER_RECOVERY_ACTIVE: _LocalBrowserRecoveryAttempt | None = None
 
 _DARWIN_APPS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -196,14 +209,23 @@ def _detach_kwargs(system: str) -> dict:
     return {"creationflags": flags} if flags else {}
 
 
-def try_launch_chrome_debug(port: int = DEFAULT_BROWSER_CDP_PORT, system: str | None = None) -> bool:
+def try_launch_chrome_debug(
+    port: int = DEFAULT_BROWSER_CDP_PORT,
+    system: str | None = None,
+    *,
+    deadline: float | None = None,
+) -> bool:
     system = system or platform.system()
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
     candidates = get_chrome_debug_candidates(system)
     if not candidates:
         return False
 
     os.makedirs(chrome_debug_data_dir(), exist_ok=True)
     for candidate in candidates:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
         try:
             subprocess.Popen(
                 [candidate, *_chrome_debug_args(port)],
@@ -215,3 +237,120 @@ def try_launch_chrome_debug(port: int = DEFAULT_BROWSER_CDP_PORT, system: str | 
         except Exception:
             continue
     return False
+
+
+def is_default_local_browser_debug_url(url: str) -> bool:
+    """Return True only for Hermes' discovery-style localhost CDP endpoint."""
+    raw = url or ""
+    return raw in {
+        "http://127.0.0.1:9222",
+        "http://127.0.0.1:9222/",
+        "http://127.0.0.1:9222/json",
+        "http://127.0.0.1:9222/json/version",
+        "http://localhost:9222",
+        "http://localhost:9222/",
+        "http://localhost:9222/json",
+        "http://localhost:9222/json/version",
+    }
+
+
+def recover_default_local_browser_debug(
+    url: str,
+    *,
+    timeout: float = 12.0,
+    poll_interval: float = 0.5,
+) -> bool:
+    """Start and health-check Hermes' local CDP browser after a disconnect.
+
+    Recovery is limited to the default localhost discovery endpoint. It never
+    launches for remote, custom-port, or concrete WebSocket targets. The
+    persistent Hermes Chrome profile is reused so ClawOps can keep the same
+    browser login state after recovery.
+    """
+    global _LOCAL_BROWSER_RECOVERY_ACTIVE
+    if not is_default_local_browser_debug_url(url):
+        return False
+    deadline = time.monotonic() + max(0.0, timeout)
+    if time.monotonic() >= deadline:
+        return False
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _LOCAL_BROWSER_RECOVERY_LOCK.acquire(timeout=remaining):
+        return False
+    new_attempt = False
+    try:
+        if _LOCAL_BROWSER_RECOVERY_ACTIVE is not None:
+            attempt = _LOCAL_BROWSER_RECOVERY_ACTIVE
+        else:
+            attempt = _LocalBrowserRecoveryAttempt()
+            _LOCAL_BROWSER_RECOVERY_ACTIVE = attempt
+            recovery_deadline = (
+                time.monotonic() + DEFAULT_LOCAL_BROWSER_RECOVERY_TIMEOUT
+            )
+            recovery_thread = threading.Thread(
+                target=_run_default_local_browser_recovery,
+                args=(attempt, recovery_deadline, poll_interval),
+                daemon=True,
+                name="hermes-cdp-recovery",
+            )
+            new_attempt = True
+    finally:
+        _LOCAL_BROWSER_RECOVERY_LOCK.release()
+
+    if new_attempt:
+        try:
+            recovery_thread.start()
+        except Exception:
+            with _LOCAL_BROWSER_RECOVERY_LOCK:
+                attempt.result = False
+                if _LOCAL_BROWSER_RECOVERY_ACTIVE is attempt:
+                    _LOCAL_BROWSER_RECOVERY_ACTIVE = None
+                attempt.done.set()
+            return False
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not attempt.done.wait(timeout=remaining):
+        return False
+    return bool(attempt.result and time.monotonic() <= deadline)
+
+
+def _run_default_local_browser_recovery(
+    attempt: _LocalBrowserRecoveryAttempt,
+    deadline: float,
+    poll_interval: float,
+) -> None:
+    """Own one complete recovery attempt; callers only wait on its result."""
+    global _LOCAL_BROWSER_RECOVERY_ACTIVE
+
+    def ready() -> bool:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        result = is_browser_debug_ready(
+            DEFAULT_BROWSER_CDP_URL,
+            timeout=min(1.0, remaining),
+        )
+        return bool(result and time.monotonic() <= deadline)
+
+    result = False
+    try:
+        if ready():
+            result = True
+        elif try_launch_chrome_debug(
+            DEFAULT_BROWSER_CDP_PORT,
+            deadline=deadline,
+        ):
+            while time.monotonic() < deadline:
+                if ready():
+                    result = True
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(max(0.05, poll_interval), remaining))
+    finally:
+        with _LOCAL_BROWSER_RECOVERY_LOCK:
+            attempt.result = result
+            if _LOCAL_BROWSER_RECOVERY_ACTIVE is attempt:
+                _LOCAL_BROWSER_RECOVERY_ACTIVE = None
+            attempt.done.set()

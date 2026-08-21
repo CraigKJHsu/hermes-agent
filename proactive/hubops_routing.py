@@ -24,10 +24,28 @@ TASK_TYPE_ALIASES = {
     "browser_republish": "browser_publish",
     "cross_platform_listing": "browser_publish",
     "secondhand_commerce_cross_platform_listing": "browser_publish",
-    "facebook_existing_listing_group_distribution": "browser_publish",
-    "group_distribution": "browser_publish",
+    "secondhand_commerce_group_status": "facebook_marketplace_readonly",
+    "facebook_existing_listing_group_distribution": (
+        "facebook_marketplace_group_publish"
+    ),
+    "facebook_marketplace_group_distribution": (
+        "facebook_marketplace_group_publish"
+    ),
+    "facebook_marketplace_group_crosspost": (
+        "facebook_marketplace_group_publish"
+    ),
+    "group_distribution": "facebook_marketplace_group_publish",
+    "facebook_page_publish": "facebook_page_api_publish",
+    "facebook_page_graph_publish": "facebook_page_api_publish",
+    "page_api_publish": "facebook_page_api_publish",
 }
-ALWAYS_APPROVAL_TASK_TYPES = {"browser_publish", "browser_ops"}
+ALWAYS_APPROVAL_TASK_TYPES = {
+    "browser_publish",
+    "browser_ops",
+    "facebook_marketplace_group_publish",
+    "facebook_page_api_publish",
+    "facebook_marketplace_price_update",
+}
 
 
 def normalize_clawops_task_type(value: str) -> str:
@@ -43,6 +61,28 @@ def registered_worker_task_types(
     docs_dir = Path(hub_ops_dir) if hub_ops_dir else DEFAULT_HUB_OPS_DIR
     rules = _read_yaml(docs_dir / "routing-rules.yaml")
     return _worker_task_types(rules)
+
+
+def registered_worker_capabilities(
+    hub_ops_dir: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Return HubOps' reserved abstract worker capability vocabulary.
+
+    These labels describe worker responsibilities (for example
+    ``memory_read`` or ``report_generate``); they are not necessarily names
+    in the Hermes runtime tool schema.
+    """
+    docs_dir = Path(hub_ops_dir) if hub_ops_dir else DEFAULT_HUB_OPS_DIR
+    registry = _read_yaml(docs_dir / "agent-registry.yaml")
+    raw_capabilities = registry.get("abstract_capability_labels")
+    if not isinstance(raw_capabilities, list):
+        return ()
+    result: list[str] = []
+    for raw_name in raw_capabilities:
+        name = str(raw_name or "").strip()
+        if name and name not in result:
+            result.append(name)
+    return tuple(result)
 
 
 def resolved_route_binding(route: Mapping[str, Any]) -> dict[str, Any]:

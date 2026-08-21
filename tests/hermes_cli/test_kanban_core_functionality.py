@@ -1065,6 +1065,737 @@ def test_create_task_persists_max_runtime(kanban_home):
         conn.close()
 
 
+def test_grace_commerce_runtime_enters_evidence_only_finalization(
+    kanban_home,
+    monkeypatch,
+):
+    """The scheduler, not prompt compliance, owns the final 120 seconds."""
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps({
+            "contract_version": "1.0",
+            "goal": {"objective": "inspect Facebook group status"},
+            "routing": {
+                "resolved": {
+                    "assignment": {
+                        "allowed_tools": ["browser_snapshot"],
+                    },
+                },
+            },
+            "user_facing_delivery": {
+                "required": True,
+                "kind": "commerce_group_status",
+                "delivery": "inline_only",
+                "subject_keys": ["Kolin"],
+            },
+        })
+        + "\n```"
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    captured = {}
+
+    class FakeProc:
+        pid = 99123
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="commerce audit",
+            body=body,
+            assignee="ops",
+            max_runtime_seconds=1200,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb._set_worker_pid(conn, tid, os.getpid())
+        old_started = int(time.time()) - 1085
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
+            )
+
+        requested = kb.request_runtime_finalization(conn)
+        assert requested == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.max_runtime_seconds == 120
+        assert task.consecutive_failures == 0
+        events = kb.list_events(conn, tid)
+        checkpoint = [
+            event for event in events
+            if event.kind == "runtime_finalization_requested"
+        ]
+        assert len(checkpoint) == 1
+        assert checkpoint[0].payload["original_limit_seconds"] == 1200
+        assert checkpoint[0].payload["finalization_budget_seconds"] == 120
+
+        finalizer = kb.claim_task(conn, tid)
+        assert finalizer is not None
+        context = kb.build_worker_context(conn, tid)
+        assert "Runtime stage: evidence-only finalization" in context
+        assert "Do not perform another browser action" in context
+        workspace = kb.resolve_workspace(finalizer)
+        monkeypatch.setattr(
+            kb,
+            "_probe_worker_capabilities",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError(
+                    "evidence-only finalization must not probe browser tools"
+                )
+            ),
+        )
+        kb._default_spawn(finalizer, str(workspace))
+        assert captured["env"]["HERMES_KANBAN_FINALIZATION_ONLY"] == "1"
+        assert "from saved evidence only" in captured["cmd"][-1]
+        assert "Do not navigate, click, search" in captured["cmd"][-1]
+    finally:
+        conn.close()
+
+
+def test_grace_commerce_finalization_is_host_local_and_terminal_on_timeout(
+    kanban_home,
+    monkeypatch,
+):
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps({
+            "user_facing_delivery": {
+                "required": True,
+                "kind": "commerce_group_status",
+            },
+        })
+        + "\n```"
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    signals = []
+    conn = kb.connect()
+    try:
+        remote_tid = kb.create_task(
+            conn,
+            title="remote commerce audit",
+            body=body,
+            assignee="ops",
+            max_runtime_seconds=240,
+        )
+        kb.claim_task(conn, remote_tid)
+        kb._set_worker_pid(conn, remote_tid, 77111)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_lock = 'remote-host:claim' WHERE id = ?",
+                (remote_tid,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 121, remote_tid),
+            )
+        assert kb.request_runtime_finalization(
+            conn,
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        ) == []
+        assert signals == []
+        assert kb.get_task(conn, remote_tid).status == "running"
+
+        tid = kb.create_task(
+            conn,
+            title="minimum commerce audit",
+            body=body,
+            assignee="ops",
+            max_runtime_seconds=240,
+        )
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, 77222)
+        assert "Finalization reserve: last 120s" in kb.build_worker_context(
+            conn,
+            tid,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 121, tid),
+            )
+        assert kb.request_runtime_finalization(conn) == [tid]
+        assert kb.get_task(conn, tid).max_runtime_seconds == 120
+
+        finalizer = kb.claim_task(conn, tid)
+        assert finalizer is not None
+        kb._set_worker_pid(conn, tid, 77333)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 121, tid),
+            )
+        assert kb.enforce_max_runtime(conn) == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        assert task.max_runtime_seconds == 240
+        assert task.consecutive_failures == 0
+        events = kb.list_events(conn, tid)
+        assert [event.kind for event in events].count(
+            "runtime_finalization_requested"
+        ) == 1
+        assert [event.kind for event in events].count(
+            "runtime_finalization_failed"
+        ) == 1
+        assert kb._runtime_finalization_state(conn, tid) is None
+    finally:
+        conn.close()
+
+
+def test_schema_blocked_commerce_execution_resumes_from_saved_evidence(
+    kanban_home,
+    monkeypatch,
+):
+    contract = {
+        "identity": {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "2",
+        },
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": ["facebook_marketplace:36803832485927906"],
+        },
+    }
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+        + json.dumps(contract)
+        + "\n```"
+    )
+    review_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: review\n```json\n"
+        + json.dumps(contract)
+        + "\n```"
+    )
+    conn = kb.connect()
+    try:
+        execution_id = kb.create_task(
+            conn,
+            title="commerce execution",
+            body=execution_body,
+            assignee="clawops-browser",
+            initial_status="blocked",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body=review_body,
+            assignee="grace",
+            parents=[execution_id],
+            initial_status="blocked",
+        )
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO grace_delegations ("
+                "delegation_id, contract_fingerprint, request_instance_id, "
+                "platform, chat_id, thread_id, session_key, session_id, "
+                "resolved_route, state, execution_task_id, review_task_id, "
+                "created_at, updated_at) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+                (
+                    "gd_saved_evidence",
+                    "f" * 64,
+                    "gri_saved_evidence",
+                    "telegram",
+                    "chat-1",
+                    "2",
+                    "agent:main:telegram:group:chat-1:2",
+                    "session-1",
+                    "{}",
+                    execution_id,
+                    review_id,
+                    now,
+                    now,
+                ),
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "browser_evidence_recorded",
+                {"operation": "snapshot", "observed_at": now},
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "blocked",
+                {
+                    "reason": "old report schema rejected local rows",
+                    "kind": "capability",
+                    "blocker": {
+                        "blocker_code": (
+                            "commerce_report_destination_ids_unavailable"
+                        ),
+                        "exact_error": (
+                            "destination_id must be canonical ASCII digits"
+                        ),
+                        "external_state_changed": False,
+                    },
+                },
+            )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="group",
+            thread_id="2",
+            user_id="owner-1",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="session-1",
+            message_id="message-1",
+            contract_fingerprint="f" * 64,
+        )
+        kb.add_comment(
+            conn,
+            execution_id,
+            "clawops-browser",
+            "COMMERCE_EVIDENCE FINAL_INLINE_REPORT\n27 named rows",
+        )
+
+        resumed = (
+            kb.resume_blocked_commerce_finalization_from_saved_evidence(
+                conn,
+                execution_task_id=execution_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id="session-2",
+                message_id="message-2",
+            )
+        )
+        assert resumed == {
+            "execution_task_id": execution_id,
+            "review_task_id": review_id,
+            "delegation_id": "gd_saved_evidence",
+            "status": "ready",
+            "already_requested": False,
+        }
+        task = kb.get_task(conn, execution_id)
+        assert task.status == "ready"
+        assert task.max_runtime_seconds == 600
+        state = kb._runtime_finalization_state(conn, execution_id)
+        assert state["source"] == "saved_commerce_evidence_schema_resume"
+        assert state["browser_allowed"] is False
+
+        replay = kb.resume_blocked_commerce_finalization_from_saved_evidence(
+            conn,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="session-2",
+            message_id="message-2",
+        )
+        assert replay["already_requested"] is True
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'triage' WHERE id = ?",
+                (execution_id,),
+            )
+        retried_from_triage = (
+            kb.resume_blocked_commerce_finalization_from_saved_evidence(
+                conn,
+                execution_task_id=execution_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id="session-2",
+                message_id="message-2",
+            )
+        )
+        assert retried_from_triage["status"] == "ready"
+        assert retried_from_triage["already_requested"] is False
+
+        with pytest.raises(ValueError, match="another authenticated"):
+            kb.resume_blocked_commerce_finalization_from_saved_evidence(
+                conn,
+                execution_task_id=execution_id,
+                platform="telegram",
+                chat_id="other-chat",
+                thread_id="2",
+                session_key="agent:main:telegram:group:other-chat:2",
+                session_id="session-2",
+                message_id="message-2",
+            )
+
+        captured = {}
+
+        class FakeProc:
+            pid = 99124
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return FakeProc()
+
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        finalizer = kb.claim_task(conn, execution_id)
+        assert finalizer is not None
+        workspace = kb.resolve_workspace(finalizer)
+        kb._default_spawn(finalizer, str(workspace))
+        assert "AUTHORITATIVE SCHEMA MIGRATION" in captured["cmd"][-1]
+        assert "omit destination_id" in captured["cmd"][-1]
+        assert "MUST be submitted with kanban_complete" in captured["cmd"][-1]
+        assert "RUNTIME_CAPABILITY_ATTESTATION" not in captured["cmd"][-1]
+    finally:
+        conn.close()
+
+
+def test_saved_evidence_continuation_rebinds_closed_report_callback(
+    kanban_home,
+):
+    listing_id = "36803832485927906"
+    subject_key = f"facebook_marketplace:{listing_id}"
+    contract = {
+        "identity": {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "2",
+        },
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": [subject_key],
+        },
+    }
+    body = json.dumps(contract)
+    conn = kb.connect()
+    try:
+        execution_id = kb.create_task(
+            conn,
+            title="commerce execution",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+                f"{body}\n```"
+            ),
+            assignee="clawops-browser",
+            initial_status="blocked",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: review\n```json\n"
+                f"{body}\n```"
+            ),
+            assignee="grace",
+            parents=[execution_id],
+            initial_status="blocked",
+        )
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO grace_delegations ("
+                "delegation_id, contract_fingerprint, request_instance_id, "
+                "platform, chat_id, thread_id, session_key, session_id, "
+                "resolved_route, state, execution_task_id, review_task_id, "
+                "created_at, updated_at) VALUES "
+                "('gd_delivery_rebind', ?, 'gri_delivery_rebind', "
+                "'telegram', 'chat-1', '2', ?, 'session-old', '{}', "
+                "'queued', ?, ?, ?, ?)",
+                (
+                    "a" * 64,
+                    "agent:main:telegram:group:chat-1:2",
+                    execution_id,
+                    review_id,
+                    now,
+                    now,
+                ),
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "browser_evidence_recorded",
+                {"operation": "snapshot", "observed_at": now},
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "blocked",
+                {
+                    "blocker": {
+                        "blocker_code": (
+                            "commerce_report_destination_ids_unavailable"
+                        ),
+                        "exact_error": "destination_id must be numeric",
+                        "external_state_changed": False,
+                    },
+                },
+            )
+            blocker_event_id = conn.execute(
+                "SELECT MAX(id) FROM task_events WHERE task_id = ? "
+                "AND kind = 'blocked'",
+                (execution_id,),
+            ).fetchone()[0]
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="group",
+            thread_id="2",
+            user_id="owner-1",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="session-old",
+            message_id="message-old",
+            contract_fingerprint="a" * 64,
+        )
+        kb.add_comment(
+            conn,
+            execution_id,
+            "clawops-browser",
+            "COMMERCE_EVIDENCE FINAL_INLINE_REPORT\n1 named row",
+        )
+        kb.resume_blocked_commerce_finalization_from_saved_evidence(
+            conn,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="session-mid",
+            message_id="message-mid",
+        )
+        execution = kb.claim_task(conn, execution_id)
+        assert execution is not None
+        report = {
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "complete": False,
+            "as_of": "2026-08-09T00:00:00+08:00",
+            "observed_at": now,
+            "rows": [{
+                "subject_key": subject_key,
+                "subject_label": "Carimali",
+                "destination_name": "二手咖啡器材交流",
+                "status": "not_posted",
+                "status_label": "未刊登",
+                "observed_at": now,
+                "verified_at": "2026-08-09T00:00:00+08:00",
+                "evidence": "visible unchecked checkbox",
+                "source_listing_id": listing_id,
+            }],
+            "coverage": [{
+                "subject_key": subject_key,
+                "subject_label": "Carimali",
+                "complete": False,
+                "named_count": 1,
+                "gap_count": None,
+                "expected_total": None,
+                "note": "one unnamed control remains",
+            }],
+        }
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="saved evidence finalized",
+            metadata={"user_facing_report": report},
+            expected_run_id=execution.current_run_id,
+        )
+        report = kb.latest_run(
+            conn, execution_id,
+        ).metadata["user_facing_report"]
+        review = kb.claim_task(conn, review_id)
+        assert review is not None
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+            expected_run_id=review.current_run_id,
+        )
+        accepted_event = max(
+            event.id
+            for event in kb.list_events(conn, review_id)
+            if event.kind == "completed"
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET state = 'attention', "
+                "last_event_id = ?, session_id = 'session-old', "
+                "last_error = 'origin session changed' "
+                "WHERE review_task_id = ?",
+                (blocker_event_id, review_id),
+            )
+
+        rebound = kb.resume_blocked_commerce_finalization_from_saved_evidence(
+            conn,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="session-current",
+            message_id="message-current",
+        )
+        assert rebound["delivery_queued"] is True
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback["state"] == "pending"
+        assert callback["session_id"] == "session-current"
+        assert callback["message_id"] == "message-current"
+        due = kb.list_due_grace_loop_callbacks(conn)
+        assert len(due) == 1
+        assert due[0]["event_id"] == accepted_event
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event,
+            lease_owner="delivery-owner",
+        )
+        reservation = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="session-current",
+            lease_owner="delivery-owner",
+            report=report,
+            chunk_index=0,
+            total_chunks=1,
+        )
+        assert reservation["should_send"] is True
+        kb.confirm_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event,
+            report=report,
+            chunk_index=0,
+            total_chunks=1,
+            message_id="telegram-1",
+        )
+        kb.record_grace_user_facing_report_delivery(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="session-current",
+            lease_owner="delivery-owner",
+            report=report,
+            chunk_count=1,
+            chunk_index=0,
+        )
+        recorded = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="session-current",
+            lease_owner="delivery-owner",
+            outcome_kind="evidence_delivered",
+            payload={"summary": "named rows and coverage gap delivered"},
+        )
+        assert recorded["outcome_kind"] == "evidence_delivered"
+        shortlist = kb.filter_saved_commerce_candidates(
+            conn,
+            listing_id=listing_id,
+            product_category="coffee_equipment",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="owner-1",
+        )
+        assert shortlist["task_created"] is False
+        assert shortlist["browser_opened"] is False
+        assert [
+            item["destination_name"]
+            for item in shortlist["recommended"]
+        ] == ["二手咖啡器材交流"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "category", "bucket"),
+    [
+        ("二手新舊咖啡設備大賣場", "coffee_equipment", "recommended"),
+        ("👍二手餐飲設備。開店撿便宜👍", "coffee_equipment", "recommended"),
+        ("【大台北地區】二手家具、二手家電買賣", "coffee_equipment", "optional"),
+        ("二手望遠鏡買賣交流", "coffee_equipment", "excluded"),
+        ("二手望遠鏡買賣交流", "telescope", "recommended"),
+        ("二手冷氣 買賣交流", "air_conditioner", "recommended"),
+    ],
+)
+def test_saved_commerce_candidate_bucket(name, category, bucket):
+    assert kb._saved_commerce_candidate_bucket(name, category)[0] == bucket
+
+
+def test_grace_commerce_finalization_does_not_extend_expired_runtime(
+    kanban_home,
+):
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps({
+            "user_facing_delivery": {
+                "required": True,
+                "kind": "commerce_group_status",
+            },
+        })
+        + "\n```"
+    )
+    signals = []
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="already expired commerce audit",
+            body=body,
+            assignee="ops",
+            max_runtime_seconds=300,
+        )
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, 77444)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 301, tid),
+            )
+
+        assert kb.request_runtime_finalization(
+            conn,
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        ) == []
+        assert signals == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.max_runtime_seconds == 300
+    finally:
+        conn.close()
+
+
 def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
     """enforce_max_runtime + dispatch_once integrate cleanly — a timed-out
     task goes through ``timed_out`` → ``ready`` and dispatch_once can then
@@ -1697,6 +2428,80 @@ def test_build_worker_context_uses_parent_run_summary(kanban_home):
         assert "Parent task results" in ctx
         assert "three angles explored; B looks strongest" in ctx
         assert '"sources"' in ctx  # metadata JSON serialized
+    finally:
+        conn.close()
+
+
+def test_grace_review_context_preserves_full_validated_commerce_report(
+    kanban_home,
+):
+    """Large chat-first reports bypass the ordinary 4 KB metadata preview."""
+    observed_at = int(time.time())
+    tail_marker = "EXACT_REPORT_TAIL_MARKER"
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-08-09T09:00:00+08:00",
+        "observed_at": observed_at,
+        "rows": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "destination_name": "二手望遠鏡買賣交流",
+            "status": "not_posted",
+            "status_label": "未刊登",
+            "observed_at": observed_at,
+            "verified_at": "2026-08-09T09:00:00+08:00",
+            "evidence": "x" * 5000 + tail_marker,
+            "source_listing_id": "36803832485927906",
+        }],
+        "coverage": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "complete": False,
+            "named_count": 1,
+            "gap_count": None,
+            "expected_total": None,
+            "expected_total_label": "unknown",
+            "note": "One named row; total unknown.",
+        }],
+    }
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n{}\n```"
+    )
+    review_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: grace_review\n```json\n{}\n```"
+    )
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="commerce evidence",
+            body=execution_body,
+            assignee="clawops-browser",
+        )
+        review = kb.create_task(
+            conn,
+            title="Grace review",
+            body=review_body,
+            assignee="grace",
+            parents=[parent],
+        )
+        kb.claim_task(conn, parent)
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="Validated partial commerce report.",
+            metadata={"user_facing_report": report},
+        )
+
+        context = kb.build_worker_context(conn, review)
+        assert "Durable user-facing report" in context
+        assert "complete validated structured handoff" in context
+        assert "二手望遠鏡買賣交流" in context
+        assert tail_marker in context
+        assert "visible-name-sha256:" in context
+        assert "replace it with a Markdown attachment" in context
     finally:
         conn.close()
 
@@ -2912,6 +3717,285 @@ def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
     assert missing["tool_checks"]["browser_upload_files"]["available"] is False
 
 
+def test_worker_capability_probe_skips_schema_for_abstract_hubops_capabilities(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "abstract-only HubOps capabilities must not start schema probes"
+        ),
+    )
+
+    result = kb._probe_worker_capabilities(
+        declared_tools=[
+            "memory_read",
+            "docs_read",
+            "web_research",
+            "report_generate",
+        ],
+        toolsets=["browser", "file", "memory", "web"],
+        env=dict(os.environ),
+        workspace=str(tmp_path),
+    )
+
+    assert result["ok"] is True
+    assert result["required_runtime_tools"] == []
+    assert result["abstract_contract_tools"] == [
+        "memory_read",
+        "docs_read",
+        "web_research",
+        "report_generate",
+    ]
+    assert result["probe_attempts"] == 0
+    assert result["probe_skipped"] == "hubops_abstract_capabilities_only"
+
+
+def test_worker_capability_probe_mixed_contract_sends_only_runtime_tools(
+    monkeypatch, tmp_path,
+):
+    completed = subprocess.CompletedProcess(
+        args=["python", "-c", "probe"],
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "declared_tools": ["browser_snapshot"],
+                "required_runtime_tools": ["browser_snapshot"],
+                "abstract_contract_tools": [],
+                "available_tools": ["browser_snapshot"],
+                "missing_required_tools": [],
+                "tool_checks": {},
+                "probe_strategy": "targeted_declared_tools",
+            }
+        ),
+        stderr="",
+    )
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(json.loads(kwargs["input"]))
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = kb._probe_worker_capabilities(
+        declared_tools=["memory_read", "browser_snapshot", "report_generate"],
+        toolsets=["browser"],
+        env=dict(os.environ),
+        workspace=str(tmp_path),
+    )
+
+    assert captured["declared_tools"] == ["browser_snapshot"]
+    assert result["declared_tools"] == [
+        "memory_read", "browser_snapshot", "report_generate",
+    ]
+    assert result["required_runtime_tools"] == ["browser_snapshot"]
+    assert result["abstract_contract_tools"] == [
+        "memory_read", "report_generate",
+    ]
+    assert result["probe_strategy"] == "targeted_declared_tools"
+
+
+def test_worker_capability_probe_retries_transient_timeout(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    completed = subprocess.CompletedProcess(
+        args=["python", "-c", "probe"],
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "declared_tools": ["browser_click"],
+                "required_runtime_tools": ["browser_click"],
+                "abstract_contract_tools": [],
+                "available_tools": ["browser_click"],
+                "missing_required_tools": [],
+                "tool_checks": {},
+            }
+        ),
+        stderr="",
+    )
+    calls = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile_home)
+    result = kb._probe_worker_capabilities(
+        declared_tools=["browser_click"],
+        toolsets=["browser-cdp"],
+        env=env,
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+
+    assert result["ok"] is True
+    assert result["probe_attempts"] == 2
+    assert calls == 2
+
+
+def test_worker_capability_probe_timeout_does_not_claim_tools_missing(
+    monkeypatch, tmp_path,
+):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile_home)
+    result = kb._probe_worker_capabilities(
+        declared_tools=["browser_click", "contract_only_pseudo_tool"],
+        toolsets=["browser-cdp"],
+        env=env,
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+
+    assert result["ok"] is False
+    assert result["missing_required_tools"] == []
+    assert result["probe_attempts"] == 2
+    assert result["probe_error"] == (
+        "isolated capability probe timed out after 1s"
+    )
+
+
+def test_worker_capability_probe_uses_matching_recent_success_after_timeout(
+    monkeypatch, tmp_path,
+):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile_home)
+    completed = subprocess.CompletedProcess(
+        args=["python", "-c", "probe"],
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "declared_tools": ["browser_click"],
+                "required_runtime_tools": ["browser_click"],
+                "abstract_contract_tools": [],
+                "available_tools": ["browser_click"],
+                "missing_required_tools": [],
+                "tool_checks": {},
+            }
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
+    fresh = kb._probe_worker_capabilities(
+        declared_tools=["memory_read", "browser_click"],
+        toolsets=["browser-cdp"],
+        env=env,
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+    assert fresh["ok"] is True
+
+    calls = 0
+
+    def timeout(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs["timeout"],
+            stderr=(
+                '{"capability_probe_stage":"builtin_tools_discovered",'
+                '"elapsed_seconds":0.75}\n'
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    restored = kb._probe_worker_capabilities(
+        declared_tools=["memory_read", "browser_click"],
+        toolsets=["browser-cdp"],
+        env=env,
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+
+    assert restored["ok"] is True
+    assert restored["probe_attempts"] == 1
+    assert restored["probe_fallback"] == "matching_recent_success_after_timeout"
+    assert restored["probe_stage"] == "builtin_tools_discovered"
+    assert restored["abstract_contract_tools"] == ["memory_read"]
+    assert calls == 1
+
+
+def test_worker_capability_probe_cache_invalidates_on_profile_config_change(
+    monkeypatch, tmp_path,
+):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    config_path = profile_home / "config.yaml"
+    config_path.write_text("browser:\n  cdp_url: http://127.0.0.1:9222\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile_home)
+    completed = subprocess.CompletedProcess(
+        args=["python", "-c", "probe"],
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "declared_tools": ["browser_click"],
+                "required_runtime_tools": ["browser_click"],
+                "abstract_contract_tools": [],
+                "available_tools": ["browser_click"],
+                "missing_required_tools": [],
+                "tool_checks": {},
+            }
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
+    assert kb._probe_worker_capabilities(
+        declared_tools=["browser_click"],
+        toolsets=["browser-cdp"],
+        env=env,
+        workspace=str(tmp_path),
+        timeout=1,
+    )["ok"] is True
+
+    # Same-length content proves invalidation is based on content as well as
+    # file metadata; a stale success must never authorize changed config.
+    original = config_path.read_text(encoding="utf-8")
+    changed = original.replace("9222", "9333")
+    assert len(changed) == len(original)
+    old_stat = config_path.stat()
+    config_path.write_text(changed, encoding="utf-8")
+    os.utime(config_path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+
+    calls = 0
+
+    def timeout(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    result = kb._probe_worker_capabilities(
+        declared_tools=["browser_click"],
+        toolsets=["browser-cdp"],
+        env=env,
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+    assert result["ok"] is False
+    assert result.get("probe_fallback") is None
+    assert calls == 2
+
+
 def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
     kanban_home, monkeypatch,
 ):
@@ -3147,8 +4231,8 @@ def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monk
     finally:
         conn.close()
 
-    assert captured["env"]["TERMINAL_TIMEOUT"] == "3570"
-    assert captured["env"]["TERMINAL_MAX_FOREGROUND_TIMEOUT"] == "3570"
+    assert captured["env"]["TERMINAL_TIMEOUT"] == "3480"
+    assert captured["env"]["TERMINAL_MAX_FOREGROUND_TIMEOUT"] == "3480"
     assert os.environ["TERMINAL_TIMEOUT"] == "180"
 
 
@@ -3228,7 +4312,211 @@ def test_build_worker_context_includes_runtime_timeout_budget(kanban_home, monke
         conn.close()
 
     assert "Max runtime: 3600s" in ctx
-    assert "Terminal timeout: 3570s" in ctx
+    assert "Terminal timeout: 3480s" in ctx
+    assert "Finalization reserve: last 120s" in ctx
+
+
+def test_uncontracted_user_report_is_evidence_and_does_not_block_completion(
+    kanban_home,
+):
+    conn = kb.connect()
+    now = int(time.time())
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        '{"contract_version":"1.0","goal":{"objective":"read-only status"}}\n'
+        "```"
+    )
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-08-04T22:00:00+08:00",
+        "observed_at": now,
+        "rows": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "destination_id": "260697590957215",
+            "destination_name": "Coffee group",
+            "status": "unknown",
+            "status_label": "未確認",
+            "observed_at": now,
+            "verified_at": "2026-08-04T22:00:00+08:00",
+            "evidence": "read-only screenshot",
+            "source_listing_id": "36803832485927906",
+        }],
+        "coverage": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "complete": False,
+            "named_count": 1,
+            "gap_count": None,
+            "expected_total": None,
+            "note": "partial evidence only",
+        }],
+    }
+    try:
+        tid = kb.create_task(conn, title="read-only status", body=body)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="partial evidence preserved",
+            metadata={"user_facing_report": report},
+        ) is True
+        assert kb.list_commerce_group_ledger(
+            conn,
+            subject_key="carimali-armonia-soft-plus",
+        ) == []
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "user_facing_report_evidence_recorded" in kinds
+        assert "user_facing_report_recorded" not in kinds
+    finally:
+        conn.close()
+
+
+def test_durable_commerce_report_merges_all_listings_and_interaction_metrics(
+    kanban_home,
+):
+    conn = kb.connect()
+    now = int(time.time())
+
+    def report(listing_id, label, group_id, group_listing_id, reactions):
+        return {
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "complete": True,
+            "as_of": "2026-08-14T12:00:00+08:00",
+            "observed_at": now,
+            "rows": [{
+                "subject_key": f"facebook_marketplace:{listing_id}",
+                "subject_label": label,
+                "destination_id": group_id,
+                "destination_name": f"{label} 社團",
+                "group_listing_id": group_listing_id,
+                "status": "public",
+                "status_label": "已刊登",
+                "reaction_count": reactions,
+                "comment_count": 0,
+                "view_count": None,
+                "observed_at": now,
+                "verified_at": "2026-08-14T12:00:00+08:00",
+                "evidence": "Exact group commerce listing was visible.",
+                "evidence_url": (
+                    "https://www.facebook.com/marketplace/item/"
+                    f"{group_listing_id}"
+                ),
+                "source_listing_id": listing_id,
+            }],
+            "coverage": [{
+                "subject_key": f"facebook_marketplace:{listing_id}",
+                "subject_label": label,
+                "complete": True,
+                "named_count": 1,
+                "gap_count": 0,
+                "expected_total": 1,
+                "listing_click_count": 100 + reactions,
+                "listing_click_window_days": 14,
+                "note": "All known group publications verified.",
+            }],
+        }
+
+    try:
+        kb.record_commerce_user_facing_report(
+            conn,
+            report=report("915975414881937", "Kolin", "111", "9001", 1),
+            source_task_id="first-session-task",
+        )
+        kb.record_commerce_user_facing_report(
+            conn,
+            report=report("222222222222222", "Second listing", "222", "9002", 0),
+            source_task_id="later-session-task",
+        )
+
+        merged = kb.build_durable_commerce_user_facing_report(conn)
+
+        assert merged is not None
+        assert {item["subject_key"] for item in merged["coverage"]} == {
+            "kolin-kd291m06",
+            "facebook_marketplace:222222222222222",
+        }
+        assert {row["group_listing_id"] for row in merged["rows"]} == {
+            "9001", "9002",
+        }
+        assert [row["reaction_count"] for row in merged["rows"]] == [0, 1]
+        assert merged["coverage"][0]["listing_click_window_days"] == 14
+    finally:
+        conn.close()
+
+
+def test_commerce_worker_context_includes_cross_session_listing_ledger(
+    kanban_home,
+):
+    conn = kb.connect()
+    now = int(time.time())
+    listing_id = "915975414881937"
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": True,
+        "as_of": "2026-08-14T12:00:00+08:00",
+        "observed_at": now,
+        "rows": [{
+            "subject_key": f"facebook_marketplace:{listing_id}",
+            "subject_label": "Kolin KD-291M06",
+            "destination_id": "207110076321670",
+            "destination_name": "二手家電冷氣買賣",
+            "group_listing_id": "845513731860834",
+            "status": "public",
+            "status_label": "已刊登",
+            "reaction_count": 1,
+            "comment_count": 0,
+            "view_count": None,
+            "observed_at": now,
+            "verified_at": "2026-08-14T12:00:00+08:00",
+            "evidence": "Exact group post visible.",
+            "evidence_url": (
+                "https://www.facebook.com/groups/207110076321670/posts/987654321"
+            ),
+            "source_listing_id": listing_id,
+        }],
+        "coverage": [{
+            "subject_key": f"facebook_marketplace:{listing_id}",
+            "subject_label": "Kolin KD-291M06",
+            "complete": True,
+            "named_count": 1,
+            "gap_count": 0,
+            "expected_total": 1,
+            "note": "All known destinations verified.",
+        }],
+    }
+    try:
+        kb.record_commerce_user_facing_report(
+            conn,
+            report=report,
+            source_task_id="prior-session-task",
+        )
+        body = (
+            "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps({
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": [f"facebook_marketplace:{listing_id}"],
+                },
+            })
+            + "\n```"
+        )
+        task_id = kb.create_task(conn, title="refresh listing", body=body)
+
+        context = kb.build_worker_context(conn, task_id)
+
+        assert "Durable commerce ledger for this exact listing scope" in context
+        assert "prior-session-task" in context
+        assert "845513731860834" in context
+        assert "gateway separately merges all listing scopes" in context
+    finally:
+        conn.close()
 
 
 

@@ -3,10 +3,13 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
+from proactive.loop_contract import canonical_marketplace_readonly_sections
 
 
 class CallbackAdapter:
@@ -255,16 +258,35 @@ def test_orphan_callback_cannot_be_listed_or_claimed(tmp_path, monkeypatch):
         )
 
 
-def _review_chain(db_path, *, event_kind="completed", accepted=True):
+def _review_chain(
+    db_path,
+    *,
+    event_kind="completed",
+    accepted=True,
+    execution_metadata=None,
+    execution_body=None,
+    review_body=None,
+    review_metadata=None,
+):
     with kb.connect_closing(db_path) as conn:
         execution_id = kb.create_task(
-            conn, title="execution", assignee="clawops-content",
+            conn,
+            title="execution",
+            body=execution_body,
+            assignee="clawops-content",
         )
-        kb.complete_task(conn, execution_id, summary="execution complete")
+        kb.complete_task(
+            conn,
+            execution_id,
+            summary="execution complete",
+            metadata=execution_metadata,
+        )
         review_id = kb.create_task(
             conn,
             title="Grace review",
+            body=review_body,
             assignee="default",
+            created_by="grace-loop-compiler",
             parents=(execution_id,),
         )
         _bind_delegation(
@@ -286,7 +308,11 @@ def _review_chain(db_path, *, event_kind="completed", accepted=True):
         if event_kind == "blocked":
             assert kb.block_task(conn, review_id, reason="KJ must choose a price")
         else:
-            metadata = {"review_outcome": "accepted"} if accepted else {"review_outcome": "unknown"}
+            metadata = review_metadata or (
+                {"review_outcome": "accepted"}
+                if accepted
+                else {"review_outcome": "unknown"}
+            )
             assert kb.complete_task(
                 conn, review_id, summary="review complete", metadata=metadata,
             )
@@ -338,6 +364,478 @@ def test_accepted_review_wakes_grace_once(tmp_path, monkeypatch):
         callback = kb.get_grace_loop_callback(conn, review_id)
     assert callback["state"] == "delivered"
     assert callback["last_event_id"] > 0
+
+
+def test_timeout_callback_carries_compiled_contract_scope(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "callback-contract-scope.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps({
+            "contract_version": "1.0",
+            "goal": {
+                "objective": "唯讀查核 Kolin Marketplace 刊登狀態",
+                "deliverables": ["社團完整名稱與目前狀態"],
+            },
+            "scope": {
+                "allowed": ["Facebook Marketplace 唯讀檢視"],
+                "forbidden": ["勾選社團", "發布"],
+            },
+            "external_targets": [
+                "Facebook Marketplace item 37217119148451132",
+            ],
+            "completion_mode": "intermediate",
+        }, ensure_ascii=False)
+        + "\n```"
+    )
+    execution_id, review_id = _review_chain(
+        db_path,
+        execution_body=execution_body,
+    )
+    with kb.connect_closing(db_path) as conn:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                execution_id,
+                "browser_evidence_recorded",
+                {
+                    "operation": "snapshot",
+                    "observed_at": int(time.time()),
+                    "visible_text": "Kolin｜In stock｜至少刊登於 1 個社團",
+                },
+            )
+            kb._append_event(
+                conn,
+                execution_id,
+                "browser_blocker_recorded",
+                {
+                    "blocker_code": "facebook_readonly_guard_mismatch",
+                    "component": "controlled_facebook_browser",
+                    "operation": "open_more_options",
+                    "listing_id": "37217119148451132",
+                    "tool": "browser_click",
+                    "tool_error_code": (
+                        "popup_semantics_changed_before_atomic_action"
+                    ),
+                    "exact_error": (
+                        "Captured snapshot popup semantics changed before "
+                        "atomic action"
+                    ),
+                    "observed_at": int(time.time()),
+                    "external_state_changed": False,
+                    "raw_cdp_or_dom_used": False,
+                },
+            )
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    prompt = adapter.handled[0].text
+    assert '"contract_scope"' in prompt
+    assert "37217119148451132" in prompt
+    assert "社團完整名稱與目前狀態" in prompt
+    assert "browser_evidence_recorded" in prompt
+    assert "browser_blocker_recorded" in prompt
+    assert "popup_semantics_changed_before_atomic_action" in prompt
+    assert "Kolin｜In stock｜至少刊登於 1 個社團" in prompt
+    assert "never ask KJ to paste or restate the original task" in prompt
+    assert "localhost CDP connection-refused" in prompt
+    assert "immediately create one fresh read-only continuation" in prompt
+    assert "Infrastructure recovery never authorizes a Facebook click" in prompt
+    assert "facebook_page_actor_guard_mismatch" in prompt
+    assert "facebook_page_guard_rejected" in prompt
+    assert "switch_into_page_visible=false is a passed negative gate" in prompt
+    assert "facebook_page_switch_required" in prompt
+    assert "report the exact failed predicate" in prompt
+    assert "no profile switch is requested" in prompt
+    assert "Hermes-controlled Facebook Page window" in prompt
+    assert f"execution_task_id={execution_id}" in prompt
+    assert f"grace_review_task_id={review_id}" in prompt
+
+
+def test_timeout_callback_hard_bounds_pathological_contract_scope(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "callback-bounded-scope.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "```json\n"
+        + json.dumps({
+            "goal": {"objective": "x" * 40_000},
+            "user_facing_delivery": {
+                "required": True,
+                "kind": "commerce_group_status",
+            },
+        })
+        + "\n```"
+    )
+    _review_chain(db_path, execution_body=execution_body)
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    prompt = adapter.handled[0].text
+    evidence_json = prompt.split("evidence_snapshot=", 1)[1].split("\n", 1)[0]
+    assert len(evidence_json) <= 16_000
+    bounded = json.loads(evidence_json)
+    assert bounded["note"].startswith("callback evidence was structurally clipped")
+
+
+def test_uncontracted_user_report_is_evidence_not_callback_poison(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "uncontracted-user-report.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id = _review_chain(
+        db_path,
+        execution_metadata={
+            "user_facing_report": {
+                "kind": "commerce_group_status",
+                "delivery": "inline_only",
+                "complete": False,
+                "as_of": "2026-08-03T13:31:46Z",
+                "observed_at": int(time.time()),
+                "rows": [],
+                "coverage": [{
+                    "subject_key": "carimali-armonia-soft-plus",
+                    "subject_label": "Carimali Armonia Soft Plus",
+                    "complete": False,
+                    "named_count": 0,
+                    "gap_count": None,
+                    "expected_total": None,
+                    "note": (
+                        "reviewed evidence without an exact delivery contract"
+                    ),
+                }],
+            },
+        },
+    )
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    assert adapter.sent == []
+    prompt = adapter.handled[0].text
+    assert "contracted_user_facing_report=false" in prompt
+    assert "Gateway has not auto-delivered it" in prompt
+    assert "no accepted Kanban completion" in prompt
+    assert "never say no deliverable was produced" in prompt
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "closed"
+    assert callback["user_report_delivered_at"] is None
+
+
+def test_saved_evidence_report_delivers_without_another_grace_turn(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "saved-evidence-delivery.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    listing_id = "36803832485927906"
+    subject_key = f"facebook_marketplace:{listing_id}"
+    contract = {
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": [subject_key],
+        },
+    }
+    body = json.dumps(contract)
+    observed_at = int(time.time())
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-08-09T00:00:00+08:00",
+        "observed_at": observed_at,
+        "rows": [{
+            "subject_key": subject_key,
+            "subject_label": "Carimali",
+            "destination_name": "二手咖啡器材交流",
+            "status": "not_posted",
+            "status_label": "未刊登",
+            "observed_at": observed_at,
+            "verified_at": "2026-08-09T00:00:00+08:00",
+            "evidence": "visible unchecked checkbox",
+            "source_listing_id": listing_id,
+        }],
+        "coverage": [{
+            "subject_key": subject_key,
+            "subject_label": "Carimali",
+            "complete": False,
+            "named_count": 1,
+            "gap_count": None,
+            "expected_total": None,
+            "note": "one unnamed Join group control remains",
+        }],
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="saved commerce evidence",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+                f"{body}\n```"
+            ),
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: review\n```json\n"
+                f"{body}\n```"
+            ),
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="saved-evidence-delivery",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="b" * 64,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                execution_id,
+                "runtime_finalization_requested",
+                {"source": "saved_commerce_evidence_schema_resume"},
+            )
+        execution = kb.claim_task(conn, execution_id)
+        assert execution is not None
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="saved evidence finalized",
+            metadata={"user_facing_report": report},
+            expected_run_id=execution.current_run_id,
+        )
+        review = kb.claim_task(conn, review_id)
+        assert review is not None
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+            expected_run_id=review.current_run_id,
+        )
+    adapter = CallbackAdapter(
+        send_result=SimpleNamespace(success=True, message_id="telegram-42"),
+    )
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.sent) == 1
+    assert "二手咖啡器材交流：尚未驗證" in adapter.sent[0][1]
+    assert "candidate checkbox does not prove" in adapter.sent[0][1]
+    assert adapter.handled == []
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        continuations = conn.execute(
+            "SELECT COUNT(*) FROM grace_delegations "
+            "WHERE origin_review_task_id = ?",
+            (review_id,),
+        ).fetchone()[0]
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "evidence_delivered"
+    assert callback["user_report_delivered_at"] is not None
+    assert continuations == 0
+
+
+@pytest.mark.parametrize(
+    "group_ids",
+    [
+        ["897927458651235"],
+        ["1333742673375089", "897927458651235"],
+    ],
+)
+def test_callback_prompt_exposes_exact_accepted_facebook_crosspost_scope(
+    tmp_path,
+    monkeypatch,
+    group_ids,
+):
+    db_path = tmp_path / "facebook-scope-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    listing_id = "37276725125275496"
+    review_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: grace_review\n"
+        "```json\n"
+        + json.dumps({
+            "grace_interpretation": (
+                f"來源 listing {listing_id} 待確認，並明確選擇"
+                "跨貼目標為 Facebook 群組 "
+                + " 與 ".join(group_ids)
+            ),
+            "memory": {
+                "working": [
+                    "KJ 指定未來目的地僅限群組 "
+                    + " 與 ".join(group_ids),
+                    "歷史候選來源為 37276725125275496。",
+                ],
+            },
+        }, ensure_ascii=False)
+        + "\n```"
+    )
+    _, review_id = _review_chain(
+        db_path,
+        review_body=review_body,
+        review_metadata={
+            "review_outcome": "accepted",
+            "verified_evidence": {
+                "canonical_listing_id": listing_id,
+                "canonical_url": (
+                    "https://www.facebook.com/marketplace/item/"
+                    f"{listing_id}/"
+                ),
+            },
+        },
+    )
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    prompt = adapter.handled[0].text
+    assert (
+        f"callback_facebook_crosspost_source_listing_id={listing_id}"
+        in prompt
+    )
+    assert (
+        'callback_facebook_crosspost_destination_group_ids='
+        + json.dumps(sorted(group_ids), ensure_ascii=False)
+        in prompt
+    )
+    assert (
+        "set user_facing_delivery.subject_keys to exactly "
+        "['facebook_marketplace:<numeric-id>']"
+        in prompt
+    )
+    assert "never add, remove, or substitute a destination" in prompt
+
+
+def test_retry_delivered_decision_callback_is_exact_and_single_use(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "retry-stale-decision.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id = _review_chain(db_path)
+    with kb.connect_closing(db_path) as conn:
+        event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (review_id,),
+        ).fetchone()
+        assert event is not None
+        event_id = int(event["id"])
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                review_id,
+                "memory_promotion_pending",
+                {"state": "pending"},
+            )
+            conn.execute(
+                """
+                UPDATE grace_loop_callbacks
+                   SET state = 'delivered', last_event_id = ?,
+                       outcome_event_id = ?, outcome_kind = 'decision_blocked',
+                       outcome_payload = '{"exact_question":"stale"}'
+                 WHERE review_task_id = ?
+                """,
+                (event_id, event_id, review_id),
+            )
+        assert kb.retry_delivered_decision_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+        )
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback["state"] == "pending"
+        replay_event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (review_id,),
+        ).fetchone()[0]
+        assert replay_event_id > event_id
+        assert callback["last_event_id"] == replay_event_id - 1
+        assert callback["outcome_kind"] is None
+        assert not kb.retry_delivered_decision_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                review_id,
+                "operator_retry_requested",
+                {"source": "test"},
+            )
+            conn.execute(
+                """
+                UPDATE grace_loop_callbacks
+                   SET state = 'delivered', last_event_id = ?,
+                       outcome_event_id = ?, outcome_kind = 'decision_blocked'
+                 WHERE review_task_id = ?
+                """,
+                (event_id, event_id, review_id),
+            )
+        assert not kb.retry_delivered_decision_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+        )
 
 
 def test_accepted_review_waits_for_background_turn_before_checking_outcome(
@@ -659,7 +1157,209 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     assert "validated_outcome=accepted" in review_event.text
 
 
-def test_execution_approval_challenge_requires_structured_outcome(
+def test_validated_execution_browser_blocker_records_capability_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "execution-capability-outcome.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    listing_id = "915975414881937"
+    observed_at = int(time.time())
+    contract = {
+        **canonical_marketplace_readonly_sections(listing_id),
+        "external_targets": [f"Facebook Marketplace listing ID {listing_id}"],
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": [f"facebook_marketplace:{listing_id}"],
+        },
+    }
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+    blocker = {
+        "blocker_code": "facebook_readonly_guard_mismatch",
+        "component": "controlled_facebook_browser",
+        "operation": "open_more_options",
+        "listing_id": listing_id,
+        "tool": "browser_click",
+        "tool_error_code": "facebook_readonly_scope_denied",
+        "exact_error": (
+            "Facebook mutation blocked: the current page is neither an "
+            "authorized numeric group destination nor a reserved create route."
+        ),
+        "observed_at": observed_at,
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook read-only inspection",
+            assignee="clawops-browser",
+            body=execution_body,
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="execution-capability-outcome",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="a" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="controlled browser read-only guard mismatch",
+            kind="capability",
+            blocker=blocker,
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    assert "validated_outcome=needs_input" in adapter.handled[0].text
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "capability_blocked"
+    outcome_payload = json.loads(callback["outcome_payload"])
+    assert outcome_payload["capability_key"] == (
+        f"facebook:marketplace-group-status:{listing_id}"
+    )
+    assert outcome_payload["retry_after"] == observed_at + 900
+
+
+def test_validated_marketplace_price_blocker_records_capability_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "price-capability-outcome.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    listing_id = "1666446304587399"
+    observed_at = int(time.time())
+    contract = {
+        "identity": {
+            "project": "secondhand_commerce",
+            "topic_name": "price update",
+            "request_instance_id": "price-callback-test",
+        },
+        "goal": {"objective": "update exact listing price"},
+        "scope": {"allowed": ["price only"], "forbidden": ["other fields"]},
+        "routing": {"task_type": "facebook_marketplace_price_update"},
+        "external_targets": [f"Facebook Marketplace item {listing_id}"],
+        "facebook_marketplace_price_update": {
+            "action": "update_price",
+            "transport": "browser",
+            "marketplace_listing_id": listing_id,
+            "currency": "TWD",
+            "price_twd": 89000,
+        },
+    }
+    execution_body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+    blocker = {
+        "blocker_code": "facebook_marketplace_price_guard_mismatch",
+        "component": "controlled_facebook_browser",
+        "operation": "update_price",
+        "listing_id": listing_id,
+        "price_twd": 89000,
+        "tool": "browser_type",
+        "tool_error_code": "facebook_readonly_scope_denied",
+        "exact_error": (
+            "Facebook mutation blocked: the current page is neither an "
+            "authorized numeric group destination, an approved Page "
+            "composer, nor a reserved create route."
+        ),
+        "observed_at": observed_at,
+        "external_state_changed": False,
+        "raw_cdp_or_dom_used": False,
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn, title="Marketplace price update",
+            assignee="clawops-browser", body=execution_body,
+        )
+        review_id = kb.create_task(
+            conn, title="Grace review", assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id,
+            suffix="price-capability-outcome",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="b" * 64,
+        )
+        assert kb.block_task(
+            conn, execution_id, reason="price guard mismatch",
+            kind="capability", blocker=blocker,
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "capability_blocked"
+    outcome_payload = json.loads(callback["outcome_payload"])
+    assert outcome_payload["capability_key"] == (
+        f"facebook:marketplace-price-update:{listing_id}"
+    )
+    assert outcome_payload["retry_after"] == observed_at + 900
+
+
+def test_execution_approval_challenge_records_exact_structured_outcome(
     tmp_path,
     monkeypatch,
 ):
@@ -716,9 +1416,9 @@ def test_execution_approval_challenge_requires_structured_outcome(
 
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
-        challenge_count = conn.execute(
+        challenge_rows = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT token
               FROM grace_approval_challenges
              WHERE origin_review_task_id = ?
                AND origin_event_id = ?
@@ -727,12 +1427,23 @@ def test_execution_approval_challenge_requires_structured_outcome(
             (review_id, adapter.handled[0].text.split(
                 "callback_event_id=", 1,
             )[1].splitlines()[0]),
-        ).fetchone()[0]
+        ).fetchall()
     assert len(adapter.handled) == 1
-    assert callback["state"] == "pending"
-    assert callback["last_event_id"] == 0
-    assert "durable checkpoint" in callback["last_error"]
-    assert challenge_count == 1
+    assert callback["state"] == "delivered"
+    assert callback["last_event_id"] > 0
+    assert callback["last_error"] is None
+    assert callback["outcome_kind"] == "approval_blocked"
+    outcome = json.loads(callback["outcome_payload"])
+    assert outcome == {
+        "action": "navigate Facebook Marketplace read-only",
+        "platform": "Facebook Marketplace",
+        "scope": {
+            "allowed": ["navigate", "click"],
+            "forbidden": ["write"],
+        },
+        "exact_question": f"核准 {challenge_rows[0]['token']}",
+    }
+    assert len(challenge_rows) == 1
 
 
 def test_expired_execution_approval_challenge_still_requires_outcome(

@@ -8,6 +8,7 @@ real browser, no real WebSocket.  Real-CDP coverage lives in
 from __future__ import annotations
 
 import json
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,6 +36,491 @@ def _patch_supervisor(monkeypatch, supervisor):
     registry.get.return_value = supervisor
     monkeypatch.setattr(bs, "SUPERVISOR_REGISTRY", registry)
     return registry
+
+
+def test_item_page_atomic_guard_accepts_all_supported_more_options_labels():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+
+    for label in ('"options"', '"more options"', '"選項"', '"更多選項"'):
+        assert label in source
+    for label in (
+        '"list in more places"',
+        '"list your item in more places"',
+        '"刊登到更多地方"',
+        '"在更多地方刊登"',
+    ):
+        assert label in source
+    assert 'crosspostStage === "open_dialog_direct"' in source
+
+
+def test_selling_page_atomic_guard_supports_traditional_chinese_row_labels():
+    from tools.browser_supervisor import CDPSupervisor
+    from tools import browser_tool
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    caller_source = inspect.getsource(browser_tool._run_atomic_ref_action)
+
+    assert '"更多選項："' in source
+    assert 'normalized_name.startswith("更多選項:")' in caller_source
+    assert '`推廣 ${listingName} 的刊登`' in source
+    assert '`為 ${listingName} 推廣刊登`' in source
+    assert '`boost listings for ${listingName}`' in source
+
+
+def test_marketplace_price_guard_binds_live_value_page_and_update_control():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+
+    assert 'marketplacePriceStage === "fill"' in source
+    assert 'canonicalIntegerPrice(this.value)' in source
+    assert 'match[1].replace(/,/g, "")' in source
+    assert '^(?:NT[$])?' in source
+    assert 'failed_predicate: failedFillPredicate' in source
+    assert 'pageIdentity: expected' in source
+    assert 'marketplacePriceStage === "submit"' in source
+    assert 'normalized_live_value: canonicalIntegerPrice(' in source
+    assert 'failed_predicate: failedSubmitPredicate' in source
+    assert '__hermesMarketplacePriceSubmitFlow' in source
+    assert 'submit_control_count: submitControls.length' in source
+    assert 'submit_control_match: markedSubmit === this' in source
+    assert 'form_present' not in source
+    assert 'same_form' not in source
+    assert 'facebook_marketplace_price_fill_guard_rejected' in source
+    assert 'facebook_marketplace_price_submit_guard_rejected' in source
+
+
+def test_marketplace_price_listing_id_does_not_enter_crosspost_guard():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    crosspost_guard = source.split(
+        "let crosspostGroupId = null;", 1
+    )[1].split('if (marketplacePriceStage === "submit")', 1)[0]
+    crosspost_state_update = source.split(
+        "delete this.__hermesAtomicGuard;", 1
+    )[1].split("// The hit test, page identity check", 1)[0]
+
+    assert "if (crosspostStage) {" in crosspost_guard
+    assert "if (requiredListingId) {" not in crosspost_guard
+    assert "if (crosspostStage) {" in crosspost_state_update
+    assert "if (requiredListingId) {" not in crosspost_state_update
+
+
+def test_page_composer_guard_accepts_canonical_facebook_page_redirects():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    page_binding = source.split(
+        "const approvedPageSlug = (() => {", 1
+    )[1].split("const pageOpenContextIn = container =>", 1)[0]
+
+    assert (
+        "canonicalPageUrlOf(location.href)\n"
+        "                              !== requiredFacebookPageUrl"
+    ) in page_binding
+    assert source.count("canonicalPageUrlOf(location.href)") == 5
+    assert "location.href !== requiredFacebookPageUrl" not in source
+
+
+def test_page_composer_open_uses_management_actor_and_diagnostic_signals():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    page_binding = source.split(
+        "const pageOpenContextIn = container => {", 1
+    )[1].split("const composerActorBindingIn =", 1)[0]
+
+    assert "const canonicalPageAnchors = [" in page_binding
+    assert "const commentActorNames =" in page_binding
+    assert 'lower.startsWith("comment as ")' in page_binding
+    assert "return normalizeActor(label.slice(11))" in page_binding
+    assert "(?:身分|身份)留言$/" in page_binding
+    assert "(?:留言身分|留言身份)" in page_binding
+    assert "const distinctCommentActorNames = commentActorNames.filter(" in page_binding
+    assert "const distinctPageNavigationActorNames = (" in page_binding
+    assert "const pageNavigationHeadingNames = (" in page_binding
+    assert "const identityBoundary = manageHeading" in page_binding
+    assert "'[role=\"separator\"],hr'" in page_binding
+    assert "Boolean(name)" in page_binding
+    assert "commentActorNames.indexOf(name) === index" in page_binding
+    assert "pageNavigationActorNames.indexOf(name) === index" in page_binding
+    assert "comment_actor_names: distinctCommentActorNames" in page_binding
+    assert "canonical_page_anchor_count:" in page_binding
+    assert "manage_page_context_visible: pageNavigations.length > 0" in page_binding
+    assert "page_navigation_heading_names:" in page_binding
+    assert "distinctPageNavigationActorNames.length === 1" in page_binding
+    assert "corroboratedManagementActors.length === 1" not in page_binding
+    assert "distinctCommentActorNames.length !== 1" not in page_binding
+    assert "const sourcePageAnchor = (" not in page_binding
+    assert "const requiredSourceActor = normalizeActor(" in page_binding
+    assert "!requiredSourceActor" in page_binding
+    assert "actor === requiredSourceActor" in page_binding
+    assert "switch_into_page_visible: sourceShowsSwitchGate" in page_binding
+    assert '"facebook_page_switch_required"' in source
+    assert '"facebook_page_source_context_unproven"' in source
+    assert "const visiblePageComposerShells = () =>" in source
+    assert "editable.closest('[role=\"dialog\"]') === dialog" in source
+    assert "const visibleDialogShellsBefore = new Set(" in source
+    assert "[...documentRef.querySelectorAll('[role=\"dialog\"]')]" in source
+    assert "pageComposersBefore" not in source
+    assert "!editable.closest('[aria-disabled=\"true\"]')" in source
+    assert "!editable.closest('[aria-readonly=\"true\"]')" in source
+    assert "editable.isContentEditable" in source
+    assert '!editable.matches(":disabled")' in source
+    assert "!editable.readOnly" in source
+    assert "opened_composer_shell_count:" in source
+    assert "attempt < 100" in source
+    settling_loop = source.split(
+        "for (let attempt = 0; attempt < 100; attempt += 1)", 1
+    )[1].split("const openedComposerShells =", 1)[0]
+    final_binding = source.split(
+        "const openedComposerShells =", 1
+    )[1].split('"facebook_page_composer_actor_mismatch"', 1)[0]
+    assert "composerActorBindingIn(" not in settling_loop
+    assert "const composerActor = composerActorBindingIn(" in final_binding
+    assert "const settledPageContext = pageOpenContextIn(" in final_binding
+    assert '"source_page_management_context"' in source
+    assert "composer_mentions_expected_actor:" not in source
+    assert "composerActorContradictionsIn" in source
+    assert "for (const element of [" in source
+    assert "dialog," in source
+    assert '"composer_actor_contradiction"' in source
+    assert source.count("contradictory_composer_actors:") >= 2
+    assert source.count("composerActorContradictions.length > 0") >= 2
+    assert "const currentSourceActorState = (() =>" in source
+    assert "source_actor_match:" in source
+    assert "source_actor_contradiction:" in source
+    assert "settled_source_actor_observable:" in source
+    assert source.count("visible_composer_count:") == 2
+    assert source.count('"visible_composer_count"') == 2
+
+
+def test_page_composer_guard_supports_exact_static_text_actor_binding():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    composer_binding = source.split(
+        "const composerActorBindingIn = (", 1
+    )[1].split("let approvedPageActor = null", 1)[0]
+
+    assert "When no" in composer_binding
+    assert "Page anchor exists in that dialog" in composer_binding
+    assert "normalizeActor(" in composer_binding
+    assert ") !== expectedActor" in composer_binding
+    assert "distinctSemanticActors.length === 1" in composer_binding
+    assert "url: requiredFacebookPageUrl" in composer_binding
+    assert "name: expectedActor" in composer_binding
+    assert "candidateTextNodes" in source
+    assert "actorElements.length !== 1" in composer_binding
+    assert "directActorTextVisible" in composer_binding
+    assert "createRange()" in source
+    assert "range.getClientRects()" in source
+    assert "textRects.every(({rect: textRect, textNode}) =>" in source
+    assert "const colorPainted = value =>" in source
+    assert 'style.filter || "none"' in source
+    assert "right >= textRect.right - epsilon" in source
+    assert "dialog.contains(actorElements[0])" in composer_binding
+    assert "hasEditableSurface(element)" in composer_binding
+    assert "element?.isContentEditable" in source
+    assert "child.isContentEditable" in source
+    assert "textbox => textbox.contains(element)" in composer_binding
+    assert "rect.bottom > textboxTop" in composer_binding
+    assert "rect.bottom > textboxTop + 24" not in composer_binding
+    assert "return bindings.length === 1 ? bindings[0] : null" in source
+
+
+def test_page_composer_actor_proof_excludes_hidden_and_offscreen_nodes():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+
+    assert source.count("const strictlyVisible = node => {") == 2
+    assert source.count("current = current.parentElement") >= 4
+    assert source.count('current.hasAttribute("hidden")') == 2
+    assert source.count('current.hasAttribute("inert")') == 2
+    assert source.count(
+        'current.getAttribute("aria-hidden") || ""'
+    ) == 2
+    assert source.count('style.visibility !== "visible"') == 2
+    assert source.count("Number(style.opacity) === 0") >= 2
+    assert source.count('style.overflowX !== "visible"') >= 4
+    assert source.count('style.overflowY !== "visible"') >= 4
+    assert source.count('clipPath && clipPath !== "none"') == 2
+    assert source.count('legacyClip && legacyClip !== "auto"') == 2
+    assert source.count("const directActorTextVisible = (") == 2
+    assert source.count('value === "paint"') >= 4
+    assert source.count('value === "strict"') >= 4
+    assert source.count('value === "content"') >= 4
+    assert source.count("current.clientLeft") >= 4
+    assert source.count("current.clientTop") >= 4
+    assert source.count("current.clientWidth") >= 4
+    assert source.count("current.clientHeight") >= 4
+    assert source.count("visibleRight <= visibleLeft") == 2
+    assert source.count("visibleBottom <= visibleTop") == 2
+    assert "&& strictlyVisible(anchor)" in source
+    assert ".filter(strictlyVisible)" in source
+    assert "|| !strictlyVisible(actorElement)" in source
+    assert source.count("candidate.url === binding.url") >= 1
+    assert source.count("candidate.name === binding.name") >= 1
+    assert source.count("return distinctBindings.length === 1") >= 1
+    assert "const pageNavigationActorNames = pageNavigations.flatMap(" in source
+    assert "management_actor_names:" in source
+    assert "const pageNavigations = [" in source
+    assert "sourceShowsSwitchGate" in source
+    assert "const visibleSwitchGateLabels = [" in source
+    assert "visibleSwitchGateLabels.some(rawLabel =>" in source
+    assert 'node.getAttribute("aria-label")' in source
+    assert '.replace(/[’‘]/g, "\'")' in source
+    assert "/切[換换]/" in source
+    assert "manage page" in source
+    assert "const managePageLabels = [" in source
+    assert "&& sourceActorAuthorized" in source
+    assert "approvedPageActorAuthorized = true" in source
+    assert "approvedPageActorAuthorized" in source
+    assert "includeDescendants = false" in source
+    assert source.count("NodeFilter.SHOW_TEXT") >= 2
+    assert "actorElement, requiredFacebookPageActor," in source
+    assert "actorElement.matches('a[href]')" in source
+    assert "textRectGroups.some(rects => !rects.length)" in source
+    assert "url: actorUrl, name: requiredFacebookPageActor" in source
+    assert "name: actorToken ? expectedActor : actorName" in source
+    assert source.count("visibleCandidateTextNodes") >= 4
+    assert ').join("")) !== expectedActor' in source
+    assert "!strictlyVisible(this)" in source
+    assert "!textboxes.includes(this)" in source
+    assert "textboxTop - rect.bottom > 240" not in source
+    assert "element.contains(candidate)" in source
+    assert "pageGuardDiagnostics" in source
+
+
+def test_selling_row_binding_does_not_treat_boost_entity_as_listing_id():
+    from tools.browser_supervisor import CDPSupervisor
+    from tools import browser_tool
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    listing_id_parser = source.split(
+        "const listingIdsIn = container =>", 1
+    )[1].split("const flow =", 1)[0]
+    association = source.split(
+        "const hasSellingActionAssociation = candidate =>", 1
+    )[1].split("let sourceBound = false", 1)[0]
+
+    assert "/ad_center/create/listingad/" not in listing_id_parser
+    assert "let firstCompleteRow = this" in association
+    assert "candidate !== firstCompleteRow" in association
+    assert "boostControls.length !== 1" in association
+    assert "provenListingName = normalizeLabel" in association
+    assert "listingName !== provenListingName" in association
+    assert 'parsed.origin === window.location.origin' in association
+    assert '=== "/ad_center/create/listingad/"' in association
+    assert 'listingad/preview' not in association
+    assert "documentSourceControls" in association
+    assert "sameAtomicControlChain" in association
+    assert "optionsAreOneAction" in association
+    assert "sharesAreOneAction" in association
+    assert "expectedShareNames.has" in association
+    assert "control.getClientRects().length > 0" in association
+    assert '!control.closest(\'[aria-hidden="true"]\')' in association
+    assert '!control.closest(\'[aria-disabled="true"]\')' in association
+    assert "targetMatch[1] !== String(requiredListingId)" not in association
+    assert "let associatedListingNode = null" in source
+    assert "if (listingNode.matches?.(pageScopeSelector))" in source
+    assert "sellingRoute\n                                  ? associatedListingNode" in source
+    assert "associatedListingNode || canonicalRowBound" in source
+    assert "sourceIds.has(String(requiredListingId))" in source
+    assert "requiredSourceEntityIds" not in source
+    assert '"guard_detail"' in inspect.getsource(browser_tool.browser_click)
+
+
+def test_canonical_item_title_proof_requires_exact_url_share_and_boost():
+    from tools.browser_tool import (
+        _canonical_marketplace_boost_label_from_refs,
+        _canonical_marketplace_boost_target_from_refs,
+        _canonical_marketplace_item_title_from_refs,
+        _is_approved_marketplace_item_url,
+        _remember_snapshot_refs,
+    )
+
+    listing_id = "915975414881937"
+    title = "Kolin KD-291M06"
+    refs = {
+        "e1": {"role": "button", "name": f"Share {title}"},
+        "e2": {
+            "role": "link",
+            "name": (
+                f"Boost listing for {title}. "
+                "Boost to reach more potential buyers"
+            ),
+        },
+    }
+    assert _is_approved_marketplace_item_url(
+        f"https://www.facebook.com/marketplace/item/{listing_id}",
+        listing_id,
+    )
+    assert not _is_approved_marketplace_item_url(
+        "https://www.facebook.com/marketplace/you/selling",
+        listing_id,
+    )
+    remember_source = inspect.getsource(_remember_snapshot_refs)
+    assert "_facebook_crosspost_source_proofs.pop" in remember_source
+    assert _canonical_marketplace_item_title_from_refs(
+        f"https://www.facebook.com/marketplace/item/{listing_id}",
+        refs,
+        listing_id,
+    ) == title
+    plural_refs = dict(refs)
+    plural_refs["e2"] = {
+        "role": "link",
+        "name": (
+            f"Boost listings for {title}. "
+            "Boost to reach more potential buyers"
+        ),
+    }
+    assert _canonical_marketplace_item_title_from_refs(
+        f"https://www.facebook.com/marketplace/item/{listing_id}",
+        plural_refs,
+        listing_id,
+    ) == title
+    assert _canonical_marketplace_item_title_from_refs(
+        "https://www.facebook.com/marketplace/you/selling",
+        refs,
+        listing_id,
+    ) is None
+
+    class FakeSupervisor:
+        def call_session_cdp(self, _session_id, method, _params):
+            if method == "DOM.resolveNode":
+                return {
+                    "ok": True,
+                    "result": {"object": {"objectId": "boost-object"}},
+                }
+            return {
+                "ok": True,
+                "result": {"result": {"value": "37276725125275496"}},
+            }
+
+    import tools.browser_supervisor as browser_supervisor
+
+    original_get = browser_supervisor.SUPERVISOR_REGISTRY.get
+    browser_supervisor.SUPERVISOR_REGISTRY.get = lambda _task: FakeSupervisor()
+    try:
+        boost_refs = dict(refs)
+        boost_refs["e2"] = {
+            **boost_refs["e2"],
+            "backend_node_id": 99,
+            "captured_session_id": "session-1",
+        }
+        boost_label = _canonical_marketplace_boost_label_from_refs(
+            boost_refs,
+            title,
+        )
+        assert boost_label == boost_refs["e2"]["name"]
+        assert _canonical_marketplace_boost_target_from_refs(
+            "browser-1",
+            boost_refs,
+            boost_label,
+            "https://www.facebook.com",
+        ) == "37276725125275496"
+    finally:
+        browser_supervisor.SUPERVISOR_REGISTRY.get = original_get
+    assert _canonical_marketplace_item_title_from_refs(
+        f"https://www.facebook.com/marketplace/item/{listing_id}",
+        {**refs, "e3": {"role": "button", "name": f"Share {title}"}},
+        listing_id,
+    ) == title
+    assert _canonical_marketplace_item_title_from_refs(
+        f"https://www.facebook.com/marketplace/item/{listing_id}",
+        {"e1": refs["e1"]},
+        listing_id,
+    ) is None
+    assert _canonical_marketplace_item_title_from_refs(
+        f"https://www.facebook.com/marketplace/item/{listing_id}",
+        {
+            "e1": {"role": "button", "name": "Share Bike"},
+            "e2": {
+                "role": "link",
+                "name": (
+                    "Boost listing for Bike. Deluxe. "
+                    "Boost to reach more potential buyers"
+                ),
+            },
+        },
+        listing_id,
+    ) is None
+
+
+def test_crosspost_atomic_guard_scrolls_only_authorized_group_rows():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+
+    assert 'crosspostStage === "select_group"' in source
+    assert "this.scrollIntoView({" in source
+    assert 'block: "center"' in source
+    assert "const findTargetPoint = rect =>" in source
+    assert "this.ownerDocument.elementFromPoint(x, y)" in source
+    assert "provenTargetPoint = findTargetPoint(rect)" in source
+
+
+def test_crosspost_atomic_guard_keeps_prebound_for_sale_id_after_relay_eviction():
+    from tools.browser_supervisor import CDPSupervisor
+
+    source = inspect.getsource(CDPSupervisor.guarded_dom_action)
+    binding = source.split(
+        "const bindAuthoritativeCrosspostRows = () =>", 1
+    )[1].split("const groupNameForId = groupId =>", 1)[0]
+
+    assert "requiredForSaleItemId || \"\"" in binding
+    assert "forSaleItemId !== String(requiredListingId)" in binding
+    assert "productItem\n                                &&" in binding
+    assert "Facebook cross-post for-sale item binding changed" in binding
+    assert "for_sale_item_id:" in binding
+
+
+def test_guarded_snapshot_reattaches_supervisor_for_persistent_page(
+    monkeypatch,
+):
+    from tools import browser_supervisor, browser_tool
+
+    expected_url = "https://www.facebook.com/marketplace/you/selling"
+    expected_identity = f"{expected_url}|123.0"
+    supervisor = MagicMock()
+    supervisor.capture_ax_tree_for_url.return_value = {
+        "ok": True,
+        "session_id": "session-1",
+        "result": {
+            "nodes": [{
+                "backendDOMNodeId": 42,
+                "role": {"value": "button"},
+                "name": {"value": "Post"},
+            }],
+        },
+    }
+    registry = MagicMock()
+    registry.get.side_effect = [None, supervisor]
+    monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", registry)
+    attached = []
+    monkeypatch.setattr(
+        browser_tool,
+        "_ensure_cdp_supervisor",
+        lambda task_id, expected_page_url=None: attached.append(
+            (task_id, expected_page_url)
+        ) or None,
+    )
+
+    nodes, error = browser_tool._snapshot_ax_nodes(
+        "persistent-task",
+        expected_url,
+        expected_identity,
+    )
+
+    assert error is None
+    assert nodes[0]["backend_node_id"] == 42
+    assert nodes[0]["captured_session_id"] == "session-1"
+    assert attached == [("persistent-task", expected_url)]
 
 
 class TestBrowserEvalSupervisorPath:
@@ -506,6 +992,175 @@ def test_capture_ax_tree_fails_closed_when_target_is_ambiguous():
         )
         assert result["ok"] is False
         assert "found 2" in result["error"]
+        assert sup._page_target_id == "test-target-id"
+        assert sup._page_session_id == "test-session-id"
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_capture_ax_tree_disambiguates_duplicate_urls_by_page_load_identity():
+    url = "https://www.facebook.com/marketplace/you/selling/"
+    calls = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargets":
+            return {
+                "result": {
+                    "targetInfos": [
+                        {"type": "page", "targetId": "old", "url": url},
+                        {"type": "page", "targetId": "current", "url": url},
+                    ]
+                }
+            }
+        if method == "Target.attachToTarget":
+            return {
+                "result": {
+                    "sessionId": f"{params['targetId']}-session",
+                }
+            }
+        if method == "Runtime.evaluate":
+            time_origin = 100.0 if session_id == "old-session" else 200.0
+            return {
+                "result": {
+                    "result": {
+                        "value": {"href": url, "timeOrigin": time_origin},
+                    }
+                }
+            }
+        if method == "Accessibility.getFullAXTree":
+            assert session_id == "current-session"
+            return {"result": {"nodes": [{"backendDOMNodeId": 42}]}}
+        if method == "Target.detachFromTarget":
+            return {"result": {}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+
+    async def fake_configure(session_id):
+        assert session_id == "current-session"
+
+    sup._configure_page_session = fake_configure
+    try:
+        result = sup.capture_ax_tree_for_url(
+            url,
+            expected_page_identity=f"{url}|200.0",
+        )
+        assert result["ok"] is True
+        assert result["target_id"] == "current"
+        assert result["session_id"] == "current-session"
+        assert sup._page_target_id == "current"
+        assert sup._page_session_id == "current-session"
+        detached = [
+            call[1]["sessionId"]
+            for call in calls
+            if call[0] == "Target.detachFromTarget"
+        ]
+        assert detached == ["old-session", "test-session-id"]
+        assert sum(call[0] == "Runtime.evaluate" for call in calls) == 3
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_capture_ax_tree_fails_closed_when_page_load_identity_is_missing():
+    url = "https://www.facebook.com/marketplace/you/selling/"
+    detached = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        if method == "Target.getTargets":
+            return {
+                "result": {
+                    "targetInfos": [
+                        {"type": "page", "targetId": "first", "url": url},
+                        {"type": "page", "targetId": "second", "url": url},
+                    ]
+                }
+            }
+        if method == "Target.attachToTarget":
+            return {
+                "result": {
+                    "sessionId": f"{params['targetId']}-session",
+                }
+            }
+        if method == "Runtime.evaluate":
+            return {
+                "result": {
+                    "result": {
+                        "value": {"href": url, "timeOrigin": 100.0},
+                    }
+                }
+            }
+        if method == "Target.detachFromTarget":
+            detached.append(params["sessionId"])
+            return {"result": {}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+    try:
+        result = sup.capture_ax_tree_for_url(
+            url,
+            expected_page_identity=f"{url}|999.0",
+        )
+        assert result["ok"] is False
+        assert "page-load identity" in result["error"]
+        assert "found 0" in result["error"]
+        assert detached == ["first-session", "second-session"]
+        assert sup._page_target_id == "test-target-id"
+        assert sup._page_session_id == "test-session-id"
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_capture_ax_tree_rejects_identity_change_during_capture():
+    url = "https://example.com/current"
+    identity_reads = 0
+    detached = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        nonlocal identity_reads
+        if method == "Target.getTargets":
+            return {
+                "result": {
+                    "targetInfos": [
+                        {"type": "page", "targetId": "current", "url": url},
+                    ]
+                }
+            }
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "current-session"}}
+        if method == "Runtime.evaluate":
+            identity_reads += 1
+            return {
+                "result": {
+                    "result": {
+                        "value": {
+                            "href": url,
+                            "timeOrigin": 100.0 if identity_reads == 1 else 200.0,
+                        },
+                    }
+                }
+            }
+        if method == "Accessibility.getFullAXTree":
+            return {"result": {"nodes": []}}
+        if method == "Target.detachFromTarget":
+            detached.append(params["sessionId"])
+            return {"result": {}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+
+    async def fake_configure(_session_id):
+        return None
+
+    sup._configure_page_session = fake_configure
+    try:
+        result = sup.capture_ax_tree_for_url(
+            url,
+            expected_page_identity=f"{url}|100.0",
+        )
+        assert result["ok"] is False
+        assert "changed during AX capture" in result["error"]
+        assert detached == ["current-session"]
         assert sup._page_target_id == "test-target-id"
         assert sup._page_session_id == "test-session-id"
     finally:
