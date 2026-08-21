@@ -243,6 +243,32 @@ def test_saved_evidence_finalization_does_not_hijack_status_questions():
     assert saved_evidence_finalization_turn_prompt(
         "t_2f6b540f 現在有 27 筆嗎？"
     ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "t_2f6b540f 的證據已保存了嗎？"
+    ) == ""
+    assert saved_evidence_finalization_turn_prompt(
+        "不要使用已保存證據完成原任務 t_2f6b540f。"
+    ) == ""
+
+
+def test_saved_evidence_finalization_preserves_nondefault_task_board(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    kb.create_board("secondhand")
+    with kb.connect_closing(board="secondhand") as conn:
+        task_id = kb.create_task(conn, title="Saved evidence execution")
+
+    prompt = saved_evidence_finalization_turn_prompt(
+        f"請使用已保存證據完成原任務 {task_id}。"
+    )
+
+    assert f'"execution_task_id": "{task_id}"' in prompt
+    assert '"board": "secondhand"' in prompt
 
 
 def test_approval_token_candidate_accepts_harmless_framing():

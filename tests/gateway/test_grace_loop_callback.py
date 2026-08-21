@@ -305,8 +305,15 @@ def _review_chain(
             message_id="42",
             contract_fingerprint="a" * 64,
         )
+        review_run = kb.claim_task(conn, review_id, claimer="reviewer")
+        assert review_run is not None
         if event_kind == "blocked":
-            assert kb.block_task(conn, review_id, reason="KJ must choose a price")
+            assert kb.block_task(
+                conn,
+                review_id,
+                reason="KJ must choose a price",
+                expected_run_id=review_run.current_run_id,
+            )
         else:
             metadata = review_metadata or (
                 {"review_outcome": "accepted"}
@@ -314,7 +321,11 @@ def _review_chain(
                 else {"review_outcome": "unknown"}
             )
             assert kb.complete_task(
-                conn, review_id, summary="review complete", metadata=metadata,
+                conn,
+                review_id,
+                summary="review complete",
+                metadata=metadata,
+                expected_run_id=review_run.current_run_id,
             )
     return execution_id, review_id
 

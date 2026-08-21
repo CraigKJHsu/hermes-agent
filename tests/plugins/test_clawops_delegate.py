@@ -434,6 +434,7 @@ def test_saved_candidate_filter_returns_inline_data_without_worker(
         "只使用已保存的 27 筆證據篩選 Carimali 咖啡機候選社團；"
         "這是內部準備，不接觸 Facebook。"
     )
+    args["saved_evidence_action"] = "filter_candidates"
     args["memory"]["working"] = [
         "Use only preserved saved evidence; 27 named destinations are known."
     ]
@@ -448,6 +449,19 @@ def test_saved_candidate_filter_returns_inline_data_without_worker(
     assert captured["product_category"] == "coffee_equipment"
     with kb.connect_closing(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_saved_candidate_filter_requires_explicit_structured_action():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _saved_commerce_candidate_request,
+    )
+
+    args = _readonly_group_status_args("36803832485927906", "Carimali")
+    args["non_goals"] = [
+        "Do not use saved evidence candidate filtering; inspect fresh state."
+    ]
+
+    assert _saved_commerce_candidate_request(args) is None
 
 
 def test_delegate_accepts_canonical_nested_loop_contract(tmp_path, monkeypatch):

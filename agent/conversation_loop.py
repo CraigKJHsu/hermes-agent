@@ -4973,9 +4973,14 @@ def run_conversation(
                         ),
                     )
                     if _repair_attempts < _repair_limit:
-                        agent._response_contract_repair_start_index = len(
-                            messages
-                        )
+                        if getattr(
+                            agent,
+                            "_response_contract_repair_start_index",
+                            None,
+                        ) is None:
+                            agent._response_contract_repair_start_index = len(
+                                messages
+                            )
                         _draft_msg = agent._build_assistant_message(
                             assistant_message, "contract_repair",
                         )

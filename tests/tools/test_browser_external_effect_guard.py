@@ -181,21 +181,26 @@ def test_successful_browser_readback_is_durable_before_completion(
         assert len(events) == 1
         assert events[0].run_id == run.current_run_id
         assert events[0].payload["operation"] == "snapshot"
-        assert "Kolin KD-291M06" in events[0].payload["visible_text"]
-        assert "sk-projABC123xyz" not in events[0].payload["visible_text"]
+        assert "visible_text" not in events[0].payload
+        assert "title" not in events[0].payload
         assert len(events[0].payload["url"]) <= 2_000
         assert events[0].payload["url"] == (
             "https://www.facebook.com/marketplace/you/selling"
         )
         assert "fragment-secret" not in events[0].payload["url"]
-        assert len(events[0].payload["title"]) <= 1_000
         assert events[0].payload["observed_at"] > 0
         assert events[0].payload["visible_text_sha256"] == hashlib.sha256(
-            events[0].payload["visible_text"].encode("utf-8"),
+            browser_tool.redact_sensitive_text(
+                "Kolin KD-291M06 — In stock — "
+                "Listed on Marketplace and at least 1 group "
+                "Authorization: Bearer sk-projABC123xyz",
+                force=True,
+            ).encode("utf-8"),
         ).hexdigest()
+        assert events[0].payload["visible_text_length"] > 0
         context = kb.build_worker_context(conn, task_id)
         assert "## Durable browser evidence" in context
-        assert "Listed on Marketplace and at least 1 group" in context
+        assert "Listed on Marketplace and at least 1 group" not in context
     finally:
         conn.close()
 

@@ -101,6 +101,55 @@ async def test_crosspost_gate_recovers_missing_post_body_without_consuming_gate(
     ]
 
 
+@pytest.mark.asyncio
+async def test_crosspost_gate_completes_when_missing_post_body_is_blocked(
+    monkeypatch,
+):
+    supervisor = bs.CDPSupervisor("t-crosspost-body-blocked", "ws://unused")
+    calls = []
+
+    async def fake_cdp(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "Fetch.getRequestPostData":
+            return {"result": {}}
+        return {}
+
+    monkeypatch.setattr(supervisor, "_cdp", fake_cdp)
+    gate = bs.CrosspostRequestGate(
+        listing_id="1666446304587399",
+        group_ids=("123",),
+        session_id="session-1",
+        graphql_url_pattern="https://www.facebook.com/api/graphql/*",
+        page_identity=(
+            "https://www.facebook.com/marketplace/item/1666446304587399|1"
+        ),
+        armed_at=0.0,
+    )
+    supervisor._crosspost_request_gate = gate
+
+    await supervisor._handle_crosspost_fetch_paused(
+        {
+            "requestId": "request-1",
+            "request": {
+                "url": "https://www.facebook.com/api/graphql/",
+                "method": "POST",
+            },
+        },
+        "session-1",
+        gate,
+        gate.graphql_url_pattern,
+    )
+
+    assert [method for method, _params in calls] == [
+        "Fetch.getRequestPostData",
+        "Fetch.failRequest",
+    ]
+    assert gate.completed.is_set()
+    assert gate.consumed is True
+    assert gate.result["dispatch_ambiguous"] is False
+    assert gate.result["request_released"] is False
+
+
 @pytest.fixture
 def isolated_registry():
     """A fresh registry instance, independent of the global SUPERVISOR_REGISTRY."""
@@ -375,10 +424,7 @@ def test_guarded_popup_revalidation_uses_snapshot_full_ax_source(monkeypatch):
         "Runtime.callFunctionOn",
     ]
     click_params = calls[-1][1]
-    assert click_params["arguments"][-2] == {"value": "ax_full"}
-    assert "expectedPopupSemanticsSource === \"ax_full\"" in (
-        click_params["functionDeclaration"]
-    )
+    assert {"value": "ax_full"} in click_params["arguments"]
 
 
 def test_guarded_page_composer_action_carries_exact_atomic_token(monkeypatch):
@@ -439,7 +485,10 @@ def test_guarded_page_composer_action_carries_exact_atomic_token(monkeypatch):
     assert "canonicalPageUrlOf(requiredFacebookPageUrl)" in (
         action_params["functionDeclaration"]
     )
-    assert "composerActorBinding?.name !== requiredFacebookPageActor" in (
+    assert "composerActorProofRequired" in (
+        action_params["functionDeclaration"]
+    )
+    assert "composerActorBinding?.name" in (
         action_params["functionDeclaration"]
     )
     assert "textboxTop - rect.bottom > 240" not in (

@@ -378,6 +378,14 @@ CLAWOPS_DELEGATE_PARAMETERS = {
         "stop_rules": _STOP_RULES,
         "memory": _MEMORY,
         "user_facing_delivery": _USER_FACING_DELIVERY,
+        "saved_evidence_action": {
+            "type": "string",
+            "enum": ["filter_candidates"],
+            "description": (
+                "Explicit internal-only action over already-saved evidence; "
+                "omit for fresh inspection or delegation work."
+            ),
+        },
         "task_type": {
             "type": "string",
             "enum": _TASK_TYPES,
@@ -763,20 +771,11 @@ def _saved_commerce_candidate_request(
     """Return listing/category for an internal saved-evidence shortlist."""
     if str(args.get("task_type") or "").strip() != (
         "secondhand_commerce_group_status"
+    ) or str(args.get("saved_evidence_action") or "").strip() != (
+        "filter_candidates"
     ):
         return None
     text = json.dumps(args, ensure_ascii=False, sort_keys=True).casefold()
-    if not any(
-        marker in text
-        for marker in ("候選", "篩選", "排除", "shortlist", "candidate")
-    ) or not any(
-        marker in text
-        for marker in (
-            "保存證據", "已保存", "preserved", "saved evidence",
-            "27 named", "27 筆", "已核實",
-        )
-    ):
-        return None
     targets = args.get("external_targets")
     if not isinstance(targets, list) or len(targets) != 1:
         return None

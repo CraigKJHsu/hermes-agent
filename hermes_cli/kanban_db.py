@@ -4352,7 +4352,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 """
                 SELECT MAX(updated_at) AS latest_at FROM task_external_effects
                  WHERE platform = 'facebook' AND effect_key LIKE 'group:%'
-                   AND state IN ('created', 'joined', 'pending_approval')
+                   AND state IN ('created', 'pending_approval')
                 """
             ).fetchone()
             if keyed_effects_available
@@ -4386,7 +4386,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             """
             SELECT MAX(updated_at) AS latest_at FROM task_external_effects
              WHERE platform = 'facebook' AND effect_key LIKE 'group:%'
-               AND state IN ('created', 'joined', 'pending_approval')
+               AND state IN ('created', 'pending_approval')
             """
         ).fetchone()
         latest_at = int(latest_effect["latest_at"] or 0)
@@ -6399,7 +6399,7 @@ def _upsert_external_effect(
     )
     if (
         platform == "facebook"
-        and state in {"created", "joined", "pending_approval"}
+        and state in {"created", "pending_approval"}
         and re.fullmatch(r"group:[1-9][0-9]*", effect_key)
     ):
         conn.execute(
@@ -18223,6 +18223,11 @@ def record_grace_loop_callback_outcome(
                 build_durable_commerce_user_facing_report(conn)
                 or user_facing_report
             )
+            if not bool(delivery_report.get("complete")):
+                raise ValueError(
+                    "The canonical user-facing commerce report is incomplete; "
+                    "continue reconciliation before closing the callback."
+                )
             if not grace_user_facing_report_delivery_matches(
                 callback,
                 event_id=event_id,

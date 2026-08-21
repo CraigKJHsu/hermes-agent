@@ -18,6 +18,47 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def test_group_join_does_not_invalidate_commerce_reconciliation(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    now = int(time.time())
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="Join unrelated group")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE commerce_group_migration_state SET reconciled = 1, "
+                "latest_group_effect_at = 0 WHERE singleton_id = 1"
+            )
+            kb._upsert_external_effect(
+                conn,
+                task_id=task_id,
+                platform="facebook",
+                state="joined",
+                external_id="123456789",
+                details=None,
+                run_id=None,
+                now=now,
+                effect_key="group:123456789",
+            )
+        migration = conn.execute(
+            "SELECT reconciled, latest_group_effect_at "
+            "FROM commerce_group_migration_state WHERE singleton_id = 1"
+        ).fetchone()
+        assert tuple(migration) == (1, 0)
+        conn.execute(
+            "DELETE FROM commerce_group_migration_state WHERE singleton_id = 1"
+        )
+        conn.commit()
+
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        migration = conn.execute(
+            "SELECT reconciled, latest_group_effect_at "
+            "FROM commerce_group_migration_state WHERE singleton_id = 1"
+        ).fetchone()
+        assert tuple(migration) == (1, 0)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -1491,11 +1532,14 @@ def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
         _bind_queued_grace_delegation(
             conn, execution_id, review_id, suffix="session-rebind",
         )
+        review_run = kb.claim_task(conn, review_id, claimer="reviewer")
+        assert review_run is not None
         assert kb.complete_task(
             conn,
             review_id,
             summary="accepted",
             metadata={"review_outcome": "accepted"},
+            expected_run_id=review_run.current_run_id,
         )
         callback = kb.list_due_grace_loop_callbacks(conn)[0]
         event_id = callback["event_id"]
@@ -1564,11 +1608,14 @@ def test_intermediate_callback_cannot_record_closed_outcome(tmp_path):
         _bind_queued_grace_delegation(
             conn, execution_id, review_id, suffix="intermediate",
         )
+        review_run = kb.claim_task(conn, review_id, claimer="reviewer")
+        assert review_run is not None
         assert kb.complete_task(
             conn,
             review_id,
             summary="accepted",
             metadata={"review_outcome": "accepted"},
+            expected_run_id=review_run.current_run_id,
         )
         callback = kb.list_due_grace_loop_callbacks(conn)[0]
         event_id = callback["event_id"]
@@ -1662,11 +1709,14 @@ def test_new_callback_generation_clears_the_previous_structured_outcome(tmp_path
         _bind_queued_grace_delegation(
             conn, execution_id, review_id, suffix="new-generation",
         )
+        review_run = kb.claim_task(conn, review_id, claimer="reviewer")
+        assert review_run is not None
         assert kb.complete_task(
             conn,
             review_id,
             summary="accepted",
             metadata={"review_outcome": "accepted"},
+            expected_run_id=review_run.current_run_id,
         )
         first = kb.list_due_grace_loop_callbacks(conn)[0]
         assert kb.claim_grace_loop_callback(

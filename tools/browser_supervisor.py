@@ -1248,8 +1248,41 @@ class CDPSupervisor:
                         session_id=session_id,
                         timeout=3.0,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if gate is not None:
+                        result = {
+                            "ok": False,
+                            "dispatch_ambiguous": True,
+                            "error": (
+                                "Facebook cross-post request body was unreadable "
+                                "and the request could not be deterministically "
+                                f"blocked: {type(exc).__name__}: {exc}"
+                            ),
+                        }
+                        with self._state_lock:
+                            if self._crosspost_request_gate is gate:
+                                self._crosspost_request_gate = None
+                            gate.result = result
+                        self._taint_and_retire_crosspost_request_gate(gate)
+                        gate.completed.set()
+                    return
+                if gate is not None:
+                    result = {
+                        "target": True,
+                        "ok": False,
+                        "request_released": False,
+                        "dispatch_ambiguous": False,
+                        "error": (
+                            "Facebook cross-post mutation was blocked because "
+                            "its POST body could not be read safely"
+                        ),
+                    }
+                    with self._state_lock:
+                        if self._crosspost_request_gate is gate:
+                            self._crosspost_request_gate = None
+                        gate.consumed = True
+                        gate.result = result
+                    gate.completed.set()
                 return
         validation = self._parse_crosspost_graphql_request(
             request, gate, graphql_url_pattern

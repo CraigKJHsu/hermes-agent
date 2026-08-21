@@ -2836,20 +2836,14 @@ def _record_guarded_browser_evidence(
                 force=True,
             )
             safe_url = _durable_evidence_url(str(url or ""))
-            safe_title = redact_sensitive_text(
-                str(title or ""),
-                force=True,
-            )[:1_000]
             payload = {
                 "operation": str(operation or "browser_read")[:80],
                 "url": safe_url,
-                "title": safe_title,
                 "observed_at": int(time.time()),
-                "visible_text": safe_text[:6_000],
                 "visible_text_sha256": hashlib.sha256(
                     safe_text.encode("utf-8", errors="replace"),
                 ).hexdigest(),
-                "visible_text_truncated": len(safe_text) > 6_000,
+                "visible_text_length": len(safe_text),
             }
             _kanban_db.record_durable_evidence_event(
                 evidence_conn,
@@ -4854,6 +4848,7 @@ def _run_atomic_ref_action(
             # Failing closed means preserving join_started so no blind retry
             # can occur when release itself is uncertain.
             pass
+    renderer_dispatch_entered = False
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -4962,6 +4957,7 @@ def _run_atomic_ref_action(
                             required_marketplace_price_twd
                         ),
                     })
+                renderer_dispatch_entered = True
                 action_result = supervisor.guarded_dom_action(
                     **guarded_action_args,
                 )
@@ -4974,8 +4970,12 @@ def _run_atomic_ref_action(
                 _facebook_marketplace_price_contexts.pop(
                     browser_task_id, None
                 )
-        # The backend may have raised after renderer dispatch. Preserve every
-        # durable reservation for reconciliation; never make this retryable.
+        if not renderer_dispatch_entered:
+            _release_known_pre_dispatch(
+                "guarded browser action failed before renderer dispatch"
+            )
+        # Once the renderer call is entered, its outcome may be ambiguous and
+        # durable reservations must remain for reconciliation.
         return json.dumps({
             "success": False,
             "error": (
@@ -5864,26 +5864,6 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         title = data.get("title", "")
         final_url = data.get("url", url)
 
-        supervisor_error = _ensure_cdp_supervisor(
-            nav_session_key,
-            expected_page_url=str(final_url or url),
-        )
-        if supervisor_error and (
-            session_info.get("cdp_url") or _get_cdp_override()
-        ):
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": (
-                        "Controlled browser exact page binding failed closed: "
-                        + supervisor_error
-                    ),
-                    "requested_url": url,
-                    "final_url": final_url,
-                },
-                ensure_ascii=False,
-            )
-
         # Post-redirect SSRF check — if the browser followed a redirect to a
         # private/internal address, block the result so the model can't read
         # internal content via subsequent browser_snapshot calls.
@@ -5917,6 +5897,26 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                 "success": False,
                 "error": "Blocked: redirect landed on a private/internal address",
             })
+
+        supervisor_error = _ensure_cdp_supervisor(
+            nav_session_key,
+            expected_page_url=str(final_url or url),
+        )
+        if supervisor_error and (
+            session_info.get("cdp_url") or _get_cdp_override()
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "Controlled browser exact page binding failed closed: "
+                        + supervisor_error
+                    ),
+                    "requested_url": url,
+                    "final_url": final_url,
+                },
+                ensure_ascii=False,
+            )
 
         response = {
             "success": True,

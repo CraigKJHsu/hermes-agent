@@ -32,12 +32,45 @@ _APPROVAL_ATTEMPT = re.compile(
 )
 _VALID_APPROVAL_TOKEN = re.compile(r"^[0-9a-f]{16}$")
 _KANBAN_TASK_ID = re.compile(r"(?<![A-Za-z0-9_])(t_[0-9a-f]{8})(?![A-Za-z0-9_])")
-_SAVED_EVIDENCE_FINALIZATION_HINTS = (
+_SAVED_EVIDENCE_HINTS = (
     "已保存", "保存紀錄", "既有證據", "耐久證據", "durable evidence",
-    "重新讀取該任務", "讀取該任務", "接續原任務", "完成原任務",
+    "saved evidence",
+)
+_SAVED_EVIDENCE_FINALIZATION_ACTIONS = (
+    "接續原任務", "完成原任務", "接續結案", "完成結案",
     "resume finalization", "continue finalization",
     "complete finalization",
 )
+_SAVED_EVIDENCE_FINALIZATION_REJECTIONS = (
+    "不要", "不用", "不需", "取消", "停止", "是否", "嗎", "?", "？",
+    "do not", "don't", "cancel", "stop", "whether",
+)
+
+
+def _saved_evidence_task_board(task_id: str) -> str | None:
+    """Resolve the sole board containing an existing task, if discoverable."""
+    from hermes_cli import kanban_db as kb
+
+    matches: list[str] = []
+    try:
+        boards = kb.list_boards(include_archived=True)
+    except Exception:
+        boards = []
+    for metadata in boards:
+        slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
+        try:
+            with kb.connect_closing(board=slug) as conn:
+                if conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone() is not None:
+                    matches.append(slug)
+        except Exception:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return None
+    return os.getenv("HERMES_KANBAN_BOARD", "").strip() or kb.DEFAULT_BOARD
 
 
 def _policy_blocks_from_text(text: str) -> list[str]:
@@ -171,19 +204,30 @@ def saved_evidence_finalization_turn_prompt(message_text: str) -> str:
     current = str(message_text or "")
     task_ids = {match.group(1) for match in _KANBAN_TASK_ID.finditer(current)}
     normalized = current.casefold()
-    if len(task_ids) != 1 or not any(
-        hint.casefold() in normalized
-        for hint in _SAVED_EVIDENCE_FINALIZATION_HINTS
+    if (
+        len(task_ids) != 1
+        or any(marker in normalized for marker in _SAVED_EVIDENCE_FINALIZATION_REJECTIONS)
+        or not any(
+            hint.casefold() in normalized
+            for hint in _SAVED_EVIDENCE_HINTS
+        )
+        or not any(
+            action.casefold() in normalized
+            for action in _SAVED_EVIDENCE_FINALIZATION_ACTIONS
+        )
     ):
         return ""
     task_id = next(iter(task_ids))
+    board = _saved_evidence_task_board(task_id)
+    if board is None:
+        return ""
     return (
         "[Trusted saved-evidence finalization routing]\n"
         "The authenticated user is referring to one existing blocked commerce "
         "execution and its already-saved evidence. This is not a new Facebook "
         "audit and not a callback continuation. You MUST call "
         "clawops_finalize_saved_evidence now with exactly "
-        f'{json.dumps({"execution_task_id": task_id, "board": "default"}, sort_keys=True)}. '
+        f'{json.dumps({"execution_task_id": task_id, "board": board}, sort_keys=True)}. '
         "Do not call clawops_delegate, do not construct a new Loop Contract, "
         "and do not open any browser. The tool result is authoritative."
     )
