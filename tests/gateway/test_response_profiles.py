@@ -309,6 +309,39 @@ def test_term_examples_must_each_be_bilingual():
     assert "每個實用例句都必須同時包含英文與繁體中文翻譯。" in errors
 
 
+def test_term_examples_may_put_translation_on_following_line():
+    response = """### 1. 基本資訊與翻譯
+**單字／詞彙**：bureaucracy
+**音標**：[bjʊˈrɑkrəsi]
+**詞性與繁體中文解釋**：名詞，官僚制度、繁瑣程序。
+### 2. 構詞拆解（字根、字首、字尾）
+**字首 (Prefix)**：無。
+**字根 (Root)**：bureau，辦公室、機構。
+**字尾 (Suffix)**：-cracy，表示統治或制度。
+### 3. 記憶法與聯想助手
+**邏輯組合**：辦公室加上制度，聯想到層層審批。
+**記憶小撇步**：看到 bureau 就想成辦公桌後面的行政流程。
+### 4. 實用例句
+1. Bureaucracy can slow down simple decisions.
+   官僚制度可能拖慢簡單決策。
+2. She got frustrated with the bureaucracy at the office.
+   她對辦公室裡的官僚程序感到很挫折。
+### 5. 延伸學習
+**同／反義詞**：red tape／efficiency
+**常用搭配詞 (Collocation)**：
+- government bureaucracy
+- corporate bureaucracy
+"""
+
+    assert translator_detail_validation_errors(
+        "translator_mastery_after_fast",
+        "bureaucracy",
+        response,
+        "[Trusted Translator learning-history precheck: result=no_match.]",
+        fast_output="官僚制度",
+    ) == []
+
+
 def test_duplicate_required_heading_is_rejected():
     response = """### 1. 整句翻譯
 已於上一則快速翻譯提供，這裡不重複全文。

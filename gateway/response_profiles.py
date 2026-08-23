@@ -735,16 +735,26 @@ def translator_detail_validation_errors(
         )
         if example_numbers != ["1", "2"]:
             errors.append("實用例句必須包含編號 1、2 的兩個英中例句。")
-        example_lines = re.findall(
-            r"(?m)^\s*\d+[.)]\s+.+$",
-            example_section,
+        example_matches = list(
+            re.finditer(r"(?m)^\s*(\d+)[.)]\s+\S.*$", example_section)
         )
+        example_blocks = [
+            example_section[
+                match.start():(
+                    example_matches[index + 1].start()
+                    if index + 1 < len(example_matches)
+                    else len(example_section)
+                )
+            ]
+            for index, match in enumerate(example_matches)
+            if match.group(1) in {"1", "2"}
+        ]
         if any(
             not (
-                re.search(r"[A-Za-z]", line)
-                and re.search(r"[\u3400-\u9fff]", line)
+                re.search(r"[A-Za-z]", block)
+                and re.search(r"[\u3400-\u9fff]", block)
             )
-            for line in example_lines
+            for block in example_blocks
         ):
             errors.append("每個實用例句都必須同時包含英文與繁體中文翻譯。")
         collocations = _content_after("**常用搭配詞 (Collocation)**")
@@ -860,7 +870,10 @@ def build_translator_detail_repair_prompt(errors: Any) -> str:
         "Return only the replacement response, use Traditional Chinese, follow "
         "the already supplied Translator output contract exactly, and do not "
         "call tools or discuss this validation message. Correct these "
-        f"program-detected violations: {serialized}]"
+        f"program-detected violations: {serialized}. For term examples, "
+        "number them as 1 and 2; each numbered example block must include a "
+        "natural English sentence and its Traditional Chinese translation, "
+        "either on the same line or the immediately following line.]"
     )
 
 
