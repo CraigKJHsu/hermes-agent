@@ -900,6 +900,7 @@ def normalize_response_profile(value: Any) -> Optional[Dict[str, Any]]:
         fallback_contract: str = "",
         *,
         allow_output_contract: bool = True,
+        allowed_output_contracts: Optional[set[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         raw_route = detail_lane.get(key)
         if key in detail_lane and not isinstance(raw_route, dict):
@@ -911,6 +912,12 @@ def normalize_response_profile(value: Any) -> Optional[Dict[str, Any]]:
             or fallback_contract
         )
         if output_contract and not allow_output_contract:
+            return None
+        if (
+            output_contract
+            and allowed_output_contracts is not None
+            and output_contract not in allowed_output_contracts
+        ):
             return None
         if (
             output_contract
@@ -1000,7 +1007,7 @@ def normalize_response_profile(value: Any) -> Optional[Dict[str, Any]]:
     failure_route = _detail_route(
         "on_fast_failure",
         legacy_skill,
-        allow_output_contract=False,
+        allowed_output_contracts={"translator_mastery_self_contained"},
     )
     if ambiguous_route is None or failure_route is None:
         return None

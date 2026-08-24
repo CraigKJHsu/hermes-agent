@@ -1212,6 +1212,32 @@ def test_failure_route_rejects_success_only_output_contract():
     ) is None
 
 
+def test_failure_route_accepts_self_contained_translator_contract():
+    profile = normalize_response_profile(
+        {
+            "strategy": "fast_then_default",
+            "fast_lane": {"handler": "translation"},
+            "detail_lane": {
+                "on_fast_success": {
+                    "skill": "translator-detail",
+                    "output_contract": "translator_mastery_after_fast",
+                },
+                "on_fast_failure": {
+                    "skill": "translator-detail",
+                    "output_contract": "translator_mastery_self_contained",
+                },
+            },
+        },
+    )
+
+    assert profile is not None
+    assert (
+        detail_lane_output_contract(profile, None)
+        == "translator_mastery_self_contained"
+    )
+    assert detail_lane_contract_prompt(profile, None) is not None
+
+
 def test_serialized_normalization_marker_cannot_bypass_validation():
     profile = normalize_response_profile(
         {
