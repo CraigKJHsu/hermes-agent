@@ -30,7 +30,10 @@ def _structured_checks(value: Any) -> bool:
 
 def grace_review_accepted(metadata: Any) -> bool:
     review_metadata = metadata if isinstance(metadata, dict) else {}
-    if review_metadata.get("approved") is False:
+    if (
+        review_metadata.get("approved") is False
+        or review_metadata.get("accepted") is False
+    ):
         return False
     explicit_verdicts = [
         str(review_metadata.get(field) or "").strip().lower()
@@ -50,6 +53,14 @@ def grace_review_accepted(metadata: Any) -> bool:
 
     has_review_evidence = (
         (isinstance(evidence, dict) and bool(evidence))
+        or (
+            isinstance(review_metadata.get("verified_facts"), dict)
+            and bool(review_metadata["verified_facts"])
+        )
+        or (
+            isinstance(review_metadata.get("reviewed_artifacts"), dict)
+            and bool(review_metadata["reviewed_artifacts"])
+        )
         or _nonempty_string_list(verification_notes)
         or _structured_checks(verified_checks)
         or (isinstance(evidence_lines, dict) and bool(evidence_lines))
@@ -68,7 +79,10 @@ def grace_review_accepted(metadata: Any) -> bool:
     return (
         visual_review_accepted
         or (
-            review_metadata.get("approved") is True
+            (
+                review_metadata.get("approved") is True
+                or review_metadata.get("accepted") is True
+            )
             and (
                 criteria is True
                 or _nonempty_string_list(criteria)
@@ -85,6 +99,7 @@ def grace_review_rejected(metadata: Any) -> bool:
     result = str(review_metadata.get("review_result") or "").strip().lower()
     return (
         review_metadata.get("approved") is False
+        or review_metadata.get("accepted") is False
         or verdict in {"rejected", "rejected_incomplete", "blocked", "failed"}
         or outcome in {"rejected", "blocked", "failed"}
         or result in {"rejected", "blocked", "failed"}

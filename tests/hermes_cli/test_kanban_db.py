@@ -540,6 +540,31 @@ def test_grace_review_completion_normalizes_equivalent_accepted_metadata(tmp_pat
     assert json.loads(row["metadata"])["review_outcome"] == "accepted"
 
 
+def test_grace_review_completion_normalizes_evidence_backed_accepted_alias(tmp_path):
+    db_path = tmp_path / "normalized-review-accepted-alias.db"
+    with kb.connect_closing(db_path) as conn:
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={
+                "accepted": True,
+                "reviewed_artifacts": {"page_hero": "/tmp/page-hero.png"},
+                "verified_facts": {"dimensions": "1600x900"},
+            },
+        )
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (review_id,),
+        ).fetchone()
+    assert json.loads(row["metadata"])["review_outcome"] == "accepted"
+
+
 def test_callback_outcome_accepts_approved_review_evidence_metadata(tmp_path):
     db_path = tmp_path / "callback-approved-evidence-metadata.db"
     with kb.connect_closing(db_path) as conn:

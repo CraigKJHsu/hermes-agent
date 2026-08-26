@@ -188,6 +188,26 @@ def test_grace_review_accepts_ep04_verified_check_list():
     }) is True
 
 
+def test_grace_review_accepts_evidence_backed_accepted_alias():
+    assert _grace_review_accepted({
+        "accepted": True,
+        "reviewed_artifacts": {"page_hero": "/tmp/page-hero.png"},
+        "verified_facts": {
+            "dimensions": "1600x900",
+            "external_actions_performed": False,
+        },
+    }) is True
+
+
+def test_grace_review_rejects_unsupported_accepted_alias():
+    assert _grace_review_accepted({"accepted": True}) is False
+    assert _grace_review_accepted({
+        "accepted": True,
+        "review_outcome": "rejected",
+        "verified_facts": {"dimensions": "1600x900"},
+    }) is False
+
+
 def test_grace_review_rejects_malformed_verified_check_list():
     assert _grace_review_accepted({
         "approved": True,
