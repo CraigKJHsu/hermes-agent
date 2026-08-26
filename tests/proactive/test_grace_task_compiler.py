@@ -4,7 +4,11 @@ import hashlib
 import json
 
 from hermes_cli import kanban_db as kb
-from proactive.grace_task_compiler import compile_and_delegate
+from proactive.grace_task_compiler import (
+    compile_and_delegate,
+    contract_internal_hermes_runtime,
+    contract_requires_image_generation,
+)
 from proactive.hubops_routing import resolved_route_binding, route_clawops_objective
 from proactive.loop_contract import contract_fingerprint, validate_loop_contract
 
@@ -243,3 +247,115 @@ def test_internal_only_image_generation_contract_uses_content_runtime_without_to
     assert execution.executor_backend == "hermes"
     assert execution.executor_profile == "clawops-content"
     assert stored["approval_required"] == 0
+
+
+def test_internal_ops_contract_uses_hermes_ops_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db()
+
+    contract = _image_contract()
+    contract["identity"]["request_instance_id"] = "internal-ops-contract-1"
+    contract["goal"] = {
+        "objective": "Inspect internal capability registry and routing.",
+        "deliverables": ["Capability report"],
+        "non_goals": ["No external action"],
+    }
+    contract["scope"] = {
+        "allowed": ["Internal registry, routing, status, and logs"],
+        "forbidden": ["Facebook, browser, credential, or network action"],
+    }
+    contract["verification"] = {
+        "checks": ["Read registry and routing"],
+        "evidence_required": ["Tool availability report"],
+        "acceptance_criteria": ["external_effect_budget=0"],
+    }
+    contract["routing"] = {"task_type": "ops", "risk_level": "low"}
+    preliminary = validate_loop_contract(contract)
+    preview = route_clawops_objective(
+        contract["goal"]["objective"],
+        project=contract["identity"]["project"],
+        task_type="ops",
+        risk_level="low",
+        approved=False,
+        contract_fingerprint=contract_fingerprint(preliminary),
+    )
+    contract["routing"]["resolved"] = resolved_route_binding(preview)
+    normalized = validate_loop_contract(contract)
+    assert contract_requires_image_generation(normalized) is False
+    assert contract_internal_hermes_runtime(
+        normalized,
+        task_type="ops",
+    ) == "clawops-ops"
+    unsafe_route = json.loads(json.dumps(normalized, ensure_ascii=False))
+    unsafe_route["routing"]["resolved"]["assignment"]["allowed_tools"].append(
+        "browser_snapshot"
+    )
+    assert contract_internal_hermes_runtime(
+        unsafe_route,
+        task_type="ops",
+    ) == ""
+    missing_tools_route = json.loads(json.dumps(normalized, ensure_ascii=False))
+    missing_tools_route["routing"]["resolved"]["assignment"].pop(
+        "allowed_tools"
+    )
+    assert contract_internal_hermes_runtime(
+        missing_tools_route,
+        task_type="ops",
+    ) == ""
+    fingerprint = contract_fingerprint(normalized)
+    session_key = "agent:main:telegram:group:chat-1:4641"
+    session_id = "session-ops-1"
+
+    with kb.connect() as conn:
+        delegation = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint=fingerprint,
+            request_instance_id=contract["identity"]["request_instance_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key=session_key,
+            session_id=session_id,
+            resolved_route=contract["routing"]["resolved"],
+            approval_required=False,
+        )
+        assert kb.claim_grace_delegation_build(
+            conn,
+            delegation_id=delegation["delegation_id"],
+            build_owner="builder-ops-1",
+        )
+
+    result = compile_and_delegate(
+        contract,
+        context={
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "4641",
+            "topic_name": "Topic 4641",
+            "project": "telegram_1003938559457_4641_bff429b6e587",
+            "memory_namespace": "telegram:-1003938559457:4641/topic",
+        },
+        task_type="ops",
+        risk_level="low",
+        approved=False,
+        delegation_id=delegation["delegation_id"],
+        delegation_build_owner="builder-ops-1",
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+        session_key=session_key,
+        session_id=session_id,
+        message_id="message-ops-1",
+        notifier_profile="default",
+    )
+
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, result.execution_task_id)
+        review = kb.get_task(conn, result.review_task_id)
+
+    assert result.assignee == "clawops-ops"
+    assert execution is not None
+    assert execution.executor_backend == "hermes"
+    assert execution.executor_profile == "clawops-ops"
+    assert review is not None
+    assert review.executor_profile == "grace-policy-review"

@@ -50,6 +50,17 @@ _ZH_TW_WRITING_ACTION_TERMS = (
     "去 ai 味",
     "自然",
 )
+_INTERNAL_OPS_TOOLS = frozenset(
+    {
+        "memory_read",
+        "docs_read",
+        "kanban",
+        "status_check",
+        "scheduler_read",
+        "logs_read",
+        "report_generate",
+    }
+)
 
 
 def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
@@ -88,6 +99,47 @@ def contract_requires_image_generation(contract: Mapping[str, Any]) -> bool:
         assignment.get("allowed_tools") if isinstance(assignment, Mapping) else []
     )
     return any(str(tool).strip() == "image_generate" for tool in allowed_tools or [])
+
+
+def contract_internal_hermes_runtime(
+    contract: Mapping[str, Any],
+    *,
+    task_type: str,
+) -> str:
+    """Return the trusted Hermes profile for a zero-effect internal route."""
+    if contract_requires_image_generation(contract):
+        return "clawops-content"
+    routing = contract.get("routing")
+    resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
+    assignment = (
+        resolved.get("assignment") if isinstance(resolved, Mapping) else {}
+    )
+    runtime_profile = str(
+        assignment.get("runtime_profile")
+        if isinstance(assignment, Mapping)
+        else ""
+    ).strip()
+    allowed_tools = {
+        str(tool or "").strip()
+        for tool in (
+            (assignment.get("allowed_tools") or [])
+            if isinstance(assignment, Mapping)
+            else []
+        )
+        if str(tool or "").strip()
+    }
+    internal_ops_route = bool(
+        allowed_tools
+        and allowed_tools <= _INTERNAL_OPS_TOOLS
+        and assignment.get("approval_required") is False
+    )
+    if (
+        task_type == "ops"
+        and runtime_profile == "clawops-ops"
+        and internal_ops_route
+    ):
+        return runtime_profile
+    return ""
 
 
 def _render_language_polish_guidance(contract: Mapping[str, Any], *, review: bool) -> list[str]:
@@ -336,9 +388,15 @@ def compile_and_delegate(
             topic_name=str(identity["topic_name"]),
             subscribed=True,
         )
-    if contract_requires_image_generation(normalized):
+    hermes_runtime_profile = contract_internal_hermes_runtime(
+        normalized,
+        task_type=task_type,
+    )
+    if hermes_runtime_profile:
         fingerprint = contract_fingerprint(normalized)
-        idempotency_key = f"clawops-content-loop:{delegation_id}:{fingerprint}"
+        idempotency_key = (
+            f"{hermes_runtime_profile}-loop:{delegation_id}:{fingerprint}"
+        )
         execution = create_clawops_task(
             str(normalized["goal"]["objective"]),
             source={
@@ -356,7 +414,7 @@ def compile_and_delegate(
             initial_status="running",
             session_id=f"grace-loop:{delegation_id}:execution",
             executor_backend="hermes",
-            executor_profile="clawops-content",
+            executor_profile=hermes_runtime_profile,
             approval_required_override=bool(approved),
             board=board,
         )
