@@ -713,7 +713,7 @@ def test_delegate_records_scope_bound_approval_from_owner_turn(
     from hermes_cli.telegram_message_path import normalize_message_path
 
     delegation_path = normalize_message_path(delegation["telegram_message_path"])
-    assert delegation_path["inbound_message_id"] == "msg-kj-request"
+    assert delegation_path["inbound_message_id"] == "msg-kj-approval"
     approval_hop = next(
         hop for hop in delegation_path["hops"] if hop["stage"] == "human_approval"
     )
@@ -1759,6 +1759,33 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     assert challenge["approval_token"] != internal_challenge["approval_token"]
     token = challenge["approval_token"]
 
+    from hermes_cli.telegram_message_path import (
+        bind_message_path,
+        build_telegram_message_path,
+        dumps_message_path,
+    )
+
+    callback_trace = bind_message_path(
+        build_telegram_message_path(
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            inbound_message_id="callback-anchor",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+        ),
+        delegation_id="gd-approval-continuation-callback",
+        execution_task_id=execution_id,
+        review_task_id=review_id,
+    )
+    with kb.connect_closing(board="secondhand") as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE grace_approval_challenges "
+                "SET telegram_message_path = ? WHERE token = ?",
+                (dumps_message_path(callback_trace), token),
+            )
+
     class CompressionSessionDB:
         def get_compression_tip(self, session_id):
             assert session_id == "grace-session-1"
@@ -1794,6 +1821,17 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     assert delegation["origin_review_task_id"] == review_id
     assert delegation["origin_event_id"] == callback["event_id"]
     assert delegation["session_id"] == "grace-session-1"
+    delegation_trace = json.loads(delegation["telegram_message_path"])
+    assert delegation_trace["delegation_id"] == queued["delegation_id"]
+    assert delegation_trace["trace_id"] != callback_trace["trace_id"]
+    approval_hop = next(
+        hop
+        for hop in delegation_trace["hops"]
+        if hop["stage"] == "human_approval"
+    )
+    assert approval_hop["identifiers"]["approval_request_trace_id"] == (
+        callback_trace["trace_id"]
+    )
     assert delegation["state"] == "queued"
     assert len(tasks) == 4
 

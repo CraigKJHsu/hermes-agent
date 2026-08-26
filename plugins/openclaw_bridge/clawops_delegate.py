@@ -1571,9 +1571,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     challenge_message_path = normalize_message_path(
                         (challenge_row or {}).get("telegram_message_path")
                     )
-                    approval_message_path = (
-                        challenge_message_path or trusted_message_path
-                    )
+                    # The callback challenge trace is already bound to its
+                    # originating delegation.  A fresh owner approval is a new
+                    # Telegram turn and must seed the continuation's trace.
+                    approval_message_path = trusted_message_path
                     approval_message_id = str(
                         trusted_message_path.get("inbound_message_id") or message_id
                     ).strip()
@@ -1586,6 +1587,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                             status="observed",
                             identifiers={
                                 "approval_message_id": approval_message_id,
+                                "approval_request_trace_id": str(
+                                    challenge_message_path.get("trace_id") or ""
+                                ),
                             },
                         )
                     delegation = kb.reserve_grace_delegation(
@@ -1599,6 +1603,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_id=(approval_bound_session_id or session_id),
                         resolved_route=contract["routing"]["resolved"],
                         approval_required=True,
+                        telegram_message_path_session_id=session_id,
                         challenge_token=approval_token,
                         user_id_sha256=user_id_sha256,
                         approved_message_id=message_id,

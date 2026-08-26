@@ -13303,6 +13303,7 @@ def reserve_grace_delegation(
     session_id: str,
     resolved_route: Mapping[str, Any],
     approval_required: bool,
+    telegram_message_path_session_id: str = "",
     challenge_token: str = "",
     user_id_sha256: str = "",
     approved_message_id: str = "",
@@ -13325,6 +13326,9 @@ def reserve_grace_delegation(
     clean_thread_id = str(thread_id or "").strip()
     clean_session_key = str(session_key or "").strip()
     clean_session_id = str(session_id or "").strip()
+    clean_message_path_session_id = str(
+        telegram_message_path_session_id or clean_session_id
+    ).strip()
     clean_objective_id = str(objective_id or "").strip()
     clean_stage_key = str(stage_key or "").strip()
     if bool(clean_objective_id) != bool(clean_stage_key):
@@ -13363,7 +13367,7 @@ def reserve_grace_delegation(
     clean_message_path = bind_message_path(
         telegram_message_path,
         session_key=clean_session_key,
-        session_id=clean_session_id,
+        session_id=clean_message_path_session_id,
         delegation_id=delegation_id,
     )
     message_path_json = dumps_message_path(clean_message_path) or None
