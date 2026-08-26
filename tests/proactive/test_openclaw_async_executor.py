@@ -873,9 +873,65 @@ def test_zero_budget_terminal_rejects_reported_external_effect(kanban_home):
     handled = make_loop_contract_terminal_handler()(run, observation)
 
     assert handled["accepted"] is False
+    assert len(handled["reason"]) <= 2000
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
     assert task is not None and task.status == "blocked"
+
+
+def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-specific-blocker-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-specific-blocker-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = (
+        "Required Facebook Graph API tool is unavailable."
+    )
+    output["result"] = {
+        "status": "blocked",
+        "summary": "Blocked before any Facebook Graph POST.",
+        "acceptanceEvidence": {},
+        "externalEffects": [],
+    }
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-specific-blocker-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    assert "Required Facebook Graph API tool is unavailable" in handled["reason"]
+    assert "No external effect was verified or recorded" in handled["reason"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+    assert ended_run is not None
+    assert "Blocked before any Facebook Graph POST" in ended_run.summary
 
 
 def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):

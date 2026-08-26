@@ -2702,17 +2702,40 @@ def make_loop_contract_terminal_handler(
             and isinstance(external_effects, list)
             and len(external_effects) <= external_effect_budget
         )
+        validation_error = (
+            str(evidence.get("resultContractError") or "").strip()
+            if isinstance(evidence, Mapping)
+            else ""
+        )
+        worker_summary = (
+            str(audited_result.get("summary") or "").strip()
+            if isinstance(audited_result, Mapping)
+            else ""
+        )
+        validation_reason = "OpenClaw Loop Contract terminal evidence failed validation."
+        details = [item for item in (validation_error, worker_summary) if item]
+        if details:
+            validation_reason = (
+                "OpenClaw Loop Contract was blocked before verified completion: "
+                + " Worker report: ".join(details)
+            )
+        if not external_effects:
+            validation_reason += " No external effect was verified or recorded."
+        validation_reason = validation_reason[:2000]
         with kb.connect_closing(board=board) as conn:
             with kb.write_txn(conn):
                 if not valid:
                     kb.block_task(
                         conn,
                         run.task_id,
-                        reason="OpenClaw Loop Contract terminal evidence failed validation.",
+                        reason=validation_reason,
                         kind="capability",
                         expected_run_id=run.id,
                     )
-                    return {"accepted": False}
+                    return {
+                        "accepted": False,
+                        "reason": validation_reason,
+                    }
                 summary = str(audited_result.get("summary") or "OpenClaw Loop Contract completed.")
                 if not kb.complete_task(
                     conn,
