@@ -13303,6 +13303,7 @@ def reserve_grace_delegation(
     session_id: str,
     resolved_route: Mapping[str, Any],
     approval_required: bool,
+    approval_challenge_session_id: str = "",
     telegram_message_path_session_id: str = "",
     challenge_token: str = "",
     user_id_sha256: str = "",
@@ -13326,6 +13327,9 @@ def reserve_grace_delegation(
     clean_thread_id = str(thread_id or "").strip()
     clean_session_key = str(session_key or "").strip()
     clean_session_id = str(session_id or "").strip()
+    clean_challenge_session_id = str(
+        approval_challenge_session_id or clean_session_id
+    ).strip()
     clean_message_path_session_id = str(
         telegram_message_path_session_id or clean_session_id
     ).strip()
@@ -13510,7 +13514,7 @@ def reserve_grace_delegation(
                     clean_chat_id,
                     clean_thread_id,
                     clean_session_key,
-                    clean_session_id,
+                    clean_challenge_session_id,
                     clean_user_hash,
                     now,
                     clean_approved_message,

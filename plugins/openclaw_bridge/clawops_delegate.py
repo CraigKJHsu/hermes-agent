@@ -385,14 +385,19 @@ def _resolve_completed_callback_board(
     platform: str,
     chat_id: str,
     thread_id: str,
-    session_id: str,
-) -> str:
+) -> tuple[str, str]:
     """Resolve a fresh approval checkpoint from durable rows, not model input."""
-    matches: list[str] = []
+    matches: list[tuple[str, str]] = []
     for metadata in kb.list_boards(include_archived=False):
         slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
         try:
             with kb.connect_closing(board=slug) as conn:
+                callback = kb.get_grace_loop_callback(conn, review_task_id)
+                callback_session_id = str(
+                    (callback or {}).get("session_id") or ""
+                ).strip()
+                if not callback_session_id:
+                    continue
                 kb.validate_completed_approval_blocker(
                     conn,
                     review_task_id=review_task_id,
@@ -400,11 +405,11 @@ def _resolve_completed_callback_board(
                     platform=platform,
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    session_id=session_id,
+                    session_id=callback_session_id,
                 )
         except (ValueError, OSError):
             continue
-        matches.append(slug)
+        matches.append((slug, callback_session_id))
     if len(matches) != 1:
         raise ValueError(
             "Fresh callback approval must resolve to exactly one durable board."
@@ -862,6 +867,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             )
         approval_challenge: dict[str, Any] | None = None
         approval_bound_session_id = ""
+        approval_callback_session_id = ""
         approval_session_matches = False
         challenge_lookup_token = approval_token or approval_refresh_token
         if challenge_lookup_token and not internal_turn:
@@ -937,14 +943,23 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             and origin_review_id
             and origin_event_id is not None
         ):
-            resolved_board = _resolve_completed_callback_board(
+            (
+                resolved_board,
+                approval_callback_session_id,
+            ) = _resolve_completed_callback_board(
                 review_task_id=origin_review_id,
                 event_id=origin_event_id,
                 platform=platform,
                 chat_id=chat_id,
                 thread_id=thread_id,
-                session_id=approval_bound_session_id or session_id,
             )
+            if not _is_same_compression_lineage(
+                approval_callback_session_id,
+                session_id,
+            ):
+                raise ValueError(
+                    "Approval callback is bound to another session lineage."
+                )
             if (
                 requested_callback_board
                 and requested_callback_board != resolved_board
@@ -1372,7 +1387,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     platform=platform,
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    session_id=approval_bound_session_id or session_id,
+                    session_id=(approval_callback_session_id or session_id),
                 )
         effective_approved = False
         approval_provenance: dict[str, Any] = {}
@@ -1600,9 +1615,12 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         chat_id=chat_id,
                         thread_id=thread_id,
                         session_key=session_key,
-                        session_id=(approval_bound_session_id or session_id),
+                        session_id=(approval_callback_session_id or session_id),
                         resolved_route=contract["routing"]["resolved"],
                         approval_required=True,
+                        approval_challenge_session_id=(
+                            approval_bound_session_id
+                        ),
                         telegram_message_path_session_id=session_id,
                         challenge_token=approval_token,
                         user_id_sha256=user_id_sha256,

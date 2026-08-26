@@ -1780,11 +1780,16 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     )
     with kb.connect_closing(board="secondhand") as conn:
         with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE grace_approval_challenges "
-                "SET telegram_message_path = ? WHERE token = ?",
-                (dumps_message_path(callback_trace), token),
-            )
+                conn.execute(
+                    "UPDATE grace_approval_challenges "
+                    "SET telegram_message_path = ?, session_id = ? "
+                    "WHERE token = ?",
+                    (
+                        dumps_message_path(callback_trace),
+                        "grace-session-compressed",
+                        token,
+                    ),
+                )
 
     class CompressionSessionDB:
         def get_compression_tip(self, session_id):
