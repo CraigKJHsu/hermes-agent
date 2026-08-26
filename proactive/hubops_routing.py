@@ -29,6 +29,14 @@ TASK_TYPE_ALIASES = {
     "group_distribution": "browser_publish",
 }
 ALWAYS_APPROVAL_TASK_TYPES = {"browser_publish", "browser_ops"}
+TASK_REQUIRED_CALLABLE_TOOLS = {
+    "facebook_page_api_publish": frozenset(
+        {
+            "facebook_page_graph_status",
+            "facebook_page_graph_publish",
+        }
+    ),
+}
 
 
 def normalize_clawops_task_type(value: str) -> str:
@@ -161,6 +169,9 @@ def route_clawops_objective(
         for tool in worker.get("required_callable_tools") or []
         if str(tool or "").strip()
     }
+    required_callable_tools.update(
+        TASK_REQUIRED_CALLABLE_TOOLS.get(canonical_task_type, ())
+    )
     if required_callable_tools:
         if runtime_callable_tools is None:
             from hermes_cli.kanban_db import probe_profile_callable_tools
