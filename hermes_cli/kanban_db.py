@@ -11652,6 +11652,34 @@ def _compiled_contract_allowed_tools(body: Optional[str]) -> list[str]:
     return result
 
 
+def _compiled_contract_required_callable_tools(body: Optional[str]) -> list[str]:
+    """Return callable requirements from the trusted execution contract."""
+    text = str(body or "")
+    if _grace_loop_stage_header(text) != "execution":
+        return []
+    match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if match is None:
+        return []
+    try:
+        contract = json.loads(match.group(1))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(contract, dict):
+        return []
+    assignment = (
+        ((contract.get("routing") or {}).get("resolved") or {}).get("assignment")
+        or {}
+    )
+    declared = assignment.get("required_callable_tools") or []
+    if not isinstance(declared, list):
+        return []
+    return list(dict.fromkeys(
+        str(item or "").strip()
+        for item in declared
+        if str(item or "").strip()
+    ))
+
+
 _WORKER_CAPABILITY_PROBE = r"""
 import json
 import sys
@@ -11678,6 +11706,7 @@ available = sorted(
 )
 available_set = set(available)
 declared = payload["declared_tools"]
+explicitly_required = set(payload.get("required_tools") or [])
 configured = set()
 for toolset in payload["toolsets"]:
     if validate_toolset(toolset):
@@ -11687,7 +11716,7 @@ registered = [
 ]
 required = [
     name for name in declared
-    if name in configured or name in set(registered)
+    if name in explicitly_required or name in configured or name in set(registered)
 ]
 abstract = [name for name in declared if name not in set(required)]
 missing = [name for name in required if name not in available_set]
@@ -11723,6 +11752,7 @@ def _probe_worker_capabilities(
     env: Mapping[str, str],
     workspace: str,
     timeout: float = 60.0,
+    required_tools: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Resolve the exact new-worker schema in an isolated Python process.
 
@@ -11730,8 +11760,14 @@ def _probe_worker_capabilities(
     profile-sensitive checks must not inherit a verdict previously computed
     for the gateway's default profile.
     """
+    required_tools = required_tools or []
+    probe_tools = list(dict.fromkeys([*declared_tools, *required_tools]))
     payload = json.dumps(
-        {"declared_tools": declared_tools, "toolsets": toolsets},
+        {
+            "declared_tools": probe_tools,
+            "required_tools": required_tools,
+            "toolsets": toolsets,
+        },
         ensure_ascii=False,
     )
     completed: Optional[subprocess.CompletedProcess[str]] = None
@@ -11754,7 +11790,7 @@ def _probe_worker_capabilities(
                 continue
             return {
                 "ok": False,
-                "declared_tools": declared_tools,
+                "declared_tools": probe_tools,
                 "required_runtime_tools": [],
                 "available_tools": [],
                 # A timeout proves nothing about individual tool presence.
@@ -11767,7 +11803,7 @@ def _probe_worker_capabilities(
         except Exception as exc:
             return {
                 "ok": False,
-                "declared_tools": declared_tools,
+                "declared_tools": probe_tools,
                 "required_runtime_tools": [],
                 "available_tools": [],
                 "missing_required_tools": [],
@@ -11777,7 +11813,7 @@ def _probe_worker_capabilities(
     if completed is None:  # pragma: no cover - defensive loop invariant
         return {
             "ok": False,
-            "declared_tools": declared_tools,
+            "declared_tools": probe_tools,
             "required_runtime_tools": [],
             "available_tools": [],
             "missing_required_tools": [],
@@ -11787,7 +11823,7 @@ def _probe_worker_capabilities(
     if completed.returncode != 0:
         return {
             "ok": False,
-            "declared_tools": declared_tools,
+            "declared_tools": probe_tools,
             "required_runtime_tools": [],
             "available_tools": [],
             "missing_required_tools": [],
@@ -11802,7 +11838,7 @@ def _probe_worker_capabilities(
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         return {
             "ok": False,
-            "declared_tools": declared_tools,
+            "declared_tools": probe_tools,
             "required_runtime_tools": [],
             "available_tools": [],
             "missing_required_tools": [],
@@ -11812,7 +11848,7 @@ def _probe_worker_capabilities(
     if not isinstance(result, dict):
         return {
             "ok": False,
-            "declared_tools": declared_tools,
+            "declared_tools": probe_tools,
             "required_runtime_tools": [],
             "available_tools": [],
             "missing_required_tools": [],
@@ -11820,6 +11856,60 @@ def _probe_worker_capabilities(
             "probe_error": "capability probe output was not an object",
         }
     result.setdefault("probe_attempts", probe_attempts)
+    return result
+
+
+def probe_profile_callable_tools(
+    *,
+    profile: str,
+    required_tools: list[str],
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """Probe a target worker profile in the same isolation used at spawn."""
+    clean_profile = str(profile or "").strip()
+    clean_required = [
+        str(tool or "").strip()
+        for tool in required_tools
+        if str(tool or "").strip()
+    ]
+    if not clean_profile or not clean_required:
+        return {
+            "ok": False,
+            "available_tools": [],
+            "missing_required_tools": clean_required,
+            "probe_error": "profile and required_tools are required",
+        }
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_arg = normalize_profile_name(clean_profile)
+        profile_home = resolve_profile_env(profile_arg)
+        toolsets = _resolve_worker_cli_toolsets(profile_home) or []
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "available_tools": [],
+            "missing_required_tools": clean_required,
+            "probe_error": f"{type(exc).__name__}: {exc}",
+        }
+    env = dict(os.environ)
+    env["HERMES_HOME"] = profile_home
+    env["HERMES_PROFILE"] = profile_arg
+    result = _probe_worker_capabilities(
+        declared_tools=clean_required,
+        required_tools=clean_required,
+        toolsets=toolsets,
+        env=env,
+        workspace=os.getcwd(),
+        timeout=timeout,
+    )
+    result.update(
+        {
+            "profile": profile_arg,
+            "profile_home": profile_home,
+            "toolsets": toolsets,
+        }
+    )
     return result
 
 
@@ -12051,9 +12141,13 @@ def _default_spawn(
         "-q", prompt,
     ])
     declared_tools = _compiled_contract_allowed_tools(task.body)
-    if declared_tools:
+    required_callable_tools = _compiled_contract_required_callable_tools(
+        task.body
+    )
+    if declared_tools or required_callable_tools:
         capability = _probe_worker_capabilities(
             declared_tools=declared_tools,
+            required_tools=required_callable_tools,
             toolsets=worker_toolsets or [],
             env=env,
             workspace=workspace,

@@ -84,6 +84,44 @@ def test_hubops_routing_selects_secondhand_agent_and_browser_worker():
     assert envelope["approval_checklist"] == "External Browser Publish"
 
 
+def test_hubops_routing_blocks_worker_with_missing_required_callable_tools():
+    envelope = route_clawops_objective(
+        "發布已核准的 Facebook Page 貼文",
+        project="hub_ops",
+        task_type="facebook_page_api_publish",
+        risk_level="medium",
+        approved=True,
+        runtime_callable_tools={"clawops-ops": {"kanban_show"}},
+    )
+
+    assert envelope["status"] == "blocked"
+    assert "Runtime capability admission failed" in envelope["blocked_reason"]
+    assert "facebook_page_graph_status" in envelope["blocked_reason"]
+    assert "facebook_page_graph_publish" in envelope["blocked_reason"]
+
+
+def test_hubops_routing_admits_worker_with_all_required_callable_tools():
+    envelope = route_clawops_objective(
+        "發布已核准的 Facebook Page 貼文",
+        project="hub_ops",
+        task_type="facebook_page_api_publish",
+        risk_level="medium",
+        approved=True,
+        runtime_callable_tools={
+            "clawops-ops": {
+                "facebook_page_graph_status",
+                "facebook_page_graph_publish",
+            }
+        },
+    )
+
+    assert envelope["status"] == "routed"
+    assert envelope["assignment"]["required_callable_tools"] == [
+        "facebook_page_graph_status",
+        "facebook_page_graph_publish",
+    ]
+
+
 def test_hubops_routing_normalizes_listing_aliases_to_browser_publish():
     aliases = (
         "listing",

@@ -2854,12 +2854,15 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
-def _grace_execution_body_with_tools(*tool_names):
+def _grace_execution_body_with_tools(*tool_names, required_callable_tools=None):
     contract = {
         "routing": {
             "resolved": {
                 "assignment": {
                     "allowed_tools": list(tool_names),
+                    "required_callable_tools": list(
+                        required_callable_tools or []
+                    ),
                 }
             }
         }
@@ -2882,6 +2885,15 @@ def test_compiled_contract_tool_parser_ignores_free_form_mentions():
             "browser_upload_files", "browser_upload_files", "browser_cdp",
         )
     ) == ["browser_upload_files", "browser_cdp"]
+    assert kb._compiled_contract_required_callable_tools(
+        _grace_execution_body_with_tools(
+            "facebook_page_graph_publish",
+            required_callable_tools=[
+                "facebook_page_graph_publish",
+                "facebook_page_graph_publish",
+            ],
+        )
+    ) == ["facebook_page_graph_publish"]
 
 
 def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
@@ -2910,6 +2922,18 @@ def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
     assert missing["ok"] is False
     assert missing["missing_required_tools"] == ["browser_upload_files"]
     assert missing["tool_checks"]["browser_upload_files"]["available"] is False
+
+    explicitly_required = kb._probe_worker_capabilities(
+        declared_tools=[],
+        required_tools=["contract_only_pseudo_tool"],
+        toolsets=["file"],
+        env=env,
+        workspace=str(tmp_path),
+    )
+    assert explicitly_required["ok"] is False
+    assert explicitly_required["missing_required_tools"] == [
+        "contract_only_pseudo_tool"
+    ]
 
 
 def test_worker_capability_probe_retries_transient_timeout(monkeypatch, tmp_path):
@@ -2977,6 +3001,7 @@ def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
     kanban_home, monkeypatch,
 ):
     popen_called = False
+    probe_args = {}
 
     def fake_popen(*args, **kwargs):
         nonlocal popen_called
@@ -2989,10 +3014,9 @@ def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
         "_resolve_worker_cli_toolsets",
         lambda _home: ["file"],
     )
-    monkeypatch.setattr(
-        kb,
-        "_probe_worker_capabilities",
-        lambda **kwargs: {
+    def fake_probe(**kwargs):
+        probe_args.update(kwargs)
+        return {
             "ok": False,
             "declared_tools": ["browser_upload_files"],
             "required_runtime_tools": ["browser_upload_files"],
@@ -3005,15 +3029,18 @@ def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
                     "available": False,
                 }
             },
-        },
-    )
+        }
+
+    monkeypatch.setattr(kb, "_probe_worker_capabilities", fake_probe)
 
     conn = kb.connect()
     try:
         tid = kb.create_task(
             conn,
             title="contract capability preflight",
-            body=_grace_execution_body_with_tools("browser_upload_files"),
+            body=_grace_execution_body_with_tools(
+                required_callable_tools=["browser_upload_files"]
+            ),
             assignee="clawops-browser",
         )
         task = kb.claim_task(conn, tid)
@@ -3025,6 +3052,8 @@ def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
         ):
             kb._default_spawn(task, str(workspace))
         assert popen_called is False
+        assert probe_args["declared_tools"] == []
+        assert probe_args["required_tools"] == ["browser_upload_files"]
 
         assert kb.block_task(
             conn,

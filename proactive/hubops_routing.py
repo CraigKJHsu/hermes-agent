@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -87,6 +87,7 @@ def route_clawops_objective(
     approved: bool = False,
     contract_fingerprint: str = "",
     hub_ops_dir: str | Path | None = None,
+    runtime_callable_tools: Mapping[str, Iterable[str]] | None = None,
 ) -> dict[str, Any]:
     clean_objective = " ".join((objective or "").split())
     if not clean_objective:
@@ -151,6 +152,53 @@ def route_clawops_objective(
             task_type=canonical_task_type,
             risk_level=risk_level,
         )
+
+    runtime_profile = str(
+        worker.get("runtime_profile") or worker_id.replace(".", "-")
+    ).strip()
+    required_callable_tools = {
+        str(tool or "").strip()
+        for tool in worker.get("required_callable_tools") or []
+        if str(tool or "").strip()
+    }
+    if required_callable_tools:
+        if runtime_callable_tools is None:
+            from hermes_cli.kanban_db import probe_profile_callable_tools
+
+            capability = probe_profile_callable_tools(
+                profile=runtime_profile,
+                required_tools=sorted(required_callable_tools),
+            )
+            available_callable_tools = {
+                str(tool or "").strip()
+                for tool in capability.get("available_tools") or []
+                if str(tool or "").strip()
+            }
+        else:
+            capability = {"ok": True}
+            available_callable_tools = {
+                str(tool or "").strip()
+                for tool in runtime_callable_tools.get(runtime_profile, ())
+                if str(tool or "").strip()
+            }
+        missing_callable_tools = sorted(
+            required_callable_tools - available_callable_tools
+        )
+        if missing_callable_tools:
+            probe_error = str(capability.get("probe_error") or "").strip()
+            return _blocked(
+                "Runtime capability admission failed for "
+                f"profile={runtime_profile}: missing callable tools: "
+                f"{', '.join(missing_callable_tools)}."
+                + (f" Probe error: {probe_error}" if probe_error else ""),
+                objective=clean_objective,
+                project=project,
+                task_type=canonical_task_type,
+                risk_level=risk_level,
+                worker_id=worker_id,
+                worker=worker,
+                approval_required=True,
+            )
 
     risk = _normalize_risk(risk_level)
     risk_limit = _normalize_risk(str(worker.get("risk_level_limit") or "low"))
@@ -338,6 +386,9 @@ def _assignment(
         "runtime_profile": str(worker.get("runtime_profile") or worker_id.replace(".", "-")),
         "display_name": str(worker.get("display_name") or worker_id),
         "allowed_tools": list(worker.get("allowed_tools") or []),
+        "required_callable_tools": list(
+            worker.get("required_callable_tools") or []
+        ),
         "risk_level_limit": risk_level_limit,
         "effective_risk_level_limit": _normalize_risk(
             effective_risk_level_limit or risk_level_limit
