@@ -394,6 +394,8 @@ def test_accepted_grace_review_delivers_parent_execution_artifact(
 
     assert len(adapter.sent) == 1
     assert "已完成驗收" in adapter.sent[0]["text"]
+    assert "正在整理證據與下一步核准項目" not in adapter.sent[0]["text"]
+    assert "若確實需要後續核准" in adapter.sent[0]["text"]
     assert len(adapter.documents) == 1
     delivered_path = Path(adapter.documents[0]["file_path"])
     assert delivered_path.name == artifact_path.name

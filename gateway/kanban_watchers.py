@@ -564,7 +564,8 @@ class GatewayKanbanWatchersMixin:
                                 if _grace_review_accepted(review_metadata):
                                     msg = (
                                         f"🧭 {tag}Grace review task {sub['task_id']} 已完成驗收；"
-                                        "Grace 正在整理證據與下一步核准項目。"
+                                        "Grace 驗收回呼正在投遞。"
+                                        "若確實需要後續核准，Grace 會另行提出明確核准項目。"
                                     )
                                 elif _grace_review_rejected(review_metadata):
                                     msg = (
