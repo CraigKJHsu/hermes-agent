@@ -11598,6 +11598,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._last_chat_result = None
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -12014,6 +12015,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            self._last_chat_result = result
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -12208,6 +12210,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             
         except Exception as e:
             print(f"Error: {e}")
+            self._last_chat_result = {
+                "final_response": f"Error: {e}",
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": str(e),
+            }
             return None
         finally:
             # Ensure streaming TTS resources are cleaned up even on error.
@@ -15191,6 +15201,38 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _block_failed_kanban_goal_q(result: object) -> bool:
+    """Persist a terminal block for goal-mode ``chat -q`` API failures."""
+    import os as _os
+
+    if not isinstance(result, dict) or not result.get("failed"):
+        return False
+    task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or _os.environ.get("HERMES_KANBAN_GOAL_MODE") != "1":
+        return False
+    error = str(result.get("error") or result.get("final_response") or "worker API failure").strip()
+    reason = (
+        "Goal-mode worker could not complete or block the task because its "
+        f"model/API call failed before tool execution: {error[:500]}"
+    )
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect()
+        try:
+            task = _kb.get_task(conn, task_id)
+            if task is not None and task.status in {"running", "ready"}:
+                return bool(_kb.block_task(conn, task_id, reason=reason, kind="transient"))
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("failed to terminal-block failed kanban goal worker: %s", exc)
+    return False
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -15679,8 +15721,28 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
-                cli.chat(query, images=single_query_images or None)
+                response = cli.chat(query, images=single_query_images or None)
+                result = getattr(cli, "_last_chat_result", None)
+                if _block_failed_kanban_goal_q(result):
+                    result = getattr(cli, "_last_chat_result", None)
+                elif os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                    try:
+                        _run_kanban_goal_loop_q(cli, response or "")
+                    except Exception as _goal_exc:
+                        logger.debug("kanban goal loop failed: %s", _goal_exc)
                 cli._print_exit_summary()
+                if isinstance(result, dict) and result.get("failed"):
+                    if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+                        "failure_reason"
+                    ) in ("rate_limit", "billing"):
+                        try:
+                            from hermes_cli.kanban_db import (
+                                KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                            )
+                            sys.exit(_RL_CODE)
+                        except Exception:
+                            pass
+                    sys.exit(1)
         finally:
             _finalize_single_query(cli)
         return

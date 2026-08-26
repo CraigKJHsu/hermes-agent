@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -26,6 +27,85 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+def test_complete_task_accepts_generic_terminal_external_effect(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="Tasker read-only profile draft")
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={
+                "external_effects": [
+                    {
+                        "target": "https://www.tasker.com.tw/users/tasker/profile",
+                        "effect_key": "readonly-tasker-profile-check",
+                        "state": "verified",
+                        "externalId": "https://www.tasker.com.tw/auth/login",
+                        "readback": "redirected to login; no public profile fields found",
+                    }
+                ]
+            },
+        )
+
+        effect = conn.execute(
+            "SELECT platform, effect_key, state, external_id, details "
+            "FROM task_external_effects WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert effect is not None
+        assert effect["platform"] == "tasker"
+        assert effect["effect_key"] == "readonly-tasker-profile-check"
+        assert effect["state"] == "verified"
+        assert effect["external_id"] == "https://www.tasker.com.tw/auth/login"
+        details = json.loads(effect["details"])
+        assert details["target"] == "https://www.tasker.com.tw/users/tasker/profile"
+        assert "redirected to login" in details["readback"]
+
+
+def test_release_stale_claims_reclaims_dead_pre_spawn_owner_before_ttl(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="pre-spawn orphan", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:999999", ttl_seconds=900)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        old_started = int(time.time()) - kb.PRE_SPAWN_ORPHAN_GRACE_SECONDS - 1
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (old_started, run_id))
+        conn.commit()
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+        assert kb.release_stale_claims(conn) == 1
+
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "ready",
+            "claim_lock": None,
+            "claim_expires": None,
+            "worker_pid": None,
+        }
+        run = conn.execute(
+            "SELECT status, outcome, error FROM task_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        assert run["status"] == "reclaimed"
+        assert run["outcome"] == "reclaimed"
+        assert "pre_spawn_orphan_lock" in run["error"]
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event["kind"] == "reclaimed"
+        assert json.loads(event["payload"])["reason"] == "pre_spawn_owner_dead"
 
 
 def _init_git_repo(repo: Path) -> None:
@@ -68,6 +148,179 @@ def _bind_queued_grace_delegation(
             now,
             now,
         ),
+    )
+
+
+def _commerce_report(*, complete: bool, observed_at: int = 1_785_657_600):
+    return {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": complete,
+        "as_of": "2026-08-02 16:00 Asia/Taipei",
+        "observed_at": observed_at,
+        "rows": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "destination_id": "902016640291333",
+            "destination_name": "【大台北地區】二手家具、二手家電買賣",
+            "status": "public",
+            "status_label": "公開可見",
+            "observed_at": observed_at,
+            "verified_at": "2026-08-02 07:43 Asia/Taipei",
+            "evidence": "社團搜尋顯示賣家的 Kolin 商品卡。",
+            "source_listing_id": "37276725125275496",
+        }],
+        "coverage": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "complete": complete,
+            "named_count": 1,
+            "gap_count": 0 if complete else 1,
+            "expected_total": 1 if complete else 2,
+            "expected_total_label": (
+                "1 個已提交目的地" if complete else "2 個已提交目的地"
+            ),
+            "note": "清單完整。" if complete else "仍有一個目的地未具名。",
+        }],
+    }
+
+
+def _required_user_facing_report_body() -> str:
+    return "\n".join([
+        "GRACE_LOOP_CONTRACT_STAGE: execution",
+        "```json",
+        '{"user_facing_delivery":{"required":true,'
+        '"kind":"commerce_group_status","delivery":"inline_only",'
+        '"subject_keys":["carimali","kolin","celestron"]}}',
+        "```",
+    ])
+
+
+def test_delegation_token_rollup_combines_sessions_and_backend_usage(
+    kanban_home, tmp_path
+):
+    state_db = tmp_path / "state.db"
+    state_conn = sqlite3.connect(state_db)
+    try:
+        state_conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0
+            )
+            """
+        )
+        state_conn.executemany(
+            """
+            INSERT INTO sessions (
+                id, input_tokens, output_tokens, cache_read_tokens,
+                cache_write_tokens, reasoning_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("origin-session", 10, 2, 30, 0, 1),
+                ("worker-session", 20, 3, 40, 4, 2),
+            ],
+        )
+        state_conn.commit()
+    finally:
+        state_conn.close()
+
+    with kb.connect() as conn:
+        execution_task = kb.create_task(
+            conn,
+            title="Execute via OpenClaw",
+            session_id="origin-session",
+            executor_backend="openclaw",
+            executor_profile="browser-readonly",
+        )
+        review_task = kb.create_task(
+            conn,
+            title="Review OpenClaw result",
+            session_id="origin-session",
+        )
+        _bind_queued_grace_delegation(
+            conn,
+            execution_task,
+            review_task,
+            suffix="token-rollup",
+        )
+        conn.execute(
+            """
+            UPDATE grace_delegations
+               SET delegation_id = 'delegation-token-rollup',
+                   contract_fingerprint = ?
+             WHERE delegation_id = 'gd-test-token-rollup'
+            """,
+            ("sha256:" + "a" * 64,),
+        )
+        claimed = kb.claim_task(conn, execution_task, claimer="openclaw:test")
+        assert claimed is not None
+        run = kb.latest_run(conn, execution_task)
+        assert run is not None
+        assert kb.merge_active_run_metadata(
+            conn,
+            execution_task,
+            expected_run_id=run.id,
+            metadata={"worker_session_id": "worker-session"},
+        )
+        assert kb.record_backend_lifecycle(
+            conn,
+            execution_task,
+            expected_run_id=run.id,
+            status="succeeded",
+            backend_run_id="backend-run-token-rollup",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="2.0",
+            terminal_observation={
+                "delegated_result": {
+                    "token_usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 5,
+                        "cache_read_tokens": 11,
+                    }
+                }
+            },
+        )
+
+        rollup = kb.delegation_token_rollup(
+            conn,
+            "delegation-token-rollup",
+            session_db_path=state_db,
+        )
+
+    assert rollup["found"] is True
+    assert rollup["session_ids"] == [
+        "grace-session-1",
+        "origin-session",
+        "worker-session",
+    ]
+    assert rollup["backend_token_usage"]["total_tokens"] == 23
+    assert rollup["hermes_session_usage"] == {
+        "input_tokens": 30,
+        "output_tokens": 5,
+        "cache_read_tokens": 70,
+        "cache_write_tokens": 4,
+        "reasoning_tokens": 3,
+        "total_tokens": 112,
+    }
+    assert rollup["total_observed_tokens"] == 135
+    assert rollup["coverage"] == {
+        "session_db_read": True,
+        "hermes_sessions_found": 2,
+        "backend_runs_found": 1,
+        "backend_runs_missing_usage": 0,
+    }
+
+
+def _required_single_subject_report_body() -> str:
+    return _required_user_facing_report_body().replace(
+        '["carimali","kolin","celestron"]',
+        '["kolin-kd291m06"]',
     )
 
 
@@ -211,6 +464,167 @@ def test_callback_lease_renewal_and_outcome_are_owner_fenced(tmp_path):
             )
 
 
+def test_callback_outcome_accepts_approved_review_metadata(tmp_path):
+    db_path = tmp_path / "callback-approved-metadata.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="approved-metadata",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"approved": True, "acceptance_criteria_met": True},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        stored = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "complete"},
+        )
+    assert stored["outcome_kind"] == "closed"
+
+
+def test_callback_outcome_accepts_approved_review_evidence_metadata(tmp_path):
+    db_path = tmp_path / "callback-approved-evidence-metadata.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="f" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="approved-evidence-metadata",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={
+                "approved": True,
+                "evidence": {"package_assets_count": 7},
+                "verification_notes": ["visual review completed"],
+            },
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        stored = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "complete"},
+        )
+    assert stored["outcome_kind"] == "closed"
+
+
+def test_callback_outcome_accepts_visual_review_file_readback_metadata(tmp_path):
+    db_path = tmp_path / "callback-visual-review-file-readback.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="a" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="visual-review-file-readback",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={
+                "visual_review": {
+                    "approved": True,
+                    "observed_elements": ["square cover", "EP03"],
+                    "defects_found": [],
+                },
+                "parent_verified_file": {
+                    "format": "PNG",
+                    "width": 1254,
+                    "height": 1254,
+                    "sha256": "966aef8157560a217bed9d4e823499cd5830064704f6e73ea465af4242ac8cf0",
+                },
+                "external_actions": False,
+            },
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        stored = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "complete"},
+        )
+    assert stored["outcome_kind"] == "closed"
+
+
 def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
     db_path = tmp_path / "callback-session-rotation.db"
     with kb.connect_closing(db_path) as conn:
@@ -332,6 +746,411 @@ def test_intermediate_callback_cannot_record_closed_outcome(tmp_path):
                 lease_owner="owner-a",
                 outcome_kind="closed",
                 payload={"summary": "stage complete"},
+            )
+
+
+def test_incomplete_user_facing_report_cannot_close_callback(tmp_path):
+    db_path = tmp_path / "incomplete-user-facing-report.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body=_required_single_subject_report_body(),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="partial group inventory",
+            metadata={"user_facing_report": _commerce_report(complete=False)},
+        )
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="incomplete-report",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="evidence accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        with pytest.raises(ValueError, match="Incomplete user-facing report"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "incorrectly closed"},
+            )
+
+
+def test_required_user_facing_report_cannot_be_omitted_on_close(tmp_path):
+    db_path = tmp_path / "missing-required-user-facing-report.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body=_required_user_facing_report_body(),
+        )
+        assert kb.complete_task(conn, execution_id, summary="missing report")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="missing-required-report",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        with pytest.raises(ValueError, match="Required user-facing report"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "incorrectly closed"},
+            )
+
+
+def test_complete_user_facing_report_can_close_callback(tmp_path):
+    db_path = tmp_path / "complete-user-facing-report.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body=_required_single_subject_report_body(),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="complete group inventory",
+            metadata={"user_facing_report": _commerce_report(complete=True)},
+        )
+        stored_report = kb.latest_run(
+            conn, execution_id,
+        ).metadata["user_facing_report"]
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="complete-report",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 0 "
+            "WHERE singleton_id = 1"
+        )
+        with pytest.raises(ValueError, match="must be reconciled"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "premature"},
+            )
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 1 "
+            "WHERE singleton_id = 1"
+        )
+        with pytest.raises(ValueError, match="delivery receipt"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "premature"},
+            )
+        reservation = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=2,
+        )
+        assert reservation["state"] == "pending"
+        assert reservation["should_send"] is True
+        with pytest.raises(ValueError, match="confirmed as sent"):
+            kb.record_grace_user_facing_report_delivery(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                report=stored_report,
+                chunk_count=2,
+                chunk_index=0,
+            )
+        duplicate = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=2,
+        )
+        assert duplicate["state"] == "pending"
+        assert duplicate["should_send"] is False
+        failed = kb.fail_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=2,
+        )
+        assert failed["state"] == "failed"
+        retry = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=2,
+        )
+        assert retry["state"] == "pending"
+        assert retry["should_send"] is True
+        confirmed = kb.confirm_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=2,
+            message_id="telegram-1",
+        )
+        assert confirmed["state"] == "sent"
+        assert confirmed["message_id"] == "telegram-1"
+        receipt = kb.record_grace_user_facing_report_delivery(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_count=2,
+            chunk_index=0,
+        )
+        assert receipt["user_report_next_chunk"] == 1
+        assert receipt["user_report_delivered_at"] is None
+        assert kb.grace_user_facing_report_next_chunk(
+            receipt,
+            event_id=callback["event_id"],
+            report=stored_report,
+            chunk_count=2,
+        ) == 1
+        kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_index=1,
+            total_chunks=2,
+        )
+        kb.confirm_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            report=stored_report,
+            chunk_index=1,
+            total_chunks=2,
+            message_id="telegram-2",
+        )
+        receipt = kb.record_grace_user_facing_report_delivery(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_count=2,
+            chunk_index=1,
+        )
+        assert receipt["user_report_next_chunk"] == 2
+        assert receipt["user_report_delivered_at"] is not None
+        stored = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "complete"},
+        )
+    assert stored["outcome_kind"] == "closed"
+
+
+def test_complete_report_must_match_requested_subjects(tmp_path):
+    db_path = tmp_path / "wrong-subject-user-facing-report.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body=_required_user_facing_report_body(),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="one subject only",
+            metadata={"user_facing_report": _commerce_report(complete=True)},
+        )
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="wrong-report-subject",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        with pytest.raises(ValueError, match="Incomplete user-facing report"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "incorrectly closed"},
             )
 
 
@@ -615,7 +1434,417 @@ def test_init_creates_expected_tables(kanban_home):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+    assert {
+        "tasks", "task_links", "task_comments", "task_events",
+        "commerce_group_ledger", "commerce_group_coverage",
+    } <= names
+
+
+def test_user_facing_report_persists_cross_task_commerce_ledger(tmp_path):
+    db_path = tmp_path / "commerce-ledger.db"
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="first audit")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="first",
+            metadata={"user_facing_report": _commerce_report(complete=False)},
+        )
+        older_id = kb.create_task(conn, title="stale correction")
+        stale_report = _commerce_report(
+            complete=False, observed_at=1_785_657_500,
+        )
+        stale_report["rows"][0]["status"] = "pending_approval"
+        stale_report["rows"][0]["status_label"] = "待審"
+        with pytest.raises(ValueError, match="stale destination evidence"):
+            kb.complete_task(
+                conn,
+                older_id,
+                summary="stale",
+                metadata={"user_facing_report": stale_report},
+            )
+
+        rows = kb.list_commerce_group_ledger(conn)
+        coverage = kb.list_commerce_group_coverage(conn)
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "public"
+    assert rows[0]["source_task_id"] == first_id
+    assert len(coverage) == 1
+    assert coverage[0]["complete"] == 0
+    assert coverage[0]["gap_count"] == 1
+
+
+def test_newer_partial_report_keeps_merged_destination_count(tmp_path):
+    db_path = tmp_path / "commerce-ledger-merge.db"
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="first destination")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="first",
+            metadata={"user_facing_report": _commerce_report(complete=False)},
+        )
+        second_report = _commerce_report(
+            complete=False, observed_at=1_785_657_700,
+        )
+        second_report["rows"][0]["destination_id"] = "207110076321670"
+        second_report["rows"][0]["destination_name"] = "二手家電冷氣買賣"
+        prior_row = _commerce_report(
+            complete=False, observed_at=1_785_657_700,
+        )["rows"][0]
+        second_report["rows"].append(prior_row)
+        second_report["coverage"][0]["named_count"] = 2
+        second_report["coverage"][0]["gap_count"] = 0
+        second_id = kb.create_task(conn, title="second destination")
+        assert kb.complete_task(
+            conn,
+            second_id,
+            summary="second",
+            metadata={"user_facing_report": second_report},
+        )
+        rows = kb.list_commerce_group_ledger(conn)
+        coverage = kb.list_commerce_group_coverage(conn)
+
+    assert len(rows) == 2
+    assert coverage[0]["named_count"] == 2
+    assert coverage[0]["gap_count"] == 0
+    assert coverage[0]["complete"] == 0
+
+
+def test_partial_report_cannot_omit_known_destinations(tmp_path):
+    db_path = tmp_path / "commerce-ledger-omission.db"
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="known destination")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="known",
+            metadata={"user_facing_report": _commerce_report(complete=False)},
+        )
+        omitted = {
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "complete": False,
+            "as_of": "2026-08-02 16:02 Asia/Taipei",
+            "observed_at": 1_785_657_720,
+            "rows": [],
+            "coverage": [{
+                "subject_key": "kolin-kd291m06",
+                "subject_label": "Kolin KD-291M06",
+                "complete": False,
+                "named_count": 0,
+                "gap_count": None,
+                "expected_total": None,
+                "expected_total_label": "總數未知",
+                "note": "錯誤地省略已知目的地。",
+            }],
+        }
+        second_id = kb.create_task(conn, title="omitted destination")
+        with pytest.raises(ValueError, match="every known destination"):
+            kb.complete_task(
+                conn,
+                second_id,
+                summary="omitted",
+                metadata={"user_facing_report": omitted},
+            )
+
+
+def test_user_facing_report_rejects_incorrect_named_count(tmp_path):
+    db_path = tmp_path / "commerce-ledger-named-count.db"
+    report = _commerce_report(complete=True)
+    report["coverage"][0]["named_count"] = 2
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="invalid report")
+        with pytest.raises(ValueError, match="named_count"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="invalid",
+                metadata={"user_facing_report": report},
+            )
+
+
+@pytest.mark.parametrize("destination_id", ["0902016640291333", "٩٠٢٠١٦٦٤٠٢٩١٣٣٣"])
+def test_user_facing_report_rejects_noncanonical_destination_id(
+    tmp_path, destination_id,
+):
+    db_path = tmp_path / "commerce-ledger-canonical-id.db"
+    report = _commerce_report(complete=True)
+    report["rows"][0]["destination_id"] = destination_id
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="invalid destination id")
+        with pytest.raises(ValueError, match="canonical ASCII digits"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="invalid",
+                metadata={"user_facing_report": report},
+            )
+
+
+def test_equal_timestamp_conflicting_destination_evidence_is_rejected(tmp_path):
+    db_path = tmp_path / "commerce-ledger-equal-clock-conflict.db"
+    first = _commerce_report(complete=False)
+    conflict = _commerce_report(complete=False)
+    conflict["rows"][0]["status"] = "rejected"
+    conflict["rows"][0]["status_label"] = "已拒絕"
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="first evidence")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="first",
+            metadata={"user_facing_report": first},
+        )
+        conflict_id = kb.create_task(conn, title="conflicting evidence")
+        with pytest.raises(ValueError, match="stale destination evidence"):
+            kb.complete_task(
+                conn,
+                conflict_id,
+                summary="conflict",
+                metadata={"user_facing_report": conflict},
+            )
+
+
+def test_equal_timestamp_conflicting_coverage_is_rejected(tmp_path):
+    db_path = tmp_path / "commerce-ledger-equal-coverage-conflict.db"
+    first = _commerce_report(complete=False)
+    conflict = _commerce_report(complete=True)
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="first coverage")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="first",
+            metadata={"user_facing_report": first},
+        )
+        conflict_id = kb.create_task(conn, title="conflicting coverage")
+        with pytest.raises(ValueError, match="stale coverage evidence"):
+            kb.complete_task(
+                conn,
+                conflict_id,
+                summary="conflict",
+                metadata={"user_facing_report": conflict},
+            )
+
+
+def test_upgrade_with_historical_group_effect_requires_reconciliation(tmp_path):
+    db_path = tmp_path / "commerce-ledger-migration.db"
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="historical Facebook action")
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO task_external_effects (
+                task_id, platform, effect_key, state, external_id,
+                created_at, updated_at
+            ) VALUES (?, 'facebook', 'group:902016640291333', 'verified',
+                      '902016640291333', ?, ?)
+            """,
+            (task_id, now, now),
+        )
+        conn.execute(
+            "DELETE FROM commerce_group_migration_state WHERE singleton_id = 1"
+        )
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        migration = conn.execute(
+            "SELECT reconciled FROM commerce_group_migration_state "
+            "WHERE singleton_id = 1"
+        ).fetchone()
+    assert migration["reconciled"] == 0
+
+
+def test_partial_backfill_cannot_clear_global_reconciliation_gate(tmp_path):
+    db_path = tmp_path / "commerce-ledger-partial-backfill.db"
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 0 "
+            "WHERE singleton_id = 1"
+        )
+        kb.record_commerce_user_facing_report(
+            conn,
+            report=_commerce_report(complete=False),
+            source_task_id="partial-backfill",
+        )
+        migration = conn.execute(
+            "SELECT reconciled FROM commerce_group_migration_state "
+            "WHERE singleton_id = 1"
+        ).fetchone()
+    assert migration["reconciled"] == 0
+
+
+def test_new_facebook_group_effect_reopens_reconciliation_gate(tmp_path):
+    db_path = tmp_path / "commerce-ledger-new-effect.db"
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="new group effect")
+        effect_time = int(time.time())
+        with kb.write_txn(conn):
+            kb._upsert_external_effect(
+                conn,
+                task_id=task_id,
+                platform="facebook",
+                state="verified",
+                external_id="902016640291333",
+                details=None,
+                run_id=None,
+                now=effect_time,
+                effect_key="group:902016640291333",
+            )
+        stale_report = _commerce_report(
+            complete=False,
+            observed_at=effect_time - 1,
+        )
+        for subject_key, subject_label in (
+            ("carimali-armonia-soft-plus", "Carimali Armonia Soft Plus"),
+            ("celestron-130eq", "Celestron 130EQ"),
+        ):
+            stale_report["coverage"].append({
+                "subject_key": subject_key,
+                "subject_label": subject_label,
+                "complete": False,
+                "named_count": 0,
+                "gap_count": None,
+                "expected_total": None,
+                "expected_total_label": "歷史總數未知",
+                "note": "尚無具名目的地。",
+            })
+        kb.record_commerce_user_facing_report(
+            conn,
+            report=stale_report,
+            source_task_id="stale-replay",
+        )
+        equal_report = _commerce_report(
+            complete=False,
+            observed_at=effect_time,
+        )
+        equal_report["coverage"].extend(stale_report["coverage"][1:])
+        kb.record_commerce_user_facing_report(
+            conn,
+            report=equal_report,
+            source_task_id="equal-time-replay",
+        )
+        migration = conn.execute(
+            "SELECT reconciled, latest_group_effect_at, "
+            "reconciled_report_observed_at FROM commerce_group_migration_state "
+            "WHERE singleton_id = 1"
+        ).fetchone()
+    assert migration["reconciled"] == 0
+    assert migration["latest_group_effect_at"] == effect_time
+    assert migration["reconciled_report_observed_at"] == effect_time
+
+
+def test_user_facing_report_allows_zero_named_destinations(tmp_path):
+    db_path = tmp_path / "commerce-ledger-zero-named.db"
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-08-02 16:00 Asia/Taipei",
+        "observed_at": 1_785_657_600,
+        "rows": [],
+        "coverage": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "complete": False,
+            "named_count": 0,
+            "gap_count": None,
+            "expected_total": None,
+            "expected_total_label": "歷史目的地尚未恢復",
+            "note": "目前沒有可具名的社團。",
+        }],
+    }
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="zero named")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="zero named",
+            metadata={"user_facing_report": report},
+        )
+        assert kb.list_commerce_group_ledger(conn) == []
+        coverage = kb.list_commerce_group_coverage(conn)
+    assert coverage[0]["named_count"] == 0
+    assert coverage[0]["complete"] == 0
+
+
+def test_unresolved_status_cannot_be_complete(tmp_path):
+    db_path = tmp_path / "commerce-ledger-unresolved.db"
+    report = _commerce_report(complete=True)
+    report["rows"][0]["status"] = "ambiguous_after_submit"
+    report["rows"][0]["status_label"] = "目前未知"
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="unresolved")
+        with pytest.raises(ValueError, match="complete must match"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="unresolved",
+                metadata={"user_facing_report": report},
+            )
+
+
+def test_report_observation_clock_is_not_replaced_by_row_order(tmp_path):
+    db_path = tmp_path / "commerce-ledger-report-clock.db"
+    report = _commerce_report(
+        complete=False, observed_at=1_785_657_700,
+    )
+    report["rows"][0]["observed_at"] = 1_785_657_500
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="report clock")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="report clock",
+            metadata={"user_facing_report": report},
+        )
+        coverage = kb.list_commerce_group_coverage(conn)
+    assert coverage[0]["observed_at"] == 1_785_657_700
+
+
+def test_future_report_timestamp_is_rejected(tmp_path):
+    db_path = tmp_path / "commerce-ledger-future-clock.db"
+    report = _commerce_report(complete=False)
+    report["observed_at"] = int(time.time()) + 10_000
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="future clock")
+        with pytest.raises(ValueError, match="plausible Unix-seconds"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="future clock",
+                metadata={"user_facing_report": report},
+            )
+
+
+def test_complete_report_rejects_stale_canonical_row(tmp_path):
+    db_path = tmp_path / "commerce-ledger-stale-complete.db"
+    newer = _commerce_report(
+        complete=False, observed_at=1_785_657_700,
+    )
+    newer["rows"][0]["status"] = "rejected"
+    newer["rows"][0]["status_label"] = "已拒絕"
+    stale_complete = _commerce_report(
+        complete=True, observed_at=1_785_657_800,
+    )
+    stale_complete["rows"][0]["observed_at"] = 1_785_657_500
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="newer canonical row")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="newer",
+            metadata={"user_facing_report": newer},
+        )
+        second_id = kb.create_task(conn, title="stale complete row")
+        with pytest.raises(ValueError, match="stale destination evidence"):
+            kb.complete_task(
+                conn,
+                second_id,
+                summary="stale complete",
+                metadata={"user_facing_report": stale_complete},
+            )
 
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):

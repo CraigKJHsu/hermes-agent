@@ -19,6 +19,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import goals
+from cli import _block_failed_kanban_goal_q
 
 
 @pytest.fixture
@@ -65,6 +66,42 @@ def test_goal_mode_without_max_turns(kanban_home):
         task = kb.get_task(conn, tid)
     assert task.goal_mode is True
     assert task.goal_max_turns is None
+
+
+def test_failed_chat_q_goal_worker_blocks_task_instead_of_clean_exit(
+    kanban_home,
+    monkeypatch,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="goal task",
+            assignee="worker",
+            goal_mode=True,
+            initial_status="running",
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+
+    blocked = _block_failed_kanban_goal_q(
+        {
+            "failed": True,
+            "error": "API call failed after 3 retries: Connection error.",
+            "final_response": "",
+        }
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    assert blocked is True
+    assert task.status == "blocked"
+    assert task.block_kind == "transient"
+    assert any(row["kind"] == "blocked" for row in events)
 
 
 def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):

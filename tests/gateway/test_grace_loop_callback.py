@@ -4,6 +4,10 @@ import time
 from types import SimpleNamespace
 
 from gateway.config import Platform
+from gateway.kanban_watchers import (
+    _confirmed_grace_provider_message_id,
+    _grace_review_accepted,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
@@ -47,7 +51,12 @@ class CallbackAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append((chat_id, text, metadata or {}))
-        return self.send_result
+        if self.send_result is not None:
+            return self.send_result
+        return SimpleNamespace(
+            success=True,
+            message_id=str(len(self.sent)),
+        )
 
 
 class DeferredCallbackAdapter(CallbackAdapter):
@@ -97,6 +106,57 @@ class DroppedCallbackAdapter(CallbackAdapter):
 
     async def handle_message(self, event):
         return None
+
+
+def test_grace_provider_receipt_rejects_success_marked_ambiguous():
+    assert _confirmed_grace_provider_message_id(SimpleNamespace(
+        success=True,
+        message_id="123",
+        delivery_ambiguous=True,
+    )) is None
+    assert _confirmed_grace_provider_message_id(SimpleNamespace(
+        success=True,
+        message_id="123",
+        delivery_ambiguous=False,
+    )) == "123"
+
+
+def test_grace_review_accepts_nonempty_criteria_list():
+    assert _grace_review_accepted({
+        "approved": True,
+        "acceptance_criteria_met": [
+            "PNG attachment exists",
+            "SHA-256 readback matches",
+        ],
+    }) is True
+
+
+def test_grace_review_accepts_approved_metadata_with_evidence():
+    assert _grace_review_accepted({
+        "approved": True,
+        "evidence": {
+            "package_assets_count": 7,
+            "cover_claimed_sha256": "30b87e090cdda4f66215339f4dfb969b9a04dfbbd8bf389b9ec17688c18ca98f",
+        },
+        "verification_notes": ["visual review completed"],
+    }) is True
+
+
+def test_grace_review_accepts_visual_review_with_file_readback():
+    assert _grace_review_accepted({
+        "visual_review": {
+            "approved": True,
+            "observed_elements": ["square cover", "EP03"],
+            "defects_found": [],
+        },
+        "parent_verified_file": {
+            "format": "PNG",
+            "width": 1254,
+            "height": 1254,
+            "sha256": "966aef8157560a217bed9d4e823499cd5830064704f6e73ea465af4242ac8cf0",
+        },
+        "external_actions": False,
+    }) is True
 
 
 def _runner(
@@ -474,6 +534,7 @@ def test_blocked_review_wakes_grace_for_user_decision(tmp_path, monkeypatch):
     assert "review_event=blocked" in adapter.handled[0].text
     assert "validated_outcome=blocked" in adapter.handled[0].text
     assert "ask only for the specific missing decision" in adapter.handled[0].text
+    assert "MUST first call clawops_delegate during this callback" not in adapter.handled[0].text
 
 
 def test_dependency_review_correction_does_not_ask_kj_for_input(
@@ -580,6 +641,8 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     assert "validated_outcome=needs_input" in event.text
     assert "KJ must choose the final product name" in event.text
     assert "do not claim that Grace reviewed or accepted" in event.text
+    assert "MUST first call clawops_delegate during this callback" not in event.text
+    assert "grace_callback_outcome exactly once" not in event.text
     trigger_line = next(
         line for line in event.text.splitlines() if line.startswith("trigger_event=")
     )
@@ -587,6 +650,12 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     assert trigger_event["kind"] == "blocked"
     payload_preview = json.loads(trigger_event["payload_preview"])
     assert payload_preview["reason"] == "KJ must choose the final product name"
+    evidence_line = next(
+        line for line in event.text.splitlines() if line.startswith("evidence_snapshot=")
+    )
+    evidence = json.loads(evidence_line.split("=", 1)[1])
+    assert "metadata" not in evidence["execution"]
+    assert "metadata_preview" not in evidence["execution"]
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
     assert callback["state"] == "delivered"
@@ -657,7 +726,209 @@ def test_callback_bounds_worker_authored_trigger_payload(tmp_path, monkeypatch):
     trigger_event = json.loads(trigger_line.split("=", 1)[1])
     assert len(trigger_event["payload_preview"]) < 4100
     assert trigger_event["payload_preview"].endswith("...[truncated]")
-    assert len(event.text) < 30000
+    evidence_line = next(
+        line for line in event.text.splitlines() if line.startswith("evidence_snapshot=")
+    )
+    evidence = json.loads(evidence_line.split("=", 1)[1])
+    assert "metadata" not in evidence["execution"]
+    assert "metadata_preview" not in evidence["execution"]
+    assert "MUST first call clawops_delegate during this callback" not in event.text
+    assert len(event.text) < 9000
+
+
+def test_large_snapshot_preserves_bounded_user_facing_report(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "bounded-user-facing-report.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-08-02 16:00 Asia/Taipei",
+        "observed_at": int(time.time()),
+        "rows": [],
+        "coverage": [{
+            "subject_key": "carimali-armonia-soft-plus",
+            "subject_label": "Carimali Armonia Soft Plus",
+            "complete": False,
+            "named_count": 0,
+            "gap_count": None,
+            "expected_total": None,
+            "expected_total_label": "目的地未知",
+            "note": "N" * 8_000,
+        }],
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                '{"user_facing_delivery":{"required":true,'
+                '"kind":"commerce_group_status","delivery":"inline_only",'
+                '"subject_keys":["carimali-armonia-soft-plus"]}}',
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="report ready",
+            metadata={
+                "user_facing_report": report,
+                "padding": "DROP-ME-" * 4_000,
+            },
+        )
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="bounded-report",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="a" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    event = adapter.handled[0]
+    evidence_line = next(
+        line
+        for line in event.text.splitlines()
+        if line.startswith("evidence_snapshot=")
+    )
+    evidence = json.loads(evidence_line.split("=", 1)[1])
+    preserved = evidence["execution"]["user_facing_report"]
+    assert preserved["coverage"][0]["note"] == "N" * 8_000
+    assert "...[truncated]" in evidence_line
+    assert len(evidence_line) < 16_000
+    assert "Gateway has already delivered that exact structured payload" in event.text
+    assert "MUST first call clawops_delegate during this callback" not in event.text
+    assert len(event.text) < 20_000
+    delivered_text = "".join(text for _, text, _ in adapter.sent)
+    assert "Carimali Armonia Soft Plus" in delivered_text
+    assert "目前沒有可具名的社團紀錄" in delivered_text
+    with kb.connect_closing(db_path) as conn:
+        receipt = kb.get_grace_loop_callback(conn, review_id)
+    assert receipt["user_report_delivered_at"] is not None
+    assert receipt["user_report_chunk_count"] == len(adapter.sent)
+
+
+def test_complete_report_is_not_sent_before_historical_reconciliation(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "blocked-complete-user-facing-report.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    now = int(time.time())
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": True,
+        "as_of": "2026-08-02 20:00 Asia/Taipei",
+        "observed_at": now,
+        "rows": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "destination_id": "902016640291333",
+            "destination_name": "【大台北地區】二手家具、二手家電買賣",
+            "status": "public",
+            "status_label": "公開可見",
+            "observed_at": now,
+            "verified_at": "2026-08-02 20:00 Asia/Taipei",
+            "evidence": "社團頁面已讀回商品卡。",
+        }],
+        "coverage": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "complete": True,
+            "named_count": 1,
+            "gap_count": 0,
+            "expected_total": 1,
+            "expected_total_label": "目前共一個目的地",
+            "note": "清單完整。",
+        }],
+    }
+    body = "\n".join([
+        "GRACE_LOOP_CONTRACT_STAGE: execution",
+        "```json",
+        '{"user_facing_delivery":{"required":true,'
+        '"kind":"commerce_group_status","delivery":"inline_only",'
+        '"subject_keys":["kolin-kd291m06"]}}',
+        "```",
+    ])
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution", body=body)
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="complete report",
+            metadata={"user_facing_report": report},
+        )
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        _bind_delegation(conn, execution_id, review_id, suffix="blocked-complete")
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="a" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 0 "
+            "WHERE singleton_id = 1"
+        )
+
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert "requires current" in callback["last_error"]
 
 
 def test_invalid_review_metadata_never_claims_acceptance(tmp_path, monkeypatch):
@@ -676,6 +947,59 @@ def test_invalid_review_metadata_never_claims_acceptance(tmp_path, monkeypatch):
 
     assert len(adapter.handled) == 1
     assert "validated_outcome=invalid_completion_metadata" in adapter.handled[0].text
+    assert "validated_outcome=accepted" not in adapter.handled[0].text
+
+
+def test_rejected_review_metadata_wakes_grace_as_blocked(tmp_path, monkeypatch):
+    db_path = tmp_path / "rejected-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn, title="execution", assignee="clawops-content",
+        )
+        kb.complete_task(conn, execution_id, summary="capability blocked")
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            parents=(execution_id,),
+        )
+        _bind_delegation(conn, execution_id, review_id, suffix="rejected")
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="a" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="review rejected incomplete",
+            metadata={
+                "approved": False,
+                "review_verdict": "rejected_incomplete",
+            },
+        )
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert len(adapter.handled) == 1
+    assert "validated_outcome=blocked" in adapter.handled[0].text
+    assert "validated_outcome=invalid_completion_metadata" not in adapter.handled[0].text
     assert "validated_outcome=accepted" not in adapter.handled[0].text
 
 

@@ -89,7 +89,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -234,6 +234,9 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
 
+PRE_SPAWN_ORPHAN_GRACE_SECONDS = DEFAULT_CRASH_GRACE_SECONDS
+
+
 # Sentinel exit code a kanban worker uses to signal "I bailed because the
 # provider rate-limited / exhausted quota, not because the task failed."
 # The dispatcher's reap classifier maps this to a ``rate_limited`` exit kind
@@ -328,6 +331,45 @@ _EXTERNAL_CREATE_HOSTS = {
         "seller.shopee.com.mx",
     }),
 }
+_EXTERNAL_PLATFORM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _normalize_external_effect_platform(
+    platform: object,
+    raw_effect: Optional[Mapping[str, Any]] = None,
+) -> str:
+    normalized = str(platform or "").strip().lower()
+    if normalized:
+        normalized = re.sub(r"[^a-z0-9_-]+", "-", normalized).strip("-")
+    if not normalized and raw_effect is not None:
+        from urllib.parse import urlsplit
+
+        for key in ("target", "external_id", "externalId", "url"):
+            value = str(raw_effect.get(key) or "").strip()
+            if not value:
+                continue
+            try:
+                host = urlsplit(value).hostname or ""
+            except ValueError:
+                host = ""
+            host = host.lower()
+            for known_platform, hosts in _EXTERNAL_CREATE_HOSTS.items():
+                if host in hosts:
+                    return known_platform
+            if host:
+                labels = [part for part in host.split(".") if part and part != "www"]
+                if labels:
+                    normalized = re.sub(
+                        r"[^a-z0-9_-]+",
+                        "-",
+                        labels[0],
+                    ).strip("-")
+                    break
+    if not normalized:
+        normalized = "generic"
+    if not _EXTERNAL_PLATFORM_RE.fullmatch(normalized):
+        raise ValueError("external effect platform must be a stable slug")
+    return normalized
 _FACEBOOK_GROUP_TARGET_RE = re.compile(
     r"Facebook Group (?P<group_id>[0-9]+)"
     r"(?:(?:（[^）]+）)|(?:「[^」]+」))?"
@@ -335,13 +377,12 @@ _FACEBOOK_GROUP_TARGET_RE = re.compile(
     r"(?P<url_group_id>[0-9]+)/?)?",
     flags=re.IGNORECASE,
 )
-_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
     """Return the sole compiled Grace contract, or None when ambiguous."""
     text = str(body or "")
-    if _grace_loop_stage_header(text) not in {"execution", "grace_review"}:
+    if _grace_loop_stage_header(text) not in {"execution", "review"}:
         return None
     fenced_blocks = re.findall(
         r"```json[ \t]*\r?\n(.*?)\r?\n```",
@@ -357,6 +398,31 @@ def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     return contract if isinstance(contract, Mapping) else None
+
+
+def grace_memory_promotion_spec(body: str) -> Optional[dict[str, Any]]:
+    """Return the exact accepted-review memory payload, or fail closed.
+
+    This reads only compiler-owned fields from the sole JSON contract.  Working
+    memory and raw conversation text are deliberately excluded.
+    """
+    text = str(body or "")
+    if _grace_loop_stage_header(text) != "review":
+        return None
+    contract = _grace_compiled_contract(text)
+    if contract is None:
+        return None
+    memory = contract.get("memory")
+    if not isinstance(memory, Mapping):
+        return None
+    namespace = str(memory.get("namespace") or "").strip()
+    raw_entries = memory.get("promote_on_acceptance")
+    if not namespace or not isinstance(raw_entries, list):
+        return None
+    entries = [str(item).strip() for item in raw_entries if str(item).strip()]
+    if not entries or len(entries) != len(raw_entries):
+        return None
+    return {"namespace": namespace, "entries": entries}
 
 
 def grace_external_group_ids(body: str) -> frozenset[str]:
@@ -382,47 +448,20 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
     return frozenset(group_ids)
 
 
-def _grace_contract_has_human_approval(
+def _grace_contract_has_legacy_human_approval(
     contract: Mapping[str, Any],
 ) -> bool:
-    """Recognize legacy elevation or one exact consumed challenge proof."""
+    """Recognize the legacy compiler-injected risk authorization."""
     authorization = contract.get("authorization")
-    if (
+    return bool(
         isinstance(authorization, Mapping)
         and authorization.get("human_approved") is True
-    ):
-        return True
-    provenance = contract.get("approval_provenance")
-    if not isinstance(provenance, Mapping):
-        return False
-    return (
-        provenance.get("source")
-        == "one_time_authenticated_owner_challenge"
-        and provenance.get("scope_binding")
-        == "exact_loop_contract_fingerprint"
-        and provenance.get("internal") is False
-        and bool(str(provenance.get("platform") or "").strip())
-        and bool(str(provenance.get("requested_message_id") or "").strip())
-        and bool(str(provenance.get("approved_message_id") or "").strip())
-        and _SHA256_HEX_RE.fullmatch(
-            str(provenance.get("user_id_sha256") or "")
-        ) is not None
-        and _SHA256_HEX_RE.fullmatch(
-            str(provenance.get("challenge_token_sha256") or "")
-        ) is not None
-        and _SHA256_HEX_RE.fullmatch(
-            str(provenance.get("contract_fingerprint") or "")
-        ) is not None
     )
 
 
-def grace_allows_facebook_group_posting(body: str) -> bool:
-    """Return whether the compiled execution contract authorizes group posts."""
-    if _grace_loop_stage_header(str(body or "")) != "execution":
-        return False
-    contract = _grace_compiled_contract(body)
-    if contract is None or not grace_external_group_ids(body):
-        return False
+def _grace_contract_is_browser_publish(
+    contract: Mapping[str, Any],
+) -> bool:
     routing = contract.get("routing")
     if not isinstance(routing, Mapping):
         return False
@@ -430,11 +469,130 @@ def grace_allows_facebook_group_posting(body: str) -> bool:
     resolved_task_type = (
         resolved.get("task_type") if isinstance(resolved, Mapping) else None
     )
+    return str(
+        routing.get("task_type") or resolved_task_type or ""
+    ).strip().casefold() == "browser_publish"
+
+
+def grace_allows_facebook_group_posting(body: str) -> bool:
+    """Return legacy body-only group-post authorization."""
+    if _grace_loop_stage_header(str(body or "")) != "execution":
+        return False
+    contract = _grace_compiled_contract(body)
+    if contract is None or not grace_external_group_ids(body):
+        return False
     return (
-        _grace_contract_has_human_approval(contract)
-        and str(
-            routing.get("task_type") or resolved_task_type or ""
-        ).strip().casefold() == "browser_publish"
+        _grace_contract_has_legacy_human_approval(contract)
+        and _grace_contract_is_browser_publish(contract)
+    )
+
+
+def grace_task_allows_facebook_group_posting(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Verify group-post authority against the task's consumed challenge."""
+    task = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?",
+        (str(task_id or "").strip(),),
+    ).fetchone()
+    if task is None:
+        return False
+    body = str(task["body"] or "")
+    if _grace_loop_stage_header(body) != "execution":
+        return False
+    contract = _grace_compiled_contract(body)
+    if (
+        contract is None
+        or not grace_external_group_ids(body)
+        or not _grace_contract_is_browser_publish(contract)
+    ):
+        return False
+    if _grace_contract_has_legacy_human_approval(contract):
+        return True
+    provenance = contract.get("approval_provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    try:
+        from proactive.loop_contract import contract_fingerprint
+    except (ImportError, TypeError, ValueError):
+        return False
+    rows = conn.execute(
+        """
+        SELECT d.challenge_token, d.contract_fingerprint,
+               d.platform, d.user_id_sha256, d.approved_message_id,
+               a.requested_message_id, a.delegation_args
+          FROM grace_delegations AS d
+          JOIN grace_approval_challenges AS a
+            ON a.token = d.challenge_token
+         WHERE d.execution_task_id = ?
+           AND d.approval_required = 1
+           AND d.state = 'queued'
+           AND a.state = 'consumed'
+           AND a.consumed_at IS NOT NULL
+           AND d.contract_fingerprint = a.contract_fingerprint
+           AND d.request_instance_id = a.request_instance_id
+           AND d.platform = a.platform
+           AND d.chat_id = a.chat_id
+           AND d.thread_id = a.thread_id
+           AND d.session_key = a.session_key
+           AND d.session_id = a.session_id
+           AND d.user_id_sha256 = a.user_id_sha256
+           AND d.approved_message_id = a.approved_message_id
+        """,
+        (str(task_id or "").strip(),),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    approval = rows[0]
+    try:
+        delegation_args = json.loads(
+            str(approval["delegation_args"] or "")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(delegation_args, Mapping):
+        return False
+    original_request = str(
+        delegation_args.get("original_request") or ""
+    )
+    audit = contract.get("audit")
+    if (
+        not isinstance(audit, Mapping)
+        or audit.get("original_request_location")
+        != "Grace session history only; not disclosed to ClawOps"
+        or audit.get("original_request_sha256")
+        != hashlib.sha256(original_request.encode("utf-8")).hexdigest()
+    ):
+        return False
+    fingerprint_contract = json.loads(json.dumps(dict(contract)))
+    fingerprint_contract.pop("audit", None)
+    fingerprint_contract.pop("authorization", None)
+    fingerprint_contract["original_request"] = original_request
+    # contract_fingerprint removes all approval_provenance before hashing,
+    # including its embedded copy of the expected digest.
+    compiled_fingerprint = contract_fingerprint(fingerprint_contract)
+    return (
+        provenance.get("source")
+        == "one_time_authenticated_owner_challenge"
+        and provenance.get("scope_binding")
+        == "exact_loop_contract_fingerprint"
+        and provenance.get("internal") is False
+        and str(provenance.get("platform") or "")
+        == str(approval["platform"] or "")
+        and str(provenance.get("requested_message_id") or "")
+        == str(approval["requested_message_id"] or "")
+        and str(provenance.get("approved_message_id") or "")
+        == str(approval["approved_message_id"] or "")
+        and str(provenance.get("user_id_sha256") or "")
+        == str(approval["user_id_sha256"] or "")
+        and str(provenance.get("contract_fingerprint") or "")
+        == compiled_fingerprint
+        == str(approval["contract_fingerprint"] or "")
+        and str(provenance.get("challenge_token_sha256") or "")
+        == hashlib.sha256(
+            str(approval["challenge_token"] or "").encode("utf-8")
+        ).hexdigest()
     )
 
 
@@ -1023,6 +1181,83 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
     )
 
 
+_TOKEN_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+)
+
+
+def _coerce_token_usage_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdecimal():
+            return int(stripped)
+    return None
+
+
+def _canonical_token_usage(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    usage: dict[str, Any] = {}
+    for key in _TOKEN_USAGE_KEYS:
+        count = _coerce_token_usage_int(value.get(key))
+        if count is not None:
+            usage[key] = count
+    component_keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    )
+    if "total_tokens" not in usage and any(key in usage for key in component_keys):
+        usage["total_tokens"] = sum(int(usage.get(key) or 0) for key in component_keys)
+    if not any(key in usage for key in _TOKEN_USAGE_KEYS):
+        return None
+    for key in ("model", "provider", "source"):
+        text = value.get(key)
+        if isinstance(text, str) and text.strip():
+            usage[key] = text.strip()
+    return usage
+
+
+def _empty_token_usage() -> dict[str, int]:
+    return {key: 0 for key in _TOKEN_USAGE_KEYS}
+
+
+def _add_token_usage(total: dict[str, int], usage: Mapping[str, Any] | None) -> None:
+    if not usage:
+        return
+    canonical = _canonical_token_usage(usage)
+    if canonical is None:
+        return
+    for key in _TOKEN_USAGE_KEYS:
+        total[key] = int(total.get(key) or 0) + int(canonical.get(key) or 0)
+
+
+def _token_usage_from_terminal_observation(
+    terminal_observation: Mapping[str, Any] | None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(terminal_observation, Mapping):
+        return None
+    delegated = terminal_observation.get("delegated_result")
+    if isinstance(delegated, Mapping):
+        usage = _canonical_token_usage(delegated.get("token_usage"))
+        if usage is not None:
+            return usage
+    return _canonical_token_usage(terminal_observation.get("token_usage"))
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1498,6 +1733,26 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Transactional outbox for memory promoted only after an accepted Grace
+-- review.  The task completion and the pending promotion row commit together;
+-- filesystem/Prompt/Mem0 work happens after commit and may be retried safely.
+CREATE TABLE IF NOT EXISTS grace_memory_promotions (
+    id              TEXT PRIMARY KEY,
+    review_task_id  TEXT NOT NULL,
+    run_id          INTEGER,
+    namespace       TEXT NOT NULL,
+    entries         TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_retry_at   INTEGER NOT NULL DEFAULT 0,
+    lease_owner     TEXT,
+    lease_expires   INTEGER,
+    result          TEXT,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1586,6 +1841,57 @@ CREATE TABLE IF NOT EXISTS task_external_effects (
     PRIMARY KEY (task_id, platform, effect_key)
 );
 
+-- Product-centric projection of Facebook group evidence across Kanban tasks.
+-- ``task_external_effects`` remains the task-scoped idempotency/audit ledger;
+-- this table supplies the long-lived human-facing inventory so a later status
+-- request cannot accidentally forget destinations recorded by an older task.
+CREATE TABLE IF NOT EXISTS commerce_group_ledger (
+    subject_key       TEXT NOT NULL,
+    subject_label     TEXT NOT NULL,
+    destination_id   TEXT NOT NULL,
+    destination_name TEXT NOT NULL,
+    source_listing_id TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL,
+    status_label      TEXT NOT NULL,
+    evidence          TEXT NOT NULL,
+    source_task_id    TEXT NOT NULL,
+    source_run_id     INTEGER,
+    observed_at       INTEGER NOT NULL,
+    verified_at       TEXT NOT NULL,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (subject_key, destination_id)
+);
+
+-- Coverage is separate from destination rows because Facebook may expose a
+-- total such as "Listed to 21 places" without exposing every destination
+-- name.  That gap must survive future tasks and must prevent false closure.
+CREATE TABLE IF NOT EXISTS commerce_group_coverage (
+    subject_key         TEXT PRIMARY KEY,
+    subject_label       TEXT NOT NULL,
+    complete            INTEGER NOT NULL DEFAULT 0,
+    named_count         INTEGER NOT NULL DEFAULT 0,
+    gap_count           INTEGER,
+    expected_total      INTEGER,
+    expected_total_label TEXT NOT NULL DEFAULT '',
+    as_of               TEXT NOT NULL DEFAULT '',
+    note                TEXT NOT NULL,
+    source_task_id      TEXT NOT NULL,
+    source_run_id       INTEGER,
+    observed_at         INTEGER NOT NULL,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS commerce_group_migration_state (
+    singleton_id        INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    reconciled          INTEGER NOT NULL DEFAULT 0,
+    latest_group_effect_at INTEGER NOT NULL DEFAULT 0,
+    reconciled_report_observed_at INTEGER NOT NULL DEFAULT 0,
+    note                TEXT NOT NULL DEFAULT '',
+    updated_at          INTEGER NOT NULL
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1620,6 +1926,8 @@ CREATE TABLE IF NOT EXISTS grace_loop_callbacks (
     message_id           TEXT,
     notifier_profile     TEXT,
     contract_fingerprint TEXT NOT NULL,
+    objective_id         TEXT,
+    stage_key            TEXT,
     completion_mode      TEXT NOT NULL DEFAULT 'terminal',
     state                TEXT NOT NULL DEFAULT 'pending',
     last_event_id        INTEGER NOT NULL DEFAULT 0,
@@ -1632,8 +1940,28 @@ CREATE TABLE IF NOT EXISTS grace_loop_callbacks (
     outcome_event_id     INTEGER,
     outcome_kind         TEXT,
     outcome_payload      TEXT,
+    user_report_event_id INTEGER,
+    user_report_digest   TEXT,
+    user_report_delivered_at INTEGER,
+    user_report_chunk_count INTEGER,
+    user_report_next_chunk INTEGER NOT NULL DEFAULT 0,
+    user_report_total_chunks INTEGER,
     created_at           INTEGER NOT NULL,
     delivered_at         INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS grace_user_report_chunk_deliveries (
+    review_task_id  TEXT NOT NULL,
+    event_id        INTEGER NOT NULL,
+    report_digest   TEXT NOT NULL,
+    chunk_index     INTEGER NOT NULL,
+    total_chunks    INTEGER NOT NULL,
+    reconciliation_effect_at INTEGER NOT NULL DEFAULT 0,
+    state           TEXT NOT NULL,
+    message_id      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (review_task_id, event_id, chunk_index)
 );
 
 -- One-time, scope-bound confirmation for external ClawOps actions.  Grace
@@ -1656,6 +1984,7 @@ CREATE TABLE IF NOT EXISTS grace_approval_challenges (
     approval_scope       TEXT NOT NULL,
     origin_review_task_id TEXT,
     origin_event_id      INTEGER,
+    telegram_message_path TEXT,
     state                TEXT NOT NULL DEFAULT 'pending',
     created_at           INTEGER NOT NULL,
     expires_at           INTEGER NOT NULL,
@@ -1684,13 +2013,58 @@ CREATE TABLE IF NOT EXISTS grace_delegations (
     approval_required       INTEGER NOT NULL DEFAULT 0,
     origin_review_task_id   TEXT,
     origin_event_id         INTEGER,
+    objective_id            TEXT,
+    stage_key               TEXT,
     state                   TEXT NOT NULL DEFAULT 'authorized',
     build_owner             TEXT,
     build_lease_expires     INTEGER,
     execution_task_id       TEXT,
     review_task_id          TEXT,
+    telegram_message_path   TEXT,
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL
+);
+
+-- Durable user outcome spanning multiple Grace -> ClawOps Loop Contracts.
+-- Individual contracts may finish while the originating user outcome remains
+-- active; this ledger is the authority that survives session rotation and
+-- context compaction.
+CREATE TABLE IF NOT EXISTS grace_objectives (
+    objective_id            TEXT PRIMARY KEY,
+    platform                TEXT NOT NULL,
+    chat_id                 TEXT NOT NULL,
+    thread_id               TEXT NOT NULL DEFAULT '',
+    session_key             TEXT NOT NULL,
+    title                   TEXT NOT NULL,
+    objective               TEXT NOT NULL,
+    original_request_sha256 TEXT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'active',
+    current_stage_key       TEXT NOT NULL,
+    terminal_stage_key      TEXT NOT NULL,
+    required_stage_keys     TEXT NOT NULL,
+    acceptance_criteria     TEXT NOT NULL,
+    next_action             TEXT NOT NULL DEFAULT '',
+    waiting_for             TEXT NOT NULL DEFAULT '',
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL,
+    completed_at            INTEGER,
+    cancelled_at            INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS grace_objective_stages (
+    objective_id       TEXT NOT NULL,
+    stage_key          TEXT NOT NULL,
+    position           INTEGER NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'planned',
+    delegation_id      TEXT,
+    execution_task_id  TEXT,
+    review_task_id     TEXT,
+    outcome_kind       TEXT,
+    evidence           TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    completed_at       INTEGER,
+    PRIMARY KEY (objective_id, stage_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -1699,17 +2073,26 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_grace_memory_promotions_due
+    ON grace_memory_promotions(state, next_retry_at, lease_expires);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_external_effects_state
     ON task_external_effects(task_id, state);
+CREATE INDEX IF NOT EXISTS idx_commerce_group_status
+    ON commerce_group_ledger(subject_key, status, observed_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_grace_callbacks_due   ON grace_loop_callbacks(state, lease_expires);
 CREATE INDEX IF NOT EXISTS idx_grace_approval_pending
     ON grace_approval_challenges(session_key, state, expires_at);
 CREATE INDEX IF NOT EXISTS idx_grace_delegation_tasks
     ON grace_delegations(execution_task_id, review_task_id);
+CREATE INDEX IF NOT EXISTS idx_grace_objectives_lane
+    ON grace_objectives(platform, chat_id, thread_id, status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grace_objective_stage_delegation
+    ON grace_objective_stages(delegation_id)
+    WHERE delegation_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_grace_delegation_origin
     ON grace_delegations(origin_review_task_id, origin_event_id)
     WHERE origin_review_task_id IS NOT NULL AND origin_event_id IS NOT NULL;
@@ -2664,6 +3047,122 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
 
+    commerce_coverage_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='commerce_group_coverage'"
+    ).fetchone() is not None
+    if commerce_coverage_exists:
+        coverage_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(commerce_group_coverage)")
+        }
+        for column, definition in (
+            ("expected_total", "expected_total INTEGER"),
+            ("as_of", "as_of TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in coverage_cols:
+                _add_column_if_missing(
+                    conn, "commerce_group_coverage", column, definition
+                )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS commerce_group_migration_state (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            reconciled INTEGER NOT NULL DEFAULT 0,
+            latest_group_effect_at INTEGER NOT NULL DEFAULT 0,
+            reconciled_report_observed_at INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    migration_cols = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(commerce_group_migration_state)"
+        )
+    }
+    for column, definition in (
+        (
+            "latest_group_effect_at",
+            "latest_group_effect_at INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "reconciled_report_observed_at",
+            "reconciled_report_observed_at INTEGER NOT NULL DEFAULT 0",
+        ),
+    ):
+        if column not in migration_cols:
+            _add_column_if_missing(
+                conn,
+                "commerce_group_migration_state",
+                column,
+                definition,
+            )
+    migration_state = conn.execute(
+        "SELECT reconciled FROM commerce_group_migration_state "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+    effects_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='task_external_effects'"
+    ).fetchone()
+    if migration_state is None:
+        historical_group_effect = (
+            conn.execute(
+                """
+                SELECT MAX(updated_at) AS latest_at FROM task_external_effects
+                 WHERE platform = 'facebook' AND effect_key LIKE 'group:%'
+                """
+            ).fetchone()
+            if effects_table_exists is not None
+            else None
+        )
+        latest_group_effect_at = int(
+            historical_group_effect["latest_at"] or 0
+            if historical_group_effect is not None
+            else 0
+        )
+        conn.execute(
+            """
+            INSERT INTO commerce_group_migration_state (
+                singleton_id, reconciled, latest_group_effect_at,
+                reconciled_report_observed_at, note, updated_at
+            ) VALUES (1, ?, ?, 0, ?, ?)
+            """,
+            (
+                0 if latest_group_effect_at else 1,
+                latest_group_effect_at,
+                (
+                    "Historical Facebook group effects require product-level reconciliation."
+                    if latest_group_effect_at
+                    else "No historical Facebook group effects required migration."
+                ),
+                int(time.time()),
+            ),
+        )
+    elif effects_table_exists is not None:
+        latest_effect = conn.execute(
+            """
+            SELECT MAX(updated_at) AS latest_at FROM task_external_effects
+             WHERE platform = 'facebook' AND effect_key LIKE 'group:%'
+            """
+        ).fetchone()
+        latest_at = int(latest_effect["latest_at"] or 0)
+        if latest_at:
+            conn.execute(
+                """
+                UPDATE commerce_group_migration_state
+                   SET latest_group_effect_at = MAX(latest_group_effect_at, ?),
+                       reconciled = CASE
+                           WHEN reconciled_report_observed_at <= ? THEN 0
+                           ELSE reconciled
+                       END
+                 WHERE singleton_id = 1
+                """,
+                (latest_at, latest_at),
+            )
+
     grace_callback_table_exists = conn.execute(
         "SELECT name FROM sqlite_master "
         "WHERE type='table' AND name='grace_loop_callbacks'"
@@ -2678,6 +3177,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "grace_loop_callbacks", "chat_type", "chat_type TEXT"
             )
         for column, definition in (
+            ("objective_id", "objective_id TEXT"),
+            ("stage_key", "stage_key TEXT"),
             (
                 "completion_mode",
                 "completion_mode TEXT NOT NULL DEFAULT 'terminal'",
@@ -2686,11 +3187,41 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("outcome_event_id", "outcome_event_id INTEGER"),
             ("outcome_kind", "outcome_kind TEXT"),
             ("outcome_payload", "outcome_payload TEXT"),
+            ("user_report_event_id", "user_report_event_id INTEGER"),
+            ("user_report_digest", "user_report_digest TEXT"),
+            (
+                "user_report_delivered_at",
+                "user_report_delivered_at INTEGER",
+            ),
+            ("user_report_chunk_count", "user_report_chunk_count INTEGER"),
+            (
+                "user_report_next_chunk",
+                "user_report_next_chunk INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("user_report_total_chunks", "user_report_total_chunks INTEGER"),
         ):
             if column not in callback_cols:
                 _add_column_if_missing(
                     conn, "grace_loop_callbacks", column, definition
                 )
+    chunk_delivery_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='grace_user_report_chunk_deliveries'"
+    ).fetchone()
+    if chunk_delivery_table_exists is not None:
+        chunk_delivery_cols = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(grace_user_report_chunk_deliveries)"
+            )
+        }
+        if "reconciliation_effect_at" not in chunk_delivery_cols:
+            _add_column_if_missing(
+                conn,
+                "grace_user_report_chunk_deliveries",
+                "reconciliation_effect_at",
+                "reconciliation_effect_at INTEGER NOT NULL DEFAULT 0",
+            )
 
     grace_challenge_table_exists = conn.execute(
         "SELECT name FROM sqlite_master "
@@ -2713,6 +3244,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("origin_event_id", "origin_event_id INTEGER"),
             ("approval_platform", "approval_platform TEXT"),
             ("approval_scope", "approval_scope TEXT"),
+            ("telegram_message_path", "telegram_message_path TEXT"),
         ):
             if column not in challenge_cols:
                 _add_column_if_missing(
@@ -2739,6 +3271,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("request_instance_id", "request_instance_id TEXT"),
             ("build_owner", "build_owner TEXT"),
             ("build_lease_expires", "build_lease_expires INTEGER"),
+            ("objective_id", "objective_id TEXT"),
+            ("stage_key", "stage_key TEXT"),
+            ("telegram_message_path", "telegram_message_path TEXT"),
         ):
             if column not in delegation_cols:
                 _add_column_if_missing(
@@ -2749,6 +3284,60 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "ON grace_delegations(platform, session_key, request_instance_id) "
             "WHERE request_instance_id IS NOT NULL"
         )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS grace_objectives (
+            objective_id TEXT PRIMARY KEY,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            session_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            original_request_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            current_stage_key TEXT NOT NULL,
+            terminal_stage_key TEXT NOT NULL,
+            required_stage_keys TEXT NOT NULL,
+            acceptance_criteria TEXT NOT NULL,
+            next_action TEXT NOT NULL DEFAULT '',
+            waiting_for TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            cancelled_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS grace_objective_stages (
+            objective_id TEXT NOT NULL,
+            stage_key TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            delegation_id TEXT,
+            execution_task_id TEXT,
+            review_task_id TEXT,
+            outcome_kind TEXT,
+            evidence TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            PRIMARY KEY (objective_id, stage_key)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_grace_objectives_lane "
+        "ON grace_objectives(platform, chat_id, thread_id, status, updated_at)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_grace_objective_stage_delegation "
+        "ON grace_objective_stages(delegation_id) "
+        "WHERE delegation_id IS NOT NULL"
+    )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -3830,6 +4419,338 @@ def list_external_effects(
     return effects
 
 
+def list_commerce_group_ledger(
+    conn: sqlite3.Connection,
+    *,
+    subject_key: Optional[str] = None,
+    include_not_posted: bool = True,
+) -> list[dict[str, Any]]:
+    """Return the latest product-centric Facebook group evidence."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if subject_key:
+        clauses.append("subject_key = ?")
+        params.append(str(subject_key).strip())
+    if not include_not_posted:
+        clauses.append("status != 'not_posted'")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""
+        SELECT subject_key, subject_label, destination_id, destination_name,
+               source_listing_id, status, status_label, evidence,
+               source_task_id, source_run_id, observed_at, verified_at,
+               created_at, updated_at
+          FROM commerce_group_ledger
+          {where}
+         ORDER BY subject_label, destination_name
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_commerce_group_coverage(
+    conn: sqlite3.Connection,
+    *,
+    subject_key: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return durable per-product destination coverage and known gaps."""
+    if subject_key:
+        rows = conn.execute(
+            """
+            SELECT * FROM commerce_group_coverage
+             WHERE subject_key = ?
+             ORDER BY subject_label
+            """,
+            (str(subject_key).strip(),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM commerce_group_coverage ORDER BY subject_label"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def commerce_group_reconciliation_ready(conn: sqlite3.Connection) -> bool:
+    """Return whether complete commerce reports are safe to show or close."""
+    state = conn.execute(
+        "SELECT reconciled FROM commerce_group_migration_state "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+    return state is not None and int(state["reconciled"] or 0) == 1
+
+
+def _upsert_commerce_user_facing_report(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    report: Mapping[str, Any],
+    now: int,
+) -> None:
+    """Project a validated commerce report into the cross-task ledger."""
+    for row in report["rows"]:
+        source_task_id = str(row.get("source_task_id") or task_id).strip()
+        existing = conn.execute(
+            """
+            SELECT subject_label, destination_name, source_listing_id,
+                   status, status_label, evidence, observed_at, verified_at
+              FROM commerce_group_ledger
+             WHERE subject_key = ? AND destination_id = ?
+            """,
+            (row["subject_key"], row["destination_id"]),
+        ).fetchone()
+        canonical_fields = (
+            "subject_label", "destination_name", "source_listing_id",
+            "status", "status_label", "evidence", "verified_at",
+        )
+        if existing is not None and (
+            int(existing["observed_at"] or 0) > int(row["observed_at"])
+            or (
+                int(existing["observed_at"] or 0) == int(row["observed_at"])
+                and any(
+                    existing[field] != (row.get(field) or "")
+                    for field in canonical_fields
+                )
+            )
+        ):
+            raise ValueError(
+                "metadata.user_facing_report contains stale destination "
+                f"evidence for {row['subject_key']}/{row['destination_id']}"
+            )
+        conn.execute(
+            """
+            INSERT INTO commerce_group_ledger (
+                subject_key, subject_label, destination_id, destination_name,
+                source_listing_id, status, status_label, evidence,
+                source_task_id, source_run_id, observed_at, verified_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subject_key, destination_id) DO UPDATE SET
+                subject_label = excluded.subject_label,
+                destination_name = excluded.destination_name,
+                source_listing_id = excluded.source_listing_id,
+                status = excluded.status,
+                status_label = excluded.status_label,
+                evidence = excluded.evidence,
+                source_task_id = excluded.source_task_id,
+                source_run_id = excluded.source_run_id,
+                observed_at = excluded.observed_at,
+                verified_at = excluded.verified_at,
+                updated_at = excluded.updated_at
+            WHERE excluded.observed_at >= commerce_group_ledger.observed_at
+            """,
+            (
+                row["subject_key"], row["subject_label"],
+                row["destination_id"], row["destination_name"],
+                row.get("source_listing_id") or "", row["status"],
+                row["status_label"], row["evidence"], source_task_id,
+                run_id, int(row["observed_at"]), row["verified_at"], now, now,
+            ),
+        )
+    reported_destinations: dict[str, set[str]] = {}
+    for row in report["rows"]:
+        reported_destinations.setdefault(row["subject_key"], set()).add(
+            row["destination_id"]
+        )
+    for item in report["coverage"]:
+        known_destinations = {
+            str(row["destination_id"])
+            for row in conn.execute(
+                "SELECT destination_id FROM commerce_group_ledger "
+                "WHERE subject_key = ?",
+                (item["subject_key"],),
+            ).fetchall()
+        }
+        if known_destinations != reported_destinations.get(
+            item["subject_key"], set()
+        ):
+            raise ValueError(
+                "metadata.user_facing_report must include every known "
+                f"destination for {item['subject_key']}"
+            )
+    for item in report["coverage"]:
+        merged = conn.execute(
+            """
+            SELECT COUNT(*) AS named_count,
+                   SUM(CASE WHEN status IN ('unknown', 'ambiguous_after_submit')
+                            THEN 1 ELSE 0 END) AS unresolved_count
+              FROM commerce_group_ledger
+             WHERE subject_key = ?
+            """,
+            (item["subject_key"],),
+        ).fetchone()
+        merged_named_count = int(merged["named_count"] or 0)
+        unresolved_count = int(merged["unresolved_count"] or 0)
+        expected_total = item["expected_total"]
+        merged_gap_count = (
+            max(expected_total - merged_named_count, 0)
+            if expected_total is not None
+            else None
+        )
+        merged_complete = bool(
+            item["complete"]
+            and expected_total is not None
+            and expected_total == merged_named_count
+            and unresolved_count == 0
+        )
+        observed_at = int(report["observed_at"])
+        existing_coverage = conn.execute(
+            """
+            SELECT subject_label, complete, named_count, gap_count,
+                   expected_total, expected_total_label, as_of, note,
+                   observed_at
+              FROM commerce_group_coverage
+             WHERE subject_key = ?
+            """,
+            (item["subject_key"],),
+        ).fetchone()
+        if existing_coverage is not None:
+            existing_values = (
+                existing_coverage["subject_label"],
+                int(existing_coverage["complete"] or 0),
+                int(existing_coverage["named_count"] or 0),
+                existing_coverage["gap_count"],
+                existing_coverage["expected_total"],
+                existing_coverage["expected_total_label"],
+                existing_coverage["as_of"],
+                existing_coverage["note"],
+            )
+            incoming_values = (
+                item["subject_label"],
+                1 if merged_complete else 0,
+                merged_named_count,
+                merged_gap_count,
+                expected_total,
+                item.get("expected_total_label") or "",
+                report["as_of"],
+                item["note"],
+            )
+            if (
+                int(existing_coverage["observed_at"] or 0) > observed_at
+                or (
+                    int(existing_coverage["observed_at"] or 0) == observed_at
+                    and existing_values != incoming_values
+                )
+            ):
+                raise ValueError(
+                    "metadata.user_facing_report contains stale coverage "
+                    f"evidence for {item['subject_key']}"
+                )
+        conn.execute(
+            """
+            INSERT INTO commerce_group_coverage (
+                subject_key, subject_label, complete, named_count, gap_count,
+                expected_total, expected_total_label, as_of, note,
+                source_task_id, source_run_id, observed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subject_key) DO UPDATE SET
+                subject_label = excluded.subject_label,
+                complete = excluded.complete,
+                named_count = excluded.named_count,
+                gap_count = excluded.gap_count,
+                expected_total = excluded.expected_total,
+                expected_total_label = excluded.expected_total_label,
+                as_of = excluded.as_of,
+                note = excluded.note,
+                source_task_id = excluded.source_task_id,
+                source_run_id = excluded.source_run_id,
+                observed_at = excluded.observed_at,
+                updated_at = excluded.updated_at
+            WHERE excluded.observed_at >= commerce_group_coverage.observed_at
+            """,
+            (
+                item["subject_key"], item["subject_label"],
+                1 if merged_complete else 0, merged_named_count,
+                merged_gap_count, expected_total,
+                item.get("expected_total_label") or "", report["as_of"],
+                item["note"], task_id, run_id, observed_at, now, now,
+            ),
+        )
+    _update_commerce_reconciliation_state(conn, report=report, now=now)
+
+
+def _update_commerce_reconciliation_state(
+    conn: sqlite3.Connection,
+    *,
+    report: Mapping[str, Any],
+    now: int,
+) -> None:
+    """Update the global gate only for the exact, complete three-item scope."""
+    from hermes_cli.user_facing_report import (
+        SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS,
+    )
+
+    reconciled_subjects = {
+        item["subject_key"] for item in report["coverage"]
+    }
+    if reconciled_subjects != SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS:
+        return
+    migration = conn.execute(
+        "SELECT latest_group_effect_at FROM commerce_group_migration_state "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+    latest_effect_at = int(
+        migration["latest_group_effect_at"] or 0
+        if migration is not None
+        else 0
+    )
+    report_observed_at = int(report["observed_at"])
+    reconciled = bool(report["complete"]) and report_observed_at > latest_effect_at
+    conn.execute(
+        """
+        INSERT INTO commerce_group_migration_state (
+            singleton_id, reconciled, latest_group_effect_at,
+            reconciled_report_observed_at, note, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton_id) DO UPDATE SET
+            reconciled = excluded.reconciled,
+            reconciled_report_observed_at =
+                excluded.reconciled_report_observed_at,
+            note = excluded.note,
+            updated_at = excluded.updated_at
+        """,
+        (
+            1 if reconciled else 0,
+            latest_effect_at,
+            report_observed_at,
+            (
+                "Carimali, Kolin, and Celestron history reconciled."
+                if reconciled
+                else "Three-item reconciliation remains incomplete or stale."
+            ),
+            now,
+        ),
+    )
+
+
+def record_commerce_user_facing_report(
+    conn: sqlite3.Connection,
+    *,
+    report: Mapping[str, Any],
+    source_task_id: str,
+) -> dict[str, Any]:
+    """Validate and persist a product-centric report outside task completion.
+
+    This is primarily for one-time reconciliation/backfill jobs. Normal workers
+    should attach the same structure to ``kanban_complete`` metadata so the
+    report and task completion commit atomically.
+    """
+    from hermes_cli.user_facing_report import normalize_user_facing_report
+
+    normalized = normalize_user_facing_report(report)
+    now = int(time.time())
+    with write_txn(conn):
+        _upsert_commerce_user_facing_report(
+            conn,
+            task_id=str(source_task_id or "").strip() or "manual-backfill",
+            run_id=None,
+            report=normalized,
+            now=now,
+        )
+    return normalized
+
+
 def _upsert_external_effect(
     conn: sqlite3.Connection,
     *,
@@ -3870,6 +4791,25 @@ def _upsert_external_effect(
             now,
         ),
     )
+    if platform == "facebook" and re.fullmatch(r"group:[1-9][0-9]*", effect_key):
+        conn.execute(
+            """
+            INSERT INTO commerce_group_migration_state (
+                singleton_id, reconciled, latest_group_effect_at,
+                reconciled_report_observed_at, note, updated_at
+            ) VALUES (
+                1, 0, ?, 0,
+                'A Facebook group effect requires commerce-ledger reconciliation.',
+                ?
+            )
+            ON CONFLICT(singleton_id) DO UPDATE SET
+                reconciled = 0,
+                latest_group_effect_at = MAX(latest_group_effect_at, excluded.latest_group_effect_at),
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            """,
+            (now, now),
+        )
 
 
 def record_external_effect(
@@ -3888,13 +4828,9 @@ def record_external_effect(
     Terminal evidence cannot be downgraded to ``absent_verified``.  The
     expected-run guard prevents a stale worker from authorizing a later retry.
     """
-    normalized_platform = str(platform or "").strip().lower()
+    normalized_platform = _normalize_external_effect_platform(platform)
     normalized_state = str(state or "").strip().lower()
     normalized_effect_key = str(effect_key or "").strip()
-    if normalized_platform not in _EXTERNAL_CREATE_HOSTS:
-        raise ValueError(
-            f"platform must be one of {sorted(_EXTERNAL_CREATE_HOSTS)}"
-        )
     if normalized_state not in _EXTERNAL_EFFECT_STATES - {"create_started"}:
         raise ValueError(
             "state is not a supported external-effect state"
@@ -3911,16 +4847,24 @@ def record_external_effect(
         r"group:([0-9]+)",
         normalized_effect_key,
     )
-    if normalized_effect_key != "create":
+    if scoped_group_match is not None:
         if normalized_platform != "facebook" or scoped_group_match is None:
             raise ValueError(
-                "object-scoped effects require facebook and group:<numeric-id>"
+                "group-scoped effects require facebook and group:<numeric-id>"
             )
         group_id = scoped_group_match.group(1)
         if external_id is not None and str(external_id).strip() != group_id:
             raise ValueError(
                 "group effect external_id must match its effect_key"
             )
+    elif normalized_state in {
+        "not_joined_verified",
+        "join_started",
+        "joined",
+        "pending_approval",
+        "needs_questions",
+    }:
+        raise ValueError("join states require a facebook group:<numeric-id> effect_key")
     now = int(time.time())
     with write_txn(conn):
         task = conn.execute(
@@ -4896,10 +5840,9 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` has an explicit sticky stop event.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from three different sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
@@ -4913,9 +5856,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       recover automatically; deterministic/systemic failures whose limit was
       forced stay blocked until an explicit repair and unblock.
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` / ``"gave_up"`` event for the task.
-    An explicit block is sticky until unblocked. A ``gave_up`` event with
+    * **Cancellation** — KJ explicitly stopped a Grace Loop.  This must never
+      be promoted by the dispatcher's ordinary dependency recomputation.
+
+    The cheapest signal that distinguishes these sources is the most recent
+    ``"blocked"`` / ``"cancelled"`` / ``"unblocked"`` / ``"gave_up"``
+    event for the task. An explicit block or cancellation is sticky until an
+    operator deliberately unblocks it. A ``gave_up`` event with
     ``limit_source=forced`` is also sticky because retrying the same worker
     before repairing the runtime would reproduce the same failure.
 
@@ -4925,13 +5872,14 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind, payload FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') "
+        "WHERE task_id = ? "
+        "AND kind IN ('blocked', 'cancelled', 'unblocked', 'gave_up') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if not row:
         return False
-    if row["kind"] == "blocked":
+    if row["kind"] in {"blocked", "cancelled"}:
         return True
     if row["kind"] != "gave_up":
         return False
@@ -4954,8 +5902,8 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
+    1. The most recent sticky event was a worker-initiated ``kanban_block``
+       or an operator cancellation — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
     2. The task's ``consecutive_failures`` has reached the effective
@@ -5523,6 +6471,76 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    pre_spawn_orphans = conn.execute(
+        """
+        SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires,
+               t.last_heartbeat_at, t.current_run_id, r.started_at
+          FROM tasks t
+          LEFT JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.status = 'running'
+           AND t.claim_lock IS NOT NULL
+           AND t.worker_pid IS NULL
+           AND t.current_run_id IS NOT NULL
+           AND COALESCE(r.started_at, 0) < ?
+           AND NOT EXISTS (
+               SELECT 1 FROM task_events e
+                WHERE e.task_id = t.id
+                  AND e.run_id = t.current_run_id
+                  AND e.kind = 'spawned'
+           )
+        """,
+        (now - PRE_SPAWN_ORPHAN_GRACE_SECONDS,),
+    ).fetchall()
+    for row in pre_spawn_orphans:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        try:
+            owner_pid = int(lock.rsplit(":", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if _pid_alive(owner_pid):
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND worker_pid IS NULL",
+                (row["id"], row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            run_id = _end_run(
+                conn,
+                row["id"],
+                outcome="reclaimed",
+                status="reclaimed",
+                error=f"pre_spawn_orphan_lock={row['claim_lock']}",
+                metadata={"claimer_pid_alive": False, "owner_pid": owner_pid},
+            )
+            _append_event(
+                conn,
+                row["id"],
+                "reclaimed",
+                {
+                    "reason": "pre_spawn_owner_dead",
+                    "claim_lock": row["claim_lock"],
+                    "owner_pid": owner_pid,
+                    "claim_expires": (
+                        int(row["claim_expires"])
+                        if row["claim_expires"] is not None else None
+                    ),
+                    "last_heartbeat_at": (
+                        int(row["last_heartbeat_at"])
+                        if row["last_heartbeat_at"] is not None else None
+                    ),
+                    "now": now,
+                },
+                run_id=run_id,
+            )
+            reclaimed += 1
+
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
@@ -6005,7 +7023,27 @@ def complete_task(
     preserved_artifacts: list[str] = []
     artifact_records: list[dict[str, Any]] = []
     external_effect_records: list[dict[str, Any]] = []
+    user_facing_report: Optional[dict[str, Any]] = None
+    grace_memory_promotion: Optional[dict[str, Any]] = None
     if isinstance(metadata, dict):
+        # Normalize into a fresh mapping so callers do not observe an in-place
+        # rewrite of their metadata object.
+        metadata = dict(metadata)
+        if "user_facing_report" in metadata:
+            from hermes_cli.user_facing_report import (
+                normalize_user_facing_report,
+            )
+
+            user_facing_report = normalize_user_facing_report(
+                metadata["user_facing_report"]
+            )
+            for report_row in user_facing_report["rows"]:
+                if not report_row.get("source_task_id"):
+                    report_row["source_task_id"] = task_id
+            user_facing_report = normalize_user_facing_report(
+                user_facing_report
+            )
+            metadata["user_facing_report"] = user_facing_report
         md_artifacts = metadata.get("artifacts")
         if isinstance(md_artifacts, (list, tuple)):
             cleaned_artifacts = [
@@ -6020,12 +7058,11 @@ def complete_task(
                     raise ValueError(
                         "each metadata.external_effects item must be an object"
                     )
-                platform = str(raw_effect.get("platform") or "").strip().lower()
+                platform = _normalize_external_effect_platform(
+                    raw_effect.get("platform"),
+                    raw_effect,
+                )
                 state = str(raw_effect.get("state") or "").strip().lower()
-                if platform not in _EXTERNAL_CREATE_HOSTS:
-                    raise ValueError(
-                        "external effect platform must be facebook or shopee"
-                    )
                 if state not in {
                     "existing", "created", "verified", "joined",
                     "pending_approval",
@@ -6040,20 +7077,23 @@ def complete_task(
                     raise ValueError(
                         "completion external effect_key must be non-empty"
                     )
-                if effect_key == "create" and state not in {
-                    "existing", "created", "verified",
-                }:
+                terminal_create_states = {"existing", "created", "verified"}
+                if effect_key == "create" and state not in terminal_create_states:
                     raise ValueError(
                         "join completion states require an object-scoped effect_key"
                     )
                 group_match = re.fullmatch(r"group:([0-9]+)", effect_key)
                 effect_external_id = (
-                    str(raw_effect.get("external_id") or "").strip() or None
+                    str(
+                        raw_effect.get("external_id")
+                        or raw_effect.get("externalId")
+                        or ""
+                    ).strip() or None
                 )
-                if effect_key != "create":
+                if group_match is not None:
                     if platform != "facebook" or group_match is None:
                         raise ValueError(
-                            "object-scoped completion effects require facebook "
+                            "group-scoped completion effects require facebook "
                             "and group:<numeric-id>"
                         )
                     group_id = group_match.group(1)
@@ -6061,7 +7101,18 @@ def complete_task(
                         raise ValueError(
                             "group completion external_id must match effect_key"
                         )
+                elif state in {"joined", "pending_approval"}:
+                    raise ValueError(
+                        "join completion states require a facebook "
+                        "group:<numeric-id> effect_key"
+                    )
                 details = raw_effect.get("details")
+                if details is None:
+                    details = {
+                        key: raw_effect[key]
+                        for key in ("target", "readback")
+                        if key in raw_effect
+                    } or None
                 if details is not None and not isinstance(details, Mapping):
                     raise ValueError(
                         "external effect details must be an object when present"
@@ -6080,6 +7131,44 @@ def complete_task(
             )
 
     with write_txn(conn):
+        if (
+            isinstance(metadata, dict)
+            and str(metadata.get("review_outcome") or "").strip().casefold()
+            == "accepted"
+        ):
+            review_row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            promotion_spec = grace_memory_promotion_spec(
+                review_row["body"] if review_row is not None else ""
+            )
+            if promotion_spec is not None:
+                canonical = json.dumps(
+                    {
+                        "review_task_id": task_id,
+                        **promotion_spec,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                promotion_id = "gmp_" + hashlib.sha256(
+                    canonical.encode("utf-8")
+                ).hexdigest()[:24]
+                grace_memory_promotion = {
+                    "id": promotion_id,
+                    "review_task_id": task_id,
+                    **promotion_spec,
+                }
+                # This status is system-owned. Ignore any model-authored claim
+                # that promotion already succeeded.
+                metadata["memory_promotion"] = {
+                    "promotion_id": promotion_id,
+                    "state": "pending",
+                    "namespace": promotion_spec["namespace"],
+                    "targets": ["topic_archive", "mem0", "prompt_memory"],
+                }
         if external_effect_records:
             fresh_scope = conn.execute(
                 "SELECT body FROM tasks WHERE id = ?",
@@ -6091,7 +7180,10 @@ def complete_task(
             for effect in external_effect_records:
                 if effect["effect_key"] == "create":
                     continue
-                group_id = effect["effect_key"].split(":", 1)[1]
+                group_match = re.fullmatch(r"group:([0-9]+)", effect["effect_key"])
+                if group_match is None:
+                    continue
+                group_id = group_match.group(1)
                 if group_id not in fresh_group_ids:
                     raise ValueError(
                         "group completion effect is not listed in the "
@@ -6151,6 +7243,41 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        if grace_memory_promotion is not None:
+            conn.execute(
+                """
+                INSERT INTO grace_memory_promotions
+                    (id, review_task_id, run_id, namespace, entries, state,
+                     attempts, next_retry_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    grace_memory_promotion["id"],
+                    task_id,
+                    run_id,
+                    grace_memory_promotion["namespace"],
+                    json.dumps(
+                        grace_memory_promotion["entries"],
+                        ensure_ascii=False,
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "memory_promotion_queued",
+                {
+                    "promotion_id": grace_memory_promotion["id"],
+                    "namespace": grace_memory_promotion["namespace"],
+                    "entry_count": len(grace_memory_promotion["entries"]),
+                },
+                run_id=run_id,
+            )
         for effect in external_effect_records:
             _upsert_external_effect(
                 conn,
@@ -6173,6 +7300,26 @@ def complete_task(
                     "state": effect["state"],
                     "external_id": effect["external_id"],
                     "source": "kanban_complete",
+                },
+                run_id=run_id,
+            )
+        if user_facing_report is not None:
+            _upsert_commerce_user_facing_report(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                report=user_facing_report,
+                now=now,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "user_facing_report_recorded",
+                {
+                    "kind": user_facing_report["kind"],
+                    "complete": user_facing_report["complete"],
+                    "row_count": len(user_facing_report["rows"]),
+                    "delivery": user_facing_report["delivery"],
                 },
                 run_id=run_id,
             )
@@ -6265,6 +7412,173 @@ def complete_task(
         summary=(summary if summary is not None else result),
     )
     return True
+
+
+def claim_due_grace_memory_promotions(
+    conn: sqlite3.Connection,
+    *,
+    lease_owner: str,
+    task_id: Optional[str] = None,
+    limit: int = 10,
+    lease_seconds: int = 300,
+    now: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Atomically claim due Grace-memory outbox rows for processing."""
+    owner = str(lease_owner or "").strip()
+    if not owner:
+        raise ValueError("lease_owner is required")
+    current = int(time.time()) if now is None else int(now)
+    bounded_limit = max(1, min(int(limit), 100))
+    params: list[Any] = [current, current]
+    task_filter = ""
+    if task_id:
+        task_filter = " AND review_task_id = ?"
+        params.append(str(task_id))
+    params.append(bounded_limit)
+    claimed: list[dict[str, Any]] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT *
+              FROM grace_memory_promotions
+             WHERE state IN ('pending', 'running')
+               AND next_retry_at <= ?
+               AND (lease_expires IS NULL OR lease_expires <= ?)
+            """
+            + task_filter
+            + " ORDER BY created_at, id LIMIT ?",
+            tuple(params),
+        ).fetchall()
+        for row in rows:
+            cur = conn.execute(
+                """
+                UPDATE grace_memory_promotions
+                   SET state = 'running',
+                       attempts = attempts + 1,
+                       lease_owner = ?,
+                       lease_expires = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                   AND state IN ('pending', 'running')
+                   AND (lease_expires IS NULL OR lease_expires <= ?)
+                """,
+                (
+                    owner,
+                    current + max(30, int(lease_seconds)),
+                    current,
+                    row["id"],
+                    current,
+                ),
+            )
+            if cur.rowcount == 1:
+                fresh = conn.execute(
+                    "SELECT * FROM grace_memory_promotions WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                if fresh is not None:
+                    claimed.append(dict(fresh))
+    return claimed
+
+
+def finish_grace_memory_promotion(
+    conn: sqlite3.Connection,
+    promotion_id: str,
+    *,
+    lease_owner: str,
+    result: Mapping[str, Any],
+    error: Optional[str],
+    retry_seconds: int,
+    now: Optional[int] = None,
+) -> bool:
+    """Persist processor readback and either close or reschedule an outbox row."""
+    current = int(time.time()) if now is None else int(now)
+    complete = bool(result.get("complete")) and not error
+    state = "done" if complete else "pending"
+    next_retry_at = 0 if complete else current + max(60, int(retry_seconds))
+    result_payload = dict(result)
+    result_payload["state"] = state
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT review_task_id, run_id FROM grace_memory_promotions WHERE id = ?",
+            (promotion_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE grace_memory_promotions
+               SET state = ?,
+                   next_retry_at = ?,
+                   lease_owner = NULL,
+                   lease_expires = NULL,
+                   result = ?,
+                   last_error = ?,
+                   updated_at = ?
+             WHERE id = ?
+               AND lease_owner = ?
+               AND state = 'running'
+            """,
+            (
+                state,
+                next_retry_at,
+                json.dumps(result_payload, ensure_ascii=False, sort_keys=True),
+                str(error or "") or None,
+                current,
+                promotion_id,
+                lease_owner,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = row["run_id"]
+        if run_id is not None:
+            run_row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            metadata: dict[str, Any] = {}
+            if run_row is not None and run_row["metadata"]:
+                try:
+                    parsed = json.loads(run_row["metadata"])
+                    if isinstance(parsed, dict):
+                        metadata = parsed
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            metadata["memory_promotion"] = {
+                "promotion_id": promotion_id,
+                **result_payload,
+                "last_error": str(error or "") or None,
+                "next_retry_at": next_retry_at or None,
+            }
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False), run_id),
+            )
+        _append_event(
+            conn,
+            row["review_task_id"],
+            "memory_promotion_completed" if complete else "memory_promotion_pending",
+            {
+                "promotion_id": promotion_id,
+                "state": state,
+                "pending_targets": list(result.get("pending_targets") or []),
+                "next_retry_at": next_retry_at or None,
+                "error": str(error or "") or None,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
+def get_grace_memory_promotion(
+    conn: sqlite3.Connection,
+    promotion_id: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM grace_memory_promotions WHERE id = ?",
+        (promotion_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -6986,6 +8300,309 @@ def block_task(
     )
     return True
 
+
+def cancel_grace_delegation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    requested_by: str,
+    requested_message_id: str,
+    owner_user_id: str = "",
+    reason: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Atomically stop one exact Grace Loop before terminating its workers.
+
+    Cancellation is deliberately a control-plane transition, not another
+    delegated execution card.  The durable state change lands first: the
+    delegation and callback are closed, both cards are parked in ``blocked``,
+    and any active runs end with ``outcome=cancelled``.  Only then may the
+    caller signal the captured host-local worker PIDs via
+    :func:`terminate_cancelled_workers`.
+
+    Persisting first is the critical ordering guarantee.  A SIGTERM makes a
+    Kanban worker exit cleanly with rc=0; if the task were still ``running``,
+    the dispatcher would misclassify that expected exit as a protocol
+    violation and emit ``gave_up``.  Once this transaction commits,
+    ``detect_crashed_workers`` no longer selects the task.
+
+    The originating platform/chat/topic must match the durable delegation. If
+    an explicit platform owner is configured, only that owner may cancel;
+    otherwise the fresh caller must match the original callback ``user_id``.
+    Returns ``None`` when the task is unknown or belongs to another lane.
+    Repeating the same cancellation is idempotent.
+    """
+    clean_task_id = str(task_id or "").strip()
+    clean_platform = str(platform or "").strip().lower()
+    clean_chat_id = str(chat_id or "").strip()
+    clean_thread_id = str(thread_id or "").strip()
+    clean_requested_by = str(requested_by or "").strip()
+    clean_message_id = str(requested_message_id or "").strip()
+    clean_owner_user_id = str(owner_user_id or "").strip()
+    clean_reason = str(reason or "").strip() or "Cancelled by KJ."
+    if not all(
+        (
+            clean_task_id,
+            clean_platform,
+            clean_chat_id,
+            clean_requested_by,
+            clean_message_id,
+        )
+    ):
+        raise ValueError(
+            "Cancellation requires task_id, platform, chat_id, requested_by, "
+            "and requested_message_id."
+        )
+
+    now = int(time.time())
+    workers: list[dict[str, Any]] = []
+    cards: list[dict[str, Any]] = []
+    with write_txn(conn):
+        delegation_row = conn.execute(
+            """
+            SELECT *
+              FROM grace_delegations
+             WHERE (execution_task_id = ? OR review_task_id = ?)
+               AND platform = ?
+               AND chat_id = ?
+               AND thread_id = ?
+             LIMIT 1
+            """,
+            (
+                clean_task_id,
+                clean_task_id,
+                clean_platform,
+                clean_chat_id,
+                clean_thread_id,
+            ),
+        ).fetchone()
+        if delegation_row is None:
+            return None
+        delegation = dict(delegation_row)
+        execution_task_id = str(delegation.get("execution_task_id") or "")
+        review_task_id = str(delegation.get("review_task_id") or "")
+        if not execution_task_id or not review_task_id:
+            raise ValueError(
+                "Grace delegation is not fully armed and cannot be cancelled by task id."
+            )
+
+        callback_row = conn.execute(
+            "SELECT user_id FROM grace_loop_callbacks WHERE review_task_id = ?",
+            (review_task_id,),
+        ).fetchone()
+        origin_user_id = str(
+            (callback_row["user_id"] if callback_row is not None else "") or ""
+        ).strip()
+        authorized_user_id = clean_owner_user_id or origin_user_id
+        if not authorized_user_id or clean_requested_by != authorized_user_id:
+            authority = (
+                "configured owner"
+                if clean_owner_user_id
+                else "original delegation requester"
+            )
+            raise ValueError(
+                f"Only the authenticated {authority} may cancel this ClawOps Loop."
+            )
+
+        if delegation.get("state") == "cancelled":
+            for card_id in (execution_task_id, review_task_id):
+                row = conn.execute(
+                    "SELECT id, status FROM tasks WHERE id = ?", (card_id,),
+                ).fetchone()
+                if row is not None:
+                    cards.append(
+                        {
+                            "task_id": str(row["id"]),
+                            "previous_status": str(row["status"]),
+                            "status": str(row["status"]),
+                            "already_terminal": row["status"] in {"done", "archived"},
+                        }
+                    )
+            return {
+                "delegation_id": str(delegation["delegation_id"]),
+                "execution_task_id": execution_task_id,
+                "review_task_id": review_task_id,
+                "idempotent_replay": True,
+                "workers": [],
+                "cards": cards,
+            }
+        if delegation.get("state") != "queued":
+            raise ValueError(
+                "Grace delegation is not queued and cannot be cancelled safely "
+                f"(state={delegation.get('state')!r})."
+            )
+
+        updated = conn.execute(
+            """
+            UPDATE grace_delegations
+               SET state = 'cancelled', build_owner = NULL,
+                   build_lease_expires = NULL, updated_at = ?
+             WHERE delegation_id = ? AND state = 'queued'
+            """,
+            (now, str(delegation["delegation_id"])),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("Grace delegation changed during cancellation.")
+
+        conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET state = 'cancelled', lease_event_id = NULL,
+                   lease_owner = NULL, lease_expires = NULL,
+                   last_error = ?
+             WHERE review_task_id = ?
+            """,
+            (clean_reason[:2000], review_task_id),
+        )
+        # The execution card owns the single durable cancellation notice.  The
+        # review card is an internal acceptance stage; keeping its subscription
+        # would send a duplicate cancellation message for the same Loop.
+        conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ?",
+            (review_task_id,),
+        )
+
+        for card_id, stage in (
+            (execution_task_id, "execution"),
+            (review_task_id, "grace_review"),
+        ):
+            row = conn.execute(
+                """
+                SELECT id, status, worker_pid, claim_lock, current_run_id
+                  FROM tasks WHERE id = ?
+                """,
+                (card_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    f"Grace delegation references missing {stage} task {card_id}."
+                )
+            previous_status = str(row["status"])
+            already_terminal = previous_status in {"done", "archived"}
+            cards.append(
+                {
+                    "task_id": card_id,
+                    "stage": stage,
+                    "previous_status": previous_status,
+                    "status": previous_status if already_terminal else "blocked",
+                    "already_terminal": already_terminal,
+                }
+            )
+            if already_terminal:
+                continue
+            if row["worker_pid"]:
+                workers.append(
+                    {
+                        "task_id": card_id,
+                        "stage": stage,
+                        "pid": int(row["worker_pid"]),
+                        "claim_lock": str(row["claim_lock"] or ""),
+                    }
+                )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status               = 'blocked',
+                       claim_lock           = NULL,
+                       claim_expires        = NULL,
+                       worker_pid           = NULL,
+                       consecutive_failures = 0,
+                       last_failure_error   = NULL,
+                       last_heartbeat_at    = NULL,
+                       block_kind           = NULL,
+                       block_recurrences    = 0
+                 WHERE id = ?
+                   AND status NOT IN ('done', 'archived')
+                """,
+                (card_id,),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(
+                    f"Task {card_id} changed during cancellation."
+                )
+            metadata = {
+                "requested_by": clean_requested_by,
+                "requested_message_id": clean_message_id,
+                "stage": stage,
+            }
+            run_id = _end_run(
+                conn,
+                card_id,
+                outcome="cancelled",
+                status="cancelled",
+                summary=clean_reason,
+                metadata=metadata,
+            )
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn,
+                    card_id,
+                    outcome="cancelled",
+                    summary=clean_reason,
+                    metadata=metadata,
+                )
+            _append_event(
+                conn,
+                card_id,
+                "cancelled",
+                {
+                    "reason": clean_reason,
+                    "requested_by": clean_requested_by,
+                    "requested_message_id": clean_message_id,
+                    "previous_status": previous_status,
+                    "stage": stage,
+                },
+                run_id=run_id,
+            )
+
+    return {
+        "delegation_id": str(delegation["delegation_id"]),
+        "execution_task_id": execution_task_id,
+        "review_task_id": review_task_id,
+        "idempotent_replay": False,
+        "workers": workers,
+        "cards": cards,
+    }
+
+
+def terminate_cancelled_workers(
+    conn: sqlite3.Connection,
+    workers: Iterable[Mapping[str, Any]],
+    *,
+    signal_fn=None,
+) -> list[dict[str, Any]]:
+    """Terminate workers captured by :func:`cancel_grace_delegation`.
+
+    The durable cancellation has already committed when this runs.  Signal
+    results are appended as separate audit events; a failed termination can
+    therefore never roll the task back to ``running`` or permit a duplicate
+    spawn.
+    """
+    results: list[dict[str, Any]] = []
+    for worker in workers:
+        task_id = str(worker.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        termination = _terminate_reclaimed_worker(
+            int(worker.get("pid") or 0),
+            str(worker.get("claim_lock") or ""),
+            signal_fn=signal_fn,
+        )
+        payload = {
+            **termination,
+            "stage": str(worker.get("stage") or ""),
+        }
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "cancellation_termination",
+                payload,
+            )
+        results.append({"task_id": task_id, **payload})
+    return results
 
 
 def promote_task(
@@ -10107,25 +11724,55 @@ def _probe_worker_capabilities(
         {"declared_tools": declared_tools, "toolsets": toolsets},
         ensure_ascii=False,
     )
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-c", _WORKER_CAPABILITY_PROBE],
-            input=payload,
-            text=True,
-            capture_output=True,
-            timeout=max(1.0, float(timeout)),
-            cwd=workspace if os.path.isdir(workspace) else None,
-            env=dict(env),
-            check=False,
-        )
-    except Exception as exc:
+    completed: Optional[subprocess.CompletedProcess[str]] = None
+    probe_attempts = 0
+    for probe_attempts in range(1, 3):
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", _WORKER_CAPABILITY_PROBE],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=max(1.0, float(timeout)),
+                cwd=workspace if os.path.isdir(workspace) else None,
+                env=dict(env),
+                check=False,
+            )
+            break
+        except subprocess.TimeoutExpired as exc:
+            if probe_attempts < 2:
+                continue
+            return {
+                "ok": False,
+                "declared_tools": declared_tools,
+                "required_runtime_tools": [],
+                "available_tools": [],
+                # A timeout proves nothing about individual tool presence.
+                # Keep the capability failure fail-closed without falsely
+                # reporting every declared or abstract tool as missing.
+                "missing_required_tools": [],
+                "probe_attempts": probe_attempts,
+                "probe_error": f"{type(exc).__name__}: {exc}",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "declared_tools": declared_tools,
+                "required_runtime_tools": [],
+                "available_tools": [],
+                "missing_required_tools": [],
+                "probe_attempts": probe_attempts,
+                "probe_error": f"{type(exc).__name__}: {exc}",
+            }
+    if completed is None:  # pragma: no cover - defensive loop invariant
         return {
             "ok": False,
             "declared_tools": declared_tools,
             "required_runtime_tools": [],
             "available_tools": [],
-            "missing_required_tools": declared_tools,
-            "probe_error": f"{type(exc).__name__}: {exc}",
+            "missing_required_tools": [],
+            "probe_attempts": probe_attempts,
+            "probe_error": "capability probe produced no result",
         }
     if completed.returncode != 0:
         return {
@@ -10133,7 +11780,8 @@ def _probe_worker_capabilities(
             "declared_tools": declared_tools,
             "required_runtime_tools": [],
             "available_tools": [],
-            "missing_required_tools": declared_tools,
+            "missing_required_tools": [],
+            "probe_attempts": probe_attempts,
             "probe_error": (
                 completed.stderr.strip()[-2000:]
                 or f"capability probe exited rc={completed.returncode}"
@@ -10147,7 +11795,8 @@ def _probe_worker_capabilities(
             "declared_tools": declared_tools,
             "required_runtime_tools": [],
             "available_tools": [],
-            "missing_required_tools": declared_tools,
+            "missing_required_tools": [],
+            "probe_attempts": probe_attempts,
             "probe_error": f"invalid capability probe output: {exc}",
         }
     if not isinstance(result, dict):
@@ -10156,9 +11805,11 @@ def _probe_worker_capabilities(
             "declared_tools": declared_tools,
             "required_runtime_tools": [],
             "available_tools": [],
-            "missing_required_tools": declared_tools,
+            "missing_required_tools": [],
+            "probe_attempts": probe_attempts,
             "probe_error": "capability probe output was not an object",
         }
+    result.setdefault("probe_attempts", probe_attempts)
     return result
 
 
@@ -11053,6 +12704,7 @@ def create_grace_approval_challenge(
     origin_review_task_id: str = "",
     origin_event_id: Optional[int] = None,
     callback_lease_owner: str = "",
+    telegram_message_path: Optional[Mapping[str, Any]] = None,
     ttl_seconds: int = 3600,
 ) -> dict:
     """Create or reuse one pending challenge for the exact compiled contract."""
@@ -11087,6 +12739,9 @@ def create_grace_approval_challenge(
     )
     now = int(time.time())
     expires_at = now + max(60, min(int(ttl_seconds), 86400))
+    from hermes_cli.telegram_message_path import dumps_message_path
+
+    message_path_json = dumps_message_path(telegram_message_path) or None
     with write_txn(conn):
         if callback_lease_owner:
             if not clean_origin_review_id or clean_origin_event_id is None:
@@ -11148,6 +12803,15 @@ def create_grace_approval_challenge(
                     origin_row.get("state") == "pending"
                     and int(origin_row.get("expires_at") or 0) > now
                 ):
+                    if message_path_json and not origin_row.get(
+                        "telegram_message_path"
+                    ):
+                        conn.execute(
+                            "UPDATE grace_approval_challenges "
+                            "SET telegram_message_path = ? WHERE token = ?",
+                            (message_path_json, origin_row["token"]),
+                        )
+                        origin_row["telegram_message_path"] = message_path_json
                     return origin_row
                 authorized = conn.execute(
                     """
@@ -11174,6 +12838,7 @@ def create_grace_approval_challenge(
                            session_id = ?, user_id_sha256 = ?,
                            requested_message_id = ?, action_summary = ?,
                            approval_platform = ?, approval_scope = ?,
+                           telegram_message_path = COALESCE(?, telegram_message_path),
                            state = 'pending', created_at = ?, expires_at = ?,
                            consumed_at = NULL, approved_message_id = NULL
                      WHERE origin_review_task_id = ?
@@ -11193,6 +12858,7 @@ def create_grace_approval_challenge(
                         action_summary.strip(),
                         approval_platform.strip(),
                         approval_scope.strip(),
+                        message_path_json,
                         now,
                         expires_at,
                         clean_origin_review_id,
@@ -11238,7 +12904,15 @@ def create_grace_approval_challenge(
             ),
         ).fetchone()
         if existing is not None:
-            return dict(existing)
+            existing_row = dict(existing)
+            if message_path_json and not existing_row.get("telegram_message_path"):
+                conn.execute(
+                    "UPDATE grace_approval_challenges "
+                    "SET telegram_message_path = ? WHERE token = ?",
+                    (message_path_json, existing_row["token"]),
+                )
+                existing_row["telegram_message_path"] = message_path_json
+            return existing_row
         token = secrets.token_hex(8)
         conn.execute(
             """
@@ -11248,8 +12922,9 @@ def create_grace_approval_challenge(
                 session_key, session_id, user_id_sha256, requested_message_id,
                 action_summary, approval_platform, approval_scope,
                 origin_review_task_id, origin_event_id,
+                telegram_message_path,
                 created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 token,
@@ -11267,6 +12942,7 @@ def create_grace_approval_challenge(
                 approval_scope.strip(),
                 clean_origin_review_id or None,
                 clean_origin_event_id,
+                message_path_json,
                 now,
                 expires_at,
             ),
@@ -11352,6 +13028,256 @@ def get_grace_approval_challenge(
 
 
 # ---------------------------------------------------------------------------
+# Durable Grace objectives (one user outcome -> multiple Loop Contracts)
+# ---------------------------------------------------------------------------
+
+_ACTIVE_GRACE_OBJECTIVE_STATUSES = frozenset(
+    {"active", "waiting_approval", "blocked", "verifying"}
+)
+
+
+def create_grace_objective(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    session_key: str,
+    title: str,
+    objective: str,
+    original_request_sha256: str,
+    required_stage_keys: Sequence[str],
+    terminal_stage_key: str,
+    acceptance_criteria: Sequence[str],
+    current_stage_key: str = "",
+    next_action: str = "",
+    waiting_for: str = "",
+) -> dict:
+    """Create one idempotent, durable originating-user objective.
+
+    Reusing ``objective_id`` is allowed only when every immutable identity and
+    completion field matches. This makes recovery scripts safe to replay while
+    preventing a later turn from silently repurposing an active objective.
+    """
+    clean_id = str(objective_id or "").strip()
+    clean_platform = str(platform or "").strip().lower()
+    clean_chat = str(chat_id or "").strip()
+    clean_thread = str(thread_id or "").strip()
+    clean_session_key = str(session_key or "").strip()
+    clean_title = str(title or "").strip()
+    clean_objective = str(objective or "").strip()
+    clean_hash = str(original_request_sha256 or "").strip().lower()
+    stages = [str(item or "").strip() for item in required_stage_keys]
+    criteria = [str(item or "").strip() for item in acceptance_criteria]
+    clean_terminal = str(terminal_stage_key or "").strip()
+    clean_current = str(current_stage_key or "").strip() or (stages[0] if stages else "")
+    required = {
+        "objective_id": clean_id,
+        "platform": clean_platform,
+        "chat_id": clean_chat,
+        "session_key": clean_session_key,
+        "title": clean_title,
+        "objective": clean_objective,
+        "original_request_sha256": clean_hash,
+        "terminal_stage_key": clean_terminal,
+        "current_stage_key": clean_current,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(
+            "Grace objective missing required field(s): " + ", ".join(missing)
+        )
+    if len(clean_hash) != 64 or any(ch not in "0123456789abcdef" for ch in clean_hash):
+        raise ValueError("Grace objective original_request_sha256 must be 64 hex characters")
+    if not stages or any(not item for item in stages) or len(set(stages)) != len(stages):
+        raise ValueError("Grace objective required_stage_keys must be unique non-empty strings")
+    if clean_terminal not in stages or clean_current not in stages:
+        raise ValueError("Grace objective current and terminal stages must be required stages")
+    if not criteria or any(not item for item in criteria):
+        raise ValueError("Grace objective acceptance_criteria must contain non-empty strings")
+    stages_json = json.dumps(
+        stages, ensure_ascii=False, separators=(",", ":")
+    )
+    criteria_json = json.dumps(
+        criteria, ensure_ascii=False, separators=(",", ":")
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM grace_objectives WHERE objective_id = ?", (clean_id,)
+        ).fetchone()
+        if existing is not None:
+            row = dict(existing)
+            expected = {
+                "platform": clean_platform,
+                "chat_id": clean_chat,
+                "thread_id": clean_thread,
+                "session_key": clean_session_key,
+                "title": clean_title,
+                "objective": clean_objective,
+                "original_request_sha256": clean_hash,
+                "terminal_stage_key": clean_terminal,
+                "required_stage_keys": stages_json,
+                "acceptance_criteria": criteria_json,
+            }
+            if any(row.get(key) != value for key, value in expected.items()):
+                raise ValueError("Existing Grace objective has another identity or completion contract")
+            return row
+        conn.execute(
+            """
+            INSERT INTO grace_objectives (
+                objective_id, platform, chat_id, thread_id, session_key,
+                title, objective, original_request_sha256, status,
+                current_stage_key, terminal_stage_key, required_stage_keys,
+                acceptance_criteria, next_action, waiting_for, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_id, clean_platform, clean_chat, clean_thread,
+                clean_session_key, clean_title, clean_objective, clean_hash,
+                clean_current, clean_terminal, stages_json, criteria_json,
+                str(next_action or "").strip(), str(waiting_for or "").strip(),
+                now, now,
+            ),
+        )
+        for position, stage_key in enumerate(stages):
+            conn.execute(
+                """
+                INSERT INTO grace_objective_stages (
+                    objective_id, stage_key, position, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'planned', ?, ?)
+                """,
+                (clean_id, stage_key, position, now, now),
+            )
+        row = conn.execute(
+            "SELECT * FROM grace_objectives WHERE objective_id = ?", (clean_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def get_grace_objective(conn: sqlite3.Connection, objective_id: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM grace_objectives WHERE objective_id = ?",
+        (str(objective_id or "").strip(),),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_active_grace_objectives(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT * FROM grace_objectives
+         WHERE platform = ? AND chat_id = ? AND thread_id = ?
+           AND status IN ('active', 'waiting_approval', 'blocked', 'verifying')
+         ORDER BY updated_at DESC, created_at DESC
+        """,
+        (
+            str(platform or "").strip().lower(),
+            str(chat_id or "").strip(),
+            str(thread_id or "").strip(),
+        ),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def grace_objective_stage_mode(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    stage_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+) -> str:
+    """Validate an objective reference and return its authoritative mode."""
+    row = get_grace_objective(conn, objective_id)
+    if row is None:
+        raise ValueError("Unknown Grace objective")
+    if row.get("status") not in _ACTIVE_GRACE_OBJECTIVE_STATUSES:
+        raise ValueError(f"Grace objective is not active: {row.get('status')}")
+    expected_lane = (
+        str(platform or "").strip().lower(),
+        str(chat_id or "").strip(),
+        str(thread_id or "").strip(),
+    )
+    actual_lane = (row["platform"], row["chat_id"], row["thread_id"])
+    if actual_lane != expected_lane:
+        raise ValueError("Grace objective belongs to another chat or topic")
+    clean_stage = str(stage_key or "").strip()
+    stages = json.loads(row["required_stage_keys"])
+    if clean_stage not in stages:
+        raise ValueError("Grace objective stage is not declared in required_stage_keys")
+    return "terminal" if clean_stage == row["terminal_stage_key"] else "intermediate"
+
+
+def _bind_grace_objective_stage(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    stage_key: str,
+    delegation_id: str,
+) -> None:
+    if not objective_id:
+        return
+    now = int(time.time())
+    stage = conn.execute(
+        "SELECT * FROM grace_objective_stages WHERE objective_id = ? AND stage_key = ?",
+        (objective_id, stage_key),
+    ).fetchone()
+    if stage is None:
+        raise ValueError("Grace objective stage does not exist")
+    if stage["delegation_id"] and stage["delegation_id"] != delegation_id:
+        raise ValueError("Grace objective stage is already bound to another delegation")
+    conn.execute(
+        """
+        UPDATE grace_objective_stages
+           SET delegation_id = ?, status = CASE WHEN status = 'done' THEN status ELSE 'queued' END,
+               updated_at = ?
+         WHERE objective_id = ? AND stage_key = ?
+        """,
+        (delegation_id, now, objective_id, stage_key),
+    )
+    conn.execute(
+        """
+        UPDATE grace_objectives
+           SET status = 'active', current_stage_key = ?, waiting_for = '', updated_at = ?
+         WHERE objective_id = ?
+        """,
+        (stage_key, now, objective_id),
+    )
+
+
+def cancel_grace_objective(
+    conn: sqlite3.Connection, *, objective_id: str, reason: str = ""
+) -> dict:
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_objectives
+               SET status = 'cancelled', waiting_for = ?, cancelled_at = ?, updated_at = ?
+             WHERE objective_id = ?
+               AND status IN ('active', 'waiting_approval', 'blocked', 'verifying')
+            """,
+            (str(reason or "").strip(), now, now, str(objective_id or "").strip()),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Grace objective is unknown or already terminal")
+        row = conn.execute(
+            "SELECT * FROM grace_objectives WHERE objective_id = ?",
+            (str(objective_id or "").strip(),),
+        ).fetchone()
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
 # Atomic/idempotent Grace delegation authorization
 # ---------------------------------------------------------------------------
 
@@ -11373,6 +13299,9 @@ def reserve_grace_delegation(
     origin_review_task_id: str = "",
     origin_event_id: Optional[int] = None,
     callback_lease_owner: str = "",
+    objective_id: str = "",
+    stage_key: str = "",
+    telegram_message_path: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Reserve one delegation and consume approval in the same transaction.
 
@@ -11386,6 +13315,10 @@ def reserve_grace_delegation(
     clean_thread_id = str(thread_id or "").strip()
     clean_session_key = str(session_key or "").strip()
     clean_session_id = str(session_id or "").strip()
+    clean_objective_id = str(objective_id or "").strip()
+    clean_stage_key = str(stage_key or "").strip()
+    if bool(clean_objective_id) != bool(clean_stage_key):
+        raise ValueError("objective_id and stage_key must be supplied together")
     route_json = json.dumps(
         dict(resolved_route or {}),
         ensure_ascii=False,
@@ -11411,6 +13344,19 @@ def reserve_grace_delegation(
             "origin_review_task_id and origin_event_id must be supplied together"
         )
     delegation_id = "gd_" + fingerprint[:32]
+    from hermes_cli.telegram_message_path import (
+        bind_message_path,
+        dumps_message_path,
+        normalize_message_path,
+    )
+
+    clean_message_path = bind_message_path(
+        telegram_message_path,
+        session_key=clean_session_key,
+        session_id=clean_session_id,
+        delegation_id=delegation_id,
+    )
+    message_path_json = dumps_message_path(clean_message_path) or None
     now = int(time.time())
     with write_txn(conn):
         if callback_lease_owner:
@@ -11484,12 +13430,28 @@ def reserve_grace_delegation(
                 "origin_event_id": (
                     int(origin_event_id) if origin_event_id is not None else None
                 ),
+                "objective_id": clean_objective_id or None,
+                "stage_key": clean_stage_key or None,
             }
             if any(row.get(key) != value for key, value in expected.items()):
                 raise ValueError(
                     "Existing Grace delegation is bound to another route, "
                     "session, approval mode, or callback origin."
                 )
+            existing_path = normalize_message_path(
+                row.get("telegram_message_path")
+            )
+            # Exact idempotent retries may arrive in a later Telegram message
+            # (approval reply, transport retry, or operator replay). Preserve
+            # the first committed origin instead of rebinding the delegation
+            # to the newer message's trace.
+            if not existing_path and message_path_json:
+                conn.execute(
+                    "UPDATE grace_delegations SET telegram_message_path = ?, updated_at = ? "
+                    "WHERE delegation_id = ? AND telegram_message_path IS NULL",
+                    (message_path_json, now, delegation_id),
+                )
+                row["telegram_message_path"] = message_path_json
             if approval_required:
                 if (
                     row.get("challenge_token") != challenge_token.strip()
@@ -11554,8 +13516,9 @@ def reserve_grace_delegation(
                 platform, chat_id, thread_id, session_key, session_id,
                 user_id_sha256, approved_message_id, resolved_route,
                 approval_required, origin_review_task_id, origin_event_id,
-                state, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'authorized', ?, ?)
+                objective_id, stage_key,
+                telegram_message_path, state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'authorized', ?, ?)
             """,
             (
                 delegation_id,
@@ -11573,9 +13536,18 @@ def reserve_grace_delegation(
                 1 if approval_required else 0,
                 origin_review_task_id.strip() or None,
                 int(origin_event_id) if origin_event_id is not None else None,
+                clean_objective_id or None,
+                clean_stage_key or None,
+                message_path_json,
                 now,
                 now,
             ),
+        )
+        _bind_grace_objective_stage(
+            conn,
+            objective_id=clean_objective_id,
+            stage_key=clean_stage_key,
+            delegation_id=delegation_id,
         )
         row = conn.execute(
             "SELECT * FROM grace_delegations WHERE delegation_id = ?",
@@ -11603,6 +13575,101 @@ def get_grace_delegation(
     else:
         return None
     return dict(row) if row is not None else None
+
+
+def telegram_message_path_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> dict[str, Any]:
+    """Return the canonical trace for either card in a Grace delegation."""
+    from hermes_cli.telegram_message_path import normalize_message_path
+
+    row = conn.execute(
+        """
+        SELECT telegram_message_path
+          FROM grace_delegations
+         WHERE execution_task_id = ? OR review_task_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        (str(task_id or "").strip(), str(task_id or "").strip()),
+    ).fetchone()
+    return normalize_message_path(
+        row["telegram_message_path"] if row is not None else None
+    )
+
+
+def update_grace_delegation_telegram_message_path(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str,
+    telegram_message_path: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Advance a trace without allowing its trusted origin to be replaced."""
+    from hermes_cli.telegram_message_path import (
+        dumps_message_path,
+        merge_message_paths,
+        normalize_message_path,
+    )
+
+    clean_id = str(delegation_id or "").strip()
+    incoming = normalize_message_path(telegram_message_path)
+    if not clean_id or not incoming:
+        raise ValueError("Delegation id and Telegram message path are required")
+    if str(incoming.get("delegation_id") or "") != clean_id:
+        raise ValueError("Telegram message path is bound to another delegation")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT telegram_message_path FROM grace_delegations WHERE delegation_id = ?",
+            (clean_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Unknown Grace delegation")
+        current = normalize_message_path(row["telegram_message_path"])
+        merged = merge_message_paths(current, incoming)
+        conn.execute(
+            "UPDATE grace_delegations SET telegram_message_path = ?, updated_at = ? "
+            "WHERE delegation_id = ?",
+            (dumps_message_path(merged), int(time.time()), clean_id),
+        )
+    return merged
+
+
+def update_grace_approval_challenge_telegram_message_path(
+    conn: sqlite3.Connection,
+    *,
+    telegram_message_path: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append an outbound receipt to the unique pending challenge trace."""
+    from hermes_cli.telegram_message_path import (
+        dumps_message_path,
+        merge_message_paths,
+        normalize_message_path,
+    )
+
+    incoming = normalize_message_path(telegram_message_path)
+    if not incoming:
+        raise ValueError("Telegram message path is required")
+    trace_id = str(incoming["trace_id"])
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT token, telegram_message_path
+              FROM grace_approval_challenges
+             WHERE state = 'pending'
+               AND json_extract(telegram_message_path, '$.trace_id') = ?
+            """,
+            (trace_id,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("Pending approval challenge trace is missing or ambiguous")
+        current = normalize_message_path(rows[0]["telegram_message_path"])
+        merged = merge_message_paths(current, incoming)
+        conn.execute(
+            "UPDATE grace_approval_challenges SET telegram_message_path = ? "
+            "WHERE token = ? AND state = 'pending'",
+            (dumps_message_path(merged), rows[0]["token"]),
+        )
+    return merged
 
 
 def claim_grace_delegation_build(
@@ -11727,12 +13794,40 @@ def mark_grace_delegation_queued(
                 raise ValueError(
                     f"Grace delegation already references another {key}"
                 )
+        from hermes_cli.telegram_message_path import (
+            actor,
+            append_hop,
+            bind_message_path,
+            dumps_message_path,
+        )
+
+        queued_path = bind_message_path(
+            existing.get("telegram_message_path"),
+            execution_task_id=execution_task_id,
+            review_task_id=review_task_id,
+        )
+        if queued_path:
+            queued_path = append_hop(
+                queued_path,
+                stage="grace_delegation",
+                from_actor=actor("grace", "grace"),
+                to_actor=actor("clawops", "clawops"),
+                status="observed",
+                identifiers={
+                    "delegation_id": delegation_id,
+                    "execution_task_id": execution_task_id,
+                    "review_task_id": review_task_id,
+                },
+            )
+        queued_path_json = dumps_message_path(queued_path) or None
         cur = conn.execute(
             """
             UPDATE grace_delegations
                SET state = 'queued', execution_task_id = ?,
                    review_task_id = ?, build_owner = NULL,
-                   build_lease_expires = NULL, updated_at = ?
+                   build_lease_expires = NULL,
+                   telegram_message_path = COALESCE(?, telegram_message_path),
+                   updated_at = ?
              WHERE delegation_id = ?
                AND state = 'building' AND build_owner = ?
                AND build_lease_expires > ?
@@ -11740,6 +13835,7 @@ def mark_grace_delegation_queued(
             (
                 execution_task_id.strip(),
                 review_task_id.strip(),
+                queued_path_json,
                 now,
                 delegation_id.strip(),
                 build_owner.strip(),
@@ -11748,6 +13844,20 @@ def mark_grace_delegation_queued(
         )
         if cur.rowcount != 1:
             raise ValueError("Grace delegation builder lease changed before commit.")
+        if existing.get("objective_id") and existing.get("stage_key"):
+            conn.execute(
+                """
+                UPDATE grace_objective_stages
+                   SET execution_task_id = ?, review_task_id = ?, status = 'queued',
+                       updated_at = ?
+                 WHERE objective_id = ? AND stage_key = ? AND delegation_id = ?
+                """,
+                (
+                    execution_task_id.strip(), review_task_id.strip(), now,
+                    existing["objective_id"], existing["stage_key"],
+                    delegation_id.strip(),
+                ),
+            )
         execution = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?",
             (execution_task_id.strip(),),
@@ -11824,6 +13934,8 @@ def add_grace_loop_callback(
     notifier_profile: Optional[str] = None,
     contract_fingerprint: str,
     completion_mode: str = "terminal",
+    objective_id: str = "",
+    stage_key: str = "",
 ) -> None:
     """Persist the return path for a dependent Grace review.
 
@@ -11842,6 +13954,20 @@ def add_grace_loop_callback(
     if missing:
         raise ValueError(f"Grace callback missing required field(s): {', '.join(missing)}")
     now = int(time.time())
+    clean_objective_id = str(objective_id or "").strip()
+    clean_stage_key = str(stage_key or "").strip()
+    if bool(clean_objective_id) != bool(clean_stage_key):
+        raise ValueError("objective_id and stage_key must be supplied together")
+    authoritative_mode = completion_mode.strip()
+    if clean_objective_id:
+        authoritative_mode = grace_objective_stage_mode(
+            conn,
+            objective_id=clean_objective_id,
+            stage_key=clean_stage_key,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=(thread_id or ""),
+        )
     normalized_chat_type = str(chat_type or "").strip().lower()
     if not normalized_chat_type:
         parts = str(session_key or "").split(":")
@@ -11856,7 +13982,8 @@ def add_grace_loop_callback(
                 review_task_id, execution_task_id, platform, chat_id, chat_type,
                 thread_id, user_id, session_key, session_id, message_id,
                 notifier_profile, contract_fingerprint, completion_mode, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                , objective_id, stage_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 review_task_id, execution_task_id, platform.strip().lower(),
@@ -11869,11 +13996,13 @@ def add_grace_loop_callback(
                 (notifier_profile or "").strip() or None,
                 contract_fingerprint.strip(),
                 (
-                    completion_mode.strip()
-                    if completion_mode.strip() in {"terminal", "intermediate"}
+                    authoritative_mode
+                    if authoritative_mode in {"terminal", "intermediate"}
                     else "terminal"
                 ),
                 now,
+                clean_objective_id or None,
+                clean_stage_key or None,
             ),
         )
 
@@ -12157,6 +14286,532 @@ def validate_completed_approval_blocker(
     return dict(row)
 
 
+def record_grace_user_facing_report_delivery(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+    report: Mapping[str, Any],
+    chunk_count: int,
+    chunk_index: int,
+) -> dict[str, Any]:
+    """Persist one confirmed inline chunk and finalize after the last one."""
+    from hermes_cli.user_facing_report import user_facing_report_digest
+
+    if (
+        isinstance(chunk_count, bool)
+        or not isinstance(chunk_count, int)
+        or chunk_count < 1
+    ):
+        raise ValueError("User-facing report delivery requires at least one chunk.")
+    if (
+        isinstance(chunk_index, bool)
+        or not isinstance(chunk_index, int)
+        or not 0 <= chunk_index < chunk_count
+    ):
+        raise ValueError("User-facing report chunk index is invalid.")
+    digest = user_facing_report_digest(report)
+    now = int(time.time())
+    with write_txn(conn):
+        callback = validate_active_grace_callback_origin(
+            conn,
+            review_task_id=review_task_id,
+            event_id=event_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        if callback.get("lease_owner") != lease_owner.strip():
+            raise ValueError("User-facing report delivery lost its callback lease.")
+        same_delivery = bool(
+            int(callback.get("user_report_event_id") or 0) == int(event_id)
+            and callback.get("user_report_digest") == digest
+            and int(callback.get("user_report_total_chunks") or 0)
+            == int(chunk_count)
+        )
+        if callback.get("user_report_delivered_at") is not None:
+            if same_delivery:
+                return callback
+            if int(callback.get("user_report_event_id") or 0) == int(event_id):
+                raise ValueError(
+                    "Another user-facing report delivery is already bound to this callback."
+                )
+        next_chunk = (
+            int(callback.get("user_report_next_chunk") or 0)
+            if same_delivery
+            else 0
+        )
+        confirmed_next = int(chunk_index) + 1
+        if int(chunk_index) < next_chunk:
+            return callback
+        if int(chunk_index) != next_chunk:
+            raise ValueError(
+                "User-facing report chunks must be confirmed in order."
+            )
+        confirmed_send = conn.execute(
+            """
+            SELECT 1 FROM grace_user_report_chunk_deliveries
+             WHERE review_task_id = ? AND event_id = ?
+               AND report_digest = ? AND chunk_index = ?
+               AND total_chunks = ? AND state = 'sent'
+            """,
+            (
+                review_task_id.strip(), int(event_id), digest,
+                int(chunk_index), int(chunk_count),
+            ),
+        ).fetchone()
+        if confirmed_send is None:
+            raise ValueError(
+                "User-facing report chunk must be confirmed as sent before "
+                "delivery progress advances."
+            )
+        delivered_at = now if confirmed_next == int(chunk_count) else None
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET user_report_event_id = ?, user_report_digest = ?,
+                   user_report_delivered_at = ?, user_report_chunk_count = ?,
+                   user_report_next_chunk = ?, user_report_total_chunks = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ?
+               AND lease_owner = ?
+               AND lease_expires > ?
+            """,
+            (
+                int(event_id), digest, delivered_at,
+                int(chunk_count) if delivered_at is not None else None,
+                confirmed_next, int(chunk_count),
+                review_task_id.strip(), int(event_id), lease_owner.strip(), now,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("User-facing report delivery receipt was not recorded.")
+        stored = conn.execute(
+            "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
+            (review_task_id.strip(),),
+        ).fetchone()
+    return dict(stored)
+
+
+def grace_user_facing_delivery_contract(
+    conn: sqlite3.Connection,
+    execution_task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the compiled delivery contract for one execution card."""
+    task = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?",
+        (execution_task_id.strip(),),
+    ).fetchone()
+    contract = _grace_compiled_contract(
+        str(task["body"] or "") if task is not None else ""
+    )
+    delivery = (
+        contract.get("user_facing_delivery")
+        if isinstance(contract, Mapping)
+        else None
+    )
+    return dict(delivery) if isinstance(delivery, Mapping) else None
+
+
+def reserve_grace_user_facing_report_chunk(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+    report: Mapping[str, Any],
+    chunk_index: int,
+    total_chunks: int,
+) -> dict[str, Any]:
+    """Reserve one external send; an old pending row requires reconciliation."""
+    from hermes_cli.user_facing_report import user_facing_report_digest
+
+    digest = user_facing_report_digest(report)
+    now = int(time.time())
+    with write_txn(conn):
+        callback = validate_active_grace_callback_origin(
+            conn,
+            review_task_id=review_task_id,
+            event_id=event_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        if callback.get("lease_owner") != lease_owner.strip():
+            raise ValueError("User-facing chunk reservation lost its callback lease.")
+        reconciliation_effect_at = 0
+        if report.get("complete") is True:
+            first_reservation = conn.execute(
+                """
+                SELECT report_digest, total_chunks, reconciliation_effect_at
+                  FROM grace_user_report_chunk_deliveries
+                 WHERE review_task_id = ? AND event_id = ? AND chunk_index = 0
+                """,
+                (review_task_id.strip(), int(event_id)),
+            ).fetchone()
+            if first_reservation is None:
+                migration = conn.execute(
+                    """
+                    SELECT reconciled, latest_group_effect_at
+                      FROM commerce_group_migration_state
+                     WHERE singleton_id = 1
+                    """
+                ).fetchone()
+                if migration is None or int(migration["reconciled"] or 0) != 1:
+                    raise ValueError(
+                        "Complete commerce report delivery requires current "
+                        "historical Facebook group reconciliation."
+                    )
+                reconciliation_effect_at = int(
+                    migration["latest_group_effect_at"] or 0
+                )
+            else:
+                if (
+                    first_reservation["report_digest"] != digest
+                    or int(first_reservation["total_chunks"] or 0)
+                    != int(total_chunks)
+                ):
+                    raise ValueError(
+                        "Complete report delivery conflicts with its bound "
+                        "reconciliation generation."
+                    )
+                reconciliation_effect_at = int(
+                    first_reservation["reconciliation_effect_at"] or 0
+                )
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO grace_user_report_chunk_deliveries (
+                review_task_id, event_id, report_digest, chunk_index,
+                total_chunks, reconciliation_effect_at, state,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                review_task_id.strip(), int(event_id), digest,
+                int(chunk_index), int(total_chunks),
+                reconciliation_effect_at, now, now,
+            ),
+        )
+        stored = conn.execute(
+            """
+            SELECT * FROM grace_user_report_chunk_deliveries
+             WHERE review_task_id = ? AND event_id = ? AND chunk_index = ?
+            """,
+            (review_task_id.strip(), int(event_id), int(chunk_index)),
+        ).fetchone()
+        if (
+            stored is None
+            or stored["report_digest"] != digest
+            or int(stored["total_chunks"] or 0) != int(total_chunks)
+            or int(stored["reconciliation_effect_at"] or 0)
+            != reconciliation_effect_at
+        ):
+            raise ValueError("User-facing chunk reservation conflicts with another report.")
+        should_send = cur.rowcount == 1
+        if stored["state"] == "failed":
+            conn.execute(
+                """
+                UPDATE grace_user_report_chunk_deliveries
+                   SET state = 'pending', updated_at = ?
+                 WHERE review_task_id = ? AND event_id = ? AND chunk_index = ?
+                   AND state = 'failed'
+                """,
+                (
+                    now, review_task_id.strip(), int(event_id), int(chunk_index),
+                ),
+            )
+            stored = conn.execute(
+                """
+                SELECT * FROM grace_user_report_chunk_deliveries
+                 WHERE review_task_id = ? AND event_id = ? AND chunk_index = ?
+                """,
+                (review_task_id.strip(), int(event_id), int(chunk_index)),
+            ).fetchone()
+            should_send = True
+    result = dict(stored)
+    result["should_send"] = should_send
+    return result
+
+
+def confirm_grace_user_facing_report_chunk(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    report: Mapping[str, Any],
+    chunk_index: int,
+    total_chunks: int,
+    message_id: str = "",
+) -> dict[str, Any]:
+    """Mark an externally acknowledged chunk sent before advancing progress."""
+    from hermes_cli.user_facing_report import user_facing_report_digest
+
+    clean_message_id = str(message_id or "").strip()
+    if not clean_message_id:
+        raise ValueError(
+            "User-facing chunk confirmation requires a provider message id."
+        )
+    digest = user_facing_report_digest(report)
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE grace_user_report_chunk_deliveries
+               SET state = 'sent', message_id = ?, updated_at = ?
+             WHERE review_task_id = ? AND event_id = ?
+               AND report_digest = ? AND chunk_index = ?
+               AND total_chunks = ? AND state = 'pending'
+            """,
+            (
+                clean_message_id, now, review_task_id.strip(),
+                int(event_id), digest, int(chunk_index), int(total_chunks),
+            ),
+        )
+        stored = conn.execute(
+            """
+            SELECT * FROM grace_user_report_chunk_deliveries
+             WHERE review_task_id = ? AND event_id = ? AND chunk_index = ?
+            """,
+            (review_task_id.strip(), int(event_id), int(chunk_index)),
+        ).fetchone()
+        if (
+            stored is None
+            or stored["state"] != "sent"
+            or stored["report_digest"] != digest
+            or int(stored["total_chunks"] or 0) != int(total_chunks)
+        ):
+            raise ValueError("User-facing chunk send was not confirmed.")
+    return dict(stored)
+
+
+def fail_grace_user_facing_report_chunk(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    report: Mapping[str, Any],
+    chunk_index: int,
+    total_chunks: int,
+) -> dict[str, Any]:
+    """Mark an explicitly rejected external send safe to reserve again."""
+    from hermes_cli.user_facing_report import user_facing_report_digest
+
+    digest = user_facing_report_digest(report)
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE grace_user_report_chunk_deliveries
+               SET state = 'failed', updated_at = ?
+             WHERE review_task_id = ? AND event_id = ?
+               AND report_digest = ? AND chunk_index = ?
+               AND total_chunks = ? AND state = 'pending'
+            """,
+            (
+                now, review_task_id.strip(), int(event_id), digest,
+                int(chunk_index), int(total_chunks),
+            ),
+        )
+        stored = conn.execute(
+            """
+            SELECT * FROM grace_user_report_chunk_deliveries
+             WHERE review_task_id = ? AND event_id = ? AND chunk_index = ?
+            """,
+            (review_task_id.strip(), int(event_id), int(chunk_index)),
+        ).fetchone()
+        if stored is None or stored["state"] != "failed":
+            raise ValueError("User-facing chunk failure was not recorded.")
+    return dict(stored)
+
+
+def grace_user_facing_report_next_chunk(
+    callback: Mapping[str, Any],
+    *,
+    event_id: int,
+    report: Mapping[str, Any],
+    chunk_count: int,
+) -> int:
+    """Return the first unconfirmed deterministic chunk for a retry."""
+    from hermes_cli.user_facing_report import user_facing_report_digest
+
+    if (
+        int(callback.get("user_report_event_id") or 0) != int(event_id)
+        or callback.get("user_report_digest")
+        != user_facing_report_digest(report)
+        or int(callback.get("user_report_total_chunks") or 0)
+        != int(chunk_count)
+    ):
+        return 0
+    return min(
+        max(int(callback.get("user_report_next_chunk") or 0), 0),
+        int(chunk_count),
+    )
+
+
+def grace_user_facing_report_delivery_matches(
+    callback: Mapping[str, Any],
+    *,
+    event_id: int,
+    report: Mapping[str, Any],
+) -> bool:
+    """Return whether this exact report was already delivered to chat."""
+    from hermes_cli.user_facing_report import user_facing_report_digest
+
+    return bool(
+        callback.get("user_report_delivered_at")
+        and int(callback.get("user_report_event_id") or 0) == int(event_id)
+        and callback.get("user_report_digest")
+        == user_facing_report_digest(report)
+        and int(callback.get("user_report_chunk_count") or 0) > 0
+        and int(callback.get("user_report_next_chunk") or 0)
+        == int(callback.get("user_report_total_chunks") or 0)
+    )
+
+
+def _apply_grace_objective_callback_outcome(
+    conn: sqlite3.Connection,
+    *,
+    callback: Mapping[str, Any],
+    kind: str,
+    payload: Mapping[str, Any],
+    successor: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Advance the durable parent outcome after a validated callback result."""
+    objective_id = str(callback.get("objective_id") or "").strip()
+    stage_key = str(callback.get("stage_key") or "").strip()
+    if not objective_id:
+        return
+    if not stage_key:
+        raise ValueError("Objective-linked callback is missing its stage key")
+    objective = get_grace_objective(conn, objective_id)
+    if objective is None or objective.get("status") not in _ACTIVE_GRACE_OBJECTIVE_STATUSES:
+        raise ValueError("Objective-linked callback references an inactive objective")
+    stage = conn.execute(
+        "SELECT * FROM grace_objective_stages WHERE objective_id = ? AND stage_key = ?",
+        (objective_id, stage_key),
+    ).fetchone()
+    if stage is None:
+        raise ValueError("Objective-linked callback references an unknown stage")
+    now = int(time.time())
+    evidence = _canonical_json(dict(payload or {}))
+    if kind == "closed":
+        if stage_key != objective["terminal_stage_key"]:
+            raise ValueError("Only the declared terminal objective stage may close the outcome")
+        incomplete = conn.execute(
+            """
+            SELECT stage_key FROM grace_objective_stages
+             WHERE objective_id = ? AND stage_key <> ? AND status <> 'done'
+             ORDER BY position
+            """,
+            (objective_id, stage_key),
+        ).fetchall()
+        if incomplete:
+            raise ValueError(
+                "Grace objective cannot close before required stages complete: "
+                + ", ".join(row["stage_key"] for row in incomplete)
+            )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'done', outcome_kind = 'closed', evidence = ?,
+                   completed_at = ?, updated_at = ?
+             WHERE objective_id = ? AND stage_key = ?
+            """,
+            (evidence, now, now, objective_id, stage_key),
+        )
+        conn.execute(
+            """
+            UPDATE grace_objectives
+               SET status = 'completed', current_stage_key = ?, next_action = '',
+                   waiting_for = '', completed_at = ?, updated_at = ?
+             WHERE objective_id = ?
+            """,
+            (stage_key, now, now, objective_id),
+        )
+        return
+    if kind == "continued":
+        successor_id = str((successor or {}).get("objective_id") or "").strip()
+        successor_stage = str((successor or {}).get("stage_key") or "").strip()
+        if successor_id != objective_id or not successor_stage:
+            raise ValueError("Continuation must queue the next stage of the same Grace objective")
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'done', outcome_kind = 'continued', evidence = ?,
+                   completed_at = ?, updated_at = ?
+             WHERE objective_id = ? AND stage_key = ?
+            """,
+            (evidence, now, now, objective_id, stage_key),
+        )
+        conn.execute(
+            """
+            UPDATE grace_objectives
+               SET status = 'active', current_stage_key = ?, next_action = ?,
+                   waiting_for = '', updated_at = ?
+             WHERE objective_id = ?
+            """,
+            (
+                successor_stage,
+                str(payload.get("next_action") or "").strip(),
+                now,
+                objective_id,
+            ),
+        )
+        return
+    next_stage_key = str(payload.get("next_stage_key") or "").strip()
+    required_stages = json.loads(objective["required_stage_keys"])
+    if not next_stage_key or next_stage_key not in required_stages:
+        raise ValueError(
+            "Objective-linked approval blocker requires a declared next_stage_key"
+        )
+    if next_stage_key == stage_key:
+        raise ValueError("Objective approval blocker must advance to a later stage")
+    conn.execute(
+        """
+        UPDATE grace_objective_stages
+           SET status = 'done', outcome_kind = 'approval_blocked', evidence = ?,
+               completed_at = ?, updated_at = ?
+         WHERE objective_id = ? AND stage_key = ?
+        """,
+        (evidence, now, now, objective_id, stage_key),
+    )
+    conn.execute(
+        """
+        UPDATE grace_objective_stages
+           SET status = 'waiting_approval', updated_at = ?
+         WHERE objective_id = ? AND stage_key = ? AND status <> 'done'
+        """,
+        (now, objective_id, next_stage_key),
+    )
+    conn.execute(
+        """
+        UPDATE grace_objectives
+           SET status = 'waiting_approval', current_stage_key = ?,
+               next_action = ?, waiting_for = ?, updated_at = ?
+         WHERE objective_id = ?
+        """,
+        (
+            next_stage_key,
+            str(payload.get("action") or "").strip(),
+            str(payload.get("exact_question") or "").strip(),
+            now,
+            objective_id,
+        ),
+    )
+
+
 def record_grace_loop_callback_outcome(
     conn: sqlite3.Connection,
     *,
@@ -12206,11 +14861,64 @@ def record_grace_loop_callback_outcome(
         )
     except (TypeError, ValueError):
         review_metadata = {}
+    execution_run = conn.execute(
+        """
+        SELECT metadata
+          FROM task_runs
+         WHERE task_id = ? AND outcome = 'completed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (str(callback.get("execution_task_id") or "").strip(),),
+    ).fetchone()
+    try:
+        execution_metadata = (
+            json.loads(execution_run["metadata"])
+            if execution_run is not None and execution_run["metadata"]
+            else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        execution_metadata = {}
+    criteria = review_metadata.get("acceptance_criteria_met")
+    evidence = review_metadata.get("evidence")
+    verification_notes = review_metadata.get("verification_notes")
+    visual_review = review_metadata.get("visual_review")
+    parent_verified_file = review_metadata.get("parent_verified_file")
+    has_review_evidence = (
+        (isinstance(evidence, dict) and bool(evidence))
+        or (
+            isinstance(verification_notes, list)
+            and any(str(item).strip() for item in verification_notes)
+        )
+    )
+    visual_review_accepted = (
+        isinstance(visual_review, dict)
+        and visual_review.get("approved") is True
+        and (
+            (isinstance(parent_verified_file, dict) and bool(parent_verified_file))
+            or visual_review.get("defects_found") == []
+        )
+    )
+    review_accepted = (
+        review_metadata.get("review_outcome") == "accepted"
+        or visual_review_accepted
+        or (
+            review_metadata.get("approved") is True
+            and (
+                criteria is True
+                or (
+                    isinstance(criteria, list)
+                    and all(str(item).strip() for item in criteria)
+                )
+                or has_review_evidence
+            )
+        )
+    )
     if (
         trigger is None
         or trigger["task_id"] != review_task_id.strip()
         or trigger["kind"] != "completed"
-        or review_metadata.get("review_outcome") != "accepted"
+        or not review_accepted
     ):
         raise ValueError(
             "Structured callback outcomes are allowed only for an accepted "
@@ -12245,6 +14953,156 @@ def record_grace_loop_callback_outcome(
                 "Intermediate callback cannot close the complete user outcome; "
                 "record a continued or approval_blocked postcondition."
             )
+        execution_task = conn.execute(
+            "SELECT body FROM tasks WHERE id = ?",
+            (str(callback.get("execution_task_id") or "").strip(),),
+        ).fetchone()
+        execution_contract = _grace_compiled_contract(
+            str(execution_task["body"] or "")
+            if execution_task is not None
+            else ""
+        )
+        user_facing_delivery = (
+            execution_contract.get("user_facing_delivery")
+            if isinstance(execution_contract, Mapping)
+            else None
+        )
+        execution_routing = (
+            execution_contract.get("routing")
+            if isinstance(execution_contract, Mapping)
+            else None
+        )
+        commerce_status_route = bool(
+            isinstance(execution_routing, Mapping)
+            and execution_routing.get("task_type")
+            == "secondhand_commerce_group_status"
+        )
+        commerce_status_contract = bool(
+            isinstance(user_facing_delivery, Mapping)
+            and user_facing_delivery.get("kind") == "commerce_group_status"
+        )
+        user_facing_report = execution_metadata.get("user_facing_report")
+        if commerce_status_route and not isinstance(
+            user_facing_delivery, Mapping
+        ):
+            raise ValueError(
+                "secondhand_commerce_group_status cannot close without an "
+                "exact user_facing_delivery contract."
+            )
+        if commerce_status_route or commerce_status_contract:
+            migration = conn.execute(
+                "SELECT reconciled FROM commerce_group_migration_state "
+                "WHERE singleton_id = 1"
+            ).fetchone()
+            if migration is None or int(migration["reconciled"] or 0) != 1:
+                raise ValueError(
+                    "Historical Facebook group destinations must be reconciled "
+                    "before a commerce group status outcome can close."
+                )
+        if (
+            (
+                commerce_status_route
+                or (
+                    isinstance(user_facing_delivery, Mapping)
+                    and user_facing_delivery.get("required") is True
+                )
+            )
+            and user_facing_report is None
+        ):
+            raise ValueError(
+                "Required user-facing report is missing; continue the task "
+                "until the complete inline payload is recorded."
+            )
+        if user_facing_report is not None:
+            from hermes_cli.user_facing_report import (
+                report_satisfies_user_facing_delivery,
+            )
+
+            if not isinstance(user_facing_delivery, Mapping):
+                raise ValueError(
+                    "Commerce user-facing report cannot close without an exact "
+                    "user_facing_delivery contract."
+                )
+            report_allows_close = report_satisfies_user_facing_delivery(
+                user_facing_report,
+                user_facing_delivery,
+            )
+            if not report_allows_close:
+                raise ValueError(
+                    "Incomplete user-facing report cannot close the complete "
+                    "user outcome; continue the read-only reconciliation or "
+                    "record the exact approval blocker."
+                )
+            report_observed_at = int(
+                user_facing_report.get("observed_at") or 0
+            )
+            requested_subjects = {
+                item["subject_key"]
+                for item in user_facing_report.get("coverage") or []
+            }
+            durable_coverage = [
+                row
+                for subject in requested_subjects
+                for row in list_commerce_group_coverage(
+                    conn, subject_key=subject,
+                )
+            ]
+            execution_task_id = str(
+                callback.get("execution_task_id") or ""
+            ).strip()
+            if (
+                len(durable_coverage) != len(requested_subjects)
+                or any(
+                    not row["complete"]
+                    or row["source_task_id"] != execution_task_id
+                    or int(row["observed_at"] or 0) != report_observed_at
+                    for row in durable_coverage
+                )
+            ):
+                raise ValueError(
+                    "Durable commerce coverage does not match this complete "
+                    "user-facing report; continue reconciliation."
+                )
+            report_rows = {
+                (row["subject_key"], row["destination_id"]): row
+                for row in user_facing_report.get("rows") or []
+            }
+            ledger_rows = {
+                (row["subject_key"], row["destination_id"]): row
+                for subject in requested_subjects
+                for row in list_commerce_group_ledger(
+                    conn, subject_key=subject,
+                )
+            }
+            compared_fields = (
+                "subject_label", "destination_name", "source_listing_id",
+                "status", "status_label", "evidence", "source_task_id",
+                "observed_at", "verified_at",
+            )
+            if (
+                report_rows.keys() != ledger_rows.keys()
+                or any(
+                    any(
+                        report_rows[key].get(field)
+                        != ledger_rows[key].get(field)
+                        for field in compared_fields
+                    )
+                    for key in report_rows
+                )
+            ):
+                raise ValueError(
+                    "Delivered user-facing report rows do not match the "
+                    "canonical commerce ledger; continue reconciliation."
+                )
+            if not grace_user_facing_report_delivery_matches(
+                callback,
+                event_id=event_id,
+                report=user_facing_report,
+            ):
+                raise ValueError(
+                    "Complete user-facing report has no successful inline "
+                    "delivery receipt for this callback."
+                )
         if not str(clean_payload.get("summary") or "").strip():
             raise ValueError("Closed callback outcome requires a summary.")
     elif kind == "approval_blocked":
@@ -12257,6 +15115,12 @@ def record_grace_loop_callback_outcome(
             raise ValueError(
                 "Approval-blocked callback outcome missing: "
                 + ", ".join(missing)
+            )
+        if callback.get("objective_id") and not str(
+            clean_payload.get("next_stage_key") or ""
+        ).strip():
+            raise ValueError(
+                "Objective-linked approval blocker requires next_stage_key"
             )
     else:
         execution_task_id = str(
@@ -12273,17 +15137,78 @@ def record_grace_loop_callback_outcome(
         delegation = get_grace_delegation(
             conn, delegation_id=delegation_id,
         )
+        objective_existing_successor = False
+        if (
+            delegation is not None
+            and callback.get("objective_id")
+            and delegation.get("objective_id") == callback.get("objective_id")
+            and delegation.get("session_key") == callback.get("session_key")
+            and delegation.get("stage_key")
+            and delegation.get("stage_key") != callback.get("stage_key")
+        ):
+            objective_stage = conn.execute(
+                """
+                SELECT delegation_id, status
+                  FROM grace_objective_stages
+                 WHERE objective_id = ? AND stage_key = ?
+                """,
+                (
+                    callback.get("objective_id"),
+                    delegation.get("stage_key"),
+                ),
+            ).fetchone()
+            successor_execution = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (execution_task_id,),
+            ).fetchone()
+            successor_review = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (next_review_task_id,),
+            ).fetchone()
+            objective_existing_successor = bool(
+                objective_stage is not None
+                and objective_stage["delegation_id"] == delegation_id
+                and objective_stage["status"] != "done"
+                and successor_execution is not None
+                and successor_execution["status"]
+                in {
+                    "triage", "todo", "scheduled", "ready", "running",
+                    "blocked", "review",
+                }
+                and successor_review is not None
+                and successor_review["status"]
+                in {
+                    "triage", "todo", "scheduled", "ready", "running",
+                    "blocked", "review",
+                }
+            )
         if (
             delegation is None
             or delegation.get("state") != "queued"
             or delegation.get("execution_task_id") != execution_task_id
             or delegation.get("review_task_id") != next_review_task_id
-            or delegation.get("origin_review_task_id") != review_task_id
-            or int(delegation.get("origin_event_id") or 0) != int(event_id)
+            or (
+                not objective_existing_successor
+                and (
+                    delegation.get("origin_review_task_id") != review_task_id
+                    or int(delegation.get("origin_event_id") or 0)
+                    != int(event_id)
+                )
+            )
             or delegation.get("platform") != platform.strip().lower()
             or delegation.get("chat_id") != chat_id.strip()
             or delegation.get("thread_id") != (thread_id or "").strip()
-            or delegation.get("session_id") != session_id.strip()
+            or (
+                not objective_existing_successor
+                and delegation.get("session_id") != session_id.strip()
+            )
+            or (
+                callback.get("objective_id")
+                and (
+                    delegation.get("objective_id") != callback.get("objective_id")
+                    or not delegation.get("stage_key")
+                )
+            )
         ):
             raise ValueError(
                 "Continuation tasks are not the queued delegation created by "
@@ -12358,6 +15283,14 @@ def record_grace_loop_callback_outcome(
                     "Approval-blocked callback outcome does not match the exact "
                     "pending challenge created by this callback."
                 )
+        successor = delegation if kind == "continued" else None
+        _apply_grace_objective_callback_outcome(
+            conn,
+            callback=current_callback,
+            kind=kind,
+            payload=clean_payload,
+            successor=successor,
+        )
         cur = conn.execute(
             """
             UPDATE grace_loop_callbacks
@@ -13142,6 +16075,139 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
+def delegation_token_rollup(
+    conn: sqlite3.Connection,
+    delegation_id: str,
+    *,
+    session_db_path: Optional[str | Path] = None,
+) -> dict[str, Any]:
+    """Return observable Hermes + backend token usage for one Grace delegation."""
+    clean_delegation_id = str(delegation_id or "").strip()
+    if not clean_delegation_id:
+        raise ValueError("delegation_id is required")
+
+    delegation = conn.execute(
+        """
+        SELECT delegation_id, session_id, execution_task_id, review_task_id
+          FROM grace_delegations
+         WHERE delegation_id = ?
+        """,
+        (clean_delegation_id,),
+    ).fetchone()
+    if delegation is None:
+        return {
+            "delegation_id": clean_delegation_id,
+            "found": False,
+            "session_ids": [],
+            "task_ids": [],
+            "hermes_session_usage": _empty_token_usage(),
+            "backend_token_usage": _empty_token_usage(),
+            "total_observed_tokens": 0,
+            "coverage": {
+                "session_db_read": False,
+                "hermes_sessions_found": 0,
+                "backend_runs_found": 0,
+                "backend_runs_missing_usage": 0,
+            },
+        }
+
+    task_ids = [
+        str(task_id).strip()
+        for task_id in (
+            delegation["execution_task_id"],
+            delegation["review_task_id"],
+        )
+        if str(task_id or "").strip()
+    ]
+    session_ids: list[str] = []
+    origin_session_id = str(delegation["session_id"] or "").strip()
+    if origin_session_id:
+        session_ids.append(origin_session_id)
+
+    backend_usage = _empty_token_usage()
+    backend_runs_found = 0
+    backend_runs_missing_usage = 0
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        rows = conn.execute(
+            f"""
+            SELECT r.metadata, t.session_id AS task_session_id
+              FROM task_runs r
+              JOIN tasks t ON t.id = r.task_id
+             WHERE r.task_id IN ({placeholders})
+             ORDER BY r.started_at ASC, r.id ASC
+            """,
+            tuple(task_ids),
+        ).fetchall()
+        for row in rows:
+            metadata = _load_json_object(row["metadata"]) or {}
+            worker_session_id = str(metadata.get("worker_session_id") or "").strip()
+            task_session_id = str(row["task_session_id"] or "").strip()
+            for session_id in (task_session_id, worker_session_id):
+                if session_id:
+                    session_ids.append(session_id)
+            usage = _canonical_token_usage(metadata.get("backend_token_usage"))
+            if usage is not None:
+                backend_runs_found += 1
+                _add_token_usage(backend_usage, usage)
+            elif metadata.get("backend_terminal_observation") is not None:
+                backend_runs_missing_usage += 1
+
+    deduped_session_ids = list(dict.fromkeys(session_ids))
+    hermes_usage = _empty_token_usage()
+    hermes_sessions_found = 0
+    session_db_read = False
+    if session_db_path is not None and deduped_session_ids:
+        session_path = Path(session_db_path).expanduser()
+        if session_path.exists():
+            placeholders = ",".join("?" for _ in deduped_session_ids)
+            state_conn = sqlite3.connect(str(session_path))
+            state_conn.row_factory = sqlite3.Row
+            try:
+                rows = state_conn.execute(
+                    f"""
+                    SELECT id, input_tokens, output_tokens, cache_read_tokens,
+                           cache_write_tokens, reasoning_tokens
+                      FROM sessions
+                     WHERE id IN ({placeholders})
+                    """,
+                    tuple(deduped_session_ids),
+                ).fetchall()
+                session_db_read = True
+                hermes_sessions_found = len(rows)
+                for row in rows:
+                    usage = {
+                        "input_tokens": row["input_tokens"],
+                        "output_tokens": row["output_tokens"],
+                        "cache_read_tokens": row["cache_read_tokens"],
+                        "cache_write_tokens": row["cache_write_tokens"],
+                        "reasoning_tokens": row["reasoning_tokens"],
+                    }
+                    _add_token_usage(hermes_usage, usage)
+            finally:
+                state_conn.close()
+
+    total_usage = _empty_token_usage()
+    _add_token_usage(total_usage, hermes_usage)
+    _add_token_usage(total_usage, backend_usage)
+    return {
+        "delegation_id": clean_delegation_id,
+        "found": True,
+        "session_ids": deduped_session_ids,
+        "task_ids": task_ids,
+        "hermes_session_usage": hermes_usage,
+        "backend_token_usage": backend_usage,
+        "total_usage": total_usage,
+        "total_observed_tokens": int(total_usage.get("total_tokens") or 0),
+        "coverage": {
+            "session_db_read": session_db_read,
+            "hermes_sessions_found": hermes_sessions_found,
+            "backend_runs_found": backend_runs_found,
+            "backend_runs_missing_usage": backend_runs_missing_usage,
+        },
+    }
+
+
 def merge_active_run_metadata(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13414,6 +16480,11 @@ def record_backend_lifecycle(
             existing_metadata["backend_terminal_observation"] = (
                 clean_terminal_observation
             )
+            backend_token_usage = _token_usage_from_terminal_observation(
+                clean_terminal_observation
+            )
+            if backend_token_usage is not None:
+                existing_metadata["backend_token_usage"] = backend_token_usage
             updated_metadata = _canonical_json(existing_metadata)
         try:
             cur = conn.execute(

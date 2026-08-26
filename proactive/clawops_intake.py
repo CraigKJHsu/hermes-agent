@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import json
 import os
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
 from proactive.hubops_routing import (
@@ -165,6 +165,8 @@ def create_clawops_task(
     session_id: Optional[str] = None,
     executor_backend: str = "hermes",
     executor_profile: Optional[str] = None,
+    skills: Optional[Iterable[str]] = None,
+    approval_required_override: Optional[bool] = None,
 ) -> ClawOpsTask:
     """Create a Hermes-owned ClawOps task in the existing kanban queue."""
     clean_objective = (objective or "").strip()
@@ -218,8 +220,10 @@ def create_clawops_task(
         if not bound_route:
             bound_route = fresh_route
 
-    approval_required = bool(
-        hubops_envelope and route_requires_owner_approval(hubops_envelope)
+    approval_required = (
+        bool(approval_required_override)
+        if approval_required_override is not None
+        else bool(hubops_envelope and route_requires_owner_approval(hubops_envelope))
     )
     delegation: Optional[dict[str, Any]] = None
     if contract is None or not contract_fingerprint or not delegation_id.strip():
@@ -291,6 +295,8 @@ def create_clawops_task(
             body += "\n" + "\n".join(
                 _scoped_worker_capability_contract(hubops_envelope)
             )
+        if contract_requires_image_generation_capabilities(contract):
+            body += "\n" + "\n".join(_image_generation_capability_contract())
     else:
         body = _body_from_objective(clean_objective, source=enriched_source, hubops_envelope=hubops_envelope)
 
@@ -315,6 +321,7 @@ def create_clawops_task(
             executor_backend=clean_executor_backend,
             executor_profile=executor_profile,
             project_namespace=str(enriched_source.get("project") or "").strip() or None,
+            skills=skills,
         )
         row = kb.get_task(conn, task_id)
         status = str(row.status if row else "ready")
@@ -583,6 +590,20 @@ def requires_image_generation_capabilities(
         haystack_parts.extend(str(v) for v in source.values() if v is not None)
     haystack = " ".join(haystack_parts).lower()
     return any(term in haystack for term in IMAGE_CONTENT_TERMS)
+
+
+def contract_requires_image_generation_capabilities(
+    contract: Optional[Mapping[str, Any]],
+) -> bool:
+    routing = contract.get("routing") if isinstance(contract, Mapping) else {}
+    resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
+    assignment = (
+        resolved.get("assignment") if isinstance(resolved, Mapping) else {}
+    )
+    allowed_tools = (
+        assignment.get("allowed_tools") if isinstance(assignment, Mapping) else []
+    )
+    return any(str(tool).strip() == "image_generate" for tool in allowed_tools or [])
 
 
 def _image_generation_capability_contract() -> list[str]:
