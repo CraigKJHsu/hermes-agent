@@ -159,6 +159,19 @@ def test_grace_review_accepts_visual_review_with_file_readback():
     }) is True
 
 
+def test_grace_review_accepts_instruction_readback_metadata():
+    assert _grace_review_accepted({
+        "reviewed_file": "/tmp/INSTRUCTIONS.md",
+        "review_result": "accepted",
+        "verified_lines": {"seven_deliverables": "7-37"},
+        "verified_checks": {
+            "seven_deliverables": True,
+            "external_actions_performed": False,
+        },
+        "approved": True,
+    }) is True
+
+
 def _runner(
     adapter,
     *,
@@ -1023,8 +1036,9 @@ def test_session_reset_sends_safe_handoff_without_injecting_old_turn(tmp_path, m
     assert "原對話已被重設" in adapter.sent[0][1]
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
-    assert callback["state"] == "attention"
-    assert callback["last_event_id"] == 0
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "closed"
+    assert callback["outcome_event_id"] == callback["last_event_id"]
 
 
 def test_compression_child_rebinds_and_delivers_callback(tmp_path, monkeypatch):
@@ -1180,8 +1194,9 @@ def test_legacy_callback_detects_session_reset_after_key_recovery(
     assert "原對話已被重設" in adapter.sent[0][1]
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
-    assert callback["state"] == "attention"
-    assert callback["last_event_id"] == 0
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "closed"
+    assert callback["outcome_event_id"] == callback["last_event_id"]
 
 
 def test_superseded_execution_blocker_coalesces_to_accepted_review(

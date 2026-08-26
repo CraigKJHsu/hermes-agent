@@ -625,6 +625,63 @@ def test_callback_outcome_accepts_visual_review_file_readback_metadata(tmp_path)
     assert stored["outcome_kind"] == "closed"
 
 
+def test_callback_outcome_accepts_instruction_readback_metadata(tmp_path):
+    db_path = tmp_path / "callback-instruction-readback.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="b" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="instruction-readback",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={
+                "reviewed_file": "/tmp/INSTRUCTIONS.md",
+                "review_result": "accepted",
+                "verified_lines": {"seven_deliverables": "7-37"},
+                "verified_checks": {
+                    "seven_deliverables": True,
+                    "external_actions_performed": False,
+                },
+                "approved": True,
+            },
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        stored = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "complete"},
+        )
+    assert stored["outcome_kind"] == "closed"
+
+
 def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
     db_path = tmp_path / "callback-session-rotation.db"
     with kb.connect_closing(db_path) as conn:

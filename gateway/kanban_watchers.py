@@ -24,56 +24,14 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hermes_cli.grace_review_metadata import (
+    grace_review_accepted as _grace_review_accepted,
+    grace_review_rejected as _grace_review_rejected,
+)
+
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
-
-
-def _grace_review_accepted(metadata: Any) -> bool:
-    review_metadata = metadata if isinstance(metadata, dict) else {}
-    criteria = review_metadata.get("acceptance_criteria_met")
-    evidence = review_metadata.get("evidence")
-    verification_notes = review_metadata.get("verification_notes")
-    visual_review = review_metadata.get("visual_review")
-    parent_verified_file = review_metadata.get("parent_verified_file")
-    has_review_evidence = (
-        (isinstance(evidence, dict) and bool(evidence))
-        or (isinstance(verification_notes, list) and any(str(item).strip() for item in verification_notes))
-    )
-    visual_review_accepted = (
-        isinstance(visual_review, dict)
-        and visual_review.get("approved") is True
-        and (
-            (isinstance(parent_verified_file, dict) and bool(parent_verified_file))
-            or visual_review.get("defects_found") == []
-        )
-    )
-    return (
-        review_metadata.get("review_outcome") == "accepted"
-        or visual_review_accepted
-        or (
-            review_metadata.get("approved") is True
-            and (
-                criteria is True
-                or (
-                    isinstance(criteria, list)
-                    and all(str(item).strip() for item in criteria)
-                )
-                or has_review_evidence
-            )
-        )
-    )
-
-
-def _grace_review_rejected(metadata: Any) -> bool:
-    review_metadata = metadata if isinstance(metadata, dict) else {}
-    verdict = str(review_metadata.get("review_verdict") or "").strip().lower()
-    outcome = str(review_metadata.get("review_outcome") or "").strip().lower()
-    return (
-        review_metadata.get("approved") is False
-        or verdict in {"rejected", "rejected_incomplete", "blocked", "failed"}
-        or outcome in {"rejected", "blocked", "failed"}
-    )
 
 
 def _confirmed_grace_provider_message_id(send_result: Any) -> Optional[str]:
@@ -1151,6 +1109,26 @@ class GatewayKanbanWatchersMixin:
                     conn.close()
             return await asyncio.to_thread(_sync_has_structured_outcome)
 
+        async def _record_terminal_closed_outcome(summary: str) -> None:
+            def _sync_record_terminal_closed_outcome() -> None:
+                conn = kb_module.connect(board=board)
+                try:
+                    kb_module.record_grace_loop_callback_outcome(
+                        conn,
+                        review_task_id=review_id,
+                        event_id=event_id,
+                        platform=platform_name,
+                        chat_id=str(callback.get("chat_id") or ""),
+                        thread_id=str(callback.get("thread_id") or ""),
+                        session_id=str(callback.get("session_id") or ""),
+                        lease_owner=lease_owner,
+                        outcome_kind="closed",
+                        payload={"summary": summary},
+                    )
+                finally:
+                    conn.close()
+            await asyncio.to_thread(_sync_record_terminal_closed_outcome)
+
         async def _escalate(error: str) -> None:
             def _sync_escalate() -> None:
                 conn = kb_module.connect(board=board)
@@ -1466,7 +1444,16 @@ class GatewayKanbanWatchersMixin:
                 mismatch_error = (
                     "origin session changed; sent safe handoff notice"
                 )
-                if outcome == "accepted":
+                if (
+                    outcome == "accepted"
+                    and str(callback.get("completion_mode") or "terminal") == "terminal"
+                ):
+                    await _record_terminal_closed_outcome(
+                        str(callback.get("review_summary") or "").strip()
+                        or f"Grace review {review_id} accepted."
+                    )
+                    await _finish()
+                elif outcome == "accepted":
                     await _escalate(mismatch_error)
                 else:
                     await _finish(mismatch_error)

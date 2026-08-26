@@ -91,6 +91,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from hermes_cli.grace_review_metadata import grace_review_accepted
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -14879,41 +14880,7 @@ def record_grace_loop_callback_outcome(
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         execution_metadata = {}
-    criteria = review_metadata.get("acceptance_criteria_met")
-    evidence = review_metadata.get("evidence")
-    verification_notes = review_metadata.get("verification_notes")
-    visual_review = review_metadata.get("visual_review")
-    parent_verified_file = review_metadata.get("parent_verified_file")
-    has_review_evidence = (
-        (isinstance(evidence, dict) and bool(evidence))
-        or (
-            isinstance(verification_notes, list)
-            and any(str(item).strip() for item in verification_notes)
-        )
-    )
-    visual_review_accepted = (
-        isinstance(visual_review, dict)
-        and visual_review.get("approved") is True
-        and (
-            (isinstance(parent_verified_file, dict) and bool(parent_verified_file))
-            or visual_review.get("defects_found") == []
-        )
-    )
-    review_accepted = (
-        review_metadata.get("review_outcome") == "accepted"
-        or visual_review_accepted
-        or (
-            review_metadata.get("approved") is True
-            and (
-                criteria is True
-                or (
-                    isinstance(criteria, list)
-                    and all(str(item).strip() for item in criteria)
-                )
-                or has_review_evidence
-            )
-        )
-    )
+    review_accepted = grace_review_accepted(review_metadata)
     if (
         trigger is None
         or trigger["task_id"] != review_task_id.strip()
