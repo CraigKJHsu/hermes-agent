@@ -14178,9 +14178,14 @@ def mark_grace_delegation_queued(
                     session_id=str(existing.get("session_id") or ""),
                 )
             else:
-                raise ValueError(
-                    "Callback continuation cannot be armed without its active "
-                    "lease or a delivered approval checkpoint."
+                validate_delivered_human_blocker(
+                    conn,
+                    review_task_id=origin_review_id,
+                    event_id=int(origin_event_raw),
+                    platform=str(existing.get("platform") or ""),
+                    chat_id=str(existing.get("chat_id") or ""),
+                    thread_id=str(existing.get("thread_id") or ""),
+                    session_id=str(existing.get("session_id") or ""),
                 )
         for key, value in (
             ("execution_task_id", execution_task_id),
@@ -14678,6 +14683,77 @@ def validate_completed_approval_blocker(
         raise ValueError(
             "Fresh approval turn is not bound to a delivered approval-blocked "
             "callback on this board and session."
+        )
+    return dict(row)
+
+
+def validate_delivered_human_blocker(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+) -> dict:
+    """Validate a fresh owner response to a delivered task blocker."""
+    row = conn.execute(
+        """
+        SELECT callback.*
+          FROM grace_loop_callbacks AS callback
+          JOIN task_events AS trigger ON trigger.id = ?
+         WHERE callback.review_task_id = ?
+           AND callback.state = 'delivered'
+           AND callback.last_event_id = ?
+           AND callback.outcome_event_id IS NULL
+           AND callback.outcome_kind IS NULL
+           AND callback.platform = ?
+           AND callback.chat_id = ?
+           AND callback.thread_id = ?
+           AND callback.session_id = ?
+           AND (
+                (
+                    trigger.task_id = callback.review_task_id
+                    AND trigger.kind IN (
+                        'blocked', 'block_loop_detected', 'gave_up',
+                        'crashed', 'timed_out'
+                    )
+                )
+                OR
+                (
+                    trigger.task_id = callback.execution_task_id
+                    AND trigger.kind IN (
+                        'blocked', 'block_loop_detected', 'gave_up',
+                        'crashed', 'timed_out'
+                    )
+                )
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM task_events AS later
+                 WHERE later.task_id = trigger.task_id
+                   AND later.id > trigger.id
+                   AND later.kind IN (
+                       'unblocked', 'promoted', 'claimed',
+                       'spawned', 'completed'
+                   )
+           )
+        """,
+        (
+            int(event_id),
+            review_task_id.strip(),
+            int(event_id),
+            platform.strip().lower(),
+            chat_id.strip(),
+            (thread_id or "").strip(),
+            session_id.strip(),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "Fresh continuation is not bound to a delivered human-input "
+            "blocker on this board and session."
         )
     return dict(row)
 

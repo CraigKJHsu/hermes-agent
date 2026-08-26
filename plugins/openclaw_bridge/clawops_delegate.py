@@ -385,9 +385,9 @@ def _resolve_completed_callback_board(
     platform: str,
     chat_id: str,
     thread_id: str,
-) -> tuple[str, str]:
-    """Resolve a fresh approval checkpoint from durable rows, not model input."""
-    matches: list[tuple[str, str]] = []
+) -> tuple[str, str, str]:
+    """Resolve a fresh callback follow-up from durable rows, not model input."""
+    matches: list[tuple[str, str, str]] = []
     for metadata in kb.list_boards(include_archived=False):
         slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
         try:
@@ -398,21 +398,39 @@ def _resolve_completed_callback_board(
                 ).strip()
                 if not callback_session_id:
                     continue
-                kb.validate_completed_approval_blocker(
-                    conn,
-                    review_task_id=review_task_id,
-                    event_id=event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=callback_session_id,
-                )
+                try:
+                    kb.validate_completed_approval_blocker(
+                        conn,
+                        review_task_id=review_task_id,
+                        event_id=event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=callback_session_id,
+                    )
+                    origin_kind = "approval_blocked"
+                except ValueError:
+                    kb.validate_delivered_human_blocker(
+                        conn,
+                        review_task_id=review_task_id,
+                        event_id=event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=callback_session_id,
+                    )
+                    origin_kind = "human_blocker"
         except (ValueError, OSError):
             continue
-        matches.append((slug, callback_session_id))
-    if len(matches) != 1:
+        matches.append((slug, callback_session_id, origin_kind))
+    if not matches:
         raise ValueError(
-            "Fresh callback approval must resolve to exactly one durable board."
+            "Fresh callback follow-up does not match a delivered approval "
+            "checkpoint or human-input blocker on any durable board."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Fresh callback follow-up resolves to multiple durable boards."
         )
     return matches[0]
 
@@ -889,6 +907,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         approval_challenge: dict[str, Any] | None = None
         approval_bound_session_id = ""
         approval_callback_session_id = ""
+        fresh_callback_origin_kind = ""
         approval_session_matches = False
         challenge_lookup_token = approval_token or approval_refresh_token
         if challenge_lookup_token and not internal_turn:
@@ -967,6 +986,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             (
                 resolved_board,
                 approval_callback_session_id,
+                fresh_callback_origin_kind,
             ) = _resolve_completed_callback_board(
                 review_task_id=origin_review_id,
                 event_id=origin_event_id,
@@ -986,7 +1006,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 and requested_callback_board != resolved_board
             ):
                 raise ValueError(
-                    "Callback board does not match the durable approval checkpoint."
+                    "Callback board does not match the durable approval "
+                    "checkpoint or callback origin."
                 )
             board = None if resolved_board == kb.DEFAULT_BOARD else resolved_board
         elif requested_callback_board:
@@ -1017,6 +1038,13 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         external_targets = (
             [] if internal_only_contract else supplied_external_targets
         )
+        if fresh_callback_origin_kind == "human_blocker" and (
+            bool(args.get("approved")) or external_targets
+        ):
+            raise ValueError(
+                "A human-blocker follow-up may create only an unapproved, "
+                "zero-external-effect continuation."
+            )
         supplied_request_instance = str(
             args.get("request_instance_id") or ""
         ).strip()
@@ -1401,7 +1429,12 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "Fresh callback approval requires review id, event id, and board."
                 )
             with kb.connect_closing(board=board) as conn:
-                kb.validate_completed_approval_blocker(
+                validator = (
+                    kb.validate_delivered_human_blocker
+                    if fresh_callback_origin_kind == "human_blocker"
+                    else kb.validate_completed_approval_blocker
+                )
+                validator(
                     conn,
                     review_task_id=origin_review_id,
                     event_id=origin_event_id,
@@ -1688,7 +1721,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     chat_id=chat_id,
                     thread_id=thread_id,
                     session_key=session_key,
-                    session_id=session_id,
+                    session_id=(approval_callback_session_id or session_id),
+                    telegram_message_path_session_id=session_id,
                     resolved_route=contract["routing"]["resolved"],
                     approval_required=False,
                     origin_review_task_id=origin_review_id,

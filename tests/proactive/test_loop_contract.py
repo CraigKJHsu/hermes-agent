@@ -54,6 +54,22 @@ def test_internal_only_target_accepts_explicit_zh_no_action_scope():
     )
 
 
+def test_internal_only_target_accepts_internal_zero_effect_sentinel():
+    assert is_internal_only_target(
+        "Internal Topic asset revision only - zero Facebook, Meta, Spotify, "
+        "Gemini Notebook, or other external platform action"
+    )
+    assert not is_internal_only_target(
+        "Topic asset revision with zero external platform action"
+    )
+    assert not is_internal_only_target(
+        "Internal campaign with zero delay before external platform action"
+    )
+    assert not is_internal_only_target(
+        "Internal campaign with non-zero external platform action"
+    )
+
+
 def test_internal_only_target_rejects_platform_target_without_both_guards():
     assert not is_internal_only_target("Facebook Page（修訂貼文並發布）")
     assert not is_internal_only_target("Gemini Notebook（不登入或操作）")

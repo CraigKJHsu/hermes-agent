@@ -1578,6 +1578,169 @@ def test_blocked_callback_cannot_create_internal_continuation(
         ) is None
 
 
+def test_fresh_owner_turn_can_create_internal_revision_from_delivered_blocker(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-compressed",
+        "HERMES_SESSION_MESSAGE_ID": "blocker-answer",
+        "HERMES_SESSION_MESSAGE_TEXT": "移除未驗證數字並重製主圖",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=execution_id,
+            review_id=review_id,
+            contract_fingerprint="2" * 64,
+            suffix="fresh-blocker-revision",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="2" * 64,
+        )
+        assert kb.block_task(conn, review_id, reason="choose revision")
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        assert kb.finish_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    class CompressionSessionDB:
+        def get_compression_tip(self, session_id):
+            assert session_id == "grace-session-1"
+            return "grace-session-compressed"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_state.SessionDB", CompressionSessionDB)
+
+    args = _nested_args()
+    args.update({
+        "approved": False,
+        "external_targets": [
+            "Internal EP04 asset revision only - zero external platform action"
+        ],
+        "origin_callback_review_id": review_id,
+        "origin_callback_event_id": callback["event_id"],
+        "origin_callback_board": "default",
+    })
+
+    queued = json.loads(handle_clawops_delegate(args))
+
+    assert queued["status"] == "queued", queued
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=queued["delegation_id"],
+        )
+    assert delegation["origin_review_task_id"] == review_id
+    assert delegation["origin_event_id"] == callback["event_id"]
+    assert delegation["session_id"] == "grace-session-1"
+
+
+def test_fresh_human_blocker_followup_cannot_authorize_external_action(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "unsafe-blocker-answer",
+        "HERMES_SESSION_MESSAGE_TEXT": "直接發布",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=execution_id,
+            review_id=review_id,
+            contract_fingerprint="3" * 64,
+            suffix="unsafe-blocker-followup",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="3" * 64,
+        )
+        assert kb.block_task(conn, review_id, reason="choose revision")
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        assert kb.finish_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    args = _external_listing_args()
+    args.update({
+        "approved": True,
+        "origin_callback_review_id": review_id,
+        "origin_callback_event_id": callback["event_id"],
+        "origin_callback_board": "default",
+    })
+
+    rejected = json.loads(handle_clawops_delegate(args))
+
+    assert rejected["status"] == "rejected"
+    assert "zero-external-effect continuation" in rejected["reason"]
+
+
 def test_callback_outcome_uses_originating_nondefault_board(
     tmp_path,
     monkeypatch,

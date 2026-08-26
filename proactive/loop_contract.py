@@ -88,9 +88,18 @@ def is_internal_only_target(value: object) -> bool:
     intent and an explicit no-platform-action phrase must be present.
     """
     target = str(value or "").strip().lower()
+    zero_effect_sentinel = re.search(
+        r"(?<![\w-])zero (?:"
+        r"facebook, meta, spotify, gemini notebook, or other "
+        r")?external platform action[.!]?$",
+        target,
+    )
     canonical_sentinel = (
         target.startswith("internal ")
-        and "no external platform action" in target
+        and (
+            "no external platform action" in target
+            or zero_effect_sentinel is not None
+        )
     )
     explicit_zh_internal_only = (
         any(marker in target for marker in _INTERNAL_ONLY_INTENT_MARKERS)
