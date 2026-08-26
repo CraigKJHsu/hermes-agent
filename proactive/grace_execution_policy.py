@@ -16,6 +16,7 @@ _DIRECT_EXECUTION_NAMES = {
     "image_generate", "computer_use", "cronjob", "ha_call_service",
     "browser_click", "browser_type", "browser_press", "browser_dialog",
     "browser_navigate", "browser_upload_files",
+    "facebook_page_graph_publish",
     "openclaw_delegate",
 }
 _DIRECT_EXECUTION_PREFIXES = (

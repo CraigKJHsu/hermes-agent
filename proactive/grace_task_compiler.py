@@ -61,6 +61,12 @@ _INTERNAL_OPS_TOOLS = frozenset(
         "report_generate",
     }
 )
+_FACEBOOK_PAGE_GRAPH_TOOLS = frozenset(
+    {"facebook_page_graph_status", "facebook_page_graph_publish"}
+)
+_FACEBOOK_PAGE_ALLOWED_TOOLS = _FACEBOOK_PAGE_GRAPH_TOOLS | frozenset(
+    {"memory_read", "docs_read", "kanban", "status_check", "report_generate"}
+)
 
 
 def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
@@ -133,6 +139,16 @@ def contract_internal_hermes_runtime(
         and allowed_tools <= _INTERNAL_OPS_TOOLS
         and assignment.get("approval_required") is False
     )
+    facebook_page_route = bool(
+        task_type == "facebook_page_api_publish"
+        and runtime_profile == "clawops-ops"
+        and _FACEBOOK_PAGE_GRAPH_TOOLS <= allowed_tools
+        and allowed_tools <= _FACEBOOK_PAGE_ALLOWED_TOOLS
+        and str(assignment.get("assigned_worker") or "")
+        == "clawops.facebook_page_api"
+    )
+    if facebook_page_route:
+        return runtime_profile
     if (
         task_type == "ops"
         and runtime_profile == "clawops-ops"

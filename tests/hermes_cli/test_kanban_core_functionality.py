@@ -2913,6 +2913,17 @@ def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
     assert "read_file" in available["required_runtime_tools"]
     assert "contract_only_pseudo_tool" in available["abstract_contract_tools"]
 
+    disabled = kb._probe_worker_capabilities(
+        declared_tools=["read_file"],
+        required_tools=["read_file"],
+        toolsets=["hermes-cli"],
+        disabled_toolsets=["file"],
+        env=env,
+        workspace=str(tmp_path),
+    )
+    assert disabled["ok"] is False
+    assert disabled["missing_required_tools"] == ["read_file"]
+
     missing = kb._probe_worker_capabilities(
         declared_tools=["browser_upload_files"],
         toolsets=["file"],

@@ -249,6 +249,45 @@ def test_internal_only_image_generation_contract_uses_content_runtime_without_to
     assert stored["approval_required"] == 0
 
 
+def test_facebook_page_api_contract_uses_hermes_ops_runtime():
+    contract = _image_contract()
+    contract["routing"] = {
+        "task_type": "facebook_page_api_publish",
+        "risk_level": "medium",
+    }
+    preliminary = validate_loop_contract(contract)
+    preview = route_clawops_objective(
+        contract["goal"]["objective"],
+        project=contract["identity"]["project"],
+        task_type="facebook_page_api_publish",
+        risk_level="medium",
+        approved=True,
+        contract_fingerprint=contract_fingerprint(preliminary),
+        runtime_callable_tools={
+            "clawops-ops": {
+                "facebook_page_graph_status",
+                "facebook_page_graph_publish",
+            }
+        },
+    )
+    assert preview["status"] == "routed"
+    contract["routing"]["resolved"] = resolved_route_binding(preview)
+    normalized = validate_loop_contract(contract)
+
+    assert contract_internal_hermes_runtime(
+        normalized,
+        task_type="facebook_page_api_publish",
+    ) == "clawops-ops"
+    unsafe = json.loads(json.dumps(normalized))
+    unsafe["routing"]["resolved"]["assignment"]["allowed_tools"].append(
+        "browser_click"
+    )
+    assert contract_internal_hermes_runtime(
+        unsafe,
+        task_type="facebook_page_api_publish",
+    ) == ""
+
+
 def test_internal_ops_contract_uses_hermes_ops_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()

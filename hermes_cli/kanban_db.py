@@ -597,6 +597,152 @@ def grace_task_allows_facebook_group_posting(
     )
 
 
+def _grace_contract_is_facebook_page_publish(
+    contract: Mapping[str, Any],
+) -> bool:
+    routing = contract.get("routing")
+    resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
+    task_type = str(
+        (routing.get("task_type") if isinstance(routing, Mapping) else "")
+        or (resolved.get("task_type") if isinstance(resolved, Mapping) else "")
+        or ""
+    ).strip().casefold()
+    return task_type == "facebook_page_api_publish"
+
+
+def grace_task_facebook_page_post_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, str]]:
+    """Return an exact approved Graph Page post contract, or ``None``."""
+    task = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?",
+        (str(task_id or "").strip(),),
+    ).fetchone()
+    if task is None:
+        return None
+    body = str(task["body"] or "")
+    if _grace_loop_stage_header(body) != "execution":
+        return None
+    contract = _grace_compiled_contract(body)
+    if contract is None or not _grace_contract_is_facebook_page_publish(contract):
+        return None
+    page_post = contract.get("facebook_page_post")
+    if not isinstance(page_post, Mapping):
+        return None
+    normalized = {
+        "action": str(page_post.get("action") or "").strip(),
+        "transport": str(page_post.get("transport") or "").strip(),
+        "page_url": str(page_post.get("page_url") or "").strip().rstrip("/"),
+        "message_sha256": str(page_post.get("message_sha256") or "").strip().lower(),
+        "image_sha256": str(page_post.get("image_sha256") or "").strip().lower(),
+    }
+    from urllib.parse import urlsplit
+
+    try:
+        parsed_page_url = urlsplit(normalized["page_url"])
+        parsed_page_port = parsed_page_url.port
+    except ValueError:
+        return None
+    if (
+        normalized["action"] != "create_post"
+        or normalized["transport"] != "graph_api"
+        or parsed_page_url.scheme != "https"
+        or str(parsed_page_url.hostname or "").casefold() != "www.facebook.com"
+        or parsed_page_port is not None
+        or parsed_page_url.path.count("/") != 1
+        or not parsed_page_url.path[1:]
+        or parsed_page_url.query
+        or parsed_page_url.fragment
+        or re.fullmatch(r"[0-9a-f]{64}", normalized["message_sha256"]) is None
+        or re.fullmatch(r"[0-9a-f]{64}", normalized["image_sha256"]) is None
+    ):
+        return None
+    targets = contract.get("external_targets")
+    if not isinstance(targets, list) or {
+        str(target or "").strip().rstrip("/") for target in targets
+    } != {normalized["page_url"]}:
+        return None
+    provenance = contract.get("approval_provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    rows = conn.execute(
+        """
+        SELECT d.challenge_token, d.contract_fingerprint,
+               d.platform, d.user_id_sha256, d.approved_message_id,
+               a.requested_message_id, a.delegation_args
+          FROM grace_delegations AS d
+          JOIN grace_approval_challenges AS a
+            ON a.token = d.challenge_token
+         WHERE d.execution_task_id = ?
+           AND d.approval_required = 1
+           AND d.state = 'queued'
+           AND a.state = 'consumed'
+           AND a.consumed_at IS NOT NULL
+           AND d.contract_fingerprint = a.contract_fingerprint
+           AND d.request_instance_id = a.request_instance_id
+           AND d.platform = a.platform
+           AND d.chat_id = a.chat_id
+           AND d.thread_id = a.thread_id
+           AND d.session_key = a.session_key
+           AND d.session_id = a.session_id
+           AND d.user_id_sha256 = a.user_id_sha256
+           AND d.approved_message_id = a.approved_message_id
+        """,
+        (str(task_id or "").strip(),),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    approval = rows[0]
+    try:
+        delegation_args = json.loads(str(approval["delegation_args"] or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(delegation_args, Mapping):
+        return None
+    original_request = str(delegation_args.get("original_request") or "")
+    audit = contract.get("audit")
+    if (
+        not isinstance(audit, Mapping)
+        or audit.get("original_request_location")
+        != "Grace session history only; not disclosed to ClawOps"
+        or audit.get("original_request_sha256")
+        != hashlib.sha256(original_request.encode("utf-8")).hexdigest()
+    ):
+        return None
+    try:
+        from proactive.loop_contract import contract_fingerprint
+
+        fingerprint_contract = json.loads(json.dumps(dict(contract)))
+        fingerprint_contract.pop("audit", None)
+        fingerprint_contract.pop("authorization", None)
+        fingerprint_contract["original_request"] = original_request
+        compiled_fingerprint = contract_fingerprint(fingerprint_contract)
+    except (ImportError, TypeError, ValueError):
+        return None
+    approval_valid = (
+        provenance.get("source") == "one_time_authenticated_owner_challenge"
+        and provenance.get("scope_binding") == "exact_loop_contract_fingerprint"
+        and provenance.get("internal") is False
+        and str(provenance.get("platform") or "")
+        == str(approval["platform"] or "")
+        and str(provenance.get("requested_message_id") or "")
+        == str(approval["requested_message_id"] or "")
+        and str(provenance.get("approved_message_id") or "")
+        == str(approval["approved_message_id"] or "")
+        and str(provenance.get("user_id_sha256") or "")
+        == str(approval["user_id_sha256"] or "")
+        and str(provenance.get("contract_fingerprint") or "")
+        == compiled_fingerprint
+        == str(approval["contract_fingerprint"] or "")
+        and str(provenance.get("challenge_token_sha256") or "")
+        == hashlib.sha256(
+            str(approval["challenge_token"] or "").encode("utf-8")
+        ).hexdigest()
+    )
+    return normalized if approval_valid else None
+
+
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
     """Render the age of an epoch-seconds timestamp as a coarse, human-
     readable string like ``just now``, ``18h ago``, ``3d ago``.
@@ -5327,6 +5473,106 @@ def reserve_external_create(
             "external_create_reserved",
             {"platform": platform, "url": url},
             run_id=int(run_id),
+        )
+    return None
+
+
+def reserve_facebook_page_create(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    page_url: str,
+    message_sha256: str,
+    image_sha256: str,
+    expected_run_id: Optional[int],
+) -> Optional[str]:
+    """Reserve one exact approved Graph API Page post before HTTP dispatch."""
+    normalized_url = str(page_url or "").strip().rstrip("/")
+    normalized_message_hash = str(message_sha256 or "").strip().lower()
+    normalized_image_hash = str(image_sha256 or "").strip().lower()
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "running"
+            or expected_run_id is None
+            or int(task["current_run_id"] or 0) != int(expected_run_id)
+        ):
+            return (
+                "Facebook Page publish blocked: caller is not the active "
+                "worker run."
+            )
+        active_run = conn.execute(
+            "SELECT status FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if active_run is None or active_run["status"] != "running":
+            return "Facebook Page publish blocked: worker run is not active."
+        approved = grace_task_facebook_page_post_contract(conn, task_id)
+        if approved is None:
+            return (
+                "Facebook Page publish blocked: no exact consumed owner "
+                "approval is bound to this execution contract."
+            )
+        if (
+            approved["page_url"] != normalized_url
+            or approved["message_sha256"] != normalized_message_hash
+            or approved["image_sha256"] != normalized_image_hash
+        ):
+            return (
+                "Facebook Page publish blocked: target or payload hashes do "
+                "not match the approved Loop Contract."
+            )
+        prior = conn.execute(
+            "SELECT state, external_id FROM task_external_effects "
+            "WHERE task_id = ? AND platform = 'facebook' "
+            "AND effect_key = 'create'",
+            (task_id,),
+        ).fetchone()
+        if prior is not None:
+            suffix = (
+                f" (external_id={prior['external_id']})"
+                if prior["external_id"]
+                else ""
+            )
+            return (
+                "Facebook Page publish blocked: durable create state is "
+                f"already {prior['state']}{suffix}; reconcile it and never "
+                "retry this contract."
+            )
+        _upsert_external_effect(
+            conn,
+            task_id=task_id,
+            platform="facebook",
+            effect_key="create",
+            state="create_started",
+            external_id=None,
+            details={
+                "page_url": normalized_url,
+                "transport": "graph_api",
+                "message_sha256": normalized_message_hash,
+                "image_sha256": normalized_image_hash,
+                "reservation": "before_graph_api_post",
+            },
+            run_id=int(expected_run_id),
+            now=now,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "external_effect_reserved",
+            {
+                "platform": "facebook",
+                "effect_key": "create",
+                "state": "create_started",
+                "page_url": normalized_url,
+                "transport": "graph_api",
+            },
+            run_id=int(expected_run_id),
         )
     return None
 
@@ -11685,18 +11931,38 @@ import json
 import sys
 
 payload = json.loads(sys.stdin.read())
-from hermes_cli.config import load_config
-from model_tools import get_tool_definitions
-from tools.registry import registry
+from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
-config = load_config()
-disabled = ((config.get("agent") or {}).get("disabled_toolsets") or [])
-definitions = get_tool_definitions(
-    enabled_toolsets=payload["toolsets"],
-    disabled_toolsets=disabled,
-    quiet_mode=True,
-)
+declared = payload["declared_tools"]
+discover_builtin_tools(tool_names=set(declared))
+if any(registry.get_entry(name) is None for name in declared):
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception:
+        pass
+configured = set()
+for toolset in payload["toolsets"]:
+    if validate_toolset(toolset):
+        configured.update(resolve_toolset(toolset))
+for toolset in payload.get("disabled_toolsets") or []:
+    if not validate_toolset(toolset):
+        continue
+    if toolset.startswith("hermes-"):
+        from toolsets import bundle_non_core_tools
+        configured.difference_update(bundle_non_core_tools(toolset))
+    else:
+        configured.difference_update(resolve_toolset(toolset))
+explicitly_required = set(payload.get("required_tools") or [])
+registered = [name for name in declared if registry.get_entry(name) is not None]
+required = [
+    name for name in declared
+    if name in explicitly_required or name in configured or name in set(registered)
+]
+abstract = [name for name in declared if name not in set(required)]
+eligible = set(required).intersection(configured)
+definitions = registry.get_definitions(eligible, quiet=True)
 available = sorted(
     definition["function"]["name"]
     for definition in definitions
@@ -11705,20 +11971,6 @@ available = sorted(
     and definition["function"].get("name")
 )
 available_set = set(available)
-declared = payload["declared_tools"]
-explicitly_required = set(payload.get("required_tools") or [])
-configured = set()
-for toolset in payload["toolsets"]:
-    if validate_toolset(toolset):
-        configured.update(resolve_toolset(toolset))
-registered = [
-    name for name in declared if registry.get_entry(name) is not None
-]
-required = [
-    name for name in declared
-    if name in explicitly_required or name in configured or name in set(registered)
-]
-abstract = [name for name in declared if name not in set(required)]
 missing = [name for name in required if name not in available_set]
 details = {}
 for name in required:
@@ -11753,6 +12005,7 @@ def _probe_worker_capabilities(
     workspace: str,
     timeout: float = 60.0,
     required_tools: Optional[list[str]] = None,
+    disabled_toolsets: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Resolve the exact new-worker schema in an isolated Python process.
 
@@ -11767,6 +12020,7 @@ def _probe_worker_capabilities(
             "declared_tools": probe_tools,
             "required_tools": required_tools,
             "toolsets": toolsets,
+            "disabled_toolsets": disabled_toolsets or [],
         },
         ensure_ascii=False,
     )
@@ -11881,11 +12135,40 @@ def probe_profile_callable_tools(
         }
     try:
         from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+        import yaml
 
         profile_arg = normalize_profile_name(clean_profile)
         profile_home = resolve_profile_env(profile_arg)
-        toolsets = _resolve_worker_cli_toolsets(profile_home) or []
-    except (FileNotFoundError, OSError, ValueError) as exc:
+        profile_config_path = Path(profile_home) / "config.yaml"
+        profile_config = yaml.safe_load(
+            profile_config_path.read_text(encoding="utf-8")
+        ) or {}
+        if not isinstance(profile_config, Mapping):
+            raise ValueError("profile config must be an object")
+        platform_toolsets = profile_config.get("platform_toolsets")
+        configured_cli = (
+            platform_toolsets.get("cli")
+            if isinstance(platform_toolsets, Mapping)
+            else None
+        )
+        toolsets = (
+            [str(item) for item in configured_cli]
+            if isinstance(configured_cli, list)
+            else ["hermes-cli"]
+        )
+        agent_config = profile_config.get("agent") or {}
+        if not isinstance(agent_config, Mapping):
+            raise ValueError("profile agent config must be an object")
+        disabled = agent_config.get("disabled_toolsets")
+        disabled_toolsets = (
+            [str(item) for item in disabled]
+            if isinstance(disabled, list)
+            else []
+        )
+        if isinstance(disabled, list):
+            disabled_names = set(disabled_toolsets)
+            toolsets = [item for item in toolsets if item not in disabled_names]
+    except (FileNotFoundError, OSError, ValueError, yaml.YAMLError) as exc:
         return {
             "ok": False,
             "available_tools": [],
@@ -11902,6 +12185,7 @@ def probe_profile_callable_tools(
         env=env,
         workspace=os.getcwd(),
         timeout=timeout,
+        disabled_toolsets=disabled_toolsets,
     )
     result.update(
         {

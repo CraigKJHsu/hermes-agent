@@ -80,6 +80,10 @@ _HERMES_CORE_TOOLS = [
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
+    # Task-scoped Facebook Page Graph API. The publish handler independently
+    # enforces consumed Loop approval, exact hashes, active-run auth, and the
+    # durable external-effect ledger.
+    "facebook_page_graph_status", "facebook_page_graph_publish",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -138,6 +142,12 @@ TOOLSETS = {
         "description": "Creative generation tools (images)",
         "tools": ["image_generate"],
         "includes": []
+    },
+
+    "facebook-pages-api": {
+        "description": "Task-scoped Facebook Page Graph API publishing",
+        "tools": ["facebook_page_graph_status", "facebook_page_graph_publish"],
+        "includes": [],
     },
 
     "video_gen": {
