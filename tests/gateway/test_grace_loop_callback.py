@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import time
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ class CallbackAdapter:
     def __init__(self, *, record_outcome=True, send_result=None):
         self.handled = []
         self.sent = []
+        self.sent_images = []
         self._active_sessions = set()
         self.record_outcome = record_outcome
         self.send_result = send_result
@@ -57,6 +59,168 @@ class CallbackAdapter:
             success=True,
             message_id=str(len(self.sent)),
         )
+
+    async def send_image_file(
+        self, chat_id, image_path, caption=None, metadata=None,
+    ):
+        self.sent_images.append((chat_id, image_path, caption, metadata or {}))
+        return SimpleNamespace(
+            success=True,
+            message_id=f"image-{len(self.sent_images)}",
+        )
+
+
+def test_legacy_telegram_content_package_is_delivered_before_callback_closes(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "content-package.db"
+    markdown = tmp_path / "package.md"
+    page = tmp_path / "page.png"
+    cover = tmp_path / "cover.png"
+    unrelated_page = tmp_path / "unrelated-page.png"
+    unrelated_cover = tmp_path / "unrelated-cover.png"
+    markdown.write_text("# Complete package\n\n" + "Body. " * 900, encoding="utf-8")
+    page.write_bytes(b"page-image")
+    cover.write_bytes(b"cover-image")
+    unrelated_page.write_bytes(b"private-page")
+    unrelated_cover.write_bytes(b"private-cover")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    contract = {
+        "external_targets": ["local://telegram-topic-release-package"],
+        "routing": {"task_type": "content_draft"},
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Complete Telegram package",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps(contract),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="package ready",
+            metadata={
+                "artifacts": [str(markdown), str(page), str(cover)],
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": True,
+                    "title": "Untrusted package",
+                    "body": "UNTRUSTED BODY",
+                    "observed_at": int(time.time()),
+                    "assets": [
+                        {
+                            "filename": "page.png",
+                            "label": "untrusted page",
+                            "path": str(unrelated_page),
+                            "sha256": hashlib.sha256(
+                                unrelated_page.read_bytes()
+                            ).hexdigest(),
+                        },
+                        {
+                            "filename": "cover.png",
+                            "label": "untrusted cover",
+                            "path": str(unrelated_cover),
+                            "sha256": hashlib.sha256(
+                                unrelated_cover.read_bytes()
+                            ).hexdigest(),
+                        },
+                    ],
+                },
+            },
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="content-package",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="b" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert "Complete package" in "".join(text for _, text, _ in adapter.sent)
+    assert "UNTRUSTED BODY" not in "".join(text for _, text, _ in adapter.sent)
+    assert [item[2] for item in adapter.sent_images] == ["page.png", "cover.png"]
+    assert all("attachments" in item[1] for item in adapter.sent_images)
+    assert all("unrelated" not in item[1] for item in adapter.sent_images)
+    with kb.connect_closing(db_path) as conn:
+        receipt = kb.get_grace_loop_callback(conn, review_id)
+    assert receipt["state"] == "delivered"
+    assert receipt["user_report_delivered_at"] is not None
+    assert receipt["user_report_chunk_count"] == (
+        len(adapter.sent) + len(adapter.sent_images)
+    )
+
+
+def test_legacy_text_only_telegram_draft_does_not_require_package_delivery(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "text-only-content.db"
+    markdown = tmp_path / "draft.md"
+    markdown.write_text("Text only draft", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    contract = {
+        "external_targets": ["local://telegram-topic-draft"],
+        "routing": {"task_type": "content_draft"},
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Text-only Telegram draft",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps(contract),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="draft ready",
+            metadata={"artifacts": [str(markdown)]},
+        )
+        assert kb.grace_user_facing_delivery_contract(
+            conn, execution_id,
+        ) is None
+        assert kb.grace_inline_content_package_report(
+            conn, execution_id,
+        ) is None
 
 
 class DeferredCallbackAdapter(CallbackAdapter):

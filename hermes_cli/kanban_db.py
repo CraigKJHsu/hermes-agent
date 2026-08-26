@@ -7308,7 +7308,7 @@ def complete_task(
             user_facing_report = normalize_user_facing_report(
                 metadata["user_facing_report"]
             )
-            for report_row in user_facing_report["rows"]:
+            for report_row in user_facing_report.get("rows") or []:
                 if not report_row.get("source_task_id"):
                     report_row["source_task_id"] = task_id
             user_facing_report = normalize_user_facing_report(
@@ -7571,13 +7571,14 @@ def complete_task(
                 run_id=run_id,
             )
         if user_facing_report is not None:
-            _upsert_commerce_user_facing_report(
-                conn,
-                task_id=task_id,
-                run_id=run_id,
-                report=user_facing_report,
-                now=now,
-            )
+            if user_facing_report["kind"] == "commerce_group_status":
+                _upsert_commerce_user_facing_report(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    report=user_facing_report,
+                    now=now,
+                )
             _append_event(
                 conn,
                 task_id,
@@ -7585,7 +7586,7 @@ def complete_task(
                 {
                     "kind": user_facing_report["kind"],
                     "complete": user_facing_report["complete"],
-                    "row_count": len(user_facing_report["rows"]),
+                    "row_count": len(user_facing_report.get("rows") or []),
                     "delivery": user_facing_report["delivery"],
                 },
                 run_id=run_id,
@@ -14900,7 +14901,111 @@ def grace_user_facing_delivery_contract(
         if isinstance(contract, Mapping)
         else None
     )
-    return dict(delivery) if isinstance(delivery, Mapping) else None
+    if isinstance(delivery, Mapping):
+        return dict(delivery)
+    if not _legacy_inline_content_package_contract(contract):
+        return None
+    attachments = list_attachments(conn, execution_task_id.strip())
+    markdown_names = [
+        attachment.filename
+        for attachment in attachments
+        if Path(attachment.filename).suffix.lower() in {".md", ".markdown"}
+    ]
+    image_names = [
+        attachment.filename
+        for attachment in attachments
+        if Path(attachment.filename).suffix.lower()
+        in {".png", ".jpg", ".jpeg", ".webp"}
+    ]
+    if len(markdown_names) != 1 or not image_names:
+        return None
+    return {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "asset_filenames": image_names,
+    }
+
+
+def _legacy_inline_content_package_contract(contract: Any) -> bool:
+    """Recognize pre-contract-field content packages addressed to Telegram."""
+    if not isinstance(contract, Mapping):
+        return False
+    routing = contract.get("routing")
+    task_type = (
+        routing.get("task_type") if isinstance(routing, Mapping) else None
+    )
+    targets = contract.get("external_targets")
+    return bool(
+        task_type == "content_draft"
+        and isinstance(targets, list)
+        and any(
+            isinstance(target, str)
+            and target.startswith("local://telegram-")
+            for target in targets
+        )
+    )
+
+
+def grace_inline_content_package_report(
+    conn: sqlite3.Connection,
+    execution_task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Build the deterministic inline payload for a Telegram content package."""
+    delivery = grace_user_facing_delivery_contract(conn, execution_task_id)
+    if not (
+        isinstance(delivery, Mapping)
+        and delivery.get("required") is True
+        and delivery.get("kind") == "content_package"
+    ):
+        return None
+    task = get_task(conn, execution_task_id)
+    attachments = list_attachments(conn, execution_task_id)
+    markdown = [
+        attachment
+        for attachment in attachments
+        if Path(attachment.filename).suffix.lower() in {".md", ".markdown"}
+    ]
+    images = [
+        attachment
+        for attachment in attachments
+        if Path(attachment.filename).suffix.lower()
+        in {".png", ".jpg", ".jpeg", ".webp"}
+    ]
+    expected_assets = set(delivery.get("asset_filenames") or [])
+    if len(markdown) != 1 or not images or {
+        image.filename for image in images
+    } != expected_assets:
+        return None
+    body_path = Path(markdown[0].stored_path)
+    if not body_path.is_file():
+        return None
+    body = body_path.read_text(encoding="utf-8").strip()
+    if not body:
+        return None
+    report_assets = []
+    for image in images:
+        image_path = Path(image.stored_path)
+        if not image_path.is_file():
+            return None
+        digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        report_assets.append({
+            "filename": image.filename,
+            "label": image.filename,
+            "path": str(image_path.resolve()),
+            "sha256": digest,
+        })
+    from hermes_cli.user_facing_report import normalize_user_facing_report
+
+    return normalize_user_facing_report({
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": True,
+        "title": task.title if task is not None else "Content package",
+        "body": body,
+        "observed_at": max(attachment.created_at for attachment in attachments),
+        "assets": report_assets,
+    })
 
 
 def reserve_grace_user_facing_report_chunk(
@@ -15416,6 +15521,13 @@ def record_grace_loop_callback_outcome(
             if isinstance(execution_contract, Mapping)
             else None
         )
+        execution_task_id = str(
+            callback.get("execution_task_id") or ""
+        ).strip()
+        if not isinstance(user_facing_delivery, Mapping):
+            user_facing_delivery = grace_user_facing_delivery_contract(
+                conn, execution_task_id,
+            )
         execution_routing = (
             execution_contract.get("routing")
             if isinstance(execution_contract, Mapping)
@@ -15431,6 +15543,16 @@ def record_grace_loop_callback_outcome(
             and user_facing_delivery.get("kind") == "commerce_group_status"
         )
         user_facing_report = execution_metadata.get("user_facing_report")
+        if (
+            isinstance(user_facing_delivery, Mapping)
+            and user_facing_delivery.get("kind") == "content_package"
+        ):
+            # Content-package paths and hashes are authority-bearing. Always
+            # rebuild them from this task's durable attachment records rather
+            # than trusting worker-authored metadata.
+            user_facing_report = grace_inline_content_package_report(
+                conn, execution_task_id,
+            )
         if commerce_status_route and not isinstance(
             user_facing_delivery, Mapping
         ):
@@ -15482,67 +15604,65 @@ def record_grace_loop_callback_outcome(
                     "user outcome; continue the read-only reconciliation or "
                     "record the exact approval blocker."
                 )
-            report_observed_at = int(
-                user_facing_report.get("observed_at") or 0
-            )
-            requested_subjects = {
-                item["subject_key"]
-                for item in user_facing_report.get("coverage") or []
-            }
-            durable_coverage = [
-                row
-                for subject in requested_subjects
-                for row in list_commerce_group_coverage(
-                    conn, subject_key=subject,
+            if user_facing_report.get("kind") == "commerce_group_status":
+                report_observed_at = int(
+                    user_facing_report.get("observed_at") or 0
                 )
-            ]
-            execution_task_id = str(
-                callback.get("execution_task_id") or ""
-            ).strip()
-            if (
-                len(durable_coverage) != len(requested_subjects)
-                or any(
-                    not row["complete"]
-                    or row["source_task_id"] != execution_task_id
-                    or int(row["observed_at"] or 0) != report_observed_at
-                    for row in durable_coverage
-                )
-            ):
-                raise ValueError(
-                    "Durable commerce coverage does not match this complete "
-                    "user-facing report; continue reconciliation."
-                )
-            report_rows = {
-                (row["subject_key"], row["destination_id"]): row
-                for row in user_facing_report.get("rows") or []
-            }
-            ledger_rows = {
-                (row["subject_key"], row["destination_id"]): row
-                for subject in requested_subjects
-                for row in list_commerce_group_ledger(
-                    conn, subject_key=subject,
-                )
-            }
-            compared_fields = (
-                "subject_label", "destination_name", "source_listing_id",
-                "status", "status_label", "evidence", "source_task_id",
-                "observed_at", "verified_at",
-            )
-            if (
-                report_rows.keys() != ledger_rows.keys()
-                or any(
-                    any(
-                        report_rows[key].get(field)
-                        != ledger_rows[key].get(field)
-                        for field in compared_fields
+                requested_subjects = {
+                    item["subject_key"]
+                    for item in user_facing_report.get("coverage") or []
+                }
+                durable_coverage = [
+                    row
+                    for subject in requested_subjects
+                    for row in list_commerce_group_coverage(
+                        conn, subject_key=subject,
                     )
-                    for key in report_rows
+                ]
+                if (
+                    len(durable_coverage) != len(requested_subjects)
+                    or any(
+                        not row["complete"]
+                        or row["source_task_id"] != execution_task_id
+                        or int(row["observed_at"] or 0) != report_observed_at
+                        for row in durable_coverage
+                    )
+                ):
+                    raise ValueError(
+                        "Durable commerce coverage does not match this complete "
+                        "user-facing report; continue reconciliation."
+                    )
+                report_rows = {
+                    (row["subject_key"], row["destination_id"]): row
+                    for row in user_facing_report.get("rows") or []
+                }
+                ledger_rows = {
+                    (row["subject_key"], row["destination_id"]): row
+                    for subject in requested_subjects
+                    for row in list_commerce_group_ledger(
+                        conn, subject_key=subject,
+                    )
+                }
+                compared_fields = (
+                    "subject_label", "destination_name", "source_listing_id",
+                    "status", "status_label", "evidence", "source_task_id",
+                    "observed_at", "verified_at",
                 )
-            ):
-                raise ValueError(
-                    "Delivered user-facing report rows do not match the "
-                    "canonical commerce ledger; continue reconciliation."
-                )
+                if (
+                    report_rows.keys() != ledger_rows.keys()
+                    or any(
+                        any(
+                            report_rows[key].get(field)
+                            != ledger_rows[key].get(field)
+                            for field in compared_fields
+                        )
+                        for key in report_rows
+                    )
+                ):
+                    raise ValueError(
+                        "Delivered user-facing report rows do not match the "
+                        "canonical commerce ledger; continue reconciliation."
+                    )
             if not grace_user_facing_report_delivery_matches(
                 callback,
                 event_id=event_id,

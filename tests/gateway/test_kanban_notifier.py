@@ -378,7 +378,25 @@ def test_accepted_grace_review_delivers_parent_execution_artifact(
             conn,
             execution_id,
             summary="execution complete",
-            metadata={"artifacts": [str(artifact_path)]},
+            metadata={
+                "artifacts": [str(artifact_path)],
+                # A worker-authored kind alone must not suppress the durable
+                # artifact when no content-package delivery contract exists.
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": True,
+                    "title": "Untrusted package claim",
+                    "body": "Not contract-backed",
+                    "observed_at": int(time.time()),
+                    "assets": [{
+                        "filename": "untrusted.png",
+                        "label": "untrusted",
+                        "path": "/tmp/untrusted.png",
+                        "sha256": "0" * 64,
+                    }],
+                },
+            },
         )
         assert kb.complete_task(
             conn,
@@ -456,6 +474,62 @@ def test_inline_user_facing_report_keeps_markdown_artifact_audit_only(
 
     assert len(adapter.sent) == 1
     assert "已完成驗收" in adapter.sent[0]["text"]
+    assert adapter.documents == []
+
+
+def test_contract_backed_content_package_never_falls_back_to_partial_artifact(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "incomplete-content-package.db"
+    partial = tmp_path / "partial.txt"
+    partial.write_text("partial", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                '{"user_facing_delivery":{"required":true,'
+                '"kind":"content_package",'
+                '"delivery":"inline_with_attachment",'
+                '"asset_filenames":["missing.png"]}}',
+                "```",
+            ]),
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _insert_loop_delegation(conn, execution_id, review_id)
+        kb.add_notify_sub(
+            conn, task_id=review_id, platform="telegram", chat_id="chat-1",
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="partial package",
+            metadata={"artifacts": [str(partial)]},
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
     assert adapter.documents == []
 
 

@@ -17,6 +17,7 @@ from typing import Any
 
 
 COMMERCE_GROUP_REPORT_KIND = "commerce_group_status"
+CONTENT_PACKAGE_REPORT_KIND = "content_package"
 INLINE_ONLY_DELIVERY = "inline_only"
 SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS = frozenset({
     "carimali-armonia-soft-plus",
@@ -38,6 +39,7 @@ UNRESOLVED_COMMERCE_GROUP_STATUSES = frozenset({
     "unknown",
 })
 MAX_REPORT_JSON_CHARS = 12_000
+MAX_CONTENT_PACKAGE_JSON_CHARS = 80_000
 MAX_FUTURE_SKEW_SECONDS = 300
 
 
@@ -62,7 +64,7 @@ def _unix_seconds(value: Any, field: str) -> int:
     return value
 
 
-def normalize_user_facing_report(raw: Any) -> dict[str, Any]:
+def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Return a validated, JSON-safe user-facing report.
 
     The first supported report kind is deliberately narrow: a durable
@@ -70,9 +72,6 @@ def normalize_user_facing_report(raw: Any) -> dict[str, Any]:
     Grace needs for an inline Telegram table and the coverage facts needed to
     prevent a partial reconstruction from being closed as a complete answer.
     """
-    if not isinstance(raw, Mapping):
-        raise ValueError("metadata.user_facing_report must be an object")
-
     kind = _required_text(raw.get("kind"), "kind")
     if kind != COMMERCE_GROUP_REPORT_KIND:
         raise ValueError(
@@ -291,6 +290,93 @@ def normalize_user_facing_report(raw: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
+    delivery = str(raw.get("delivery") or "inline_with_attachment").strip()
+    if delivery != "inline_with_attachment":
+        raise ValueError(
+            "metadata.user_facing_report content_package delivery must be "
+            "inline_with_attachment"
+        )
+    if raw.get("complete") is not True:
+        raise ValueError(
+            "metadata.user_facing_report content_package complete must be true"
+        )
+    title = _required_text(raw.get("title"), "title")
+    body = _required_text(raw.get("body"), "body")
+    observed_at = _unix_seconds(raw.get("observed_at"), "observed_at")
+    raw_assets = raw.get("assets")
+    if not isinstance(raw_assets, list) or not raw_assets:
+        raise ValueError(
+            "metadata.user_facing_report content_package assets must be a "
+            "non-empty list"
+        )
+    assets: list[dict[str, str]] = []
+    seen_filenames: set[str] = set()
+    for index, raw_asset in enumerate(raw_assets):
+        if not isinstance(raw_asset, Mapping):
+            raise ValueError(
+                f"metadata.user_facing_report assets[{index}] must be an object"
+            )
+        filename = _required_text(
+            raw_asset.get("filename"), f"assets[{index}].filename"
+        )
+        if filename in seen_filenames:
+            raise ValueError(
+                "metadata.user_facing_report contains duplicate asset filename: "
+                + filename
+            )
+        seen_filenames.add(filename)
+        path = _required_text(raw_asset.get("path"), f"assets[{index}].path")
+        digest = _required_text(
+            raw_asset.get("sha256"), f"assets[{index}].sha256"
+        ).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(
+                f"metadata.user_facing_report assets[{index}].sha256 must be "
+                "64 lowercase hexadecimal characters"
+            )
+        assets.append({
+            "filename": filename,
+            "label": _required_text(
+                raw_asset.get("label"), f"assets[{index}].label"
+            ),
+            "path": path,
+            "sha256": digest,
+        })
+    normalized = {
+        "kind": CONTENT_PACKAGE_REPORT_KIND,
+        "delivery": delivery,
+        "complete": True,
+        "title": title,
+        "body": body,
+        "observed_at": observed_at,
+        "assets": assets,
+    }
+    if len(json.dumps(normalized, ensure_ascii=False, sort_keys=True)) > (
+        MAX_CONTENT_PACKAGE_JSON_CHARS
+    ):
+        raise ValueError(
+            "metadata.user_facing_report content_package exceeds the inline "
+            "delivery size limit"
+        )
+    return normalized
+
+
+def normalize_user_facing_report(raw: Any) -> dict[str, Any]:
+    """Return a validated, JSON-safe user-facing report."""
+    if not isinstance(raw, Mapping):
+        raise ValueError("metadata.user_facing_report must be an object")
+    kind = _required_text(raw.get("kind"), "kind")
+    if kind == COMMERCE_GROUP_REPORT_KIND:
+        return _normalize_commerce_group_report(raw)
+    if kind == CONTENT_PACKAGE_REPORT_KIND:
+        return _normalize_content_package_report(raw)
+    raise ValueError(
+        "metadata.user_facing_report kind must be commerce_group_status or "
+        "content_package"
+    )
+
+
 def report_satisfies_user_facing_delivery(
     report: Any,
     delivery_contract: Any,
@@ -302,6 +388,18 @@ def report_satisfies_user_facing_delivery(
         normalized = normalize_user_facing_report(report)
     except ValueError:
         return False
+    if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
+        requested_assets = delivery_contract.get("asset_filenames")
+        return (
+            delivery_contract.get("required") is True
+            and delivery_contract.get("kind") == CONTENT_PACKAGE_REPORT_KIND
+            and delivery_contract.get("delivery") == normalized["delivery"]
+            and isinstance(requested_assets, list)
+            and bool(requested_assets)
+            and set(requested_assets)
+            == {asset["filename"] for asset in normalized["assets"]}
+            and bool(normalized["complete"])
+        )
     requested_subjects = delivery_contract.get("subject_keys")
     if (
         delivery_contract.get("required") is not True
@@ -335,6 +433,17 @@ def report_matches_user_facing_delivery(
         normalized = normalize_user_facing_report(report)
     except ValueError:
         return False
+    if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
+        requested_assets = delivery_contract.get("asset_filenames")
+        return (
+            delivery_contract.get("required") is True
+            and delivery_contract.get("kind") == CONTENT_PACKAGE_REPORT_KIND
+            and delivery_contract.get("delivery") == normalized["delivery"]
+            and isinstance(requested_assets, list)
+            and bool(requested_assets)
+            and set(requested_assets)
+            == {asset["filename"] for asset in normalized["assets"]}
+        )
     requested_subjects = delivery_contract.get("subject_keys")
     if (
         delivery_contract.get("required") is not True
@@ -390,6 +499,12 @@ def render_user_facing_report_chunks(
 ) -> list[str]:
     """Render every report row and coverage gap into bounded chat chunks."""
     normalized = normalize_user_facing_report(report)
+    if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
+        text = f"{normalized['title']}\n\n{normalized['body']}"
+        return [
+            text[offset:offset + max_chars]
+            for offset in range(0, len(text), max_chars)
+        ]
     rows_by_subject: dict[str, list[dict[str, Any]]] = {}
     for row in normalized["rows"]:
         rows_by_subject.setdefault(row["subject_key"], []).append(row)

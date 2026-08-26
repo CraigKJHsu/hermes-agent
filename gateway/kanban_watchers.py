@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import hashlib
 import logging
 import math
 import os
@@ -1507,6 +1508,28 @@ class GatewayKanbanWatchersMixin:
             if isinstance(execution_metadata, dict)
             else None
         )
+        if outcome == "accepted":
+            with kb_module.connect_closing(board=board) as conn:
+                delivery_contract = (
+                    kb_module.grace_user_facing_delivery_contract(
+                        conn, execution_id,
+                    )
+                )
+                canonical_content_package = (
+                    kb_module.grace_inline_content_package_report(
+                        conn, execution_id,
+                    )
+                )
+            if (
+                isinstance(delivery_contract, dict)
+                and delivery_contract.get("kind") == "content_package"
+            ):
+                user_facing_report = canonical_content_package
+            if user_facing_report is not None:
+                execution_metadata = dict(execution_metadata)
+                execution_metadata["user_facing_report"] = user_facing_report
+                execution_evidence["metadata"] = execution_metadata
+                full_snapshot["execution"] = execution_evidence
         blocker_outcomes = {
             "blocked",
             "needs_input",
@@ -1759,18 +1782,41 @@ class GatewayKanbanWatchersMixin:
                     "inline user-facing report does not match its delivery contract"
                 )
             chunks = render_user_facing_report_chunks(user_facing_report)
+            delivery_items: list[tuple[str, Any]] = [
+                ("text", chunk) for chunk in chunks
+            ]
+            if user_facing_report.get("kind") == "content_package":
+                delivery_items.extend(
+                    ("asset", asset)
+                    for asset in user_facing_report.get("assets") or []
+                )
             report_digest = user_facing_report_digest(user_facing_report)
             next_chunk = kb_module.grace_user_facing_report_next_chunk(
                 callback,
                 event_id=event_id,
                 report=user_facing_report,
-                chunk_count=len(chunks),
+                chunk_count=len(delivery_items),
             )
             send_meta = {}
             if callback.get("thread_id"):
                 send_meta["thread_id"] = str(callback["thread_id"])
             send_meta = _callback_send_metadata(send_meta)
-            for chunk_index in range(next_chunk, len(chunks)):
+            for chunk_index in range(next_chunk, len(delivery_items)):
+                item_kind, item_payload = delivery_items[chunk_index]
+                asset_path: Optional[Path] = None
+                if item_kind == "asset":
+                    asset_path = Path(str(item_payload["path"]))
+                    if not asset_path.is_file():
+                        raise RuntimeError(
+                            "inline content-package asset is missing: "
+                            + str(asset_path)
+                        )
+                    digest = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+                    if digest != item_payload["sha256"]:
+                        raise RuntimeError(
+                            "inline content-package asset digest changed: "
+                            + item_payload["filename"]
+                        )
                 chunk_meta = dict(send_meta)
                 chunk_meta["idempotency_key"] = (
                     f"grace-report:{review_id}:{event_id}:"
@@ -1788,7 +1834,7 @@ class GatewayKanbanWatchersMixin:
                         lease_owner=lease_owner,
                         report=user_facing_report,
                         chunk_index=chunk_index,
-                        total_chunks=len(chunks),
+                        total_chunks=len(delivery_items),
                     )
                 if reservation["state"] == "pending" and not reservation[
                     "should_send"
@@ -1797,11 +1843,20 @@ class GatewayKanbanWatchersMixin:
                         "ambiguous prior inline chunk delivery requires reconciliation"
                     )
                 if reservation["state"] != "sent":
-                    send_result = await adapter.send(
-                        str(callback["chat_id"]),
-                        chunks[chunk_index],
-                        metadata=chunk_meta,
-                    )
+                    if item_kind == "text":
+                        send_result = await adapter.send(
+                            str(callback["chat_id"]),
+                            str(item_payload),
+                            metadata=chunk_meta,
+                        )
+                    else:
+                        assert asset_path is not None
+                        send_result = await adapter.send_image_file(
+                            str(callback["chat_id"]),
+                            str(asset_path),
+                            caption=str(item_payload["label"]),
+                            metadata=chunk_meta,
+                        )
                     message_id = _confirmed_grace_provider_message_id(send_result)
                     delivery_ambiguous = bool(
                         getattr(send_result, "delivery_ambiguous", False)
@@ -1817,7 +1872,7 @@ class GatewayKanbanWatchersMixin:
                                     event_id=event_id,
                                     report=user_facing_report,
                                     chunk_index=chunk_index,
-                                    total_chunks=len(chunks),
+                                    total_chunks=len(delivery_items),
                                 )
                         raise RuntimeError(
                             "inline user-facing report was not delivered: "
@@ -1830,7 +1885,7 @@ class GatewayKanbanWatchersMixin:
                             event_id=event_id,
                             report=user_facing_report,
                             chunk_index=chunk_index,
-                            total_chunks=len(chunks),
+                            total_chunks=len(delivery_items),
                             message_id=message_id,
                         )
                 with kb_module.connect_closing(board=board) as conn:
@@ -1844,7 +1899,7 @@ class GatewayKanbanWatchersMixin:
                         session_id=str(callback.get("session_id") or ""),
                         lease_owner=lease_owner,
                         report=user_facing_report,
-                        chunk_count=len(chunks),
+                        chunk_count=len(delivery_items),
                         chunk_index=chunk_index,
                     )
                 callback.update(receipt)
@@ -1947,6 +2002,18 @@ class GatewayKanbanWatchersMixin:
                 parent_run = kb_module.latest_run(conn, parent_id)
                 parent_metadata = getattr(parent_run, "metadata", None) or {}
                 report = parent_metadata.get("user_facing_report")
+                delivery_contract = (
+                    kb_module.grace_user_facing_delivery_contract(
+                        conn, parent_id,
+                    )
+                )
+                if (
+                    isinstance(delivery_contract, dict)
+                    and delivery_contract.get("kind") == "content_package"
+                ):
+                    # Callback owns both text and attachment delivery for a
+                    # contract-backed content package.
+                    return None, None
                 if report is not None:
                     from hermes_cli.user_facing_report import (
                         report_is_inline_only,
