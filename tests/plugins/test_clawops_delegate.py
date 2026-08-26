@@ -1759,6 +1759,16 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     assert challenge["approval_token"] != internal_challenge["approval_token"]
     token = challenge["approval_token"]
 
+    class CompressionSessionDB:
+        def get_compression_tip(self, session_id):
+            assert session_id == "grace-session-1"
+            return "grace-session-compressed"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_state.SessionDB", CompressionSessionDB)
+
     values["HERMES_SESSION_MESSAGE_ID"] = "fresh-approval"
     values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
     approval_args = json.loads(json.dumps(args))
@@ -1766,9 +1776,16 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     approval_args.pop("origin_callback_review_id")
     approval_args.pop("origin_callback_event_id")
     approval_args.pop("origin_callback_board")
+
+    values["HERMES_SESSION_ID"] = "grace-session-after-reset"
+    wrong_lineage = json.loads(handle_clawops_delegate(approval_args))
+    assert wrong_lineage["status"] == "rejected"
+    assert "another session lineage" in wrong_lineage["reason"]
+
+    values["HERMES_SESSION_ID"] = "grace-session-compressed"
     queued = json.loads(handle_clawops_delegate(approval_args))
 
-    assert queued["status"] == "queued"
+    assert queued["status"] == "queued", queued
     with kb.connect_closing(board="secondhand") as conn:
         delegation = kb.get_grace_delegation(
             conn, delegation_id=queued["delegation_id"],
@@ -1776,6 +1793,7 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
         tasks = kb.list_tasks(conn)
     assert delegation["origin_review_task_id"] == review_id
     assert delegation["origin_event_id"] == callback["event_id"]
+    assert delegation["session_id"] == "grace-session-1"
     assert delegation["state"] == "queued"
     assert len(tasks) == 4
 

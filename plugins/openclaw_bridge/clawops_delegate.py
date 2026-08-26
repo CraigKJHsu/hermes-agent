@@ -431,6 +431,29 @@ def _resolve_approval_challenge(token: str) -> tuple[str, dict[str, Any]]:
     return matches[0]
 
 
+def _is_same_compression_lineage(
+    bound_session_id: str,
+    current_session_id: str,
+) -> bool:
+    """Allow a durable approval only across a verified compression chain."""
+    bound = str(bound_session_id or "").strip()
+    current = str(current_session_id or "").strip()
+    if not bound or not current:
+        return False
+    if bound == current:
+        return True
+    try:
+        from hermes_state import SessionDB
+
+        session_db = SessionDB()
+        try:
+            return session_db.get_compression_tip(bound) == current
+        finally:
+            session_db.close()
+    except Exception:
+        return False
+
+
 _CANCEL_INTENT = re.compile(
     r"(?:取消|停止(?:執行|工作|任務)?|停停|先停|不要再執行|\bstop\b|\bcancel\b)",
     re.IGNORECASE,
@@ -838,11 +861,24 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "approval_token; it cannot be treated as a fresh request."
             )
         approval_challenge: dict[str, Any] | None = None
+        approval_bound_session_id = ""
+        approval_session_matches = False
         challenge_lookup_token = approval_token or approval_refresh_token
         if challenge_lookup_token and not internal_turn:
             approval_board, approval_challenge = _resolve_approval_challenge(
                 challenge_lookup_token,
             )
+            approval_bound_session_id = str(
+                approval_challenge.get("session_id") or ""
+            ).strip()
+            approval_session_matches = _is_same_compression_lineage(
+                approval_bound_session_id,
+                session_id,
+            )
+            if not approval_session_matches:
+                raise ValueError(
+                    "Approval token is bound to another session lineage."
+                )
             challenge_review_id = str(
                 approval_challenge.get("origin_review_task_id") or ""
             ).strip()
@@ -907,7 +943,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 platform=platform,
                 chat_id=chat_id,
                 thread_id=thread_id,
-                session_id=session_id,
+                session_id=approval_bound_session_id or session_id,
             )
             if (
                 requested_callback_board
@@ -1209,7 +1245,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 or approval_challenge.get("chat_id") != chat_id
                 or approval_challenge.get("thread_id") != thread_id
                 or approval_challenge.get("session_key") != session_key
-                or approval_challenge.get("session_id") != session_id
+                or not approval_session_matches
                 or approval_challenge.get("user_id_sha256")
                 != expected_user_hash
                 or approval_challenge.get("approval_platform")
@@ -1265,7 +1301,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 or approval_challenge.get("chat_id") != chat_id
                 or approval_challenge.get("thread_id") != thread_id
                 or approval_challenge.get("session_key") != session_key
-                or approval_challenge.get("session_id") != session_id
+                or not approval_session_matches
                 or approval_challenge.get("user_id_sha256")
                 != expected_user_hash
                 or approval_challenge.get("approval_platform")
@@ -1336,7 +1372,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     platform=platform,
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    session_id=session_id,
+                    session_id=approval_bound_session_id or session_id,
                 )
         effective_approved = False
         approval_provenance: dict[str, Any] = {}
@@ -1560,7 +1596,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         chat_id=chat_id,
                         thread_id=thread_id,
                         session_key=session_key,
-                        session_id=session_id,
+                        session_id=(approval_bound_session_id or session_id),
                         resolved_route=contract["routing"]["resolved"],
                         approval_required=True,
                         challenge_token=approval_token,
