@@ -15,15 +15,31 @@ def _nonempty_string(value: Any) -> bool:
 
 
 def _nonempty_string_list(value: Any) -> bool:
-    return isinstance(value, list) and any(str(item).strip() for item in value)
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and bool(item.strip()) for item in value)
+    )
 
 
-def _truthy_check_dict(value: Any) -> bool:
-    return isinstance(value, dict) and any(item is True for item in value.values())
+def _structured_checks(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value) and any(item is True for item in value.values())
+    return _nonempty_string_list(value)
 
 
 def grace_review_accepted(metadata: Any) -> bool:
     review_metadata = metadata if isinstance(metadata, dict) else {}
+    if review_metadata.get("approved") is False:
+        return False
+    explicit_verdicts = [
+        str(review_metadata.get(field) or "").strip().lower()
+        for field in ("review_outcome", "review_result", "review_verdict")
+    ]
+    explicit_verdicts = [value for value in explicit_verdicts if value]
+    if explicit_verdicts:
+        return all(value == "accepted" for value in explicit_verdicts)
+
     criteria = review_metadata.get("acceptance_criteria_met")
     evidence = review_metadata.get("evidence")
     verification_notes = review_metadata.get("verification_notes")
@@ -35,7 +51,7 @@ def grace_review_accepted(metadata: Any) -> bool:
     has_review_evidence = (
         (isinstance(evidence, dict) and bool(evidence))
         or _nonempty_string_list(verification_notes)
-        or _truthy_check_dict(verified_checks)
+        or _structured_checks(verified_checks)
         or (isinstance(evidence_lines, dict) and bool(evidence_lines))
         or _nonempty_string_list(review_metadata.get("authoritative_sources_verified"))
         or _nonempty_string(review_metadata.get("reviewed_file"))
@@ -50,17 +66,12 @@ def grace_review_accepted(metadata: Any) -> bool:
         )
     )
     return (
-        review_metadata.get("review_outcome") == "accepted"
-        or review_metadata.get("review_result") == "accepted"
-        or visual_review_accepted
+        visual_review_accepted
         or (
             review_metadata.get("approved") is True
             and (
                 criteria is True
-                or (
-                    isinstance(criteria, list)
-                    and all(str(item).strip() for item in criteria)
-                )
+                or _nonempty_string_list(criteria)
                 or has_review_evidence
             )
         )

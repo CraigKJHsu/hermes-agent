@@ -9,6 +9,7 @@ from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
     get_session_env,
     override_session_message_text,
+    rebind_turn_vars,
     set_session_vars,
     clear_session_vars,
     _VAR_MAP,
@@ -69,6 +70,34 @@ async def test_message_text_override_is_task_local_and_restored():
         get_session_env("HERMES_SESSION_MESSAGE_TEXT")
         == "核准 expiredtoken"
     )
+
+
+def test_queued_human_turn_clears_internal_callback_provenance():
+    set_session_vars(
+        message_id="callback-anchor",
+        message_text="[SYSTEM: callback]",
+        internal=True,
+        grace_callback_board="default",
+        grace_callback_lease_owner="lease-a",
+        grace_callback_review_id="t_review",
+        grace_callback_event_id="42",
+    )
+
+    rebind_turn_vars(
+        message_id="human-message-5071",
+        message_text="核准 approval-token",
+        internal=False,
+        owner_user_id="kj",
+    )
+
+    assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "human-message-5071"
+    assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == "核准 approval-token"
+    assert get_session_env("HERMES_SESSION_INTERNAL") == "false"
+    assert get_session_env("HERMES_SESSION_OWNER_USER_ID") == "kj"
+    assert get_session_env("HERMES_GRACE_CALLBACK_BOARD") == ""
+    assert get_session_env("HERMES_GRACE_CALLBACK_LEASE_OWNER") == ""
+    assert get_session_env("HERMES_GRACE_CALLBACK_REVIEW_ID") == ""
+    assert get_session_env("HERMES_GRACE_CALLBACK_EVENT_ID") == ""
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):

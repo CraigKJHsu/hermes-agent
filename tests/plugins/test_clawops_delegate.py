@@ -1350,6 +1350,8 @@ def test_callback_outcome_requires_active_internal_callback(
         "HERMES_SESSION_ID": "grace-session-1",
         "HERMES_SESSION_INTERNAL": "true",
         "HERMES_GRACE_CALLBACK_LEASE_OWNER": "test-lease",
+        "HERMES_GRACE_CALLBACK_REVIEW_ID": review_id,
+        "HERMES_GRACE_CALLBACK_EVENT_ID": str(callback["event_id"]),
     }
     monkeypatch.setattr(
         "plugins.openclaw_bridge.clawops_delegate.get_session_env",
@@ -1379,6 +1381,10 @@ def test_callback_outcome_requires_active_internal_callback(
     assert "exactly one pending challenge" in unsupported_block["reason"]
     recorded = json.loads(handle_grace_callback_outcome(args))
     assert recorded["status"] == "recorded"
+    inferred = dict(args)
+    inferred.pop("review_task_id")
+    inferred.pop("event_id")
+    assert json.loads(handle_grace_callback_outcome(inferred))["status"] == "recorded"
     replay = json.loads(handle_grace_callback_outcome(args))
     assert replay["status"] == "recorded"
     changed = json.loads(handle_grace_callback_outcome({

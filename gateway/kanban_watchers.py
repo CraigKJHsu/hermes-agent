@@ -574,7 +574,8 @@ class GatewayKanbanWatchersMixin:
                                 else:
                                     msg = (
                                         f"⚠️ {tag}Grace review task {sub['task_id']} 已完成，"
-                                        "但缺少 review_outcome=accepted；不視為驗收通過，"
+                                        "但缺少可驗證的 accepted verdict 與結構化證據；"
+                                        "不視為驗收通過，"
                                         "已交由 Grace 處理。"
                                     )
                             else:
@@ -723,7 +724,7 @@ class GatewayKanbanWatchersMixin:
                                     artifact_payload = getattr(ev, "payload", None)
                                     if loop_context.get("stage") == "grace_review":
                                         review_metadata = getattr(run, "metadata", None) or {}
-                                        if review_metadata.get("review_outcome") == "accepted":
+                                        if _grace_review_accepted(review_metadata):
                                             (
                                                 artifact_task,
                                                 artifact_payload,
@@ -1858,6 +1859,8 @@ class GatewayKanbanWatchersMixin:
                     "internal_kind": "grace_callback",
                     "grace_callback_board": str(board or ""),
                     "grace_callback_lease_owner": lease_owner,
+                    "grace_callback_review_id": review_id,
+                    "grace_callback_event_id": str(event_id),
                     "execution_assignee": str(
                         callback.get("execution_assignee") or ""
                     ),

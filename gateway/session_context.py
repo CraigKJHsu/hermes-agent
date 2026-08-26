@@ -81,6 +81,12 @@ _GRACE_CALLBACK_BOARD: ContextVar = ContextVar(
 _GRACE_CALLBACK_LEASE_OWNER: ContextVar = ContextVar(
     "HERMES_GRACE_CALLBACK_LEASE_OWNER", default=_UNSET
 )
+_GRACE_CALLBACK_REVIEW_ID: ContextVar = ContextVar(
+    "HERMES_GRACE_CALLBACK_REVIEW_ID", default=_UNSET
+)
+_GRACE_CALLBACK_EVENT_ID: ContextVar = ContextVar(
+    "HERMES_GRACE_CALLBACK_EVENT_ID", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -131,6 +137,8 @@ _VAR_MAP = {
     "HERMES_SESSION_OWNER_USER_ID": _SESSION_OWNER_USER_ID,
     "HERMES_GRACE_CALLBACK_BOARD": _GRACE_CALLBACK_BOARD,
     "HERMES_GRACE_CALLBACK_LEASE_OWNER": _GRACE_CALLBACK_LEASE_OWNER,
+    "HERMES_GRACE_CALLBACK_REVIEW_ID": _GRACE_CALLBACK_REVIEW_ID,
+    "HERMES_GRACE_CALLBACK_EVENT_ID": _GRACE_CALLBACK_EVENT_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -169,6 +177,8 @@ def set_session_vars(
     owner_user_id: str = "",
     grace_callback_board: str = "",
     grace_callback_lease_owner: str = "",
+    grace_callback_review_id: str = "",
+    grace_callback_event_id: str = "",
     cwd: str = "",
     async_delivery: bool = True,
 ) -> list:
@@ -204,6 +214,8 @@ def set_session_vars(
         _SESSION_OWNER_USER_ID.set(owner_user_id),
         _GRACE_CALLBACK_BOARD.set(grace_callback_board),
         _GRACE_CALLBACK_LEASE_OWNER.set(grace_callback_lease_owner),
+        _GRACE_CALLBACK_REVIEW_ID.set(grace_callback_review_id),
+        _GRACE_CALLBACK_EVENT_ID.set(grace_callback_event_id),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -213,6 +225,33 @@ def set_session_vars(
     except Exception:
         pass
     return tokens
+
+
+def rebind_turn_vars(
+    *,
+    message_id: str = "",
+    message_text: str = "",
+    internal: bool = False,
+    owner_user_id: str = "",
+    grace_callback_board: str = "",
+    grace_callback_lease_owner: str = "",
+    grace_callback_review_id: str = "",
+    grace_callback_event_id: str = "",
+) -> None:
+    """Replace provenance that belongs to one turn inside a reused session.
+
+    Queued follow-ups are drained recursively without rebuilding the whole
+    session. Their authorization provenance must still come from the queued
+    event, never from the preceding internal callback turn.
+    """
+    _SESSION_MESSAGE_ID.set(message_id)
+    _SESSION_MESSAGE_TEXT.set(message_text)
+    _SESSION_INTERNAL.set("true" if internal else "false")
+    _SESSION_OWNER_USER_ID.set(owner_user_id)
+    _GRACE_CALLBACK_BOARD.set(grace_callback_board)
+    _GRACE_CALLBACK_LEASE_OWNER.set(grace_callback_lease_owner)
+    _GRACE_CALLBACK_REVIEW_ID.set(grace_callback_review_id)
+    _GRACE_CALLBACK_EVENT_ID.set(grace_callback_event_id)
 
 
 def begin_cron_run_state() -> dict[str, str]:
@@ -270,6 +309,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_OWNER_USER_ID,
         _GRACE_CALLBACK_BOARD,
         _GRACE_CALLBACK_LEASE_OWNER,
+        _GRACE_CALLBACK_REVIEW_ID,
+        _GRACE_CALLBACK_EVENT_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

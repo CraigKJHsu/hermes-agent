@@ -172,6 +172,45 @@ def test_grace_review_accepts_instruction_readback_metadata():
     }) is True
 
 
+def test_grace_review_accepts_ep04_verified_check_list():
+    assert _grace_review_accepted({
+        "approved": True,
+        "verified_checks": [
+            "seven deliverables verified",
+            "page hero and audio brief visually inspected",
+            "external actions were not performed",
+        ],
+        "asset_declarations": {
+            "page_hero": {"dimensions": "1664x936"},
+            "audio_brief": {"dimensions": "1254x1254"},
+        },
+        "publication_approved": False,
+    }) is True
+
+
+def test_grace_review_rejects_malformed_verified_check_list():
+    assert _grace_review_accepted({
+        "approved": True,
+        "verified_checks": [False],
+    }) is False
+    assert _grace_review_accepted({
+        "approved": True,
+        "verified_checks": ["visual inspection passed", None],
+    }) is False
+
+
+def test_grace_review_explicit_rejection_overrides_approved_evidence():
+    assert _grace_review_accepted({
+        "review_outcome": "rejected",
+        "approved": True,
+        "verified_checks": ["visual inspection completed"],
+    }) is False
+    assert _grace_review_accepted({
+        "review_outcome": "accepted",
+        "approved": False,
+    }) is False
+
+
 def _runner(
     adapter,
     *,

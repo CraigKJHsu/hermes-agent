@@ -1740,14 +1740,36 @@ def handle_grace_callback_outcome(
         ).strip()
         if not callback_lease_owner:
             raise ValueError("Internal callback lease owner is missing.")
+        trusted_review_id = get_session_env(
+            "HERMES_GRACE_CALLBACK_REVIEW_ID", "",
+        ).strip()
+        trusted_event_id = get_session_env(
+            "HERMES_GRACE_CALLBACK_EVENT_ID", "",
+        ).strip()
+        supplied_review_id = str(args.get("review_task_id") or "").strip()
+        supplied_event_id = str(args.get("event_id") or "").strip()
+        if trusted_review_id and supplied_review_id not in {"", trusted_review_id}:
+            raise ValueError(
+                "Callback review_task_id conflicts with the trusted callback context."
+            )
+        if trusted_event_id and supplied_event_id not in {"", trusted_event_id}:
+            raise ValueError(
+                "Callback event_id conflicts with the trusted callback context."
+            )
+        review_task_id = trusted_review_id or supplied_review_id
+        event_id = int(trusted_event_id or supplied_event_id or 0)
+        if not review_task_id or event_id <= 0:
+            raise ValueError(
+                "Active callback review_task_id and event_id are required."
+            )
         payload = dict(args.get("payload") or {})
         if str(args.get("outcome_kind") or "") == "approval_blocked":
             payload["board"] = callback_board or "default"
         with kb.connect_closing(board=callback_board or None) as conn:
             kb.rebind_active_grace_callback_session(
                 conn,
-                review_task_id=str(args.get("review_task_id") or ""),
-                event_id=int(args.get("event_id") or 0),
+                review_task_id=review_task_id,
+                event_id=event_id,
                 platform=get_session_env("HERMES_SESSION_PLATFORM", ""),
                 chat_id=get_session_env("HERMES_SESSION_CHAT_ID", ""),
                 thread_id=get_session_env("HERMES_SESSION_THREAD_ID", ""),
@@ -1756,8 +1778,8 @@ def handle_grace_callback_outcome(
             )
             row = kb.record_grace_loop_callback_outcome(
                 conn,
-                review_task_id=str(args.get("review_task_id") or ""),
-                event_id=int(args.get("event_id") or 0),
+                review_task_id=review_task_id,
+                event_id=event_id,
                 platform=get_session_env("HERMES_SESSION_PLATFORM", ""),
                 chat_id=get_session_env("HERMES_SESSION_CHAT_ID", ""),
                 thread_id=get_session_env("HERMES_SESSION_THREAD_ID", ""),

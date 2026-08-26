@@ -7030,6 +7030,19 @@ def complete_task(
         # Normalize into a fresh mapping so callers do not observe an in-place
         # rewrite of their metadata object.
         metadata = dict(metadata)
+        task_scope = conn.execute(
+            "SELECT body FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        task_body = str(task_scope["body"] or "") if task_scope is not None else ""
+        if (
+            "GRACE_LOOP_CONTRACT_STAGE: grace_review" in task_body
+            and grace_review_accepted(metadata)
+        ):
+            # Persist one canonical verdict at the write boundary. Models may
+            # express the same evidence in equivalent structured shapes, but
+            # every downstream consumer should observe the same accepted form.
+            metadata["review_outcome"] = "accepted"
         if "user_facing_report" in metadata:
             from hermes_cli.user_facing_report import (
                 normalize_user_facing_report,
@@ -7132,11 +7145,7 @@ def complete_task(
             )
 
     with write_txn(conn):
-        if (
-            isinstance(metadata, dict)
-            and str(metadata.get("review_outcome") or "").strip().casefold()
-            == "accepted"
-        ):
+        if isinstance(metadata, dict) and grace_review_accepted(metadata):
             review_row = conn.execute(
                 "SELECT body FROM tasks WHERE id = ?",
                 (task_id,),
@@ -14235,7 +14244,7 @@ def validate_accepted_grace_callback_origin(
         trigger is None
         or trigger["task_id"] != review_task_id.strip()
         or trigger["kind"] != "completed"
-        or metadata.get("review_outcome") != "accepted"
+        or not grace_review_accepted(metadata)
     ):
         raise ValueError(
             "Internal continuation requires an accepted Grace-review "

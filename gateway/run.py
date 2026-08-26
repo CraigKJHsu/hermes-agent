@@ -10486,6 +10486,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).get("grace_callback_lease_owner")
                 or ""
             ),
+            grace_callback_review_id=str(
+                (
+                    getattr(event, "internal_context", None) or {}
+                ).get("grace_callback_review_id")
+                or ""
+            ),
+            grace_callback_event_id=str(
+                (
+                    getattr(event, "internal_context", None) or {}
+                ).get("grace_callback_event_id")
+                or ""
+            ),
             telegram_message_path=_telegram_message_path,
         )
         
@@ -14790,6 +14802,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_text: str = "",
         grace_callback_board: str = "",
         grace_callback_lease_owner: str = "",
+        grace_callback_review_id: str = "",
+        grace_callback_event_id: str = "",
         telegram_message_path: Optional[Mapping[str, Any]] = None,
     ) -> list:
         """Set session context variables for the current async task.
@@ -14827,6 +14841,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             owner_user_id=owner_user_id,
             grace_callback_board=grace_callback_board,
             grace_callback_lease_owner=grace_callback_lease_owner,
+            grace_callback_review_id=grace_callback_review_id,
+            grace_callback_event_id=grace_callback_event_id,
             telegram_message_path=dumps_message_path(telegram_message_path),
             async_delivery=_async_delivery,
         )
@@ -19560,6 +19576,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         pass
+
+                from gateway.session_context import rebind_turn_vars
+
+                rebind_turn_vars(
+                    message_id=str(next_message_id or ""),
+                    message_text=str(next_message or ""),
+                    internal=bool(
+                        getattr(pending_event, "internal", False)
+                        if pending_event is not None
+                        else False
+                    ),
+                    owner_user_id=self._configured_external_action_owner(
+                        next_source
+                    ),
+                    grace_callback_board=str(
+                        next_interaction_context.get("grace_callback_board")
+                        or ""
+                    ),
+                    grace_callback_lease_owner=str(
+                        next_interaction_context.get(
+                            "grace_callback_lease_owner"
+                        )
+                        or ""
+                    ),
+                    grace_callback_review_id=str(
+                        next_interaction_context.get("grace_callback_review_id")
+                        or ""
+                    ),
+                    grace_callback_event_id=str(
+                        next_interaction_context.get("grace_callback_event_id")
+                        or ""
+                    ),
+                )
 
                 followup_result = await self._run_agent(
                     message=next_message,
