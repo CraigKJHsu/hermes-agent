@@ -223,6 +223,38 @@ def test_delegate_rejects_explicit_stop_instead_of_creating_cancel_task(
     assert "clawops_cancel" in result["reason"]
 
 
+@pytest.mark.parametrize(
+    ("message", "is_cancel"),
+    [
+        ("停止執行", True),
+        ("建立 task-scoped approval challenge 後停止，等待我核准", False),
+        ("建立 task-scoped approval challenge 後停止並等待我核准", False),
+        ("create an approval challenge then stop and wait for approval", False),
+        ("create an approval challenge then stop, and wait for approval", False),
+        ("建立 task-scoped approval challenge 後停止，並等待我核准", False),
+        ("create an approval challenge then stop waiting for approval", True),
+        (
+            "建立 task-scoped approval challenge\n後停止，等待我核准",
+            False,
+        ),
+        (
+            "建立 task-scoped approval challenge 後停止，等待我核准；"
+            "另外請停止目前任務",
+            True,
+        ),
+    ],
+)
+def test_cancel_classifier_masks_only_approval_checkpoint_stop(
+    message,
+    is_cancel,
+):
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _is_explicit_cancel_message,
+    )
+
+    assert _is_explicit_cancel_message(message) is is_cancel
+
+
 def test_delegate_creates_execution_and_terra_review_cards(tmp_path, monkeypatch):
     registry = tmp_path / "registry.yaml"
     registry.write_text(

@@ -479,18 +479,39 @@ _CANCEL_META_CONTEXT = re.compile(
     r"(?:流程|功能|機制|邏輯|程式(?:碼)?|介面|按鈕|API)",
     re.IGNORECASE,
 )
+_APPROVAL_CHECKPOINT_STOP = re.compile(
+    r"(?:task[-_ ]scoped\s+)?approval\s+challenge\s*"
+    r"(?:後|then)\s*(?P<stop>停止|\bstop\b)"
+    r"(?:\s*[，,]\s*(?:(?:並(?:且)?|and)\s*)?"
+    r"|\s*(?:並(?:且)?|and)\s*)"
+    r"(?:等待|wait(?:ing)?(?:\s+for)?)"
+    r".{0,16}?(?:核准|approval)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _without_approval_checkpoint_stop(message_text: str) -> str:
+    """Remove only the stop token bound to an approval checkpoint."""
+    def _mask(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        start, end = match.span("stop")
+        offset = match.start()
+        return matched[: start - offset] + matched[end - offset :]
+
+    return _APPROVAL_CHECKPOINT_STOP.sub(_mask, message_text)
 
 
 def _is_explicit_cancel_message(message_text: str) -> bool:
     """Fail closed unless the authenticated turn clearly asks to stop work."""
     clean = str(message_text or "").strip()
+    cancel_candidate = _without_approval_checkpoint_stop(clean)
     if (
-        not clean
-        or any(phrase in clean for phrase in _CANCEL_NEGATIONS)
-        or _CANCEL_META_CONTEXT.search(clean) is not None
+        not cancel_candidate
+        or any(phrase in cancel_candidate for phrase in _CANCEL_NEGATIONS)
+        or _CANCEL_META_CONTEXT.search(cancel_candidate) is not None
     ):
         return False
-    return _CANCEL_INTENT.search(clean) is not None
+    return _CANCEL_INTENT.search(cancel_candidate) is not None
 
 
 def _resolve_cancel_board(
