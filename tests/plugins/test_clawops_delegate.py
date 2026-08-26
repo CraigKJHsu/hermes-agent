@@ -8,6 +8,39 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def _isolated_openclaw_loop_backend(monkeypatch):
+    """Delegate contract tests must not depend on the live OpenClaw gateway."""
+
+    def accepted(args, **_kwargs):
+        backend_agent_id = args.get("backend_agent_id") or "missioncrew-executor"
+        return {
+            "task_id": args["task_id"],
+            "status": "queued",
+            "summary": "OpenClaw accepted the Loop Contract.",
+            "artifacts": [],
+            "tool_calls": [{"name": "openclaw_bridge_http"}],
+            "audit_log": ["accepted"],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll.",
+            "protocol_version": "2.0",
+            "protocol_correlated": True,
+            "delegation_id": args["delegation_id"],
+            "attempt_id": args["attempt_id"],
+            "contract_fingerprint": args["contract_fingerprint"],
+            "identity_correlated": True,
+            "backend_run_id": "openclaw-loop-test-run",
+            "backend_agent_id": backend_agent_id,
+            "backend_session_key": f"agent:{backend_agent_id}:subagent:test-loop",
+        }
+
+    monkeypatch.setattr(
+        "proactive.openclaw_async_executor.delegate_loop_contract_to_openclaw",
+        accepted,
+    )
+
+
 def _args():
     return {
         "original_request": "請執行下一步",
@@ -164,6 +197,32 @@ def test_safe_approval_message_allows_only_harmless_framing(
     assert _is_safe_approval_message(message, "abc123") is accepted
 
 
+def test_delegate_rejects_explicit_stop_instead_of_creating_cancel_task(
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_SOURCE": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_MESSAGE_ID": "stop-1",
+        "HERMES_SESSION_MESSAGE_TEXT": "停止執行",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(_nested_args()))
+
+    assert result["status"] == "rejected"
+    assert result["task_created"] is False
+    assert "clawops_cancel" in result["reason"]
+
+
 def test_delegate_creates_execution_and_terra_review_cards(tmp_path, monkeypatch):
     registry = tmp_path / "registry.yaml"
     registry.write_text(
@@ -200,7 +259,9 @@ def test_delegate_creates_execution_and_terra_review_cards(tmp_path, monkeypatch
         review = kb.get_task(conn, result["grace_review_task_id"])
         parents = kb.parent_ids(conn, review.id)
         callback = kb.get_grace_loop_callback(conn, review.id)
-    assert execution.assignee.startswith("clawops-")
+    assert execution.assignee == "openclaw"
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
     assert execution.goal_mode is True
     assert "original user wording is audit evidence only" in execution.body
     assert "請執行下一步" not in execution.body
@@ -210,9 +271,7 @@ def test_delegate_creates_execution_and_terra_review_cards(tmp_path, monkeypatch
     assert review.assignee == "default"
     assert review.status == "todo"
     assert parents == [execution.id]
-    assert execution.session_id == (
-        f"grace-loop:{result['delegation_id']}:execution"
-    )
+    assert execution.session_id is None
     assert review.session_id == (
         f"grace-loop:{result['delegation_id']}:review"
     )
@@ -261,6 +320,115 @@ def test_delegate_accepts_canonical_nested_loop_contract(tmp_path, monkeypatch):
     assert result["project"] == "secondhand_commerce"
     assert result["execution_task_id"]
     assert result["grace_review_task_id"]
+
+
+def test_codex_local_operator_authorizes_external_action_without_telegram_spoof(
+    tmp_path,
+    monkeypatch,
+):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '2'\n"
+        "    topic_name: 二手拍賣\n    project: secondhand_commerce\n"
+        "    aliases: [secondhand_commerce]\n"
+        "    memory_namespace: topic:2/secondhand\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    values = {
+        "HERMES_SESSION_PLATFORM": "codex",
+        "HERMES_SESSION_SOURCE": "codex_local_operator",
+        "HERMES_SESSION_CHAT_ID": "",
+        "HERMES_SESSION_THREAD_ID": "",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "codex:thread:019fc18d",
+        "HERMES_SESSION_ID": "codex-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "codex-turn-1",
+        "HERMES_CODEX_AUTHORIZATION_ID": "codex-auth-1",
+        "HERMES_CODEX_THREAD_ID": "019fc18d",
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    args = _external_listing_args()
+    args["context_alias"] = "secondhand_commerce"
+    args["approved"] = True
+
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    assert result["assigned_agent"] == "openclaw"
+    with kb.connect_closing(db_path) as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+        review = kb.get_task(conn, result["grace_review_task_id"])
+        delegation = conn.execute(
+            "SELECT * FROM grace_delegations WHERE delegation_id = ?",
+            (result["delegation_id"],),
+        ).fetchone()
+        challenge = conn.execute(
+            "SELECT * FROM grace_approval_challenges ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+    assert review.executor_backend == "hermes"
+    assert delegation["platform"] == "telegram"
+    assert delegation["chat_id"] == "chat-1"
+    assert delegation["thread_id"] == "2"
+    assert delegation["approved_message_id"] == "codex-approval:codex-auth-1"
+    assert challenge["requested_message_id"] == "codex-request:codex-auth-1"
+    assert challenge["approved_message_id"] == "codex-approval:codex-auth-1"
+    assert '"source": "codex_local_operator"' in execution.body
+    assert '"requested_by": "codex_local_operator"' in execution.body
+
+
+def test_codex_local_operator_rejects_spoofed_request_instance(
+    tmp_path,
+    monkeypatch,
+):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '2'\n"
+        "    topic_name: 二手拍賣\n    project: secondhand_commerce\n"
+        "    aliases: [secondhand_commerce]\n"
+        "    memory_namespace: topic:2/secondhand\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    values = {
+        "HERMES_SESSION_PLATFORM": "codex",
+        "HERMES_SESSION_SOURCE": "codex_local_operator",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "codex:thread:019fc18d",
+        "HERMES_SESSION_ID": "codex-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "codex-turn-1",
+        "HERMES_CODEX_AUTHORIZATION_ID": "codex-auth-1",
+        "HERMES_CODEX_THREAD_ID": "019fc18d",
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    args = _external_listing_args()
+    args["context_alias"] = "secondhand_commerce"
+    args["approved"] = True
+    args["request_instance_id"] = "model-chosen-instance"
+
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "rejected"
+    assert "authorization-derived instance" in result["reason"]
 
 
 def test_delegate_lifts_canonical_siblings_misnested_inside_scope(
@@ -537,8 +705,19 @@ def test_delegate_records_scope_bound_approval_from_owner_turn(
     assert provenance["contract_fingerprint"] == callback["contract_fingerprint"]
     with kb.connect_closing(tmp_path / "kanban.db") as conn:
         challenge = kb.get_grace_approval_challenge(conn, token)
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=result["delegation_id"]
+        )
     assert challenge["state"] == "consumed"
     assert challenge["approved_message_id"] == "msg-kj-approval"
+    from hermes_cli.telegram_message_path import normalize_message_path
+
+    delegation_path = normalize_message_path(delegation["telegram_message_path"])
+    assert delegation_path["inbound_message_id"] == "msg-kj-request"
+    approval_hop = next(
+        hop for hop in delegation_path["hops"] if hop["stage"] == "human_approval"
+    )
+    assert approval_hop["identifiers"]["approval_message_id"] == "msg-kj-approval"
 
     values["HERMES_SESSION_MESSAGE_ID"] = "msg-kj-reuse"
     values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
@@ -715,6 +894,203 @@ def test_delegate_fails_closed_for_route_with_controlled_external_capabilities(
     assert result["task_created"] is False
 
 
+def test_marketplace_readonly_target_queues_without_external_approval(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-marketplace-readonly",
+        "HERMES_SESSION_MESSAGE_TEXT": "唯讀查核 Marketplace 候選社團",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args["task_type"] = "facebook_marketplace_readonly"
+    args["external_targets"] = [
+        "Facebook Marketplace listing ID 915975414881937"
+    ]
+    args["goal"]["objective"] = "唯讀查核 Marketplace 候選社團"
+    args["scope"]["forbidden"] = [
+        "任何選取、加入、刊登、分享或 Facebook 狀態變更"
+    ]
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+        review = kb.get_task(conn, result["grace_review_task_id"])
+        run = kb.latest_run(conn, result["execution_task_id"])
+    assert execution is not None
+    assert review is not None
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["approval_grant_id"] == ""
+    assert run.metadata["credential_refs"] == []
+
+
+def test_scoped_browser_readonly_marketplace_fallback_is_canonicalized(
+    tmp_path,
+    monkeypatch,
+):
+    listing_id = "915975414881937"
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-browser-readonly-fallback",
+        "HERMES_SESSION_MESSAGE_TEXT": "請接續安全的候選社團只讀階段",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args.update({
+        "task_type": "browser_readonly",
+        "risk_level": "low",
+        "approved": False,
+        "external_targets": [listing_id],
+    })
+    args["goal"] = {
+        "objective": (
+            "只讀檢視 Facebook Marketplace listing "
+            f"{listing_id} 的 More options → List in more places"
+        ),
+        "deliverables": ["候選社團名稱與目前可見狀態"],
+        "non_goals": ["不勾選或送出"],
+    }
+    args["scope"] = {
+        "allowed": [
+            "只讀檢視 Facebook Marketplace listing "
+            f"{listing_id} 的 More options → List in more places"
+        ],
+        "forbidden": [
+            "不勾選任何社團 checkbox",
+            "不按 Post、Publish 或 Submit",
+            "不變更任何 Facebook 外部狀態",
+        ],
+    }
+    args["verification"] = {
+        "checks": ["完整讀取 List in more places 可見候選社團"],
+        "evidence_required": ["可見名稱與狀態"],
+        "acceptance_criteria": ["零 Facebook 狀態變更"],
+    }
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued", result
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+        run = kb.latest_run(conn, result["execution_task_id"])
+        challenge_count = conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0]
+    assert execution is not None
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert challenge_count == 0
+    assert '"task_type": "secondhand_commerce_group_status"' in execution.body
+    assert f"Facebook Marketplace listing ID {listing_id}" in execution.body
+
+
+def test_internal_instructions_artifact_does_not_request_public_approval(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-internal-instructions",
+        "HERMES_SESSION_MESSAGE_TEXT": "只更新本 Topic Instructions",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args["task_type"] = "content_draft"
+    args["goal"]["objective"] = "只更新本 Topic Instructions"
+    args["external_targets"] = [
+        "Internal Topic Instructions artifact only — no external platform action"
+    ]
+    args["scope"]["forbidden"] = ["不得操作任何外部平台"]
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=result["delegation_id"]
+        )
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["approval_grant_id"] == ""
+    assert delegation is not None
+    assert delegation["approval_required"] == 0
+
+
+def test_explicit_zh_internal_targets_do_not_request_public_approval(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-zh-internal-instructions",
+        "HERMES_SESSION_MESSAGE_TEXT": "只更新本 Topic Instructions",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args["task_type"] = "content_draft"
+    args["goal"]["objective"] = "只更新本 Topic Instructions"
+    args["external_targets"] = [
+        "Facebook Page（僅修訂貼文文案結構與規則，不登入或操作）",
+        "Gemini Notebook（僅產出貼入用 Prompt，不登入或操作）",
+        "Podcast Hosting／Apple Podcasts（僅產出 Title 與 Description，不上架或操作）",
+        "Spotify／Podcast Hosting（僅產出可貼入 Description 與精簡 Instructions 規則，不登入或上架）",
+        "Facebook Page（僅校正內部文案與主圖資料，不登入、編輯或發布）",
+    ]
+    args["scope"]["forbidden"] = ["不得操作任何外部平台"]
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=result["delegation_id"]
+        )
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["allowed_tools"] == ["read", "write", "web_search"]
+    assert delegation is not None
+    assert delegation["approval_required"] == 0
+
+
 def test_delegate_retry_resumes_same_saga_after_partial_failure(
     tmp_path,
     monkeypatch,
@@ -734,7 +1110,7 @@ def test_delegate_retry_resumes_same_saga_after_partial_failure(
     _configure_secondhand_context(tmp_path, monkeypatch, values)
     args = _external_listing_args()
     from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
-    from proactive import grace_task_compiler
+    from proactive import openclaw_async_executor
 
     challenge = json.loads(handle_clawops_delegate(args))
     token = challenge["approval_token"]
@@ -742,7 +1118,7 @@ def test_delegate_retry_resumes_same_saga_after_partial_failure(
     values["HERMES_SESSION_MESSAGE_ID"] = "msg-saga-approval"
     values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
 
-    original_subscribe = grace_task_compiler.subscribe_clawops_task
+    original_subscribe = openclaw_async_executor.kb.add_notify_sub
     calls = {"count": 0}
 
     def fail_once(*call_args, **call_kwargs):
@@ -752,21 +1128,17 @@ def test_delegate_retry_resumes_same_saga_after_partial_failure(
         return original_subscribe(*call_args, **call_kwargs)
 
     monkeypatch.setattr(
-        grace_task_compiler, "subscribe_clawops_task", fail_once,
+        openclaw_async_executor.kb, "add_notify_sub", fail_once,
     )
     first = json.loads(handle_clawops_delegate(args))
     assert first["status"] == "rejected"
     assert "simulated subscription failure" in first["reason"]
     with kb.connect_closing(tmp_path / "kanban.db") as conn:
         tasks_after_failure = kb.list_tasks(conn)
-    assert len(tasks_after_failure) == 2
-    assert next(
-        task for task in tasks_after_failure
-        if task.title.startswith("ClawOps:")
-    ).status == "blocked"
+    assert tasks_after_failure == []
 
     monkeypatch.setattr(
-        grace_task_compiler, "subscribe_clawops_task", original_subscribe,
+        openclaw_async_executor.kb, "add_notify_sub", original_subscribe,
     )
     values["HERMES_SESSION_MESSAGE_ID"] = "msg-saga-retry"
     retry = json.loads(handle_clawops_delegate(args))
@@ -843,14 +1215,14 @@ def test_delegate_rejects_route_drift_between_authorization_and_enqueue(
     _configure_secondhand_context(tmp_path, monkeypatch, values)
     args = _external_listing_args()
     from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
-    from proactive import clawops_intake
+    from plugins.openclaw_bridge import clawops_delegate
 
     challenge = json.loads(handle_clawops_delegate(args))
     token = challenge["approval_token"]
     args["approval_token"] = token
     values["HERMES_SESSION_MESSAGE_ID"] = "msg-drift-approval"
     values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
-    original_route = clawops_intake.route_clawops_objective
+    original_route = clawops_delegate.route_clawops_objective
 
     def drifted_route(*route_args, **route_kwargs):
         route = original_route(*route_args, **route_kwargs)
@@ -859,17 +1231,17 @@ def test_delegate_rejects_route_drift_between_authorization_and_enqueue(
         return changed
 
     monkeypatch.setattr(
-        clawops_intake, "route_clawops_objective", drifted_route,
+        clawops_delegate, "route_clawops_objective", drifted_route,
     )
     rejected = json.loads(handle_clawops_delegate(args))
     assert rejected["status"] == "rejected"
-    assert "route changed after contract authorization" in rejected["reason"]
+    assert "bound to another contract" in rejected["reason"]
     with kb.connect_closing(tmp_path / "kanban.db") as conn:
         tasks = kb.list_tasks(conn)
     assert tasks == []
 
     monkeypatch.setattr(
-        clawops_intake, "route_clawops_objective", original_route,
+        clawops_delegate, "route_clawops_objective", original_route,
     )
     values["HERMES_SESSION_MESSAGE_ID"] = "msg-drift-retry"
     resumed = json.loads(handle_clawops_delegate(args))
@@ -919,9 +1291,11 @@ def test_model_visible_schema_exposes_required_nested_parameters():
     ]
     assert "goal" in CLAWOPS_DELEGATE_PARAMETERS["required"]
     assert "contract_fingerprint" not in CLAWOPS_DELEGATE_PARAMETERS["properties"]
-    assert CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"] == list(
-        registered_worker_task_types()
-    )
+    assert CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"] == [
+        *registered_worker_task_types(),
+        "secondhand_commerce_group_status",
+    ]
+    assert "user_facing_delivery" in CLAWOPS_DELEGATE_PARAMETERS["properties"]
     assert "listing" not in CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"]
     validate(_nested_args(), CLAWOPS_DELEGATE_PARAMETERS)
 

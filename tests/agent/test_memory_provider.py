@@ -1,6 +1,7 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
+import threading
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -384,6 +385,32 @@ class TestMemoryManager:
         assert p2.initialized
         assert p1._init_kwargs["session_id"] == "test-123"
         assert p1._init_kwargs["platform"] == "cli"
+
+    def test_initialize_all_bounded_times_out_without_blocking(self):
+        """A wedged optional provider cannot block first-turn startup."""
+        release = threading.Event()
+        started = threading.Event()
+
+        class BlockingProvider(FakeMemoryProvider):
+            def initialize(self, session_id, **kwargs):
+                started.set()
+                release.wait(timeout=2)
+                super().initialize(session_id, **kwargs)
+
+        mgr = MemoryManager()
+        provider = BlockingProvider("blocking")
+        mgr.add_provider(provider)
+
+        completed = mgr.initialize_all_bounded(
+            session_id="slow-session",
+            platform="telegram",
+            timeout_seconds=0.01,
+        )
+
+        assert started.is_set()
+        assert completed is False
+        assert provider.initialized is False
+        release.set()
 
     # -- Error resilience ---------------------------------------------------
 

@@ -7,8 +7,10 @@ from plugins.openclaw_bridge.tools import (
     pre_gateway_dispatch,
 )
 from plugins.openclaw_bridge.clawops_delegate import (
+    CLAWOPS_CANCEL_SCHEMA,
     CLAWOPS_DELEGATE_SCHEMA,
     GRACE_CALLBACK_OUTCOME_SCHEMA,
+    handle_clawops_cancel,
     handle_clawops_delegate,
     handle_grace_callback_outcome,
 )
@@ -28,6 +30,18 @@ def register(ctx) -> None:
             "Questions and explanations must be answered by Grace without this tool."
         ),
         emoji="GC",
+    )
+    ctx.register_tool(
+        name="clawops_cancel",
+        toolset="openclaw",
+        schema=CLAWOPS_CANCEL_SCHEMA,
+        handler=handle_clawops_cancel,
+        description=(
+            "When KJ explicitly asks to stop an existing ClawOps task, cancel "
+            "that exact lane-bound Loop directly. Never create a new delegated "
+            "task whose objective is to cancel another task."
+        ),
+        emoji="STOP",
     )
     ctx.register_tool(
         name="grace_callback_outcome",

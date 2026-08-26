@@ -1,0 +1,5 @@
+[    4337ms] [ERROR] Failed to load resource: the server responded with a status of 401 (Unauthorized) @ http://127.0.0.1:9127/api/auth/me:0
+[    7807ms] [WARNING] task queue exceeded allotted deadline by 77ms @ http://127.0.0.1:9127/assets/index-BwgPCL_a.js:135
+[  470242ms] [WARNING] [chat] PTY WebSocket closed code=1012 @ http://127.0.0.1:9127/assets/index-BwgPCL_a.js:233
+[  470621ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:9127/api/status:0
+[  480621ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:9127/api/status:0

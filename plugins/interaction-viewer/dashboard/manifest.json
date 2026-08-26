@@ -1,0 +1,14 @@
+{
+  "name": "interaction-viewer",
+  "label": "Interaction Timeline",
+  "description": "Read-only provenance timeline for human, agent handoff, and execution interactions.",
+  "icon": "MessagesSquare",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/interactions",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

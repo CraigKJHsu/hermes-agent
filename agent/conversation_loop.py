@@ -62,10 +62,117 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+import proactive.prompt_policy as _prompt_policy
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+# A fresh-session prompt build performs several lazy imports and filesystem
+# reads.  Keep it off the caller after a bounded wait so one wedged import or
+# mount cannot hold an entire gateway turn until the generic 30-minute
+# inactivity timeout.  The lock also prevents a timed-out build from spawning
+# one additional stuck builder per new session; while the original daemon
+# thread is still alive, later fresh sessions immediately use the safe prompt.
+_SYSTEM_PROMPT_BUILD_LOCK = threading.Lock()
+_SYSTEM_PROMPT_BUILD_TIMEOUT_ENV = "HERMES_SYSTEM_PROMPT_BUILD_TIMEOUT"
+_SYSTEM_PROMPT_BUILD_TIMEOUT_DEFAULT_S = 60.0
+
+
+class _SystemPromptBuildTimeout(TimeoutError):
+    """Raised when initial system-prompt enrichment misses its deadline."""
+
+
+def _system_prompt_build_timeout_seconds() -> float:
+    raw = os.getenv(_SYSTEM_PROMPT_BUILD_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _SYSTEM_PROMPT_BUILD_TIMEOUT_DEFAULT_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; using %.0fs",
+            _SYSTEM_PROMPT_BUILD_TIMEOUT_ENV,
+            raw,
+            _SYSTEM_PROMPT_BUILD_TIMEOUT_DEFAULT_S,
+        )
+        return _SYSTEM_PROMPT_BUILD_TIMEOUT_DEFAULT_S
+
+
+def _touch_prompt_activity(agent, description: str) -> None:
+    try:
+        agent._touch_activity(description)
+    except Exception:
+        # Activity reporting is diagnostic. It must never become another
+        # reason a first turn cannot start.
+        pass
+
+
+def _build_system_prompt_bounded(agent, system_message) -> str:
+    """Build a fresh prompt with a hard caller-side deadline.
+
+    Python cannot safely kill a thread blocked in an import or filesystem
+    syscall.  The builder therefore runs on one daemon thread guarded by a
+    process-wide slot.  On timeout the caller proceeds with a policy-verified
+    minimal prompt; the late result is ignored and cannot mutate
+    ``agent._cached_system_prompt`` because assignment happens only in the
+    caller.
+    """
+    timeout_s = _system_prompt_build_timeout_seconds()
+    if timeout_s <= 0:
+        return agent._build_system_prompt(system_message)
+
+    # Never queue another builder behind a known-stuck one. A healthy
+    # concurrent build gets a short chance to finish before we fall back.
+    slot_wait_s = min(timeout_s, 1.0)
+    if not _SYSTEM_PROMPT_BUILD_LOCK.acquire(timeout=slot_wait_s):
+        raise _SystemPromptBuildTimeout(
+            "another system-prompt build is still in progress"
+        )
+
+    done = threading.Event()
+    outcome: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            outcome["prompt"] = agent._build_system_prompt(system_message)
+        except BaseException as exc:  # propagated on the caller thread
+            outcome["error"] = exc
+        finally:
+            _SYSTEM_PROMPT_BUILD_LOCK.release()
+            done.set()
+
+    thread = threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"system-prompt-build-{str(getattr(agent, 'session_id', ''))[:20]}",
+    )
+    thread.start()
+    if not done.wait(timeout=timeout_s):
+        raise _SystemPromptBuildTimeout(
+            f"system-prompt build exceeded {timeout_s:.1f}s"
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    return str(outcome.get("prompt") or "")
+
+
+def _minimal_safe_system_prompt(system_message) -> str:
+    """Return a small recovery prompt; active Grace policy is added later."""
+    parts = [
+        "You are Hermes Agent. Follow the authenticated user's current request "
+        "and use the available tools to complete it. Do not claim that an "
+        "action completed without tool or runtime evidence.",
+    ]
+    if isinstance(system_message, str) and system_message.strip():
+        parts.append(system_message.strip())
+    parts.append(
+        "[Runtime recovery mode] Optional system-prompt enrichment timed out. "
+        "Continue with the live tool schemas and the mandatory Grace operating "
+        "policy below. Treat missing optional memory or skill-index context as "
+        "unknown rather than inventing it."
+    )
+    return "\n\n".join(parts)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -331,18 +438,39 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         )
 
     # First turn of a new session (or recovering from a broken stored
-    # prompt) — build from scratch.
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    # prompt) — build from scratch.  This used to run synchronously with no
+    # deadline or activity boundary; a wedged lazy import left gateway turns
+    # at iteration=0/tool=none until the 30-minute inactivity watchdog fired.
+    _touch_prompt_activity(agent, "building initial system prompt")
+    agent._system_prompt_fallback_used = False
     try:
-        from proactive.prompt_policy import ensure_active_policy_prompt
-
-        agent._cached_system_prompt = ensure_active_policy_prompt(agent._cached_system_prompt)
+        agent._cached_system_prompt = _build_system_prompt_bounded(
+            agent, system_message
+        )
+    except _SystemPromptBuildTimeout as exc:
+        agent._system_prompt_fallback_used = True
+        logger.error(
+            "Initial system-prompt build timed out for session=%s: %s. "
+            "Continuing with a policy-verified minimal prompt.",
+            agent.session_id or "none",
+            exc,
+        )
+        agent._cached_system_prompt = _minimal_safe_system_prompt(system_message)
+    try:
+        agent._cached_system_prompt = _prompt_policy.ensure_active_policy_prompt(
+            agent._cached_system_prompt
+        )
     except Exception as exc:
         logger.warning("Failed to inject active Grace prompt policy", exc_info=True)
         raise RuntimeError(
             "Active Grace prompt policy could not be verified; refusing to "
             "start an unprotected model turn."
         ) from exc
+    _touch_prompt_activity(
+        agent,
+        "initial system prompt ready"
+        + (" (safe fallback)" if agent._system_prompt_fallback_used else ""),
+    )
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
@@ -390,6 +518,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted Model/Provider lines are stale."""
 
+    # Recovery prompts are intentionally one-turn-only. They may have been
+    # persisted by the early crash-resilience session path, but must never
+    # become a permanent prefix-cache snapshot for a long-lived topic.
+    if "[Runtime recovery mode]" in str(prompt or ""):
+        return False
+
     def line_value(label: str) -> str:
         prefix = f"{label}:"
         value = ""
@@ -412,9 +546,7 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # If policy changes, old long-lived gateway sessions must rebuild their
     # prompt automatically instead of silently continuing with stale rules.
     try:
-        from proactive.prompt_policy import stored_prompt_matches_active_policy
-
-        if not stored_prompt_matches_active_policy(prompt):
+        if not _prompt_policy.stored_prompt_matches_active_policy(prompt):
             return False
     except Exception:
         logger.warning("Failed to compare active Grace prompt policy", exc_info=True)

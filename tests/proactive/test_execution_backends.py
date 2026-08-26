@@ -35,7 +35,7 @@ def test_routes_isolated_readonly_browser_to_openclaw_with_audit_evidence():
 
     assert decision["selected_backend"] == "openclaw"
     assert decision["decided_at"] == 123
-    assert decision["mode"] == "shadow"
+    assert decision["mode"] == "enforced"
     assert decision["selection_reason"].endswith("openclaw")
     assert decision["candidates"][0] == {
         "backend": "openclaw",
@@ -105,10 +105,10 @@ def test_preferred_backend_does_not_override_missing_capabilities():
     assert decision["candidates"][0]["eligible"] is False
     assert "missing_capabilities:code,tests" in decision["candidates"][0]["reasons"]
     assert decision["selected_backend"] is None
-    codex = next(
-        item for item in decision["candidates"] if item["backend"] == "codex"
-    )
-    assert "disabled" in codex["reasons"]
+    assert [item["backend"] for item in decision["candidates"]] == [
+        "hermes",
+        "openclaw",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -171,12 +171,12 @@ def test_semantic_class_prevents_capability_only_fallback():
         decision,
         failed_backend="openclaw",
     ) is None
-    assert decision["candidates"][1]["semantic_compatible"] is False
-    assert "semantic_class_mismatch:browser_readonly" in decision["candidates"][1]["reasons"]
+    assert len(decision["candidates"]) == 1
 
 
 def test_semantic_fallback_selects_next_compatible_backend():
     registry = load_backend_registry()
+    registry["policy"]["selection_order"] = ["codex", "hermes", "openclaw"]
     registry["backends"]["codex"]["enabled"] = True
     registry["backends"]["codex"]["semantic_classes"].append("analysis")
     requirements = ExecutionRequirements.build(
@@ -193,21 +193,47 @@ def test_semantic_fallback_selects_next_compatible_backend():
     ) == "hermes"
 
 
+def test_target_policy_prefers_openclaw_for_verified_code_capability():
+    requirements = ExecutionRequirements.build(
+        capabilities=["code", "local_files", "tests", "isolated_workspace"],
+        semantic_class="local_code",
+        risk_level="medium",
+        credential_policy="agent_scoped",
+        workspace_policy="dedicated",
+        session_policy="ephemeral",
+        max_runtime_seconds=900,
+    )
+
+    decision = route_execution_backend(
+        requirements,
+        registry=load_backend_registry(),
+        now=904,
+    )
+
+    assert decision["selected_backend"] == "openclaw"
+    assert decision["candidates"][0]["backend"] == "openclaw"
+    assert decision["candidates"][0]["eligible"] is True
+    assert decision["fallback_order"] == []
+
+
 def test_shadow_report_compares_outcome_cost_duration_and_evidence():
     requirements = ExecutionRequirements.build(
         capabilities=["analysis"],
         semantic_class="analysis",
     )
+    registry = load_backend_registry()
+    registry["shadow_mode"] = True
+    registry["policy"]["selection_order"] = ["openclaw", "hermes"]
     decision = route_execution_backend(
         requirements,
-        registry=load_backend_registry(),
+        registry=registry,
         now=902,
     )
 
     report = build_shadow_comparison_report(
         decision,
         {
-            "codex": {
+            "openclaw": {
                 "status": "succeeded",
                 "duration_ms": 1200,
                 "cost_units": 3.5,
@@ -222,7 +248,7 @@ def test_shadow_report_compares_outcome_cost_duration_and_evidence():
         },
     )
 
-    assert report["selected_backend"] == "hermes"
+    assert report["selected_backend"] == "openclaw"
     assert report["summary"] == {
         "observed_backends": 2,
         "comparable_backends": 1,

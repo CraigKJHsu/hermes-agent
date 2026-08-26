@@ -65,6 +65,9 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _SESSION_MESSAGE_TEXT: ContextVar = ContextVar(
     "HERMES_SESSION_MESSAGE_TEXT", default=_UNSET
 )
+_TELEGRAM_MESSAGE_PATH: ContextVar = ContextVar(
+    "HERMES_TELEGRAM_MESSAGE_PATH", default=_UNSET
+)
 # Security provenance for task-scoped external approvals.  Internal gateway
 # callbacks deliberately reuse the originating route and user id, so user_id
 # alone cannot prove that the current turn is a fresh human authorization.
@@ -123,6 +126,7 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_MESSAGE_TEXT": _SESSION_MESSAGE_TEXT,
+    "HERMES_TELEGRAM_MESSAGE_PATH": _TELEGRAM_MESSAGE_PATH,
     "HERMES_SESSION_INTERNAL": _SESSION_INTERNAL,
     "HERMES_SESSION_OWNER_USER_ID": _SESSION_OWNER_USER_ID,
     "HERMES_GRACE_CALLBACK_BOARD": _GRACE_CALLBACK_BOARD,
@@ -160,6 +164,7 @@ def set_session_vars(
     session_id: str = "",
     message_id: str = "",
     message_text: str = "",
+    telegram_message_path: str = "",
     internal: bool = False,
     owner_user_id: str = "",
     grace_callback_board: str = "",
@@ -194,6 +199,7 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_MESSAGE_TEXT.set(message_text),
+        _TELEGRAM_MESSAGE_PATH.set(telegram_message_path),
         _SESSION_INTERNAL.set("true" if internal else "false"),
         _SESSION_OWNER_USER_ID.set(owner_user_id),
         _GRACE_CALLBACK_BOARD.set(grace_callback_board),
@@ -259,6 +265,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_MESSAGE_TEXT,
+        _TELEGRAM_MESSAGE_PATH,
         _SESSION_INTERNAL,
         _SESSION_OWNER_USER_ID,
         _GRACE_CALLBACK_BOARD,

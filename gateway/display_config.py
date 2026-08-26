@@ -53,6 +53,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Prefix Telegram conversational/delegation messages with their trusted
+    # interaction class and agent path. Disabled globally; operators opt in
+    # per platform because the labels intentionally add visible chat chrome.
+    "interaction_labels": False,
 }
 
 # ---------------------------------------------------------------------------

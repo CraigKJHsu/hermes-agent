@@ -196,6 +196,57 @@ def test_show_explicit_task_id(worker_env):
     assert d["task"]["id"] == other
 
 
+def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="OpenClaw execution",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\ncontract",
+            assignee="openclaw",
+            executor_backend="openclaw",
+        )
+        claimed_parent = kb.claim_task(conn, parent)
+        assert claimed_parent is not None and claimed_parent.current_run_id
+        evidence = {
+            "listing": {"listingId": "915975414881937"},
+            "destinations": [{"name": f"group-{index}"} for index in range(10)],
+        }
+        assert kb.complete_task(
+            conn,
+            parent,
+            result="large wrapped backend result",
+            summary="read-only evidence complete",
+            metadata={
+                "acceptance_evidence": evidence,
+                "external_effects": [],
+            },
+            expected_run_id=int(claimed_parent.current_run_id),
+        )
+        review = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\ncontract",
+            assignee="default",
+            parents=[parent],
+        )
+        kb.recompute_ready(conn)
+        claimed_review = kb.claim_task(conn, review)
+        assert claimed_review is not None
+    finally:
+        conn.close()
+
+    shown = json.loads(kt._handle_show({"task_id": review}))
+
+    assert shown["view"] == "grace_review_compact"
+    assert "worker_context" not in shown
+    assert shown["parent_evidence"][0]["acceptance_evidence"] == evidence
+    assert shown["parent_evidence"][0]["external_effects"] == []
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

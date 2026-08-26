@@ -28,12 +28,13 @@
     "max_runtime_seconds": { "type": "integer", "minimum": 1 },
     "output_format": { "type": "string", "minLength": 1 },
     "audit_required": { "type": "boolean" },
-    "protocol_version": { "type": "string", "enum": ["1.0", "2.0"] },
+    "protocol_version": { "type": "string", "enum": ["1.0", "2.0", "3.0-draft"] },
     "delegation_id": { "type": "string", "minLength": 1 },
     "attempt_id": { "type": "string", "minLength": 1 },
     "contract_fingerprint": { "type": "string", "minLength": 1 },
     "project": { "type": "string", "minLength": 1 },
     "topic_id": { "type": "string", "minLength": 1 },
+    "task_type": { "type": "string", "minLength": 1 },
     "executor_backend": { "type": "string", "enum": ["hermes", "codex", "openclaw"] },
     "executor_profile": { "type": "string", "minLength": 1 },
     "backend_agent_id": { "type": "string", "minLength": 1 },
@@ -47,7 +48,14 @@
     "target_url": { "type": "string", "format": "uri", "minLength": 1 },
     "start_idempotency_key": { "type": "string", "minLength": 1 },
     "backend_run_id": { "type": "string", "minLength": 1 },
-    "dry_run": { "type": "boolean" }
+    "backend_session_key": { "type": "string", "minLength": 1 },
+    "dry_run": { "type": "boolean" },
+    "scope": { "type": "object" },
+    "context_packet": { "type": "object" },
+    "confirmation_policy": { "type": "object" },
+    "result_contract": { "type": "object" },
+    "loop_contract": { "type": "object" },
+    "message_path": { "type": "object" }
   },
   "allOf": [
     {
@@ -71,6 +79,35 @@
           "credential_refs",
           "idempotency_key",
           "dry_run"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": { "protocol_version": { "const": "3.0-draft" } },
+        "required": ["protocol_version"]
+      },
+      "then": {
+        "required": [
+          "delegation_id",
+          "attempt_id",
+          "contract_fingerprint",
+          "project",
+          "topic_id",
+          "task_type",
+          "executor_backend",
+          "executor_profile",
+          "backend_agent_id",
+          "external_effect_budget",
+          "workspace_policy",
+          "session_policy",
+          "credential_refs",
+          "idempotency_key",
+          "dry_run",
+          "scope",
+          "context_packet",
+          "confirmation_policy",
+          "result_contract"
         ]
       }
     }

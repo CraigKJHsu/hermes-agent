@@ -24,6 +24,7 @@ TASK_TYPE_ALIASES = {
     "browser_republish": "browser_publish",
     "cross_platform_listing": "browser_publish",
     "secondhand_commerce_cross_platform_listing": "browser_publish",
+    "secondhand_commerce_group_status": "research",
     "facebook_existing_listing_group_distribution": "browser_publish",
     "group_distribution": "browser_publish",
 }
@@ -56,6 +57,7 @@ def resolved_route_binding(route: Mapping[str, Any]) -> dict[str, Any]:
                 "risk_level",
                 "agent_assignment",
                 "assignment",
+                "backend_role_card",
                 "approval_checklist",
                 "output_schema",
             )
@@ -216,6 +218,21 @@ def route_clawops_objective(
         risk_level=risk,
     )
 
+    agent_assignment = _agent_assignment(
+        agent_id,
+        (agents or {}).get(agent_id) if isinstance(agents, Mapping) else None,
+    )
+    assignment = _assignment(
+        worker_id,
+        worker,
+        approval_required=approval_required,
+        effective_risk_level_limit=(risk if risk_authorization else risk_limit),
+    )
+    approval_checklist = str(
+        (assign or {}).get("approval_checklist") or worker.get("approval_checklist") or ""
+    )
+    output_schema = worker.get("output_schema") or {}
+
     return {
         "status": "routed",
         "objective": clean_objective,
@@ -223,16 +240,20 @@ def route_clawops_objective(
         "task_type": canonical_task_type,
         "requested_task_type": requested_task_type,
         "risk_level": risk,
-        "agent_assignment": _agent_assignment(agent_id, (agents or {}).get(agent_id) if isinstance(agents, Mapping) else None),
-        "assignment": _assignment(
-            worker_id,
-            worker,
-            approval_required=approval_required,
-            effective_risk_level_limit=(risk if risk_authorization else risk_limit),
+        "agent_assignment": agent_assignment,
+        "assignment": assignment,
+        "backend_role_card": _backend_role_card(
+            agent_assignment=agent_assignment,
+            assignment=assignment,
+            worker=worker,
+            approval_checklist=approval_checklist,
+            output_schema=output_schema,
+            task_type=canonical_task_type,
+            risk_level=risk,
         ),
         "risk_authorization": risk_authorization,
-        "approval_checklist": str((assign or {}).get("approval_checklist") or worker.get("approval_checklist") or ""),
-        "output_schema": worker.get("output_schema") or {},
+        "approval_checklist": approval_checklist,
+        "output_schema": output_schema,
     }
 
 
@@ -335,8 +356,46 @@ def _agent_assignment(agent_id: str, agent: Any) -> dict[str, Any]:
         "display_name": str(agent.get("display_name") or agent_id),
         "role": str(agent.get("role") or ""),
         "primary_model": str(agent.get("primary_model") or ""),
+        "fallback_model": str(agent.get("fallback_model") or ""),
         "allowed_projects": list(agent.get("allowed_projects") or []),
         "approval_required": bool(agent.get("approval_required", False)),
+    }
+
+
+def _backend_role_card(
+    *,
+    agent_assignment: Mapping[str, Any],
+    assignment: Mapping[str, Any],
+    worker: Mapping[str, Any],
+    approval_checklist: str,
+    output_schema: Any,
+    task_type: str,
+    risk_level: str,
+) -> dict[str, Any]:
+    output = output_schema if isinstance(output_schema, Mapping) else {}
+    return {
+        "agent_id": str(agent_assignment.get("assigned_agent") or ""),
+        "agent_display_name": str(agent_assignment.get("display_name") or ""),
+        "agent_role": str(agent_assignment.get("role") or ""),
+        "worker_id": str(assignment.get("assigned_worker") or ""),
+        "worker_display_name": str(assignment.get("display_name") or ""),
+        "worker_role": str(worker.get("role") or ""),
+        "runtime_profile": str(assignment.get("runtime_profile") or ""),
+        "task_type": task_type,
+        "risk_level": risk_level,
+        "risk_level_limit": str(assignment.get("risk_level_limit") or ""),
+        "effective_risk_level_limit": str(
+            assignment.get("effective_risk_level_limit") or ""
+        ),
+        "approval_required": bool(assignment.get("approval_required")),
+        "approval_required_actions": list(
+            assignment.get("approval_required_actions") or []
+        ),
+        "approval_checklist": approval_checklist,
+        "output_format": str(output.get("format") or ""),
+        "required_sections": list(output.get("required_sections") or []),
+        "primary_model": str(agent_assignment.get("primary_model") or ""),
+        "fallback_model": str(agent_assignment.get("fallback_model") or ""),
     }
 
 

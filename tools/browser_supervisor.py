@@ -1085,7 +1085,7 @@ class CDPSupervisor:
                 "result": payload.get("result", {}).get("value"),
             }
         function_declaration = """
-        function(expected, action, text, token, requireGroupComposer) {
+        async function(expected, action, text, token, requireGroupComposer) {
           const guard = this.__hermesAtomicGuard;
           const fail = message => {
             guard?.observer?.disconnect();
@@ -1128,13 +1128,20 @@ class CDPSupervisor:
             fail("Captured snapshot node changed after semantic validation");
           }
           if (action === "fill") {
-            const proto = this instanceof HTMLTextAreaElement
-              ? HTMLTextAreaElement.prototype
-              : this instanceof HTMLInputElement
-                ? HTMLInputElement.prototype
-                : null;
-            const setter = proto
+            const isNativeSelect = this instanceof HTMLSelectElement;
+            const proto = isNativeSelect
+              ? HTMLSelectElement.prototype
+              : this instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : this instanceof HTMLInputElement
+                  ? HTMLInputElement.prototype
+                  : null;
+            const valueSetter = proto
               && Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            const selectedIndexSetter = isNativeSelect
+              && Object.getOwnPropertyDescriptor(
+                HTMLSelectElement.prototype, "selectedIndex"
+              )?.set;
             this.focus();
             if (
               `${location.href}|${performance.timeOrigin}` !== expected
@@ -1146,7 +1153,44 @@ class CDPSupervisor:
             }
             guard.observer.disconnect();
             delete this.__hermesAtomicGuard;
-            if (this.isContentEditable) {
+            if (isNativeSelect) {
+              const normalize = value => String(value ?? "")
+                .replace(/\\s+/g, " ").trim().toLowerCase();
+              const requested = normalize(text);
+              const matches = [...this.options].filter(option => (
+                normalize(option.label || option.textContent) === requested
+                || String(option.value) === String(text ?? "")
+              ));
+              if (!requested || matches.length !== 1) {
+                throw new Error(
+                  "Guarded select requires one exact enabled option label or value"
+                );
+              }
+              const option = matches[0];
+              if (
+                this.multiple
+                || this.matches(":disabled")
+                || option.matches(":disabled")
+                || !selectedIndexSetter
+              ) {
+                throw new Error("Guarded select target or option is disabled");
+              }
+              const previousIndex = this.selectedIndex;
+              selectedIndexSetter.call(this, option.index);
+              if (this.value !== option.value || this.selectedIndex !== option.index) {
+                selectedIndexSetter.call(this, previousIndex);
+                throw new Error("Guarded select did not retain the exact requested option");
+              }
+              this.dispatchEvent(new Event("input", {bubbles: true}));
+              this.dispatchEvent(new Event("change", {bubbles: true}));
+              await Promise.resolve();
+              if (this.value !== option.value || this.selectedIndex !== option.index) {
+                selectedIndexSetter.call(this, previousIndex);
+                throw new Error(
+                  "Guarded select did not retain the exact requested option after events"
+                );
+              }
+            } else if (this.isContentEditable) {
               this.textContent = String(text ?? "");
               this.dispatchEvent(new InputEvent("input", {
                 bubbles: true,
@@ -1154,10 +1198,10 @@ class CDPSupervisor:
                 data: String(text ?? "")
               }));
               this.dispatchEvent(new Event("change", {bubbles: true}));
-            } else if (!setter) {
+            } else if (!valueSetter) {
               throw new Error("Guarded fill target has no native value setter");
             } else {
-              setter.call(this, String(text ?? ""));
+              valueSetter.call(this, String(text ?? ""));
               this.dispatchEvent(new InputEvent("input", {
                 bubbles: true, inputType: "insertText", data: String(text ?? "")
               }));

@@ -24,7 +24,7 @@
     "errors": { "type": "array" },
     "requires_human_review": { "type": "boolean" },
     "recommended_next_action": { "type": "string" },
-    "protocol_version": { "type": "string", "enum": ["1.0", "2.0"] },
+    "protocol_version": { "type": "string", "enum": ["1.0", "2.0", "3.0-draft"] },
     "delegation_id": { "type": "string", "minLength": 1 },
     "attempt_id": { "type": "string", "minLength": 1 },
     "contract_fingerprint": { "type": "string", "minLength": 1 },
@@ -33,12 +33,47 @@
     "backend_run_id": { "type": "string", "minLength": 1 },
     "backend_agent_id": { "type": "string", "minLength": 1 },
     "backend_session_key": { "type": "string", "minLength": 1 },
-    "result_digest": { "type": "string", "minLength": 1 }
+    "token_usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
+        "reasoning_tokens": { "type": "integer", "minimum": 0 },
+        "total_tokens": { "type": "integer", "minimum": 0 },
+        "model": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 }
+      }
+    },
+    "result_digest": { "type": "string", "minLength": 1 },
+    "actions_taken": { "type": "array" },
+    "evidence": { "type": "array" },
+    "files_changed": { "type": "array" },
+    "external_effects": { "type": "array" },
+    "needs_review": { "type": "boolean" }
   },
   "allOf": [
     {
       "if": {
         "properties": { "protocol_version": { "const": "2.0" } },
+        "required": ["protocol_version"]
+      },
+      "then": {
+        "required": [
+          "delegation_id",
+          "attempt_id",
+          "contract_fingerprint",
+          "identity_correlated",
+          "protocol_correlated"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": { "protocol_version": { "const": "3.0-draft" } },
         "required": ["protocol_version"]
       },
       "then": {
@@ -64,6 +99,27 @@
           "backend_run_id",
           "backend_agent_id",
           "backend_session_key"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "protocol_version": { "const": "3.0-draft" },
+          "status": { "const": "succeeded" }
+        },
+        "required": ["protocol_version", "status"]
+      },
+      "then": {
+        "required": [
+          "backend_run_id",
+          "backend_agent_id",
+          "backend_session_key",
+          "actions_taken",
+          "evidence",
+          "files_changed",
+          "external_effects",
+          "needs_review"
         ]
       }
     }

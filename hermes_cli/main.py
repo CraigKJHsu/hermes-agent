@@ -11708,7 +11708,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
-        "project", "proxy",
+        "project", "proxy", "trace",
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
@@ -12459,6 +12459,11 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # Read-only end-to-end correlation lookup.
+    from hermes_cli.telegram_trace import build_parser as _build_trace_parser
+
+    _build_trace_parser(subparsers)
 
     # =========================================================================
     # project command — named, multi-folder workspaces

@@ -1744,6 +1744,10 @@ DEFAULT_CONFIG = {
         # applies where tool_progress is already enabled. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        # Add actor/class and agent-route headers to Telegram conversation,
+        # delegation, execution and callback messages. Off by default; enable
+        # with display.platforms.telegram.interaction_labels.
+        "interaction_labels": False,
         # How a reasoning/thinking summary renders when show_reasoning is on.
         # "code" (default) = 💭 fenced code block; "blockquote" = "> " lines;
         # "subtext" = "-# " lines (Discord small grey metadata text). Discord
@@ -2051,6 +2055,16 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Accepted Grace Kanban reviews use a transactional outbox and the
+        # same bounded-capacity tiers as the daily digest path.
+        "promotion": {
+            "warn_usage_ratio": 0.75,
+            "critical_usage_ratio": 0.90,
+            "retry_seconds": 1800,
+            "max_prompt_chars": 400,
+            "warn_prompt_chars": 250,
+            "critical_merge_chars": 160,
+        },
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

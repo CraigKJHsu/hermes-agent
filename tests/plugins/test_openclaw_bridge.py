@@ -90,6 +90,51 @@ def test_protocol_v2_schemas_require_identity_and_success_evidence():
         validate_delegated_result(base_result)
 
 
+def test_protocol_v3_task_schema_requires_context_and_confirmation_contracts():
+    from plugins.openclaw_bridge.schemas import validate_delegated_task
+
+    task = {
+        "task_id": "task-v3",
+        "requested_by": "hermes",
+        "objective": "Publish only after approval.",
+        "context_refs": [],
+        "allowed_tools": ["browser.read"],
+        "denied_tools": [],
+        "risk_level": "medium",
+        "requires_confirmation": False,
+        "max_runtime_seconds": 300,
+        "output_format": "json",
+        "audit_required": True,
+        "protocol_version": "3.0-draft",
+        "delegation_id": "delegation-v3",
+        "attempt_id": "attempt-v3",
+        "contract_fingerprint": "sha256:v3",
+        "project": "secondhand_commerce",
+        "topic_id": "telegram/thread/2",
+        "task_type": "browser_publish",
+        "executor_backend": "openclaw",
+        "executor_profile": "browser",
+        "backend_agent_id": "openclaw-browser-operator",
+        "external_effect_budget": 1,
+        "workspace_policy": "dedicated",
+        "session_policy": "ephemeral",
+        "credential_refs": [],
+        "idempotency_key": "attempt-v3",
+        "dry_run": True,
+        "scope": {"allowed_actions": ["browser.read"]},
+        "context_packet": {"summary": "approved scoped context"},
+        "confirmation_policy": {"required_before": ["publish"]},
+        "result_contract": {"required_fields": ["status", "audit_log"]},
+    }
+
+    assert validate_delegated_task(task) == task
+
+    missing = dict(task)
+    missing.pop("context_packet")
+    with pytest.raises(ValueError):
+        validate_delegated_task(missing)
+
+
 def test_high_risk_task_stops_at_approval_gate():
     from plugins.openclaw_bridge.tools import delegate_to_openclaw
 
@@ -147,6 +192,101 @@ def test_requires_confirmation_stops_before_transport():
     assert result["requires_human_review"] is True
 
 
+def test_scoped_loop_contract_approval_passes_browser_confirmation_policy():
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "OpenClaw accepted the Loop Contract execution.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll the OpenClaw run.",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-loop",
+            "attempt_id": "attempt-loop",
+            "contract_fingerprint": "fingerprint-loop",
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "run-loop",
+            "backend_agent_id": "missioncrew-executor",
+            "backend_session_key": "session-loop",
+        }
+
+    result = tools.delegate_loop_contract_to_openclaw(
+        {
+            "task_id": "task-loop",
+            "objective": "Publish within an approved Loop Contract.",
+            "risk_level": "high",
+            "allowed_tools": ["browser"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-loop",
+            "attempt_id": "attempt-loop",
+            "contract_fingerprint": "fingerprint-loop",
+            "project": "secondhand_commerce",
+            "topic_id": "2",
+            "task_type": "browser_publish",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-executor",
+            "approval_grant_id": "delegation-loop",
+            "external_effect_budget": 1,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": ["hermes-controlled-browser"],
+            "idempotency_key": "attempt-loop:start",
+            "openclaw_task_id": "openclaw.agent.loop_contract_start",
+            "dry_run": False,
+            "loop_contract": {
+                "trace": {
+                    "telegram_message_path": {
+                        "trace_id": "tgtrace-loop",
+                        "platform": "telegram",
+                    }
+                },
+                "routing": {"task_type": "browser_publish"},
+                "external_targets": ["https://www.facebook.com/groups/1/"],
+                "approval_provenance": {
+                    "contract_fingerprint": "fingerprint-loop",
+                    "scope_binding": "exact_loop_contract_fingerprint",
+                },
+            },
+            "message_path": {
+                "trace_id": "tgtrace-loop",
+                "platform": "telegram",
+                "chat_id": "chat_opaque",
+            },
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert result["backend_run_id"] == "run-loop"
+    assert result["backend_agent_id"] == "missioncrew-executor"
+    assert result["protocol_correlated"] is True
+    assert len(seen) == 1
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+    payload = tools._openclaw_payload(
+        seen[0],
+        config,
+        live_async_capability=tools._LOOP_CONTRACT_ASYNC_CAPABILITY,
+    )
+    assert payload["input"]["messagePath"]["trace_id"] == "tgtrace-loop"
+
+
 def test_low_risk_task_builds_valid_delegated_task_and_uses_transport():
     from plugins.openclaw_bridge.tools import delegate_to_openclaw
 
@@ -181,6 +321,99 @@ def test_low_risk_task_builds_valid_delegated_task_and_uses_transport():
     assert len(seen) == 1
     assert seen[0]["objective"] == "Read status"
     assert seen[0]["requires_confirmation"] is False
+
+
+def test_protocol_v3_payload_carries_context_confirmation_and_result_contracts():
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "v3-dry-run",
+            "objective": "Prepare a publish preview but stop before publish.",
+            "risk_level": "medium",
+            "allowed_tools": ["browser.read"],
+            "requires_confirmation": False,
+            "protocol_version": "3.0-draft",
+            "delegation_id": "delegation-v3",
+            "attempt_id": "attempt-v3",
+            "contract_fingerprint": "sha256:v3",
+            "project": "secondhand_commerce",
+            "topic_id": "telegram/thread/2",
+            "task_type": "browser_publish",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser",
+            "backend_agent_id": "openclaw-browser-operator",
+            "external_effect_budget": 1,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-v3",
+            "dry_run": True,
+            "scope": {"allowed_actions": ["browser.read"], "external_effect_budget": 1},
+            "context_packet": {"summary": "scoped context"},
+            "confirmation_policy": {"required_before": ["publish"]},
+            "result_contract": {"required_fields": ["status", "audit_log"]},
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    payload = tools._openclaw_payload(task, config)
+
+    assert payload["protocolVersion"] == "3.0-draft"
+    assert payload["identity"]["taskType"] == "browser_publish"
+    assert payload["contract"] == {
+        "scope": {"allowed_actions": ["browser.read"], "external_effect_budget": 1},
+        "contextPacket": {"summary": "scoped context"},
+        "confirmationPolicy": {"required_before": ["publish"]},
+        "resultContract": {"required_fields": ["status", "audit_log"]},
+    }
+    assert payload["dryRun"] is True
+
+
+def test_protocol_v3_live_execution_still_fails_closed_until_template_is_verified():
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "v3-live",
+            "objective": "Try unsupported live publish.",
+            "risk_level": "medium",
+            "allowed_tools": ["browser.read"],
+            "requires_confirmation": False,
+            "protocol_version": "3.0-draft",
+            "delegation_id": "delegation-v3",
+            "attempt_id": "attempt-v3",
+            "contract_fingerprint": "sha256:v3",
+            "project": "secondhand_commerce",
+            "topic_id": "telegram/thread/2",
+            "task_type": "browser_publish",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser",
+            "backend_agent_id": "openclaw-browser-operator",
+            "external_effect_budget": 1,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-v3",
+            "dry_run": False,
+            "scope": {"allowed_actions": ["browser.read"]},
+            "context_packet": {"summary": "scoped context"},
+            "confirmation_policy": {"required_before": ["publish"]},
+            "result_contract": {"required_fields": ["status", "audit_log"]},
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    with pytest.raises(ValueError, match="Protocol v3 live templates must be verified"):
+        tools._openclaw_payload(task, config)
 
 
 def test_external_facebook_work_is_not_sent_to_dry_run_bridge():
@@ -316,6 +549,7 @@ def test_plugin_registers_tool_command_and_gateway_hook():
     assert calls == {
         "tools": [
             "clawops_delegate",
+            "clawops_cancel",
             "grace_callback_outcome",
             "openclaw_delegate",
         ],
@@ -789,6 +1023,284 @@ def test_http_mapper_preserves_nonterminal_backend_status_without_ok(
     assert result["status"] == status
     assert result["errors"] == []
     assert result["requires_human_review"] is False
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "expected_artifact_type", "expected_next_action"),
+    [
+        (
+            {
+                "ok": True,
+                "status": "request_context",
+                "protocolVersion": "3.0-draft",
+                "summary": "Need destination.",
+                "executionIdentity": {
+                    "delegationId": "delegation-v3",
+                    "attemptId": "attempt-v3",
+                    "contractFingerprint": "sha256:v3",
+                },
+                "question": "Which destination should I use?",
+                "neededFields": ["target_url"],
+                "reason": "No approved destination was disclosed.",
+            },
+            "request_context",
+            "Ask Grace for scoped context",
+        ),
+        (
+            {
+                "ok": True,
+                "status": "request_confirmation",
+                "protocolVersion": "3.0-draft",
+                "summary": "Ready to publish.",
+                "executionIdentity": {
+                    "delegationId": "delegation-v3",
+                    "attemptId": "attempt-v3",
+                    "contractFingerprint": "sha256:v3",
+                },
+                "action": "publish_facebook_group_post",
+                "riskLevel": "L3",
+                "externalEffects": ["public_post"],
+            },
+            "request_confirmation",
+            "Ask KJ for explicit approval",
+        ),
+    ],
+)
+def test_protocol_v3_mapper_turns_openclaw_interruptions_into_grace_review_blocks(
+    monkeypatch,
+    response_payload,
+    expected_artifact_type,
+    expected_next_action,
+):
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "v3-interruption",
+            "objective": "Prepare a browser task.",
+            "risk_level": "medium",
+            "allowed_tools": ["browser.read"],
+            "requires_confirmation": False,
+            "protocol_version": "3.0-draft",
+            "delegation_id": "delegation-v3",
+            "attempt_id": "attempt-v3",
+            "contract_fingerprint": "sha256:v3",
+            "project": "secondhand_commerce",
+            "topic_id": "telegram/thread/2",
+            "task_type": "browser_publish",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser",
+            "backend_agent_id": "openclaw-browser-operator",
+            "external_effect_budget": 1,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-v3",
+            "dry_run": True,
+            "scope": {"allowed_actions": ["browser.read"]},
+            "context_packet": {"summary": "scoped context"},
+            "confirmation_policy": {"required_before": ["publish"]},
+            "result_contract": {"required_fields": ["status", "audit_log"]},
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(response_payload).encode("utf-8")
+
+    monkeypatch.setattr(tools, "urlopen", lambda _request, timeout: Response())
+
+    result = tools.post_to_openclaw_bridge(task, config)
+
+    assert result["status"] == "blocked"
+    assert result["requires_human_review"] is True
+    assert result["protocol_version"] == "3.0-draft"
+    assert result["identity_correlated"] is True
+    assert result["errors"] == [expected_artifact_type]
+    assert expected_next_action in result["recommended_next_action"]
+    assert any(
+        artifact["type"] == expected_artifact_type
+        for artifact in result["artifacts"]
+    )
+
+
+def test_protocol_v3_mapper_preserves_standardized_success_result(monkeypatch):
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "v3-standard-result",
+            "objective": "Run a standardized OpenClaw result.",
+            "risk_level": "medium",
+            "allowed_tools": ["browser.read"],
+            "requires_confirmation": False,
+            "protocol_version": "3.0-draft",
+            "delegation_id": "delegation-v3",
+            "attempt_id": "attempt-v3",
+            "contract_fingerprint": "sha256:v3",
+            "project": "hub_ops",
+            "topic_id": "telegram/thread/2",
+            "task_type": "research",
+            "executor_backend": "openclaw",
+            "executor_profile": "research",
+            "backend_agent_id": "openclaw-researcher",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-v3",
+            "dry_run": True,
+            "scope": {"allowed_actions": ["browser.read"]},
+            "context_packet": {"summary": "scoped context"},
+            "confirmation_policy": {"required_before": ["publish"]},
+            "result_contract": {"required_fields": ["status", "audit_log"]},
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": "succeeded",
+                    "protocolVersion": "3.0-draft",
+                    "summary": "Standardized result complete.",
+                    "executionIdentity": {
+                        "delegationId": "delegation-v3",
+                        "attemptId": "attempt-v3",
+                        "contractFingerprint": "sha256:v3",
+                    },
+                    "backendExecution": {
+                        "backendRunId": "backend-v3",
+                        "backendAgentId": "openclaw-researcher",
+                        "sessionKey": "agent:openclaw-researcher:session:v3",
+                    },
+                    "actionsTaken": [
+                        {"action": "browser.read", "target": "https://example.com/"}
+                    ],
+                    "evidence": [
+                        {"kind": "snapshot", "ref": "kanban-attachment://snap"}
+                    ],
+                    "filesChanged": [],
+                    "externalEffects": [],
+                    "needsReview": True,
+                    "auditLog": [{"event": "task_completed"}],
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr(tools, "urlopen", lambda _request, timeout: Response())
+
+    result = tools.post_to_openclaw_bridge(task, config)
+
+    assert result["status"] == "succeeded"
+    assert result["requires_human_review"] is True
+    assert result["actions_taken"] == [
+        {"action": "browser.read", "target": "https://example.com/"}
+    ]
+    assert result["evidence"] == [
+        {"kind": "snapshot", "ref": "kanban-attachment://snap"}
+    ]
+    assert result["files_changed"] == []
+    assert result["external_effects"] == []
+    assert result["needs_review"] is True
+    assert result["backend_run_id"] == "backend-v3"
+
+
+def test_protocol_v3_success_without_standardized_result_fails_closed(monkeypatch):
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "v3-missing-standard-result",
+            "objective": "Claim success without standardized fields.",
+            "risk_level": "medium",
+            "allowed_tools": ["browser.read"],
+            "requires_confirmation": False,
+            "protocol_version": "3.0-draft",
+            "delegation_id": "delegation-v3",
+            "attempt_id": "attempt-v3",
+            "contract_fingerprint": "sha256:v3",
+            "project": "hub_ops",
+            "topic_id": "telegram/thread/2",
+            "task_type": "research",
+            "executor_backend": "openclaw",
+            "executor_profile": "research",
+            "backend_agent_id": "openclaw-researcher",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-v3",
+            "dry_run": True,
+            "scope": {"allowed_actions": ["browser.read"]},
+            "context_packet": {"summary": "scoped context"},
+            "confirmation_policy": {"required_before": ["publish"]},
+            "result_contract": {"required_fields": ["status", "audit_log"]},
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": "succeeded",
+                    "protocolVersion": "3.0-draft",
+                    "summary": "Incomplete success.",
+                    "executionIdentity": {
+                        "delegationId": "delegation-v3",
+                        "attemptId": "attempt-v3",
+                        "contractFingerprint": "sha256:v3",
+                    },
+                    "backendExecution": {
+                        "backendRunId": "backend-v3",
+                        "backendAgentId": "openclaw-researcher",
+                        "sessionKey": "agent:openclaw-researcher:session:v3",
+                    },
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr(tools, "urlopen", lambda _request, timeout: Response())
+
+    result = tools.post_to_openclaw_bridge(task, config)
+
+    assert result["status"] == "failed"
+    assert result["requires_human_review"] is True
+    assert "OpenClaw response omitted standardized result field actions_taken." in result["errors"]
+    assert "OpenClaw response omitted standardized result field needs_review." in result["errors"]
 
 
 @pytest.mark.parametrize("error_body", [b"[]", b"null", b'"upstream failed"'])
@@ -1499,6 +2011,89 @@ def test_protocol_v2_http_response_maps_matching_execution_identity(monkeypatch)
     assert result["attempt_id"] == "attempt-identity"
     assert result["contract_fingerprint"] == "sha256:identity"
     assert result["identity_correlated"] is True
+
+
+def test_protocol_v2_http_response_preserves_backend_token_usage(monkeypatch):
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "browser-contract-usage",
+            "objective": "Read the Example Domain page.",
+            "risk_level": "low",
+            "allowed_tools": ["browser.read"],
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-usage",
+            "attempt_id": "attempt-usage",
+            "contract_fingerprint": "sha256:usage",
+            "project": "hub_ops",
+            "topic_id": "readonly-browser",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser-readonly",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-usage",
+            "openclaw_task_id": "openclaw.browser.read_snapshot",
+            "target_url": "https://example.com/",
+            "dry_run": False,
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": "succeeded",
+                    "protocolVersion": "2.0",
+                    "executionIdentity": {
+                        "delegationId": "delegation-usage",
+                        "attemptId": "attempt-usage",
+                        "contractFingerprint": "sha256:usage",
+                    },
+                    "backendExecution": {
+                        "backendRunId": "backend-run-usage",
+                        "backendAgentId": "missioncrew-browser-readonly",
+                        "sessionKey": "agent:missioncrew-browser-readonly:subagent:test",
+                        "tokenUsage": {
+                            "inputTokens": 10,
+                            "cachedInputTokens": 7,
+                            "outputTokens": 3,
+                            "reasoningOutputTokens": 2,
+                            "model": "gpt-test",
+                        },
+                    },
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr(tools, "urlopen", lambda _request, timeout: Response())
+
+    result = tools.post_to_openclaw_bridge(task, config)
+
+    assert result["status"] == "succeeded"
+    assert result["token_usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 3,
+        "cache_read_tokens": 7,
+        "reasoning_tokens": 2,
+        "total_tokens": 22,
+        "model": "gpt-test",
+    }
 
 
 @pytest.mark.parametrize(

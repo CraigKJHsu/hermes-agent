@@ -5,6 +5,7 @@ author: KJ
 kind: backend
 provides_tools:
   - clawops_delegate
+  - clawops_cancel
   - grace_callback_outcome
   - openclaw_delegate
 provides_commands:

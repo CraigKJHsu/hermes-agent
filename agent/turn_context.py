@@ -311,7 +311,16 @@ def build_turn_context(
         )
 
     # ── System prompt (cached per session for prefix caching) ──
+    # A safe fallback is deliberately one-turn-only. Force the next turn to
+    # retry full enrichment instead of pinning the reduced recovery prompt in
+    # the cached AIAgent for the rest of the Telegram topic.
+    if getattr(agent, "_system_prompt_fallback_used", False):
+        agent._cached_system_prompt = None
     if agent._cached_system_prompt is None:
+        try:
+            agent._touch_activity("preparing initial system prompt")
+        except Exception:
+            pass
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
@@ -470,7 +479,10 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query,
+                session_id=agent.session_id or "",
+            ) or ""
         except Exception:
             pass
 

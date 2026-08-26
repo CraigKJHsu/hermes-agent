@@ -71,6 +71,7 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
+        self._activities = []
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -99,6 +100,9 @@ class _FakeAgent:
 
     def _persist_session(self, *_a, **_k):
         self._persist_calls += 1
+
+    def _touch_activity(self, description):
+        self._activities.append(description)
 
 
 @pytest.fixture(autouse=True)
@@ -214,6 +218,23 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     # The prompt was populated before the DB row was created.
     assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
+    assert "preparing initial system prompt" in agent._activities
+
+
+def test_safe_fallback_is_invalidated_and_rebuilt_on_next_turn():
+    agent = _FakeAgent()
+    agent._cached_system_prompt = "[Runtime recovery mode] reduced"
+    agent._system_prompt_fallback_used = True
+
+    def _restore(_agent, _system_message, _history):
+        assert _agent._cached_system_prompt is None
+        _agent._cached_system_prompt = "FULL-SYSTEM"
+        _agent._system_prompt_fallback_used = False
+
+    ctx = _build(agent, restore_or_build_system_prompt=_restore)
+
+    assert ctx.active_system_prompt == "FULL-SYSTEM"
+    assert agent._cached_system_prompt == "FULL-SYSTEM"
 
 
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
@@ -284,4 +305,3 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
-

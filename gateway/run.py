@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Mapping, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -2641,6 +2641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
         self._warn_if_docker_media_delivery_is_risky()
+        self._warn_if_invalid_response_profile_pronunciation()
         _gateway_runner_ref = _weakref.ref(self)
 
         # Load ephemeral config from config.yaml / env vars.
@@ -3001,6 +3002,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "This is fine if the model already emits host-visible paths, but MEDIA file delivery can fail "
             "for container-local paths like '/workspace/...' or '/output/...'."
         )
+
+    def _warn_if_invalid_response_profile_pronunciation(self) -> None:
+        """Warn when fast translation pronunciation values use unsupported aliases.
+
+        The translation normalizer only recognizes ``kk_single_english_word``.
+        Older/newer aliases silently fall back to no pronunciation output, which
+        makes failures difficult to trace. Emit explicit startup warnings instead.
+        """
+        for platform, platform_cfg in self.config.platforms.items():
+            extra = getattr(platform_cfg, "extra", None)
+            if not isinstance(extra, dict):
+                continue
+
+            response_profiles = extra.get("response_profiles")
+            if not isinstance(response_profiles, dict):
+                continue
+
+            platform_name = getattr(platform, "value", str(platform))
+            for profile_name, raw_profile in response_profiles.items():
+                if not isinstance(raw_profile, dict):
+                    logger.warning(
+                        "Gateway config warning: %s.%s is not a mapping; response profile will be ignored.",
+                        platform_name,
+                        profile_name,
+                    )
+                    continue
+
+                strategy = str(raw_profile.get("strategy") or "").strip().lower()
+                if strategy != "fast_then_default":
+                    continue
+
+                fast_lane = raw_profile.get("fast_lane")
+                if not isinstance(fast_lane, dict):
+                    continue
+                handler = str(fast_lane.get("handler") or "").strip().lower()
+                if handler != "translation":
+                    continue
+
+                raw_pronunciation = str(fast_lane.get("pronunciation") or "").strip()
+                normalized_pronunciation = raw_pronunciation.strip().lower()
+                if raw_pronunciation and normalized_pronunciation != "kk_single_english_word":
+                    logger.warning(
+                        "Gateway response_profile check: %s.%s uses unsupported fast_lane.pronunciation='%s'; "
+                        "use 'kk_single_english_word' for translator fast-lane KK output.",
+                        platform_name,
+                        profile_name,
+                        raw_pronunciation,
+                    )
 
 
 
@@ -10111,6 +10160,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         _response_profile_user_text = str(getattr(event, "text", None) or "")
 
+        # Telegram labels are provenance-backed and opt-in. Seed the event
+        # with the known inbound class now; delegation/tool callbacks may
+        # refine the path later in this same turn before final delivery.
+        if source.platform == Platform.TELEGRAM:
+            try:
+                from gateway.display_config import resolve_display_setting
+                from gateway.telegram_interaction_labels import (
+                    initialize_turn_interaction_context,
+                )
+
+                _labels_enabled = bool(
+                    resolve_display_setting(
+                        _load_gateway_config(),
+                        "telegram",
+                        "interaction_labels",
+                        False,
+                    )
+                )
+                if _labels_enabled:
+                    _event_context = initialize_turn_interaction_context(
+                        getattr(event, "internal_context", None) or {}
+                    )
+                    event.internal_context = _event_context
+            except Exception:
+                logger.debug(
+                    "Telegram interaction label initialization failed",
+                    exc_info=True,
+                )
+
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
@@ -10343,6 +10421,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+
+        # Create or continue the trusted Telegram trace after the canonical
+        # session id is known. This metadata is Gateway-owned and never read
+        # from the natural-language prompt or model tool arguments.
+        _telegram_message_path = {}
+        if source.platform == Platform.TELEGRAM:
+            try:
+                from hermes_cli.telegram_message_path import (
+                    METADATA_KEY as _MESSAGE_PATH_KEY,
+                    bind_message_path,
+                    build_telegram_message_path,
+                )
+
+                _event_context = dict(
+                    getattr(event, "internal_context", None) or {}
+                )
+                _telegram_message_path = bind_message_path(
+                    _event_context.get(_MESSAGE_PATH_KEY),
+                    session_key=context.session_key,
+                    session_id=context.session_id,
+                )
+                if not _telegram_message_path:
+                    _telegram_message_path = build_telegram_message_path(
+                        chat_id=str(source.chat_id or ""),
+                        thread_id=str(source.thread_id or ""),
+                        chat_type=str(source.chat_type or ""),
+                        user_id=str(source.user_id or ""),
+                        inbound_message_id=str(
+                            getattr(event, "message_id", None)
+                            or source.message_id
+                            or ""
+                        ),
+                        reply_to_message_id=str(
+                            getattr(event, "reply_to_message_id", None) or ""
+                        ),
+                        session_key=context.session_key,
+                        session_id=context.session_id,
+                        codex_thread_id=os.getenv("HERMES_CODEX_THREAD_ID", ""),
+                    )
+                _event_context[_MESSAGE_PATH_KEY] = _telegram_message_path
+                event.internal_context = _event_context
+            except Exception:
+                logger.warning(
+                    "Telegram message-path initialization failed",
+                    exc_info=True,
+                )
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(
@@ -10362,6 +10486,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).get("grace_callback_lease_owner")
                 or ""
             ),
+            telegram_message_path=_telegram_message_path,
         )
         
         # Read privacy.redact_pii from config (re-read per message)
@@ -10377,21 +10502,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         try:
-            from proactive.prompt_policy import approval_turn_prompt
+            from proactive.prompt_policy import (
+                active_objectives_prompt,
+                approval_turn_prompt,
+            )
 
             approval_prompt = approval_turn_prompt(str(event.text or ""))
             if approval_prompt:
                 context_prompt = f"{context_prompt}\n\n{approval_prompt}"
+            objective_prompt = active_objectives_prompt(
+                platform=(source.platform.value if source.platform else ""),
+                chat_id=str(source.chat_id or ""),
+                thread_id=str(source.thread_id or ""),
+            )
+            if objective_prompt:
+                context_prompt = f"{context_prompt}\n\n{objective_prompt}"
         except Exception:
             logger.warning(
-                "Failed to inject approval-turn routing prompt",
+                "Failed to inject Grace control-plane prompt",
                 exc_info=True,
             )
             adapter = self.adapters.get(source.platform)
             if adapter:
                 await adapter.send(
                     source.chat_id,
-                    "核准路由政策目前無法驗證，這則訊息未交給模型、也沒有"
+                    "Grace 任務延續或核准政策目前無法驗證，這則訊息未交給模型、也沒有"
                     "執行任何外部動作。請稍後重試。",
                     metadata=self._thread_metadata_for_source(source),
                 )
@@ -11061,7 +11196,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             recovered_args = _find_bound_clawops_approval_args(
                 history, _approval_token,
             )
-            _approval_records: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+            _approval_records: List[
+                tuple[str, Dict[str, Any], Dict[str, Any]]
+            ] = []
             if recovered_args is None:
                 response = (
                     "這則核准訊息沒有找到可驗證的原始合約，因此沒有執行"
@@ -11086,7 +11223,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "status": "rejected",
                         "reason": f"{type(exc).__name__}: {exc}",
                     }
-                _approval_records.append((approval_args, approval_result))
+                _approval_records.append(
+                    ("clawops_delegate", approval_args, approval_result)
+                )
 
                 reason = str(approval_result.get("reason") or "")
                 if (
@@ -11115,7 +11254,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "status": "rejected",
                             "reason": f"{type(exc).__name__}: {exc}",
                         }
-                    _approval_records.append((recovered_args, fresh_result))
+                    _approval_records.append(
+                        ("clawops_delegate", recovered_args, fresh_result)
+                    )
                     if fresh_result.get("status") == "approval_required":
                         response = (
                             "原核准碼已過期；不是「好吧」、標點或空白的"
@@ -11162,7 +11303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.session_store.append_to_transcript(
                 session_entry.session_id, _approval_user_entry,
             )
-            for index, (record_args, record_result) in enumerate(
+            for index, (record_tool, record_args, record_result) in enumerate(
                 _approval_records, start=1,
             ):
                 call_id = (
@@ -11179,7 +11320,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "id": call_id,
                                 "type": "function",
                                 "function": {
-                                    "name": "clawops_delegate",
+                                    "name": record_tool,
                                     "arguments": json.dumps(
                                         record_args,
                                         ensure_ascii=False,
@@ -11195,7 +11336,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                     {
                         "role": "tool",
-                        "tool_name": "clawops_delegate",
+                        "tool_name": record_tool,
                         "tool_call_id": call_id,
                         "content": json.dumps(
                             record_result,
@@ -11211,10 +11352,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Approval result could not be delivered: platform adapter "
                     "is unavailable."
                 )
+            _approval_metadata = self._thread_metadata_for_source(source)
+            if source.platform == Platform.TELEGRAM and isinstance(
+                getattr(event, "internal_context", None), dict,
+            ):
+                from gateway.telegram_interaction_labels import (
+                    METADATA_KEY as _INTERACTION_METADATA_KEY,
+                    interaction_metadata_from_message_path,
+                    is_queued_clawops_delegation,
+                    merge_interaction_metadata,
+                )
+
+                _approval_route_tool = (
+                    _approval_records[-1][0] if _approval_records else ""
+                )
+                _approval_route_result = (
+                    _approval_records[-1][2] if _approval_records else {}
+                )
+                _approval_interaction = event.internal_context.get(
+                    _INTERACTION_METADATA_KEY
+                )
+                if is_queued_clawops_delegation(
+                    _approval_route_tool,
+                    _approval_route_result,
+                ):
+                    _assigned = str(
+                        _approval_route_result.get("assigned_agent") or ""
+                    )
+                    from hermes_cli.telegram_message_path import (
+                        METADATA_KEY as _MESSAGE_PATH_KEY,
+                        bind_message_path,
+                        normalize_message_path,
+                    )
+
+                    _approval_path_source = event.internal_context.get(
+                        _MESSAGE_PATH_KEY
+                    )
+                    _approval_board = str(
+                        _approval_route_result.get("kanban_board") or "default"
+                    )
+                    try:
+                        from hermes_cli import kanban_db as _kb
+
+                        with _kb.connect_closing(board=_approval_board) as _conn:
+                            _canonical_delegation = _kb.get_grace_delegation(
+                                _conn,
+                                delegation_id=str(
+                                    _approval_route_result.get("delegation_id") or ""
+                                ),
+                            )
+                        _approval_path_source = normalize_message_path(
+                            (_canonical_delegation or {}).get(
+                                "telegram_message_path"
+                            )
+                        ) or _approval_path_source
+                    except Exception:
+                        logger.warning(
+                            "Canonical approval Telegram trace lookup failed",
+                            exc_info=True,
+                        )
+                    _approval_path = bind_message_path(
+                        _approval_path_source,
+                        delegation_id=_approval_route_result.get("delegation_id"),
+                        execution_task_id=_approval_route_result.get("execution_task_id"),
+                        review_task_id=_approval_route_result.get("grace_review_task_id"),
+                        openclaw_backend_agent_id=_assigned,
+                    )
+                    if _approval_path:
+                        event.internal_context[_MESSAGE_PATH_KEY] = _approval_path
+                    event.internal_context["kanban_board"] = _approval_board
+                    if _INTERACTION_METADATA_KEY in event.internal_context:
+                        _approval_interaction = (
+                            interaction_metadata_from_message_path(
+                                _approval_path,
+                                "handoff",
+                                actor_id=_assigned,
+                            )[_INTERACTION_METADATA_KEY]
+                        )
+                        event.internal_context[_INTERACTION_METADATA_KEY] = (
+                            _approval_interaction
+                        )
+                _approval_metadata = merge_interaction_metadata(
+                    _approval_metadata,
+                    (
+                        _approval_interaction
+                        if isinstance(_approval_interaction, dict)
+                        else None
+                    ),
+                )
+                from hermes_cli.telegram_message_path import (
+                    METADATA_KEY as _MESSAGE_PATH_KEY,
+                )
+
+                _approval_message_path = event.internal_context.get(
+                    _MESSAGE_PATH_KEY
+                )
+                if isinstance(_approval_message_path, dict):
+                    _approval_metadata = dict(_approval_metadata or {})
+                    _approval_metadata[_MESSAGE_PATH_KEY] = _approval_message_path
+                if event.internal_context.get("kanban_board"):
+                    _approval_metadata["kanban_board"] = event.internal_context[
+                        "kanban_board"
+                    ]
             send_result = await adapter.send(
                 source.chat_id,
                 response,
-                metadata=self._thread_metadata_for_source(source),
+                metadata=_approval_metadata,
             )
             if not getattr(send_result, "success", False):
                 logger.warning(
@@ -11226,7 +11469,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 send_result = await adapter.send(
                     source.chat_id,
                     response,
-                    metadata=self._thread_metadata_for_source(source),
+                    metadata=_approval_metadata,
                 )
             if not getattr(send_result, "success", False):
                 self.session_store.append_to_transcript(
@@ -11302,6 +11545,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response_profile_user_text=_response_profile_user_text,
                 detail_contract_name=_detail_contract_name,
                 learning_history_note=_learning_history_note,
+                interaction_context=getattr(event, "internal_context", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -11329,6 +11573,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            if source.platform == Platform.TELEGRAM:
+                try:
+                    from gateway.telegram_interaction_labels import (
+                        METADATA_KEY as _INTERACTION_METADATA_KEY,
+                        delegation_result_from_messages,
+                        delegation_was_queued,
+                        interaction_metadata_from_message_path,
+                    )
+
+                    _delegation = delegation_result_from_messages(
+                        agent_result.get("messages") or [],
+                    )
+                    _event_context = getattr(event, "internal_context", None)
+                    if (
+                        delegation_was_queued(_delegation)
+                        and isinstance(_event_context, dict)
+                    ):
+                        _assigned = str(
+                            _delegation.get("assigned_agent") or ""
+                        )
+                        from hermes_cli.telegram_message_path import (
+                            METADATA_KEY as _MESSAGE_PATH_KEY,
+                            actor,
+                            append_hop,
+                            bind_message_path,
+                        )
+
+                        _bound_path = bind_message_path(
+                            _event_context.get(_MESSAGE_PATH_KEY),
+                            delegation_id=_delegation.get("delegation_id"),
+                            execution_task_id=_delegation.get("execution_task_id"),
+                            review_task_id=_delegation.get("grace_review_task_id"),
+                            openclaw_backend_agent_id=_assigned,
+                        )
+                        if _bound_path:
+                            _bound_path = append_hop(
+                                _bound_path,
+                                stage="grace_delegation",
+                                from_actor=actor("grace", "grace"),
+                                to_actor=actor("clawops", "clawops"),
+                                status="observed",
+                                identifiers={
+                                    "delegation_id": _delegation.get("delegation_id"),
+                                    "execution_task_id": _delegation.get("execution_task_id"),
+                                    "review_task_id": _delegation.get("grace_review_task_id"),
+                                },
+                            )
+                            _event_context[_MESSAGE_PATH_KEY] = _bound_path
+                        if _delegation.get("kanban_board"):
+                            _event_context["kanban_board"] = _delegation[
+                                "kanban_board"
+                            ]
+                        if _INTERACTION_METADATA_KEY in _event_context:
+                            _event_context[_INTERACTION_METADATA_KEY] = (
+                                interaction_metadata_from_message_path(
+                                    _bound_path,
+                                    "handoff",
+                                    actor_id=_assigned,
+                                )[_INTERACTION_METADATA_KEY]
+                            )
+                    elif (
+                        isinstance(_delegation, dict)
+                        and _delegation.get("status") == "approval_required"
+                        and isinstance(_event_context, dict)
+                    ):
+                        _event_context["telegram_trace_pending_approval"] = True
+                except Exception:
+                    logger.debug(
+                        "Telegram final delegation route extraction failed",
+                        exc_info=True,
+                    )
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -14475,6 +14790,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_text: str = "",
         grace_callback_board: str = "",
         grace_callback_lease_owner: str = "",
+        telegram_message_path: Optional[Mapping[str, Any]] = None,
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -14485,6 +14801,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+        from hermes_cli.telegram_message_path import dumps_message_path
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -14510,6 +14827,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             owner_user_id=owner_user_id,
             grace_callback_board=grace_callback_board,
             grace_callback_lease_owner=grace_callback_lease_owner,
+            telegram_message_path=dumps_message_path(telegram_message_path),
             async_delivery=_async_delivery,
         )
 
@@ -16223,6 +16541,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response_profile_user_text: str = "",
         detail_contract_name: Optional[str] = None,
         learning_history_note: str = "",
+        interaction_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16246,6 +16565,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response_profile_user_text=response_profile_user_text,
                 detail_contract_name=detail_contract_name,
                 learning_history_note=learning_history_note,
+                interaction_context=interaction_context,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -16262,6 +16582,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response_profile_user_text=response_profile_user_text,
                 detail_contract_name=detail_contract_name,
                 learning_history_note=learning_history_note,
+                interaction_context=interaction_context,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -16299,6 +16620,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response_profile_user_text: str = "",
         detail_contract_name: Optional[str] = None,
         learning_history_note: str = "",
+        interaction_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17124,6 +17446,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        _interaction_labels_enabled = bool(
+            source.platform == Platform.TELEGRAM
+            and resolve_display_setting(
+                user_config,
+                platform_key,
+                "interaction_labels",
+                False,
+            )
+        )
+        if _interaction_labels_enabled and isinstance(interaction_context, dict):
+            from gateway.telegram_interaction_labels import (
+                METADATA_KEY as _INTERACTION_METADATA_KEY,
+                merge_interaction_metadata,
+            )
+
+            _status_thread_metadata = merge_interaction_metadata(
+                _status_thread_metadata,
+                interaction_context.get(_INTERACTION_METADATA_KEY),
+            )
+
         # Once Grace has compiled the canonical Loop Contract, show the user
         # that exact understanding before ClawOps begins. This replaces the
         # generic timer acknowledgement for delegated Telegram tasks and is
@@ -17133,6 +17475,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             resolve_display_setting(user_config, platform_key, "delegation_confirmation")
         )
         _delegation_confirmation_fired = threading.Event()
+
+        def _set_telegram_interaction(
+            kind: str,
+            path: List[str],
+            *,
+            assigned_agent: str = "",
+        ) -> None:
+            if not _interaction_labels_enabled or not isinstance(
+                interaction_context, dict,
+            ):
+                return
+            from gateway.telegram_interaction_labels import (
+                METADATA_KEY as _INTERACTION_METADATA_KEY,
+                interaction_metadata,
+            )
+
+            descriptor = interaction_metadata(
+                kind,
+                path,
+                assigned_agent=assigned_agent,
+            )[_INTERACTION_METADATA_KEY]
+            interaction_context[_INTERACTION_METADATA_KEY] = descriptor
+            if isinstance(_status_thread_metadata, dict):
+                _status_thread_metadata[_INTERACTION_METADATA_KEY] = descriptor
 
         def tool_start_ack_callback(call_id, tool_name, args):
             voice_ack_callback(call_id, tool_name, args)
@@ -17192,6 +17558,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
                 confirmation_future.add_done_callback(_log_delegation_confirmation)
+
+        def tool_complete_route_callback(
+            _call_id: str,
+            tool_name: str,
+            _args: Any,
+            function_result: Any,
+        ) -> None:
+            if tool_name != "clawops_delegate":
+                return
+            try:
+                from gateway.telegram_interaction_labels import (
+                    delegation_result_from_messages,
+                    is_queued_clawops_delegation,
+                )
+
+                result = delegation_result_from_messages([
+                    {
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "content": function_result,
+                    }
+                ])
+                if not is_queued_clawops_delegation(tool_name, result):
+                    return
+                assigned = str((result or {}).get("assigned_agent") or "")
+                from hermes_cli.telegram_message_path import (
+                    METADATA_KEY as _MESSAGE_PATH_KEY,
+                    bind_message_path,
+                )
+
+                if isinstance(interaction_context, dict):
+                    bound_path = bind_message_path(
+                        interaction_context.get(_MESSAGE_PATH_KEY),
+                        delegation_id=(result or {}).get("delegation_id"),
+                        execution_task_id=(result or {}).get("execution_task_id"),
+                        review_task_id=(result or {}).get("grace_review_task_id"),
+                        openclaw_backend_agent_id=assigned,
+                    )
+                    if bound_path:
+                        interaction_context[_MESSAGE_PATH_KEY] = bound_path
+                        if isinstance(_status_thread_metadata, dict):
+                            _status_thread_metadata[_MESSAGE_PATH_KEY] = bound_path
+                    if (result or {}).get("kanban_board"):
+                        interaction_context["kanban_board"] = result[
+                            "kanban_board"
+                        ]
+                        if isinstance(_status_thread_metadata, dict):
+                            _status_thread_metadata["kanban_board"] = result[
+                                "kanban_board"
+                            ]
+                path = ["你", "Grace", "ClawOps"]
+                if assigned:
+                    path.append(assigned)
+                _set_telegram_interaction(
+                    "handoff",
+                    path,
+                    assigned_agent=assigned,
+                )
+            except Exception:
+                logger.debug(
+                    "Telegram delegation route extraction failed",
+                    exc_info=True,
+                )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -17589,7 +18018,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Telegram contract-derived ClawOps handoff confirmation.
             agent.tool_start_callback = (
                 tool_start_ack_callback
-                if _voice_ack_guild[0] is not None or _delegation_confirmation_enabled
+                if (
+                    _voice_ack_guild[0] is not None
+                    or _delegation_confirmation_enabled
+                    or _interaction_labels_enabled
+                )
+                else None
+            )
+            agent.tool_complete_callback = (
+                tool_complete_route_callback
+                if _interaction_labels_enabled
                 else None
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
@@ -19071,6 +19509,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_interaction_context = dict(interaction_context or {})
+                if _interaction_labels_enabled:
+                    from gateway.telegram_interaction_labels import (
+                        initialize_turn_interaction_context,
+                        propagate_interaction_context,
+                    )
+
+                    next_interaction_context = (
+                        initialize_turn_interaction_context(
+                            next_interaction_context
+                        )
+                    )
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -19088,6 +19538,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_interaction_context = dict(
+                        getattr(pending_event, "internal_context", None) or {}
+                    )
+                    if _interaction_labels_enabled:
+                        next_interaction_context = (
+                            initialize_turn_interaction_context(
+                                next_interaction_context
+                            )
+                        )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -19113,7 +19572,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    interaction_context=next_interaction_context,
                 )
+                if (
+                    _interaction_labels_enabled
+                    and isinstance(interaction_context, dict)
+                ):
+                    propagate_interaction_context(
+                        interaction_context,
+                        next_interaction_context,
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

@@ -261,9 +261,11 @@ class TestPlatformReconnectWatcher:
 
     @pytest.mark.asyncio
     async def test_cold_connect_defaults_to_is_reconnect_false(self):
-        """The cold-start connect path (_connect_adapter_with_timeout with no
-        is_reconnect arg) must default to False so a first boot still drops any
-        stale queue (#46621)."""
+        """The cold-start path keeps the shared adapter contract's False default.
+
+        Telegram now preserves pending updates independently of this lifecycle
+        hint; other adapters may still use it to distinguish reconnect setup.
+        """
         runner = _make_runner()
         adapter = StubAdapter(succeed=True)
 

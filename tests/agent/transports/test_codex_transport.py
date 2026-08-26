@@ -272,6 +272,14 @@ class TestCodexBuildKwargs:
         # "minimal" should be clamped to "low"
         assert kw.get("reasoning", {}).get("effort") == "low"
 
+    def test_spark_none_effort_clamped(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.3-codex-spark", messages=messages, tools=[],
+            reasoning_config={"effort": "none"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "low"
+
     def test_xai_reasoning_effort_passed(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

@@ -173,6 +173,36 @@ def test_readonly_openclaw_executor_closes_execution_and_review_tasks(kanban_hom
         assert run.metadata["snapshot_chars"] == len("Example Domain")
 
 
+def test_readonly_openclaw_executor_persists_backend_token_usage(kanban_home):
+    def transport(task):
+        result = _successful_result(task)
+        result["token_usage"] = {
+            "input_tokens": 11,
+            "output_tokens": 5,
+            "cache_read_tokens": 13,
+            "reasoning_tokens": 2,
+        }
+        return result
+
+    result = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=transport,
+    )
+
+    assert result["status"] == "succeeded"
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+        assert run is not None
+        assert run.metadata["backend_token_usage"] == {
+            "input_tokens": 11,
+            "output_tokens": 5,
+            "cache_read_tokens": 13,
+            "reasoning_tokens": 2,
+            "total_tokens": 31,
+        }
+
+
 def test_readonly_execution_and_review_finalize_in_one_transaction(
     kanban_home, monkeypatch
 ):

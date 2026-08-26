@@ -1216,17 +1216,27 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    agent._memory_adjudicator = None
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            adjudication_config = mem_config.get("adjudication", {})
+            if isinstance(adjudication_config, dict) and adjudication_config.get("enabled", False):
+                from agent.memory_adjudication import MemoryAdjudicator
+                agent._memory_adjudicator = MemoryAdjudicator(
+                    adjudication_config,
+                    hermes_home=get_hermes_home(),
+                )
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    adjudicator=agent._memory_adjudicator,
+                    session_id=agent.session_id or "",
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1244,7 +1254,9 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    adjudicator=agent._memory_adjudicator,
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
@@ -1293,8 +1305,36 @@ def init_agent(
                         _init_kwargs["agent_workspace"] = "hermes"
                     except Exception:
                         pass
-                    agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    _raw_mem_init_timeout = os.getenv(
+                        "HERMES_MEMORY_PROVIDER_INIT_TIMEOUT", "10"
+                    ).strip()
+                    try:
+                        _mem_init_timeout = max(
+                            0.0, float(_raw_mem_init_timeout or "10")
+                        )
+                    except (TypeError, ValueError):
+                        _mem_init_timeout = 10.0
+                        _ra().logger.warning(
+                            "Invalid HERMES_MEMORY_PROVIDER_INIT_TIMEOUT=%r; "
+                            "using 10s",
+                            _raw_mem_init_timeout,
+                        )
+                    _mem_init_ok = agent._memory_manager.initialize_all_bounded(
+                        timeout_seconds=_mem_init_timeout,
+                        **_init_kwargs,
+                    )
+                    if _mem_init_ok:
+                        _ra().logger.info(
+                            "Memory provider '%s' activated", _mem_provider_name
+                        )
+                    else:
+                        agent._memory_provider_init_timed_out = True
+                        agent._memory_manager = None
+                        _ra().logger.warning(
+                            "Memory provider '%s' disabled for this agent after "
+                            "initialization timeout",
+                            _mem_provider_name,
+                        )
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None

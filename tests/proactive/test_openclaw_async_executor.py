@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -8,8 +9,12 @@ from hermes_cli import kanban_db as kb
 from proactive import openclaw_async_executor
 from proactive.backend_poll_worker import poll_due_backend_runs
 from proactive.openclaw_async_executor import (
+    make_loop_contract_poll_adapter,
+    make_loop_contract_terminal_handler,
     make_zero_effect_async_poll_adapter,
     make_zero_effect_async_terminal_handler,
+    retry_ready_loop_contract_execution,
+    start_loop_contract_execution,
     start_zero_effect_async_acceptance,
 )
 
@@ -131,6 +136,746 @@ def _pending_admission_result(task):
         }
     ]
     return result
+
+
+def _loop_result(task, status):
+    terminal = status == "succeeded"
+    backend_agent_id = task.get("backend_agent_id") or "missioncrew-executor"
+    return {
+        "task_id": task["task_id"],
+        "status": status,
+        "summary": f"OpenClaw Loop Contract is {status}.",
+        "artifacts": ([{
+            "type": "openclaw_result",
+            "value": {
+                "evidence": {
+                    "terminal": True,
+                    "resultContractValid": True,
+                    "externalEffectBudget": 0,
+                },
+                "result": {
+                    "status": "succeeded",
+                    "summary": "Loop Contract completed.",
+                    "acceptanceEvidence": ["verified"],
+                    "externalEffects": [],
+                },
+            },
+        }] if terminal else []),
+        "tool_calls": [{"name": "openclaw_bridge_http"}],
+        "audit_log": ["accepted"],
+        "errors": [],
+        "requires_human_review": False,
+        "recommended_next_action": "Review." if terminal else "Poll.",
+        "protocol_version": "2.0",
+        "protocol_correlated": True,
+        "delegation_id": task["delegation_id"],
+        "attempt_id": task["attempt_id"],
+        "contract_fingerprint": task["contract_fingerprint"],
+        "identity_correlated": True,
+        "backend_run_id": "openclaw-loop-run-1",
+        "backend_agent_id": backend_agent_id,
+        "backend_session_key": (
+            task.get("backend_session_key")
+            or f"agent:{backend_agent_id}:subagent:test-loop"
+        ),
+    }
+
+
+def test_loop_contract_routes_execution_to_openclaw_and_keeps_grace_review(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-routing-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-routing-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+        review = kb.get_task(conn, started["review_task_id"])
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert execution is not None
+    assert execution.assignee == "openclaw"
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+    assert run is not None
+    assert run.metadata["backend_agent_id"] == "missioncrew-research"
+    role_card = run.metadata["loop_contract"]["routing"]["resolved"][
+        "backend_role_card"
+    ]
+    assert role_card["agent_id"] == "research"
+    assert role_card["agent_display_name"] == "Research Agent"
+    assert role_card["agent_role"] == "market_research_and_evidence"
+    assert role_card["primary_model"] == "codex"
+    assert role_card["fallback_model"] == "gemini-3.1-pro"
+    assert role_card["worker_id"] == "clawops.research"
+    assert role_card["worker_role"] == "research"
+    assert role_card["runtime_profile"] == "clawops-research"
+    assert role_card["approval_required"] is False
+    assert role_card["output_format"] == "markdown"
+    assert "evidence" in role_card["required_sections"]
+    assert "驗證 OpenClaw 真實非同步零副作用執行。" not in execution.body
+    assert review is not None
+    assert review.executor_backend == "hermes"
+    assert review.executor_profile == "grace-policy-review"
+
+
+def test_external_loop_contract_requires_scoped_approval(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-external-1"
+    contract["external_targets"] = ["Facebook Page: MissionCrew.ai"]
+
+    with pytest.raises(ValueError, match="requires scoped approval"):
+        start_loop_contract_execution(
+            contract=contract,
+            task_type="browser_publish",
+            risk_level="high",
+            approved=False,
+            delegation_id="delegation-loop-external-1",
+            transport=lambda task: _loop_result(task, "queued"),
+        )
+
+
+def test_image_generation_loop_contract_requires_matching_backend_capability(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-image-generation-1"
+    contract["goal"]["objective"] = "Generate and verify a 16:9 Hero image."
+    contract["goal"]["deliverables"] = [
+        "Generated image file",
+        "Visual inspection",
+        "SHA-256",
+    ]
+    contract["routing"] = {
+        "resolved": {
+            "assignment": {
+                "allowed_tools": [
+                    "memory_read",
+                    "docs_read",
+                    "draft_markdown",
+                    "image_generate",
+                ],
+            },
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="missing_capabilities:image_generate"):
+        start_loop_contract_execution(
+            contract=contract,
+            task_type="content_draft",
+            risk_level="low",
+            approved=True,
+            delegation_id="delegation-loop-image-generation-1",
+            transport=lambda task: _loop_result(task, "queued"),
+        )
+
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_internal_artifact_sentinel_has_no_external_effect_budget(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-internal-artifact-1"
+    contract["external_targets"] = [
+        "Internal Topic Instructions artifact only — no external platform action"
+    ]
+
+    def transport(task):
+        assert task["external_effect_budget"] == 0
+        assert task["allowed_tools"] == ["read", "write", "web_search"]
+        assert task["credential_refs"] == []
+        assert "external_targets" not in task["loop_contract"]
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-internal-artifact-1",
+        transport=transport,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["max_poll_iterations"] == 0
+
+
+def test_explicit_zh_internal_targets_have_no_external_effect_budget(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-zh-internal-artifact-1"
+    contract["external_targets"] = [
+        "Facebook Page（僅修訂貼文文案結構與規則，不登入或操作）",
+        "Gemini Notebook（僅產出貼入用 Prompt，不登入或操作）",
+        "Podcast Hosting／Apple Podcasts（僅產出 Title 與 Description，不上架或操作）",
+    ]
+
+    def transport(task):
+        assert task["external_effect_budget"] == 0
+        assert task["allowed_tools"] == ["read", "write", "web_search"]
+        assert "external_targets" not in task["loop_contract"]
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-zh-internal-artifact-1",
+        transport=transport,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+
+
+def test_content_draft_url_target_has_no_external_effect_budget(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "tasker-content-draft-1"
+    contract["external_targets"] = [
+        "https://www.tasker.com.tw/users/tasker/profile"
+    ]
+    contract["scope"] = {
+        "allowed": ["僅產製本地文字草稿"],
+        "forbidden": ["瀏覽、登入或修改外部網站"],
+    }
+
+    def transport(task):
+        assert task["external_effect_budget"] == 0
+        assert task["allowed_tools"] == ["read", "write", "web_search"]
+        assert task["credential_refs"] == []
+        assert "external_targets" not in task["loop_contract"]
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=True,
+        delegation_id="delegation-tasker-content-draft-1",
+        transport=transport,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+
+
+def test_missing_specialized_loop_agent_workspace_falls_back_to_executor(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "missing-content-agent-1"
+    executor_workspace = (
+        Path.home()
+        / "my_agent_team"
+        / "openclaw-workspace"
+        / "agents"
+        / "missioncrew-executor"
+    )
+    executor_workspace.mkdir(parents=True)
+
+    def transport(task):
+        assert task["backend_agent_id"] == "missioncrew-executor"
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-missing-content-agent-1",
+        transport=transport,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["backend_agent_id"] == "missioncrew-executor"
+
+
+def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "marketplace-readonly-1"
+    contract["external_targets"] = [
+        "Facebook Marketplace listing ID 915975414881937"
+    ]
+
+    def transport(task):
+        assert task["external_effect_budget"] == 0
+        assert not task.get("approval_grant_id")
+        assert task["allowed_tools"] == ["read", "web_search", "browser"]
+        assert task["credential_refs"] == []
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_marketplace_readonly",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-marketplace-readonly-1",
+        transport=transport,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["credential_refs"] == []
+
+
+def test_loop_start_replays_ambiguous_timeout_with_same_key(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-timeout-replay-1"
+    seen_keys = []
+
+    def timeout_transport(task):
+        seen_keys.append(task["idempotency_key"])
+        raise TimeoutError("response lost after admission")
+
+    first = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-timeout-replay-1",
+        transport=timeout_transport,
+    )
+    assert first["status"] == "retrying"
+
+    def replay_transport(task):
+        seen_keys.append(task["idempotency_key"])
+        return _loop_result(task, "queued")
+
+    replayed = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-timeout-replay-1",
+        transport=replay_transport,
+    )
+
+    assert replayed["status"] == "queued"
+    assert replayed["run_id"] == first["run_id"]
+    assert replayed["deduplicated"] is True
+    assert seen_keys[0] == seen_keys[1]
+
+
+def test_loop_start_replays_ambiguous_result_with_same_key(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-result-replay-1"
+    seen_keys = []
+
+    def pending_transport(task):
+        seen_keys.append(task["idempotency_key"])
+        return _pending_admission_result(task)
+
+    first = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-result-replay-1",
+        transport=pending_transport,
+    )
+    assert first["status"] == "retrying"
+
+    def replay_transport(task):
+        seen_keys.append(task["idempotency_key"])
+        return _loop_result(task, "queued")
+
+    replayed = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-result-replay-1",
+        transport=replay_transport,
+    )
+
+    assert replayed["status"] == "queued"
+    assert replayed["run_id"] == first["run_id"]
+    assert seen_keys[0] == seen_keys[1]
+
+
+def test_loop_start_rejects_uncorrelated_protocol(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-protocol-reject-1"
+
+    def transport(task):
+        result = _loop_result(task, "queued")
+        result["protocol_correlated"] = False
+        return result
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-protocol-reject-1",
+        transport=transport,
+    )
+
+    assert started["status"] == "blocked"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+
+
+def test_loop_contract_terminal_result_releases_grace_review(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-terminal-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-terminal-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    adapter = make_loop_contract_poll_adapter(
+        transport=lambda task: _loop_result(task, "succeeded")
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    observation = adapter(run)
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+        review = kb.get_task(conn, started["review_task_id"])
+    assert execution is not None and execution.status == "done"
+    assert review is not None and review.status in {"ready", "todo"}
+
+
+def test_loop_contract_terminal_accepts_result_text_json(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-terminal-result-text-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-terminal-result-text-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    result = output.pop("result")
+    output["resultText"] = json.dumps(result, ensure_ascii=False)
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-result-text-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+    assert execution is not None and execution.status == "done"
+
+
+def test_loop_contract_synchronous_success_is_completed_before_return(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-sync-terminal-1"
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-sync-terminal-1",
+        transport=lambda task: _loop_result(task, "succeeded"),
+    )
+
+    assert started["status"] == "succeeded"
+    assert started["terminal_review"]["accepted"] is True
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+        review = kb.get_task(conn, started["review_task_id"])
+    assert execution is not None and execution.status == "done"
+    assert review is not None and review.status in {"ready", "todo"}
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("backend_run_id", "wrong-run"),
+        ("backend_agent_id", "wrong-agent"),
+        ("backend_session_key", "wrong-session"),
+        ("protocol_version", "1.0"),
+    ],
+)
+def test_loop_contract_poll_rejects_cross_run_backend_identity(
+    kanban_home,
+    field,
+    wrong_value,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = f"loop-poll-mismatch-{field}"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id=f"delegation-loop-poll-mismatch-{field}",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+
+    def mismatched(task):
+        result = _loop_result(task, "running")
+        result[field] = wrong_value
+        return result
+
+    adapter = make_loop_contract_poll_adapter(transport=mismatched)
+    with pytest.raises(ValueError, match="backend correlation mismatch"):
+        adapter(run)
+
+
+def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-correction-1"
+    from hermes_cli.telegram_message_path import build_telegram_message_path
+
+    message_path = build_telegram_message_path(
+        chat_id="chat-1",
+        thread_id="2",
+        user_id="kj",
+        inbound_message_id="message-correction-1",
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-correction-1",
+        telegram_message_path=message_path,
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="incomplete evidence",
+            expected_run_id=run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 1)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"candidate URLs are missing"}',
+            ),
+        )
+        conn.commit()
+
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    retried = retry_ready_loop_contract_execution(
+        started["execution_task_id"],
+        transport=transport,
+    )
+
+    assert retried["execution_task_id"] == started["execution_task_id"]
+    assert retried["run_id"] != started["run_id"]
+    assert seen["objective"] == contract["goal"]["objective"]
+    assert seen["external_effect_budget"] == 0
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        run = kb.get_run(conn, int(retried["run_id"]))
+        assert task is not None and task.status == "running"
+        assert run is not None
+        assert run.metadata["correction_reason"] == "candidate URLs are missing"
+        assert run.metadata["contract_fingerprint"] != (
+            kb.get_run(conn, int(started["run_id"])).metadata["contract_fingerprint"]
+        )
+        assert run.metadata["loop_contract"]["verification"]["review_feedback"] == [
+            "candidate URLs are missing"
+        ]
+        assert run.metadata["telegram_message_path"]["run_id"] == str(run.id)
+        assert run.metadata["telegram_message_path"]["openclaw_backend_run_id"]
+        assert (
+            run.metadata["backend_telegram_message_path"]["trace_id"]
+            == message_path["trace_id"]
+        )
+        assert (
+            run.metadata["loop_contract"]["audit"]["original_request_sha256"]
+            == seen["loop_contract"]["audit"]["original_request_sha256"]
+        )
+
+    with kb.connect() as conn:
+        corrected_run = kb.get_run(conn, int(retried["run_id"]))
+        assert corrected_run is not None
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="still incomplete",
+            expected_run_id=corrected_run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 2)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"source timestamps are missing"}',
+            ),
+        )
+        conn.commit()
+
+    second_retry = retry_ready_loop_contract_execution(
+        started["execution_task_id"],
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        second_run = kb.get_run(conn, int(second_retry["run_id"]))
+    assert second_run is not None
+    assert second_run.metadata["loop_contract"]["verification"][
+        "review_feedback"
+    ] == ["candidate URLs are missing", "source timestamps are missing"]
+
+
+def test_grace_correction_does_not_auto_replay_external_effects(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-effect-correction-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-effect-correction-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        assert kb.merge_active_run_metadata(
+            conn,
+            started["execution_task_id"],
+            expected_run_id=run.id,
+            metadata={
+                "external_effect_budget": 1,
+                "approval_grant_id": "original-scoped-grant",
+            },
+        )
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="evidence incomplete",
+            expected_run_id=run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', '{}', 1)
+            """,
+            (started["execution_task_id"],),
+        )
+        conn.commit()
+
+    with pytest.raises(ValueError, match="fresh scoped approval"):
+        retry_ready_loop_contract_execution(
+            started["execution_task_id"],
+            transport=lambda _task: pytest.fail("must not replay an external effect"),
+        )
+
+
+def test_zero_budget_terminal_rejects_reported_external_effect(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-effect-evidence-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-effect-evidence-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["artifacts"][0]["value"]["result"]["externalEffects"] = [
+        {"platform": "facebook", "state": "published"}
+    ]
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
 
 
 def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):

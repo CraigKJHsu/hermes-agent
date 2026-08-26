@@ -3272,7 +3272,7 @@ class TestCodexAdapterReasoningTranslation:
     """
 
     @staticmethod
-    def _build_adapter():
+    def _build_adapter(model="gpt-5.3-codex"):
         """Build a _CodexCompletionsAdapter with a mocked responses.create()."""
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace
@@ -3312,7 +3312,7 @@ class TestCodexAdapterReasoningTranslation:
 
         real_client = MagicMock()
         real_client.responses.create = _create
-        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+        adapter = _CodexCompletionsAdapter(real_client, model)
         return adapter, captured_kwargs
 
     def test_reasoning_effort_medium_translated_to_top_level(self):
@@ -3333,6 +3333,14 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
         assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_spark_reasoning_effort_none_clamped_to_low(self):
+        adapter, captured = self._build_adapter("gpt-5.3-codex-spark")
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "none"}},
+        )
+        assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
 
     def test_reasoning_effort_low_passed_through(self):
         adapter, captured = self._build_adapter()
@@ -4496,6 +4504,72 @@ class TestAuxiliaryMaxTokensParam:
         ):
             assert auxiliary_max_tokens_param(4096, model="") == {"max_tokens": 4096}
             assert auxiliary_max_tokens_param(4096, model=None) == {"max_tokens": 4096}
+
+
+class TestSameProviderModelFallback:
+    def test_configured_chain_allows_different_model_on_same_provider(self, monkeypatch):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        client = MagicMock(name="spark_client")
+        entry = {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex-spark",
+        }
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {
+                "model": "gpt-5.6-luna",
+                "fallback_chain": [entry],
+            },
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            lambda candidate: (client, candidate["model"]),
+        )
+
+        resolved_client, model, _ = _try_configured_fallback_chain(
+            "fast_translation",
+            "openai-codex",
+            failed_model="gpt-5.6-luna",
+        )
+
+        assert resolved_client is client
+        assert model == "gpt-5.3-codex-spark"
+
+    def test_main_chain_allows_different_model_on_same_provider(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        client = MagicMock(name="spark_client")
+        entry = {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex-spark",
+        }
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: {"fallback_providers": [entry]}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            lambda config: config["fallback_providers"],
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "openai-codex"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._is_provider_unhealthy", lambda provider: False
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            lambda candidate: (client, candidate["model"]),
+        )
+
+        resolved_client, model, _ = _try_main_fallback_chain(
+            "compression",
+            "openai-codex",
+            failed_model="gpt-5.6-terra",
+        )
+
+        assert resolved_client is client
+        assert model == "gpt-5.3-codex-spark"
 
 
 # ── Regression tests for issue #52392 ─────────────────────────────────────

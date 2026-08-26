@@ -6,7 +6,7 @@ import shlex
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -18,6 +18,25 @@ from proactive.tool_policy import PolicyLevel, decide_action, load_tool_policy
 DEFAULT_OPENCLAW_BRIDGE_PATH = "/api/plugins/hermes-bridge/tasks"
 DEFAULT_OPENCLAW_TEMPLATE = "agents.ask_team"
 _ZERO_EFFECT_ASYNC_CAPABILITY = object()
+_LOOP_CONTRACT_ASYNC_CAPABILITY = object()
+_READONLY_BROWSER_ALLOWED_URLS = frozenset(
+    {
+        "https://example.com/",
+        "https://www.linkedin.com/in/craig-k-j-hsu-6012b815",
+    }
+)
+_LOOP_CONTRACT_AGENT_IDS = frozenset(
+    {
+        "missioncrew-browser-readonly",
+        "missioncrew-research",
+        "missioncrew-content",
+        "missioncrew-ops",
+        "missioncrew-devops",
+        "missioncrew-browser-operator",
+        "missioncrew-review",
+        "missioncrew-executor",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -46,12 +65,14 @@ OPENCLAW_DELEGATE_PARAMETERS = {
         "target_url": {"type": "string"},
         "start_idempotency_key": {"type": "string"},
         "backend_run_id": {"type": "string"},
+        "backend_session_key": {"type": "string"},
         "protocol_version": {"type": "string"},
         "delegation_id": {"type": "string"},
         "attempt_id": {"type": "string"},
         "contract_fingerprint": {"type": "string"},
         "project": {"type": "string"},
         "topic_id": {"type": "string"},
+        "task_type": {"type": "string"},
         "executor_backend": {"type": "string"},
         "executor_profile": {"type": "string"},
         "backend_agent_id": {"type": "string"},
@@ -62,6 +83,11 @@ OPENCLAW_DELEGATE_PARAMETERS = {
         "credential_refs": {"type": "array", "items": {"type": "string"}},
         "idempotency_key": {"type": "string"},
         "dry_run": {"type": "boolean"},
+        "scope": {"type": "object"},
+        "context_packet": {"type": "object"},
+        "confirmation_policy": {"type": "object"},
+        "result_contract": {"type": "object"},
+        "loop_contract": {"type": "object"},
     },
     "required": ["objective"],
 }
@@ -79,14 +105,15 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
         if raw_protocol_version is None
         else str(raw_protocol_version).strip()
     )
-    if protocol_version not in {"1.0", "2.0"}:
+    if protocol_version not in {"1.0", "2.0", "3.0-draft"}:
         raise ValueError(
-            "protocol_version must be explicitly '1.0' or '2.0' when provided"
+            "protocol_version must be explicitly '1.0', '2.0', or "
+            "'3.0-draft' when provided"
         )
-    if protocol_version == "2.0":
+    if protocol_version in {"2.0", "3.0-draft"}:
         for field in ("requires_confirmation", "audit_required", "dry_run"):
             if field in args and not isinstance(args[field], bool):
-                raise ValueError(f"Protocol v2 {field} must be a boolean")
+                raise ValueError(f"Protocol {protocol_version} {field} must be a boolean")
         for field in (
             "context_refs",
             "allowed_tools",
@@ -100,7 +127,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
                 not isinstance(item, str) for item in value
             ):
                 raise ValueError(
-                    f"Protocol v2 {field} must be an array of strings"
+                    f"Protocol {protocol_version} {field} must be an array of strings"
                 )
         if "external_effect_budget" in args:
             budget = args["external_effect_budget"]
@@ -110,9 +137,13 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
                 or budget < 0
             ):
                 raise ValueError(
-                    "Protocol v2 external_effect_budget must be a "
+                    f"Protocol {protocol_version} external_effect_budget must be a "
                     "non-negative integer"
                 )
+        if "message_path" in args and not isinstance(args["message_path"], dict):
+            raise ValueError(
+                f"Protocol {protocol_version} message_path must be an object"
+            )
         if "max_runtime_seconds" in args:
             runtime = args["max_runtime_seconds"]
             if (
@@ -121,8 +152,19 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
                 or runtime <= 0
             ):
                 raise ValueError(
-                    "Protocol v2 max_runtime_seconds must be a positive integer"
+                    f"Protocol {protocol_version} max_runtime_seconds must be a positive integer"
                 )
+        if protocol_version == "3.0-draft":
+            for field in (
+                "scope",
+                "context_packet",
+                "confirmation_policy",
+                "result_contract",
+            ):
+                if field in args and not isinstance(args[field], dict):
+                    raise ValueError(
+                        f"Protocol {protocol_version} {field} must be an object"
+                    )
     risk = str(args.get("risk_level") or "medium").lower()
     requires_confirmation = bool(args.get("requires_confirmation", risk in {"high", "critical"}))
     task = {
@@ -138,7 +180,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
         "output_format": str(args.get("output_format") or "markdown"),
         "audit_required": bool(args.get("audit_required", True)),
     }
-    if protocol_version == "2.0":
+    if protocol_version in {"2.0", "3.0-draft"}:
         required_v2 = (
             "delegation_id",
             "attempt_id",
@@ -148,14 +190,24 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
             "executor_profile",
             "backend_agent_id",
         )
+        if protocol_version == "3.0-draft":
+            required_v2 = (
+                *required_v2,
+                "task_type",
+                "scope",
+                "context_packet",
+                "confirmation_policy",
+                "result_contract",
+            )
         missing = [name for name in required_v2 if not str(args.get(name) or "").strip()]
         if missing:
             raise ValueError(
-                "Protocol v2 requires field(s): " + ", ".join(missing)
+                f"Protocol {protocol_version} requires field(s): "
+                + ", ".join(missing)
             )
         task.update(
             {
-                "protocol_version": "2.0",
+                "protocol_version": protocol_version,
                 "delegation_id": str(args["delegation_id"]).strip(),
                 "attempt_id": str(args["attempt_id"]).strip(),
                 "contract_fingerprint": str(args["contract_fingerprint"]).strip(),
@@ -173,6 +225,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
         for field in (
             "project",
             "topic_id",
+            "task_type",
             "executor_profile",
             "backend_agent_id",
             "approval_grant_id",
@@ -180,10 +233,23 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
             "target_url",
             "start_idempotency_key",
             "backend_run_id",
+            "backend_session_key",
         ):
             value = str(args.get(field) or "").strip()
             if value:
                 task[field] = value
+        if isinstance(args.get("message_path"), dict):
+            task["message_path"] = dict(args["message_path"])
+        if isinstance(args.get("loop_contract"), dict):
+            task["loop_contract"] = dict(args["loop_contract"])
+        if protocol_version == "3.0-draft":
+            for field in (
+                "scope",
+                "context_packet",
+                "confirmation_policy",
+                "result_contract",
+            ):
+                task[field] = dict(args.get(field) or {})
     return validate_delegated_task(task)
 
 
@@ -449,7 +515,8 @@ def _openclaw_payload(
         and task.get("credential_refs") == []
         and task.get("requires_confirmation") is False
         and task.get("allowed_tools") == ["browser.read"]
-        and str(task.get("target_url") or "").strip() == "https://example.com/"
+        and str(task.get("target_url") or "").strip()
+        in _READONLY_BROWSER_ALLOWED_URLS
         and bool(str(task.get("project") or "").strip())
         and bool(str(task.get("topic_id") or "").strip())
         and bool(str(task.get("idempotency_key") or "").strip())
@@ -492,14 +559,49 @@ def _openclaw_payload(
             )
         )
     )
+    is_live_loop_contract_async = (
+        live_async_capability is _LOOP_CONTRACT_ASYNC_CAPABILITY
+        and task.get("protocol_version") == "2.0"
+        and template
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+        and task.get("dry_run") is False
+        and task.get("executor_backend") == "openclaw"
+        and task.get("executor_profile") == "loop-contract"
+        and task.get("backend_agent_id") in _LOOP_CONTRACT_AGENT_IDS
+        and task.get("workspace_policy") == "dedicated"
+        and task.get("session_policy") in {"ephemeral", "persistent"}
+        and isinstance(task.get("credential_refs"), list)
+        and task.get("requires_confirmation") is False
+        and bool(str(task.get("project") or "").strip())
+        and bool(str(task.get("topic_id") or "").strip())
+        and bool(str(task.get("idempotency_key") or "").strip())
+        and (
+            int(task.get("external_effect_budget") or 0) == 0
+            or bool(str(task.get("approval_grant_id") or "").strip())
+        )
+        and (
+            template == "openclaw.agent.loop_contract_start"
+            or (
+                bool(str(task.get("start_idempotency_key") or "").strip())
+                and bool(str(task.get("backend_run_id") or "").strip())
+                and bool(str(task.get("backend_session_key") or "").strip())
+            )
+        )
+    )
     if (
         task.get("dry_run") is False
         and not is_live_read_snapshot
         and not is_live_zero_effect_async
+        and not is_live_loop_contract_async
     ):
         raise ValueError(
             "Only the Protocol v2 zero-effect OpenClaw templates may set "
-            "dry_run=false."
+            "dry_run=false. Protocol v3 live templates must be verified before "
+            "admission."
         )
     payload = {
         "taskId": template,
@@ -513,6 +615,16 @@ def _openclaw_payload(
             "contextRefs": list(task.get("context_refs") or []),
             "delegatedTaskId": task["task_id"],
             "outputFormat": task["output_format"],
+            **(
+                {"loopContract": dict(task["loop_contract"])}
+                if isinstance(task.get("loop_contract"), dict)
+                else {}
+            ),
+            **(
+                {"messagePath": dict(task["message_path"])}
+                if isinstance(task.get("message_path"), dict)
+                else {}
+            ),
             **(
                 {"url": str(task["target_url"]).strip()}
                 if task.get("target_url")
@@ -532,20 +644,30 @@ def _openclaw_payload(
                 if task.get("backend_run_id")
                 else {}
             ),
+            **(
+                {"backendSessionKey": str(task["backend_session_key"]).strip()}
+                if task.get("backend_session_key")
+                else {}
+            ),
         },
         "dryRun": bool(task.get("dry_run", True)),
         "idempotencyKey": str(task.get("idempotency_key") or task["task_id"]),
     }
-    if task.get("protocol_version") == "2.0":
+    if task.get("protocol_version") in {"2.0", "3.0-draft"}:
         payload.update(
             {
-                "protocolVersion": "2.0",
+                "protocolVersion": task.get("protocol_version"),
                 "identity": {
                     "delegationId": task["delegation_id"],
                     "attemptId": task["attempt_id"],
                     "contractFingerprint": task["contract_fingerprint"],
                     "project": task.get("project"),
                     "topicId": task.get("topic_id"),
+                    **(
+                        {"taskType": task.get("task_type")}
+                        if task.get("task_type")
+                        else {}
+                    ),
                 },
                 "routing": {
                     "executorBackend": task.get("executor_backend"),
@@ -561,6 +683,13 @@ def _openclaw_payload(
                 },
             }
         )
+    if task.get("protocol_version") == "3.0-draft":
+        payload["contract"] = {
+            "scope": dict(task.get("scope") or {}),
+            "contextPacket": dict(task.get("context_packet") or {}),
+            "confirmationPolicy": dict(task.get("confirmation_policy") or {}),
+            "resultContract": dict(task.get("result_contract") or {}),
+        }
     return payload
 
 
@@ -569,10 +698,10 @@ def _with_protocol_failure_correlation(
     result: dict[str, Any],
 ) -> dict[str, Any]:
     """Preserve Protocol v2 request identity without claiming a response echo."""
-    if task.get("protocol_version") == "2.0":
+    if task.get("protocol_version") in {"2.0", "3.0-draft"}:
         result.update(
             {
-                "protocol_version": "2.0",
+                "protocol_version": str(task.get("protocol_version") or ""),
                 "delegation_id": task["delegation_id"],
                 "attempt_id": task["attempt_id"],
                 "contract_fingerprint": task["contract_fingerprint"],
@@ -581,6 +710,145 @@ def _with_protocol_failure_correlation(
             }
         )
     return result
+
+
+def _protocol_label(protocol_version: str) -> str:
+    if protocol_version == "2.0":
+        return "v2"
+    return protocol_version
+
+
+def _result_field(payload: Mapping[str, Any], snake: str, camel: str) -> Any:
+    if snake in payload:
+        return payload.get(snake)
+    return payload.get(camel)
+
+
+def _result_list(
+    payload: Mapping[str, Any],
+    snake: str,
+    camel: str,
+    *,
+    errors: list[str],
+    required: bool,
+) -> list[Any]:
+    value = _result_field(payload, snake, camel)
+    if value is None:
+        if required:
+            errors.append(f"OpenClaw response omitted standardized result field {snake}.")
+        return []
+    if not isinstance(value, list):
+        errors.append(f"OpenClaw response standardized result field {snake} must be an array.")
+        return []
+    return list(value)
+
+
+def _result_bool(
+    payload: Mapping[str, Any],
+    snake: str,
+    camel: str,
+    *,
+    errors: list[str],
+    required: bool,
+) -> bool | None:
+    value = _result_field(payload, snake, camel)
+    if value is None:
+        if required:
+            errors.append(f"OpenClaw response omitted standardized result field {snake}.")
+        return None
+    if not isinstance(value, bool):
+        errors.append(f"OpenClaw response standardized result field {snake} must be a boolean.")
+        return None
+    return value
+
+
+_TOKEN_USAGE_FIELDS = (
+    ("input_tokens", ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens")),
+    ("output_tokens", ("output_tokens", "outputTokens", "completion_tokens", "completionTokens")),
+    (
+        "cache_read_tokens",
+        (
+            "cache_read_tokens",
+            "cacheReadTokens",
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+        ),
+    ),
+    (
+        "cache_write_tokens",
+        (
+            "cache_write_tokens",
+            "cacheWriteTokens",
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+        ),
+    ),
+    (
+        "reasoning_tokens",
+        ("reasoning_tokens", "reasoningTokens", "reasoning_output_tokens", "reasoningOutputTokens"),
+    ),
+    ("total_tokens", ("total_tokens", "totalTokens")),
+)
+
+
+def _coerce_token_count(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdecimal():
+            return int(stripped)
+    return None
+
+
+def _find_mapping_value(payload: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in payload:
+            return payload.get(key)
+    return None
+
+
+def _normalize_token_usage(
+    payload: Mapping[str, Any],
+    backend: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    candidates: list[Mapping[str, Any]] = []
+    for container in (payload, backend or {}):
+        if not isinstance(container, Mapping):
+            continue
+        for key in ("token_usage", "tokenUsage", "usage"):
+            value = container.get(key)
+            if isinstance(value, Mapping):
+                candidates.append(value)
+        candidates.append(container)
+
+    usage: dict[str, Any] = {}
+    for target_key, source_keys in _TOKEN_USAGE_FIELDS:
+        for candidate in candidates:
+            value = _coerce_token_count(_find_mapping_value(candidate, source_keys))
+            if value is not None:
+                usage[target_key] = value
+                break
+
+    token_total_keys = {"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"}
+    if "total_tokens" not in usage and any(key in usage for key in token_total_keys):
+        usage["total_tokens"] = sum(int(usage.get(key) or 0) for key in token_total_keys)
+    if not any(key in usage for key in token_total_keys | {"total_tokens"}):
+        return None
+
+    for meta_key in ("model", "provider", "source"):
+        for candidate in candidates:
+            value = candidate.get(meta_key)
+            if isinstance(value, str) and value.strip():
+                usage[meta_key] = value.strip()
+                break
+    return usage
 
 
 def post_to_openclaw_bridge(
@@ -692,11 +960,18 @@ def post_to_openclaw_bridge(
             else False
         )
     )
+    requested_interruption = str(
+        openclaw_result.get("type") or openclaw_result.get("status") or ""
+    ).strip()
     status = str(openclaw_result.get("status") or ("succeeded" if ok else "failed"))
     if status == "accepted":
         status = "queued"
     if status not in {"queued", "running", "succeeded", "failed", "blocked"}:
-        status = "succeeded" if ok else "failed"
+        status = (
+            "blocked"
+            if requested_interruption in {"request_context", "request_confirmation"}
+            else ("succeeded" if ok else "failed")
+        )
     if ok_present and not ok:
         status = "failed"
     if status in {"failed", "blocked"}:
@@ -710,18 +985,19 @@ def post_to_openclaw_bridge(
         else ""
     )
     protocol_correlated = (
-        expected_protocol != "2.0" or returned_protocol == expected_protocol
+        expected_protocol == "1.0" or returned_protocol == expected_protocol
     )
     protocol_errors: list[str] = []
     if not ok_type_valid:
         protocol_errors.append("OpenClaw response ok must be a boolean.")
-    if expected_protocol == "2.0" and returned_protocol != "2.0":
+    if expected_protocol in {"2.0", "3.0-draft"} and returned_protocol != expected_protocol:
         protocol_errors.append(
-            "OpenClaw response did not explicitly echo Protocol v2."
+            "OpenClaw response did not explicitly echo "
+            f"Protocol {_protocol_label(expected_protocol)}."
         )
     execution_identity = openclaw_result.get("executionIdentity")
-    identity_correlated = expected_protocol != "2.0"
-    if expected_protocol == "2.0":
+    identity_correlated = expected_protocol == "1.0"
+    if expected_protocol in {"2.0", "3.0-draft"}:
         expected_identity = {
             "delegationId": str(task.get("delegation_id") or ""),
             "attemptId": str(task.get("attempt_id") or ""),
@@ -743,14 +1019,19 @@ def post_to_openclaw_bridge(
                     f"OpenClaw response executionIdentity.{field} did not match the request."
                 )
     backend = openclaw_result.get("backendExecution")
-    claimed_success = ok and status == "succeeded"
-    if expected_protocol == "2.0" and claimed_success:
+    claimed_success = (
+        ok
+        and status == "succeeded"
+        and requested_interruption not in {"request_context", "request_confirmation"}
+    )
+    if expected_protocol in {"2.0", "3.0-draft"} and claimed_success:
         returned_backend = backend if isinstance(backend, dict) else {}
         for field in ("backendRunId", "backendAgentId", "sessionKey"):
             value = returned_backend.get(field)
             if not isinstance(value, str) or not value.strip():
                 protocol_errors.append(
-                    f"OpenClaw Protocol v2 success response omitted backendExecution.{field}."
+                    f"OpenClaw Protocol {_protocol_label(expected_protocol)} "
+                    f"success response omitted backendExecution.{field}."
                 )
         expected_agent_id = str(task.get("backend_agent_id") or "")
         returned_agent_id = returned_backend.get("backendAgentId")
@@ -765,6 +1046,26 @@ def post_to_openclaw_bridge(
     if protocol_errors:
         ok = False
         status = "failed"
+    request_packet: dict[str, Any] | None = None
+    if requested_interruption in {"request_context", "request_confirmation"}:
+        status = "blocked"
+        ok = False
+        request_packet = {
+            "type": requested_interruption,
+            "question": openclaw_result.get("question"),
+            "needed_fields": openclaw_result.get("neededFields")
+            or openclaw_result.get("needed_fields")
+            or [],
+            "reason": openclaw_result.get("reason"),
+            "action": openclaw_result.get("action"),
+            "risk_level": openclaw_result.get("riskLevel")
+            or openclaw_result.get("risk_level"),
+            "summary": openclaw_result.get("summary"),
+            "external_effects": openclaw_result.get("externalEffects")
+            or openclaw_result.get("external_effects")
+            or [],
+            "evidence": openclaw_result.get("evidence") or [],
+        }
     active = status in {"queued", "running"}
     raw_artifacts = openclaw_result.get("artifacts")
     if raw_artifacts is None:
@@ -784,6 +1085,57 @@ def post_to_openclaw_bridge(
                 "value": openclaw_result["output"],
             }
         )
+    if request_packet is not None:
+        returned_artifacts.append(
+            {
+                "type": requested_interruption,
+                "value": request_packet,
+            }
+        )
+    standardized_required = (
+        expected_protocol == "3.0-draft"
+        and status == "succeeded"
+        and requested_interruption not in {"request_context", "request_confirmation"}
+    )
+    actions_taken = _result_list(
+        openclaw_result,
+        "actions_taken",
+        "actionsTaken",
+        errors=protocol_errors,
+        required=standardized_required,
+    )
+    evidence = _result_list(
+        openclaw_result,
+        "evidence",
+        "evidence",
+        errors=protocol_errors,
+        required=standardized_required,
+    )
+    files_changed = _result_list(
+        openclaw_result,
+        "files_changed",
+        "filesChanged",
+        errors=protocol_errors,
+        required=standardized_required,
+    )
+    external_effects = _result_list(
+        openclaw_result,
+        "external_effects",
+        "externalEffects",
+        errors=protocol_errors,
+        required=standardized_required,
+    )
+    needs_review = _result_bool(
+        openclaw_result,
+        "needs_review",
+        "needsReview",
+        errors=protocol_errors,
+        required=standardized_required,
+    )
+    if protocol_errors:
+        ok = False
+        status = "failed"
+        active = False
     delegated_result = {
         "task_id": task["task_id"],
         "status": status,
@@ -795,32 +1147,74 @@ def post_to_openclaw_bridge(
             protocol_errors
             if protocol_errors
             else (
-                []
-                if ok or active
-                else [
-                    str(
-                        (openclaw_result.get("error") or {}).get("message")
-                        if isinstance(openclaw_result.get("error"), dict)
-                        else openclaw_result.get("error")
-                        or "openclaw_bridge_failed"
-                    )
-                ]
+                [requested_interruption]
+                if request_packet is not None
+                else (
+                    []
+                    if ok or active
+                    else [
+                        str(
+                            (openclaw_result.get("error") or {}).get("message")
+                            if isinstance(openclaw_result.get("error"), dict)
+                            else openclaw_result.get("error")
+                            or "openclaw_bridge_failed"
+                        )
+                    ]
+                )
             )
         ),
-        "requires_human_review": bool(
-            openclaw_result.get(
-                "requiresHumanReview",
-                status in {"failed", "blocked"},
+        "requires_human_review": (
+            True
+            if request_packet is not None
+            else (
+                bool(
+                    openclaw_result.get(
+                        "requiresHumanReview",
+                        status in {"failed", "blocked"},
+                    )
+                )
+                or (ok_present and not ok)
+                or bool(protocol_errors)
+                or bool(needs_review)
             )
-        )
-        or (ok_present and not ok)
-        or bool(protocol_errors),
-        "recommended_next_action": str(openclaw_result.get("recommendedNextAction") or ("Review OpenClaw result." if not ok else "Return summarized result to KJ.")),
+        ),
+        "recommended_next_action": str(
+            openclaw_result.get("recommendedNextAction")
+            or (
+                "Ask Grace for scoped context and resume the OpenClaw run."
+                if requested_interruption == "request_context"
+                else (
+                    "Ask KJ for explicit approval through Grace before resuming."
+                    if requested_interruption == "request_confirmation"
+                    else (
+                        "Review OpenClaw result."
+                        if not ok
+                        else "Return summarized result to KJ."
+                    )
+                )
+            )
+        ),
     }
-    if expected_protocol == "2.0":
+    if actions_taken or "actionsTaken" in openclaw_result or "actions_taken" in openclaw_result:
+        delegated_result["actions_taken"] = actions_taken
+    if evidence or "evidence" in openclaw_result:
+        delegated_result["evidence"] = evidence
+    if files_changed or "filesChanged" in openclaw_result or "files_changed" in openclaw_result:
+        delegated_result["files_changed"] = files_changed
+    if external_effects or "externalEffects" in openclaw_result or "external_effects" in openclaw_result:
+        delegated_result["external_effects"] = external_effects
+    if needs_review is not None:
+        delegated_result["needs_review"] = needs_review
+    token_usage = _normalize_token_usage(
+        openclaw_result,
+        backend if isinstance(backend, Mapping) else None,
+    )
+    if token_usage is not None:
+        delegated_result["token_usage"] = token_usage
+    if expected_protocol in {"2.0", "3.0-draft"}:
         delegated_result.update(
             {
-                "protocol_version": "2.0",
+                "protocol_version": expected_protocol,
                 "delegation_id": str(task.get("delegation_id") or ""),
                 "attempt_id": str(task.get("attempt_id") or ""),
                 "contract_fingerprint": str(task.get("contract_fingerprint") or ""),
@@ -849,15 +1243,28 @@ def delegate_to_openclaw(
 ) -> dict[str, Any]:
     task = build_delegated_task(args)
     risk = task["risk_level"]
-    if task["requires_confirmation"] or risk in {"high", "critical"}:
+    is_loop_contract_async = (
+        _live_async_capability is _LOOP_CONTRACT_ASYNC_CAPABILITY
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+    )
+    scoped_approval = bool(str(task.get("approval_grant_id") or "").strip())
+    if task["requires_confirmation"] or (
+        risk in {"high", "critical"}
+        and not (is_loop_contract_async and scoped_approval)
+    ):
         return _blocked_result(task, f"Delegated task risk_level={risk} requires approval.")
-    if _requires_clawops_runtime(task):
+    if _requires_clawops_runtime(task) and not is_loop_contract_async:
         return _blocked_capability_result(
             task,
             "This work belongs in the Hermes-owned ClawOps runtime queue, not the OpenClaw dry-run bridge.",
             "Create a /clawops task so HubOps routing can assign the appropriate ClawOps worker/agent.",
         )
-    if _requires_external_browser_capability(task):
+    if _requires_external_browser_capability(task) and not is_loop_contract_async:
         return _blocked_capability_result(
             task,
             "Facebook/external browser work cannot be delegated to the OpenClaw dry-run bridge.",
@@ -880,13 +1287,33 @@ def delegate_to_openclaw(
             "Create the zero-effect task through the ClawOps execution backend "
             "router.",
         )
+    if (
+        task.get("dry_run") is False
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+        and _live_async_capability is not _LOOP_CONTRACT_ASYNC_CAPABILITY
+    ):
+        return _blocked_capability_result(
+            task,
+            "Live Loop Contract execution requires the durable OpenClaw "
+            "execution adapter.",
+            "Create the task through Grace's validated Loop Contract compiler.",
+        )
 
     policy = load_tool_policy(policy_path)
     for action in task["allowed_tools"]:
         decision = decide_action(action, policy)
         if decision.level is PolicyLevel.DENY:
             return _blocked_result(task, f"Tool policy denied delegated action: {action}")
-        if decision.level is PolicyLevel.CONFIRM_FIRST and risk != "low":
+        if (
+            decision.level is PolicyLevel.CONFIRM_FIRST
+            and risk != "low"
+            and not (is_loop_contract_async and scoped_approval)
+        ):
             return _blocked_result(task, f"Delegated action requires confirmation: {action}")
 
     result = (
@@ -914,6 +1341,21 @@ def delegate_zero_effect_async_to_openclaw(
         transport=transport,
         policy_path=policy_path,
         _live_async_capability=_ZERO_EFFECT_ASYNC_CAPABILITY,
+    )
+
+
+def delegate_loop_contract_to_openclaw(
+    args: dict[str, Any],
+    *,
+    transport: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    policy_path: str | None = None,
+) -> dict[str, Any]:
+    """Execute one validated Loop Contract through the private live adapter."""
+    return delegate_to_openclaw(
+        args,
+        transport=transport,
+        policy_path=policy_path,
+        _live_async_capability=_LOOP_CONTRACT_ASYNC_CAPABILITY,
     )
 
 

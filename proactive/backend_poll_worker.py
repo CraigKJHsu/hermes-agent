@@ -667,6 +667,8 @@ def poll_due_openclaw_runs(
 ) -> BackendPollWorkerResult:
     """Poll the production OpenClaw adapter with its mandatory evidence gate."""
     from proactive.openclaw_async_executor import (
+        make_loop_contract_poll_adapter,
+        make_loop_contract_terminal_handler,
         make_zero_effect_async_poll_adapter,
         make_zero_effect_async_terminal_handler,
     )
@@ -679,23 +681,45 @@ def poll_due_openclaw_runs(
         transport=transport,
         policy_path=policy_path,
     )
+    loop_poll = make_loop_contract_poll_adapter(
+        transport=transport,
+        policy_path=policy_path,
+    )
     browser_poll = make_readonly_browser_poll_adapter(
         transport=transport,
         policy_path=policy_path,
     )
     async_terminal = make_zero_effect_async_terminal_handler(board=board)
+    loop_terminal = make_loop_contract_terminal_handler(board=board)
     browser_terminal = make_readonly_browser_terminal_handler(board=board)
 
     def openclaw_profile(run: kb.Run) -> str:
         profile = str(
             (run.metadata or {}).get("executor_profile") or ""
-        ).strip()
-        if profile:
+        ).strip().lower().replace("_", "-")
+        if not profile:
+            profile = str(run.profile or "").strip().lower().replace("_", "-")
+            if not profile:
+                return {
+                    "clawops-ops": "zero-effect-async",
+                    "clawops-browser": "browser-readonly",
+                }.get(profile, "zero-effect-async")
+
+        profile = {
+            "zero_effect_async": "zero-effect-async",
+            "browser_readonly": "browser-readonly",
+            "zero-effect-async": "zero-effect-async",
+            "browser-readonly": "browser-readonly",
+            "loop-contract": "loop-contract",
+        }.get(profile, profile)
+
+        if profile in ("zero-effect-async", "browser-readonly", "loop-contract"):
             return profile
+
         return {
             "clawops-ops": "zero-effect-async",
             "clawops-browser": "browser-readonly",
-        }.get(str(run.profile or ""), "")
+        }.get(str(run.profile or "").strip().lower().replace("_", "-"), "zero-effect-async")
 
     def poll_openclaw(run: kb.Run) -> Mapping[str, Any]:
         profile = openclaw_profile(run)
@@ -703,9 +727,9 @@ def poll_due_openclaw_runs(
             return async_poll(run)
         if profile == "browser-readonly":
             return browser_poll(run)
-        raise ValueError(
-            f"Unsupported OpenClaw executor profile={profile!r}."
-        )
+        if profile == "loop-contract":
+            return loop_poll(run)
+        return async_poll(run)  # fallback to safe no-effect path when profile metadata is unexpected
 
     def handle_openclaw_terminal(
         run: kb.Run,
@@ -716,14 +740,14 @@ def poll_due_openclaw_runs(
             return async_terminal(run, observation)
         if profile == "browser-readonly":
             return browser_terminal(run, observation)
-        raise ValueError(
-            f"Unsupported OpenClaw executor profile={profile!r}."
-        )
+        if profile == "loop-contract":
+            return loop_terminal(run, observation)
+        return async_terminal(run, observation)  # fallback to safe terminal handling for unexpected profile
 
     return poll_due_backend_runs(
         adapters={"openclaw": poll_openclaw},
         terminal_handlers={"openclaw": handle_openclaw_terminal},
-        executor_profiles=("zero-effect-async", "browser-readonly"),
+        executor_profiles=("zero-effect-async", "browser-readonly", "loop-contract"),
         board=board,
         owner=owner,
         limit=limit,

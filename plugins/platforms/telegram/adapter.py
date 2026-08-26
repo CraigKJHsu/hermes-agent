@@ -2490,13 +2490,12 @@ class TelegramAdapter(BasePlatformAdapter):
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
 
-        ``is_reconnect`` distinguishes a cold first boot (False — drop any
-        stale Bot API queue) from a watcher reconnect after a prolonged
-        outage (True — preserve the updates Telegram queued while the bot
-        was offline, otherwise every message sent during the outage is
-        silently lost). The in-process network-error ladder and the
-        409-conflict handler already pass ``drop_pending_updates=False``
-        for the same reason; bootstrap follows suit on the reconnect path.
+        ``is_reconnect`` is retained for the shared adapter contract, but
+        Telegram preserves the Bot API update queue on both cold starts and
+        watcher reconnects. Process restarts are normal lifecycle events, so
+        dropping the whole queue would silently lose user messages sent while
+        the gateway was offline. ``/restart`` redelivery is handled separately
+        by the durable update-id marker.
 
         Env vars for webhook mode::
 
@@ -2736,9 +2735,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     allowed_updates=Update.ALL_TYPES,
                     # Webhooks are push-based — Telegram does not hold a
                     # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    # in practice. Keep it aligned with polling bootstrap.
+                    drop_pending_updates=False,
                 )
                 self._webhook_mode = True
                 logger.info(
@@ -2779,10 +2777,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve updates across both cold process starts and
+                    # watcher reconnects. launchd/container restarts are normal
+                    # lifecycle events, not authorization to discard user input.
+                    drop_pending_updates=False,
                     error_callback=_polling_error_callback,
                 )
             
@@ -2986,6 +2984,97 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Interaction labels are supplied by trusted gateway/Kanban metadata.
+        # Keep this at the Telegram boundary so normal sends, rich sends and
+        # chunked sends all render the same actor/path header.
+        from gateway.telegram_interaction_labels import (
+            decorate_telegram_message,
+        )
+
+        content = decorate_telegram_message(content, metadata)
+
+        def _record_trace_delivery(message_ids: list[Any]) -> bool:
+            if not isinstance(metadata, dict):
+                return True
+            from hermes_cli.telegram_message_path import (
+                METADATA_KEY as _MESSAGE_PATH_KEY,
+                record_outbound_delivery,
+            )
+
+            interaction = metadata.get("telegram_interaction") or {}
+            path = record_outbound_delivery(
+                metadata.get(_MESSAGE_PATH_KEY),
+                message_ids,
+                interaction_kind=str(interaction.get("kind") or ""),
+            )
+            if not path:
+                return True
+            metadata[_MESSAGE_PATH_KEY] = path
+            delegation_id = str(path.get("delegation_id") or "").strip()
+            pending_approval = bool(
+                metadata.get("telegram_trace_pending_approval")
+            )
+            if not delegation_id and not pending_approval:
+                return True
+            try:
+                from hermes_cli import kanban_db as _kb
+
+                explicit_board = str(metadata.get("kanban_board") or "").strip()
+                candidates = (
+                    [explicit_board]
+                    if explicit_board
+                    else [
+                        str(item.get("slug") or "")
+                        for item in _kb.list_boards()
+                        if str(item.get("slug") or "").strip()
+                    ]
+                )
+                matched_boards: list[str] = []
+                for candidate in candidates:
+                    if not _kb.kanban_db_path(board=candidate).is_file():
+                        continue
+                    with _kb.connect_closing(board=candidate) as conn:
+                        if delegation_id:
+                            matched = _kb.get_grace_delegation(
+                                conn,
+                                delegation_id=delegation_id,
+                            ) is not None
+                        else:
+                            matched = conn.execute(
+                                "SELECT 1 FROM grace_approval_challenges "
+                                "WHERE state = 'pending' AND "
+                                "json_extract(telegram_message_path, '$.trace_id') = ?",
+                                (str(path["trace_id"]),),
+                            ).fetchone() is not None
+                        if matched:
+                            matched_boards.append(candidate)
+                if len(matched_boards) != 1:
+                    raise RuntimeError(
+                        "Telegram trace delegation board is missing or ambiguous"
+                    )
+                with _kb.connect_closing(board=matched_boards[0]) as conn:
+                    if delegation_id:
+                        _kb.update_grace_delegation_telegram_message_path(
+                            conn,
+                            delegation_id=delegation_id,
+                            telegram_message_path=path,
+                        )
+                    else:
+                        _kb.update_grace_approval_challenge_telegram_message_path(
+                            conn,
+                            telegram_message_path=path,
+                        )
+                metadata["telegram_trace_persistence"] = "persisted"
+                return True
+            except Exception:
+                metadata["telegram_trace_persistence"] = "ambiguous"
+                logger.warning(
+                    "[%s] Telegram outbound trace persistence failed",
+                    self.name,
+                    exc_info=True,
+                )
+                return False
+
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
@@ -3032,6 +3121,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
+                        _rich_ids = []
+                        if rich_result.message_id:
+                            _rich_ids.append(rich_result.message_id)
+                        _rich_ids.extend(
+                            (rich_result.raw_response or {}).get("message_ids", [])
+                            if isinstance(rich_result.raw_response, dict)
+                            else []
+                        )
+                        trace_persisted = _record_trace_delivery(_rich_ids)
                         # Re-trigger typing like the legacy success path does,
                         # but ONLY for intermediate sends. On the final reply
                         # (metadata["notify"]) the gateway has already torn down
@@ -3043,6 +3141,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await self.send_typing(chat_id, metadata=metadata)
                             except Exception:
                                 pass  # Typing failures are non-fatal
+                        if not trace_persisted:
+                            return SendResult(
+                                success=False,
+                                message_id=rich_result.message_id,
+                                error="telegram_delivered_trace_persistence_ambiguous",
+                                raw_response=rich_result.raw_response,
+                                retryable=False,
+                                delivery_ambiguous=True,
+                            )
                     return rich_result
 
             # Format and split message if needed
@@ -3315,6 +3422,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            trace_persisted = _record_trace_delivery(message_ids)
+
+            if not trace_persisted:
+                return SendResult(
+                    success=False,
+                    message_id=message_ids[0] if message_ids else None,
+                    error="telegram_delivered_trace_persistence_ambiguous",
+                    raw_response={
+                        "message_ids": message_ids,
+                        "requested_thread_id": requested_thread_id,
+                        "thread_fallback": used_thread_fallback,
+                    },
+                    retryable=False,
+                    delivery_ambiguous=True,
+                )
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -3504,6 +3627,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        from gateway.telegram_interaction_labels import (
+            decorate_telegram_message,
+        )
+
+        content = decorate_telegram_message(content, metadata)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -3939,6 +4068,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+
+        from gateway.telegram_interaction_labels import (
+            decorate_telegram_message,
+        )
+
+        content = decorate_telegram_message(content, metadata)
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final

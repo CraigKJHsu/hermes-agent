@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 from hermes_cli import kanban_db as kb
+from proactive.loop_contract import contract_fingerprint
 from tools import browser_camofox
 from tools import browser_supervisor
 from tools import browser_tool
@@ -771,33 +773,99 @@ def test_lowercase_group_targets_and_browser_publish_authority_are_accepted():
     assert kb.grace_allows_facebook_group_posting(body) is True
 
 
-def test_compiler_display_group_targets_and_challenge_proof_are_accepted():
+def test_compiler_display_targets_require_consumed_challenge(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    token = "challenge-token"
+    user_hash = "a" * 64
+    original_request = "publish to the two approved groups"
+    contract = {
+        "approval_provenance": {
+            "source": "one_time_authenticated_owner_challenge",
+            "scope_binding": "exact_loop_contract_fingerprint",
+            "internal": False,
+            "platform": "telegram",
+            "requested_message_id": "2391",
+            "approved_message_id": "2395",
+            "user_id_sha256": user_hash,
+            "challenge_token_sha256": hashlib.sha256(
+                token.encode("utf-8")
+            ).hexdigest(),
+        },
+        "external_targets": [
+            "Facebook Group 897927458651235「大台灣二手家具家電交流*"
+            "免費贈送＆民眾/店家買賣」"
+            "https://www.facebook.com/groups/897927458651235/",
+            "Facebook Group 1466446866915040「二手｜液晶電視 中古 家電"
+            " 買賣交流 社團」"
+            "https://www.facebook.com/groups/1466446866915040/",
+        ],
+        "routing": {"task_type": "browser_publish"},
+    }
+    fingerprint = contract_fingerprint({
+        **contract,
+        "original_request": original_request,
+    })
+    contract["approval_provenance"]["contract_fingerprint"] = fingerprint
+    contract["audit"] = {
+        "original_request_location": (
+            "Grace session history only; not disclosed to ClawOps"
+        ),
+        "original_request_sha256": hashlib.sha256(
+            original_request.encode("utf-8")
+        ).hexdigest(),
+    }
     body = (
         "GRACE_LOOP_CONTRACT_STAGE: execution\n"
-        '```json\n{"approval_provenance":{'
-        '"source":"one_time_authenticated_owner_challenge",'
-        '"scope_binding":"exact_loop_contract_fingerprint",'
-        '"internal":false,"platform":"telegram",'
-        '"requested_message_id":"2391","approved_message_id":"2395",'
-        f'"user_id_sha256":"{"a" * 64}",'
-        f'"challenge_token_sha256":"{"b" * 64}",'
-        f'"contract_fingerprint":"{"c" * 64}"'
-        '},'
-        '"external_targets":['
-        '"Facebook Group 897927458651235「大台灣二手家具家電交流*'
-        '免費贈送＆民眾/店家買賣」'
-        'https://www.facebook.com/groups/897927458651235/",'
-        '"Facebook Group 1466446866915040「二手｜液晶電視 中古 家電'
-        ' 買賣交流 社團」'
-        'https://www.facebook.com/groups/1466446866915040/"],'
-        '"routing":{"task_type":"browser_publish"}}\n```'
+        f"```json\n{json.dumps(contract, ensure_ascii=False)}\n```"
     )
-
-    assert kb.grace_external_group_ids(body) == frozenset({
-        "897927458651235",
-        "1466446866915040",
-    })
-    assert kb.grace_allows_facebook_group_posting(body) is True
+    with kb.connect_closing(db_path) as conn:
+        task_id, _ = _execution_task(conn, body=body)
+        conn.execute(
+            """
+            INSERT INTO grace_approval_challenges (
+                token, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id, session_key, session_id,
+                user_id_sha256, requested_message_id, action_summary,
+                approval_platform, approval_scope, delegation_args,
+                state, created_at, expires_at, consumed_at,
+                approved_message_id
+            ) VALUES (?, ?, 'request-1', 'telegram', 'chat-1', '2',
+                      'session-key', 'session-id', ?, '2391', 'publish',
+                      'Facebook', '[]', ?, 'consumed', 1, 2, 2, '2395')
+            """,
+            (
+                token,
+                fingerprint,
+                user_hash,
+                json.dumps({"original_request": original_request}),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                challenge_token, platform, chat_id, thread_id, session_key,
+                session_id, user_id_sha256, approved_message_id,
+                resolved_route, approval_required, state, execution_task_id,
+                review_task_id, created_at, updated_at
+            ) VALUES ('gd-1', ?, 'request-1', ?, 'telegram', 'chat-1', '2',
+                      'session-key', 'session-id', ?, '2395',
+                      '{"task_type":"browser_publish"}', 1, 'queued', ?,
+                      'review-1', 1, 1)
+            """,
+            (fingerprint, token, user_hash, task_id),
+        )
+        conn.commit()
+        assert kb.grace_external_group_ids(body) == frozenset({
+            "897927458651235",
+            "1466446866915040",
+        })
+        assert kb.grace_allows_facebook_group_posting(body) is False
+        assert kb.grace_task_allows_facebook_group_posting(
+            conn,
+            task_id,
+        ) is True
 
 
 def test_compiler_display_group_target_rejects_mismatched_url_id():

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -25,15 +26,22 @@ import time
 import pytest
 
 
+_MACOS_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
 pytestmark = pytest.mark.skipif(
-    not shutil.which("google-chrome") and not shutil.which("chromium"),
+    not shutil.which("google-chrome")
+    and not shutil.which("chromium")
+    and not os.path.isfile(_MACOS_CHROME),
     reason="Chrome/Chromium not installed",
 )
 
 
 def _find_chrome() -> str:
-    for candidate in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(candidate)
+    for candidate in (
+        "google-chrome", "chromium", "chromium-browser", _MACOS_CHROME,
+    ):
+        path = candidate if os.path.isfile(candidate) else shutil.which(candidate)
         if path:
             return path
     pytest.skip("no Chrome binary found")
@@ -131,12 +139,39 @@ def chrome_cdp(request):
 
 def _test_page_url() -> str:
     html = """<!doctype html>
-<html><head><title>Supervisor pytest</title></head><body>
+<html><head><meta charset="utf-8"><title>Supervisor pytest</title></head><body>
 <h1>Supervisor pytest</h1>
 <button aria-label="Join group" onclick="window.__joined = true">
   Join group
 </button>
 <div role="textbox" aria-label="Draft body" contenteditable="true"></div>
+<label for="language">Profile Language</label>
+<select id="language"
+  oninput="window.__selectInputCtor = event.constructor.name; window.__selectInputType = event.inputType || null"
+  onchange="window.__languageChanges = (window.__languageChanges || 0) + 1">
+  <option value="en_US">English (English)</option>
+  <option value="zh_TW">Traditional Chinese (legacy duplicate value)</option>
+  <option value="zh_TW">正體中文 (Chinese (Traditional))</option>
+</select>
+<label for="optgroup-disabled-language">Optgroup Disabled Language</label>
+<select id="optgroup-disabled-language">
+  <option value="en_US">English (English)</option>
+  <optgroup label="Unavailable" disabled>
+    <option value="zh_TW">正體中文 (Chinese (Traditional))</option>
+  </optgroup>
+</select>
+<fieldset disabled>
+  <label for="fieldset-disabled-language">Fieldset Disabled Language</label>
+  <select id="fieldset-disabled-language">
+    <option value="en_US">English (English)</option>
+    <option value="zh_TW">正體中文 (Chinese (Traditional))</option>
+  </select>
+</fieldset>
+<label for="controlled-language">Controlled Language</label>
+<select id="controlled-language" onchange="this.selectedIndex = 0">
+  <option value="en_US">English (English)</option>
+  <option value="zh_TW">正體中文 (Chinese (Traditional))</option>
+</select>
 <iframe id="inner" srcdoc="<body><h2>frame-marker</h2></body>" width="400" height="100"></iframe>
 </body></html>"""
     return "data:text/html;base64," + base64.b64encode(html.encode()).decode()
@@ -266,12 +301,51 @@ def test_guarded_dom_action_revalidates_semantics_and_contenteditable(
         text="guarded content",
     )
     assert filled["ok"] is True
+    selected = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("combobox", "Profile Language"),
+        expected_page_identity=identity,
+        expected_role="combobox",
+        expected_name="Profile Language",
+        action="fill",
+        text="正體中文 (Chinese (Traditional))",
+    )
+    assert selected["ok"] is True, selected
+    for disabled_name in (
+        "Optgroup Disabled Language",
+        "Fieldset Disabled Language",
+    ):
+        rejected_select = supervisor.guarded_dom_action(
+            backend_node_id=backend_id("combobox", disabled_name),
+            expected_page_identity=identity,
+            expected_role="combobox",
+            expected_name=disabled_name,
+            action="fill",
+            text="正體中文 (Chinese (Traditional))",
+        )
+        assert rejected_select["ok"] is False
+        assert "disabled" in rejected_select["error"]
+    controlled = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("combobox", "Controlled Language"),
+        expected_page_identity=identity,
+        expected_role="combobox",
+        expected_name="Controlled Language",
+        action="fill",
+        text="正體中文 (Chinese (Traditional))",
+    )
+    assert controlled["ok"] is False
+    assert "after events" in controlled["error"]
     readback = supervisor.call_page_cdp(
         "Runtime.evaluate",
         {
             "expression": (
                 "({joined: window.__joined === true, "
-                "draft: document.querySelector('[contenteditable]').textContent})"
+                "draft: document.querySelector('[contenteditable]').textContent, "
+                "language: document.querySelector('select').value, "
+                "languageLabel: document.querySelector('select').selectedOptions[0].textContent.trim(), "
+                "disabledLanguages: [...document.querySelectorAll('select')].slice(1).map(node => node.value), "
+                "selectInputCtor: window.__selectInputCtor, "
+                "selectInputType: window.__selectInputType, "
+                "languageChanges: window.__languageChanges})"
             ),
             "returnByValue": True,
         },
@@ -279,6 +353,12 @@ def test_guarded_dom_action_revalidates_semantics_and_contenteditable(
     assert readback["result"]["result"]["value"] == {
         "joined": True,
         "draft": "guarded content",
+        "language": "zh_TW",
+        "languageLabel": "正體中文 (Chinese (Traditional))",
+        "disabledLanguages": ["en_US", "en_US", "en_US"],
+        "selectInputCtor": "Event",
+        "selectInputType": None,
+        "languageChanges": 1,
     }
 
     changed = supervisor.call_page_cdp(

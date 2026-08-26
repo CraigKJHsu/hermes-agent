@@ -798,9 +798,14 @@ class _CodexCompletionsAdapter:
                     # Codex backend, which rejects e.g. {"effort": null}
                     # with a 400.
                     effort = reasoning_cfg.get("effort") or "medium"
-                    # Codex backend rejects "minimal"; clamp to "low" to
-                    # match the main-agent Codex transport behavior.
-                    if effort == "minimal":
+                    # Codex backend rejects "minimal"; Spark additionally
+                    # rejects "none". Clamp both to the nearest supported
+                    # level so auxiliary fallback matches the main transport.
+                    if effort == "minimal" or (
+                        str(model or "").strip().lower()
+                        == "gpt-5.3-codex-spark"
+                        and effort == "none"
+                    ):
                         effort = "low"
                     resp_kwargs["reasoning"] = {
                         "effort": effort,
@@ -3357,6 +3362,7 @@ def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
+    failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -3376,6 +3382,9 @@ def _try_configured_fallback_chain(
         return None, None, ""
 
     skip = failed_provider.lower().strip()
+    failed_model_norm = str(
+        failed_model or task_config.get("model") or ""
+    ).strip().lower()
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -3383,9 +3392,15 @@ def _try_configured_fallback_chain(
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
-        if not fb_provider or fb_provider.lower() == skip:
-            continue
         fb_model = str(entry.get("model", "")).strip() or None
+        if not fb_provider:
+            continue
+        if fb_provider.lower() == skip and (
+            not failed_model_norm
+            or not fb_model
+            or fb_model.lower() == failed_model_norm
+        ):
+            continue
 
         label = f"fallback_chain[{i}]({fb_provider})"
 
@@ -3479,6 +3494,7 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -3503,6 +3519,7 @@ def _try_main_fallback_chain(
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    failed_model_norm = str(failed_model or "").strip().lower()
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -3515,7 +3532,9 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        if fb_norm in skip:
+        if fb_norm in skip and (
+            not failed_model_norm or fb_model.lower() == failed_model_norm
+        ):
             tried.append(f"{label} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm):
@@ -6109,16 +6128,19 @@ def call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
@@ -6584,16 +6606,19 @@ async def async_call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)

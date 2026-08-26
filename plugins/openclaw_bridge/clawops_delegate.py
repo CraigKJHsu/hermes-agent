@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import time
@@ -14,6 +15,12 @@ from gateway.session_context import (
     record_cron_functional_error,
 )
 from hermes_cli import kanban_db as kb
+from hermes_cli.telegram_message_path import (
+    actor,
+    append_hop,
+    build_telegram_message_path,
+    normalize_message_path,
+)
 from proactive.grace_task_compiler import compile_and_delegate
 from proactive.hubops_routing import (
     registered_worker_task_types,
@@ -21,7 +28,13 @@ from proactive.hubops_routing import (
     route_requires_owner_approval,
     route_clawops_objective,
 )
-from proactive.loop_contract import contract_fingerprint, validate_loop_contract
+from proactive.loop_contract import (
+    browser_readonly_marketplace_fallback_listing_id,
+    canonical_marketplace_readonly_sections,
+    contract_fingerprint,
+    is_internal_only_target as _is_internal_only_target,
+    validate_loop_contract,
+)
 from proactive.thread_context_registry import (
     resolve_thread_context,
     resolve_thread_context_alias,
@@ -29,7 +42,10 @@ from proactive.thread_context_registry import (
 
 
 _LIST = {"type": "array", "items": {"type": "string"}, "minItems": 1}
-_TASK_TYPES = list(registered_worker_task_types())
+_TASK_TYPES = [
+    *registered_worker_task_types(),
+    "secondhand_commerce_group_status",
+]
 _APPROVAL_ATTEMPT = re.compile(r"核准[ \t\u3000]+([^ \t\u3000，,。.!！？?、:：;；]+)")
 
 
@@ -121,6 +137,26 @@ _MEMORY = {
     "required": ["working", "promote_on_acceptance"],
     "additionalProperties": False,
 }
+_USER_FACING_DELIVERY = {
+    "type": "object",
+    "properties": {
+        "required": {"type": "boolean", "const": True},
+        "kind": {"type": "string", "enum": ["commerce_group_status"]},
+        "delivery": {"type": "string", "enum": ["inline_only"]},
+        "subject_keys": _LIST,
+    },
+    "required": ["required", "kind", "delivery", "subject_keys"],
+    "additionalProperties": False,
+}
+_OBJECTIVE_REF = {
+    "type": "object",
+    "properties": {
+        "objective_id": {"type": "string"},
+        "stage_key": {"type": "string"},
+    },
+    "required": ["objective_id", "stage_key"],
+    "additionalProperties": False,
+}
 
 CLAWOPS_DELEGATE_PARAMETERS = {
     "type": "object",
@@ -133,6 +169,15 @@ CLAWOPS_DELEGATE_PARAMETERS = {
         "verification": _VERIFICATION,
         "stop_rules": _STOP_RULES,
         "memory": _MEMORY,
+        "user_facing_delivery": _USER_FACING_DELIVERY,
+        "objective_ref": {
+            **_OBJECTIVE_REF,
+            "description": (
+                "Required when the active Topic prompt names a durable Grace "
+                "objective. The database, not the model, decides whether this "
+                "stage is terminal or intermediate."
+            ),
+        },
         "task_type": {
             "type": "string",
             "enum": _TASK_TYPES,
@@ -209,6 +254,36 @@ CLAWOPS_DELEGATE_SCHEMA = {
     "parameters": CLAWOPS_DELEGATE_PARAMETERS,
 }
 
+CLAWOPS_CANCEL_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "task_id": {
+            "type": "string",
+            "description": (
+                "Exact execution_task_id or grace_review_task_id from the "
+                "existing ClawOps delegation."
+            ),
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "Short human-readable reason for stopping the existing work."
+            ),
+        },
+    },
+    "required": ["task_id"],
+    "additionalProperties": False,
+}
+
+CLAWOPS_CANCEL_SCHEMA = {
+    "description": (
+        "Cancel one existing ClawOps Loop after KJ explicitly asks to stop it. "
+        "Use this control-plane tool instead of delegating a new cancellation "
+        "task. The exact task must belong to the authenticated chat/topic."
+    ),
+    "parameters": CLAWOPS_CANCEL_PARAMETERS,
+}
+
 GRACE_CALLBACK_OUTCOME_PARAMETERS = {
     "type": "object",
     "properties": {
@@ -222,7 +297,8 @@ GRACE_CALLBACK_OUTCOME_PARAMETERS = {
             "type": "object",
             "description": (
                 "closed: summary; continued: delegation_id, execution_task_id, "
-                "review_task_id; approval_blocked: action, platform, scope, exact_question"
+                "review_task_id; approval_blocked: action, platform, scope, "
+                "exact_question, plus next_stage_key for an objective-linked callback"
             ),
         },
     },
@@ -241,6 +317,19 @@ GRACE_CALLBACK_OUTCOME_SCHEMA = {
 
 def _canonical_sections(args: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     """Accept the canonical nested contract and preserve legacy callers during rollout."""
+    listing_id = browser_readonly_marketplace_fallback_listing_id(args)
+    if listing_id is not None:
+        args.update(canonical_marketplace_readonly_sections(listing_id))
+        args["task_type"] = "secondhand_commerce_group_status"
+        args["external_targets"] = [
+            f"Facebook Marketplace listing ID {listing_id}",
+        ]
+        args["user_facing_delivery"] = {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": [f"facebook_marketplace:{listing_id}"],
+        }
     scope = args.get("scope")
     if isinstance(scope, dict):
         # Some providers occasionally place the following canonical siblings
@@ -342,6 +431,210 @@ def _resolve_approval_challenge(token: str) -> tuple[str, dict[str, Any]]:
     return matches[0]
 
 
+_CANCEL_INTENT = re.compile(
+    r"(?:取消|停止(?:執行|工作|任務)?|停停|先停|不要再執行|\bstop\b|\bcancel\b)",
+    re.IGNORECASE,
+)
+_CANCEL_NEGATIONS = (
+    "不要取消",
+    "不用取消",
+    "不必取消",
+    "不要停止",
+    "不用停止",
+    "不必停止",
+    "繼續執行",
+)
+_CANCEL_META_CONTEXT = re.compile(
+    r"(?:修改|修正|新增|設計|實作|測試|檢查|調整|說明|改善)"
+    r".{0,8}(?:取消|停止)"
+    r"|(?:取消|停止).{0,4}"
+    r"(?:流程|功能|機制|邏輯|程式(?:碼)?|介面|按鈕|API)",
+    re.IGNORECASE,
+)
+
+
+def _is_explicit_cancel_message(message_text: str) -> bool:
+    """Fail closed unless the authenticated turn clearly asks to stop work."""
+    clean = str(message_text or "").strip()
+    if (
+        not clean
+        or any(phrase in clean for phrase in _CANCEL_NEGATIONS)
+        or _CANCEL_META_CONTEXT.search(clean) is not None
+    ):
+        return False
+    return _CANCEL_INTENT.search(clean) is not None
+
+
+def _resolve_cancel_board(
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+) -> str | None:
+    """Resolve one exact lane-bound delegation without trusting model scope."""
+    candidates: list[str | None] = [None]
+    try:
+        candidates.extend(
+            str(item.get("slug") or kb.DEFAULT_BOARD)
+            for item in kb.list_boards(include_archived=False)
+        )
+    except OSError:
+        pass
+    matches: list[str] = []
+    seen_paths: set[str] = set()
+    for board in candidates:
+        try:
+            db_path = str(kb.kanban_db_path(board=board).resolve())
+        except OSError:
+            db_path = f"board:{board or kb.DEFAULT_BOARD}"
+        if db_path in seen_paths:
+            continue
+        seen_paths.add(db_path)
+        try:
+            with kb.connect_closing(board=board) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM grace_delegations
+                     WHERE (execution_task_id = ? OR review_task_id = ?)
+                       AND platform = ? AND chat_id = ? AND thread_id = ?
+                     LIMIT 1
+                    """,
+                    (
+                        task_id,
+                        task_id,
+                        platform,
+                        chat_id,
+                        thread_id,
+                    ),
+                ).fetchone()
+        except (OSError, ValueError):
+            continue
+        if row is not None:
+            matches.append(board or kb.DEFAULT_BOARD)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def handle_clawops_cancel(
+    args: dict[str, Any] | None = None,
+    **_kwargs: Any,
+) -> str:
+    """Cancel an existing lane-bound Grace Loop without spawning more work."""
+    args = dict(args or {})
+    task_id = str(args.get("task_id") or "").strip()
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    owner_user_id = get_session_env(
+        "HERMES_SESSION_OWNER_USER_ID", "",
+    ).strip()
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
+    internal_turn = (
+        get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower()
+        == "true"
+    )
+    session_source = get_session_env(
+        "HERMES_SESSION_SOURCE", "",
+    ).strip().lower()
+    try:
+        if os.getenv("HERMES_KANBAN_TASK", "").strip():
+            raise ValueError(
+                "A Kanban worker cannot cancel another Loop; cancellation "
+                "must come from KJ's authenticated Grace turn."
+            )
+        if internal_turn or session_source == "cron" or platform == "cron":
+            raise ValueError(
+                "ClawOps cancellation requires a fresh authenticated user turn."
+            )
+        if not task_id:
+            raise ValueError("Cancellation requires an exact task_id.")
+        if not platform or not chat_id or not message_id:
+            raise ValueError(
+                "Cancellation requires authenticated platform, chat, and message identity."
+            )
+        if not user_id:
+            raise ValueError("Cancellation requires an authenticated user identity.")
+        if not _is_explicit_cancel_message(message_text):
+            raise ValueError(
+                "The current authenticated message does not explicitly request cancellation."
+            )
+        board = _resolve_cancel_board(
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if board is None:
+            raise ValueError(
+                "Task was not found in this authenticated chat/topic, or its board is ambiguous."
+            )
+        reason = str(args.get("reason") or "").strip()
+        if not reason:
+            reason = "KJ 已要求停止執行。"
+        reason = reason[:2000]
+        with kb.connect_closing(board=board) as conn:
+            cancellation = kb.cancel_grace_delegation(
+                conn,
+                task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                requested_by=user_id,
+                requested_message_id=message_id,
+                owner_user_id=owner_user_id,
+                reason=reason,
+            )
+            if cancellation is None:
+                raise ValueError(
+                    "Task no longer matches this authenticated chat/topic."
+                )
+            terminations = kb.terminate_cancelled_workers(
+                conn, cancellation.get("workers") or [],
+            )
+        termination_confirmed = all(
+            bool(item.get("terminated")) for item in terminations
+        )
+        already_terminal = [
+            item["task_id"]
+            for item in cancellation.get("cards") or []
+            if item.get("already_terminal")
+        ]
+        return json.dumps(
+            {
+                "status": (
+                    "cancelled" if termination_confirmed
+                    else "cancellation_pending"
+                ),
+                "task_created": False,
+                "delegation_id": cancellation["delegation_id"],
+                "execution_task_id": cancellation["execution_task_id"],
+                "grace_review_task_id": cancellation["review_task_id"],
+                "idempotent_replay": bool(
+                    cancellation.get("idempotent_replay")
+                ),
+                "termination_confirmed": termination_confirmed,
+                "terminated_workers": terminations,
+                "already_terminal_tasks": already_terminal,
+                "reason": reason,
+            },
+            ensure_ascii=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "task_created": False,
+                "reason": str(exc),
+            },
+            ensure_ascii=False,
+        )
+
+
 def _queued_delegation_replay(
     delegation: dict[str, Any] | None,
     *,
@@ -374,6 +667,13 @@ def _queued_delegation_replay(
             "topic_name": topic_name,
             "assigned_agent": execution.assignee,
             "delegation_id": str(delegation["delegation_id"]),
+            "kanban_board": str(board or kb.DEFAULT_BOARD),
+            "trace_id": str(
+                normalize_message_path(
+                    delegation.get("telegram_message_path")
+                ).get("trace_id")
+                or ""
+            ),
             "execution_task_id": str(delegation["execution_task_id"]),
             "grace_review_task_id": str(delegation["review_task_id"]),
             "progress_subscription": bool(subscriptions),
@@ -387,6 +687,49 @@ def _queued_delegation_replay(
     )
 
 
+def _stable_contract_discriminator(
+    *,
+    identity: dict[str, Any],
+    board: str,
+    args: dict[str, Any],
+    goal: dict[str, Any],
+    scope: dict[str, Any],
+    verification: dict[str, Any],
+    stop_rules: dict[str, Any],
+    memory: dict[str, Any],
+    task_type: str,
+    risk_level: str,
+    external_targets: list[str],
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "identity": identity,
+                "board": board,
+                "original_request": str(args.get("original_request") or "").strip(),
+                "grace_interpretation": str(
+                    args.get("grace_interpretation") or ""
+                ).strip(),
+                "trigger": str(args.get("trigger") or "").strip(),
+                "goal": goal,
+                "scope": scope,
+                "verification": verification,
+                "stop_rules": stop_rules,
+                "memory": memory,
+                "task_type": task_type,
+                "risk_level": risk_level,
+                "completion_mode": str(args.get("completion_mode") or "").strip(),
+                "user_facing_delivery": args.get("user_facing_delivery"),
+                "objective_ref": args.get("objective_ref"),
+                "external_targets": external_targets,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) -> str:
     """Create execution + Grace-review cards only after a complete contract exists."""
     args = dict(args or {})
@@ -397,6 +740,11 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     session_platform = platform
     session_source = get_session_env("HERMES_SESSION_SOURCE", "").strip().lower()
     scheduled_turn = session_source == "cron" or session_platform == "cron"
+    codex_local_operator = session_source == "codex_local_operator"
+    codex_authorization_id = get_session_env(
+        "HERMES_CODEX_AUTHORIZATION_ID", "",
+    ).strip()
+    codex_thread_id = get_session_env("HERMES_CODEX_THREAD_ID", "").strip()
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
     user_id = get_session_env("HERMES_SESSION_USER_ID", "")
@@ -405,6 +753,19 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     trusted_cron_session_id = session_id if session_source == "cron" else ""
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
+    trusted_message_path = normalize_message_path(
+        get_session_env("HERMES_TELEGRAM_MESSAGE_PATH", "")
+    )
+    if platform == "telegram" and not trusted_message_path:
+        trusted_message_path = build_telegram_message_path(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            inbound_message_id=message_id,
+            session_key=session_key,
+            session_id=session_id,
+            codex_thread_id=codex_thread_id,
+        )
     internal_turn = (
         get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower() == "true"
     )
@@ -453,6 +814,15 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         notifier_profile = "default"
     try:
         approval_candidate = _approval_token_candidate(message_text)
+        if (
+            not internal_turn
+            and not scheduled_turn
+            and _is_explicit_cancel_message(message_text)
+        ):
+            raise ValueError(
+                "An explicit stop request cannot create another delegated "
+                "task. Use clawops_cancel for the existing task id."
+            )
         if internal_turn and (approval_token or approval_refresh_token):
             raise ValueError(
                 "An internal callback cannot consume an approval token."
@@ -506,7 +876,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             board = (
                 None if approval_board == kb.DEFAULT_BOARD else approval_board
             )
-        if platform and platform not in {"cron"}:
+        if platform and platform not in {"cron", "codex"}:
             context = resolve_thread_context(
                 platform=platform, chat_id=chat_id, thread_id=thread_id,
             )
@@ -518,18 +888,14 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         project = str(context["project"])
         topic_name = str(context["topic_name"])
         namespace = str(context.get("memory_namespace") or f"topic:{chat_id}:{thread_id}/{project}")
-        scheduled_identity = (
-            {
-                "platform": platform,
-                "chat_id": chat_id,
-                "thread_id": thread_id,
-                "project": project,
-                "topic_name": topic_name,
-                "memory_namespace": namespace,
-            }
-            if scheduled_turn
-            else {}
-        )
+        source_bound_identity = {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "project": project,
+            "topic_name": topic_name,
+            "memory_namespace": namespace,
+        }
         if (
             not internal_turn
             and origin_review_id
@@ -558,12 +924,27 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             session_id = session_id or f"cron:{project}"
         goal, scope, verification, stop_rules, memory = _canonical_sections(args)
         task_type = str(args.get("task_type") or "")
+        if (
+            task_type == "secondhand_commerce_group_status"
+            and not isinstance(args.get("user_facing_delivery"), dict)
+        ):
+            raise ValueError(
+                "secondhand_commerce_group_status requires "
+                "user_facing_delivery"
+            )
         risk_level = str(args.get("risk_level") or "")
-        external_targets = [
+        supplied_external_targets = [
             str(item).strip()
             for item in list(args.get("external_targets") or [])
             if str(item).strip()
         ]
+        internal_only_contract = bool(supplied_external_targets) and all(
+            _is_internal_only_target(item)
+            for item in supplied_external_targets
+        )
+        external_targets = (
+            [] if internal_only_contract else supplied_external_targets
+        )
         supplied_request_instance = str(
             args.get("request_instance_id") or ""
         ).strip()
@@ -597,7 +978,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     f"{origin_review_id}:{origin_event_id}"
                 ).encode("utf-8")
             ).hexdigest()[:32]
-        elif not scheduled_turn and message_id:
+        elif not scheduled_turn and not codex_local_operator and message_id:
             request_instance_id = "gri_" + hashlib.sha256(
                 (
                     f"message:{session_platform}:{session_key}:{message_id}"
@@ -612,35 +993,19 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "message-derived instance."
                 )
         elif scheduled_turn and trusted_cron_session_id:
-            scheduled_contract_discriminator = hashlib.sha256(
-                json.dumps(
-                    {
-                        "identity": scheduled_identity,
-                        "board": str(board or "default"),
-                        "original_request": str(
-                            args.get("original_request") or ""
-                        ).strip(),
-                        "grace_interpretation": str(
-                            args.get("grace_interpretation") or ""
-                        ).strip(),
-                        "trigger": str(args.get("trigger") or "").strip(),
-                        "goal": goal,
-                        "scope": scope,
-                        "verification": verification,
-                        "stop_rules": stop_rules,
-                        "memory": memory,
-                        "task_type": task_type,
-                        "risk_level": risk_level,
-                        "completion_mode": str(
-                            args.get("completion_mode") or ""
-                        ).strip(),
-                        "external_targets": external_targets,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
+            scheduled_contract_discriminator = _stable_contract_discriminator(
+                identity=source_bound_identity,
+                board=str(board or "default"),
+                args=args,
+                goal=goal,
+                scope=scope,
+                verification=verification,
+                stop_rules=stop_rules,
+                memory=memory,
+                task_type=task_type,
+                risk_level=risk_level,
+                external_targets=external_targets,
+            )
             request_instance_id = "gri_" + hashlib.sha256(
                 (
                     f"cron:{trusted_cron_session_id}:"
@@ -652,8 +1017,40 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 and supplied_request_instance != request_instance_id
             ):
                 raise ValueError(
-                    "Scheduled request_instance_id must match the trusted "
-                    "scheduler-derived instance."
+                "Scheduled request_instance_id must match the trusted "
+                "scheduler-derived instance."
+            )
+        elif codex_local_operator and codex_authorization_id and session_id:
+            codex_contract_discriminator = _stable_contract_discriminator(
+                identity={
+                    **source_bound_identity,
+                    "codex_thread_id": codex_thread_id,
+                    "codex_authorization_id": codex_authorization_id,
+                },
+                board=str(board or "default"),
+                args=args,
+                goal=goal,
+                scope=scope,
+                verification=verification,
+                stop_rules=stop_rules,
+                memory=memory,
+                task_type=task_type,
+                risk_level=risk_level,
+                external_targets=external_targets,
+            )
+            request_instance_id = "gri_" + hashlib.sha256(
+                (
+                    f"codex-local:{session_id}:{codex_authorization_id}:"
+                    f"{codex_contract_discriminator}"
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            if (
+                supplied_request_instance
+                and supplied_request_instance != request_instance_id
+            ):
+                raise ValueError(
+                    "Codex local request_instance_id must match the "
+                    "authorization-derived instance."
                 )
         elif scheduled_turn and supplied_request_instance:
             # Compatibility for direct scheduled callers that predate the
@@ -676,6 +1073,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "requested_by": (
                     "trusted_scheduled_job"
                     if scheduled_turn
+                    else "codex_local_operator"
+                    if codex_local_operator
                     else "authenticated_user"
                 ),
                 "compiled_by": "Grace",
@@ -698,8 +1097,30 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             },
             "completion_mode": str(args.get("completion_mode") or "").strip(),
         }
+        if isinstance(args.get("user_facing_delivery"), dict):
+            contract["user_facing_delivery"] = dict(
+                args["user_facing_delivery"]
+            )
         if external_targets:
             contract["external_targets"] = external_targets
+        objective_ref = args.get("objective_ref")
+        if isinstance(objective_ref, dict):
+            clean_objective_ref = {
+                "objective_id": str(
+                    objective_ref.get("objective_id") or ""
+                ).strip(),
+                "stage_key": str(objective_ref.get("stage_key") or "").strip(),
+            }
+            with kb.connect_closing(board=board) as conn:
+                contract["completion_mode"] = kb.grace_objective_stage_mode(
+                    conn,
+                    objective_id=clean_objective_ref["objective_id"],
+                    stage_key=clean_objective_ref["stage_key"],
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                )
+            contract["objective_ref"] = clean_objective_ref
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -720,7 +1141,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         contract["routing"]["resolved"] = resolved_route_binding(routing_preview)
         normalized_contract = validate_loop_contract(contract)
         exact_fingerprint = contract_fingerprint(normalized_contract)
-        approval_needed = route_requires_owner_approval(routing_preview)
+        approval_needed = (
+            route_requires_owner_approval(routing_preview)
+            and not internal_only_contract
+        )
         approval_scope = list(scope.get("allowed") or [])
         approval_platform = "、".join(external_targets)
         approval_scope_json = json.dumps(
@@ -949,7 +1373,101 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "challenge but cannot consume one. KJ must send the exact reply "
                     "in a fresh authenticated turn."
                 )
-            if not approval_token:
+            if codex_local_operator and not approval_token:
+                if not bool(args.get("approved")):
+                    raise ValueError(
+                        "Codex local external-action delegation requires "
+                        "approved=true."
+                    )
+                if not codex_authorization_id or not codex_thread_id:
+                    raise ValueError(
+                        "Codex local external-action delegation requires "
+                        "HERMES_CODEX_AUTHORIZATION_ID and HERMES_CODEX_THREAD_ID."
+                    )
+                requested_message_id = f"codex-request:{codex_authorization_id}"
+                approved_message_id = f"codex-approval:{codex_authorization_id}"
+                with kb.connect_closing(board=board) as conn:
+                    existing_delegation = kb.get_grace_delegation(
+                        conn, contract_fingerprint=exact_fingerprint,
+                    )
+                replay = _queued_delegation_replay(
+                    existing_delegation,
+                    project=project,
+                    topic_name=topic_name,
+                    board=board,
+                )
+                if replay is not None:
+                    return replay
+                with kb.connect_closing(board=board) as conn:
+                    challenge = kb.create_grace_approval_challenge(
+                        conn,
+                        contract_fingerprint=exact_fingerprint,
+                        request_instance_id=request_instance_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_key=session_key,
+                        session_id=session_id,
+                        user_id_sha256=user_id_sha256,
+                        requested_message_id=requested_message_id,
+                        action_summary=str(goal.get("objective") or "").strip(),
+                        approval_platform=approval_platform,
+                        approval_scope=approval_scope_json,
+                        origin_review_task_id=origin_review_id,
+                        origin_event_id=origin_event_id,
+                        telegram_message_path=trusted_message_path,
+                    )
+                    delegation = kb.reserve_grace_delegation(
+                        conn,
+                        contract_fingerprint=exact_fingerprint,
+                        request_instance_id=request_instance_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_key=session_key,
+                        session_id=session_id,
+                        resolved_route=contract["routing"]["resolved"],
+                        approval_required=True,
+                        challenge_token=str(challenge["token"]),
+                        user_id_sha256=user_id_sha256,
+                        approved_message_id=approved_message_id,
+                        origin_review_task_id=origin_review_id,
+                        origin_event_id=origin_event_id,
+                        objective_id=str(
+                            (contract.get("objective_ref") or {}).get(
+                                "objective_id"
+                            )
+                            or ""
+                        ),
+                        stage_key=str(
+                            (contract.get("objective_ref") or {}).get(
+                                "stage_key"
+                            )
+                            or ""
+                        ),
+                        telegram_message_path=trusted_message_path,
+                    )
+                approval_provenance = {
+                    "source": "codex_local_operator",
+                    "platform": platform,
+                    "requested_message_id": requested_message_id,
+                    "approved_message_id": approved_message_id,
+                    "user_id_sha256": user_id_sha256,
+                    "internal": False,
+                    "codex_authorization_id_sha256": hashlib.sha256(
+                        codex_authorization_id.encode("utf-8")
+                    ).hexdigest(),
+                    "codex_thread_id": codex_thread_id,
+                    "contract_fingerprint": exact_fingerprint,
+                    "scope_binding": "exact_loop_contract_fingerprint",
+                }
+                effective_approved = True
+            elif codex_local_operator and approval_token:
+                raise ValueError(
+                    "Codex local operator approvals must use the dedicated "
+                    "local authorization path, not a Telegram approval token."
+                )
+            elif not approval_token:
                 with kb.connect_closing(board=board) as conn:
                     existing_delegation = kb.get_grace_delegation(
                         conn, contract_fingerprint=exact_fingerprint,
@@ -984,6 +1502,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         callback_lease_owner=(
                             callback_lease_owner if internal_turn else ""
                         ),
+                        telegram_message_path=trusted_message_path,
                     )
                 token = str(challenge["token"])
                 return json.dumps(
@@ -1008,43 +1527,77 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     },
                     ensure_ascii=False,
                 )
-            with kb.connect_closing(board=board) as conn:
-                challenge_row = kb.get_grace_approval_challenge(
-                    conn, approval_token,
-                )
-                delegation = kb.reserve_grace_delegation(
-                    conn,
-                    contract_fingerprint=exact_fingerprint,
-                    request_instance_id=request_instance_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_key=session_key,
-                    session_id=session_id,
-                    resolved_route=contract["routing"]["resolved"],
-                    approval_required=True,
-                    challenge_token=approval_token,
-                    user_id_sha256=user_id_sha256,
-                    approved_message_id=message_id,
-                    origin_review_task_id=origin_review_id,
-                    origin_event_id=origin_event_id,
-                )
-            if challenge_row is None:
-                raise ValueError("Approval challenge was not found.")
-            approval_provenance = {
-                "source": "one_time_authenticated_owner_challenge",
-                "platform": platform,
-                "requested_message_id": challenge_row["requested_message_id"],
-                "approved_message_id": delegation["approved_message_id"],
-                "user_id_sha256": user_id_sha256,
-                "internal": False,
-                "challenge_token_sha256": hashlib.sha256(
-                    approval_token.encode("utf-8")
-                ).hexdigest(),
-                "contract_fingerprint": exact_fingerprint,
-                "scope_binding": "exact_loop_contract_fingerprint",
-            }
-            effective_approved = True
+            elif approval_token:
+                with kb.connect_closing(board=board) as conn:
+                    challenge_row = kb.get_grace_approval_challenge(
+                        conn, approval_token,
+                    )
+                    challenge_message_path = normalize_message_path(
+                        (challenge_row or {}).get("telegram_message_path")
+                    )
+                    approval_message_path = (
+                        challenge_message_path or trusted_message_path
+                    )
+                    approval_message_id = str(
+                        trusted_message_path.get("inbound_message_id") or message_id
+                    ).strip()
+                    if approval_message_path and approval_message_id:
+                        approval_message_path = append_hop(
+                            approval_message_path,
+                            stage="human_approval",
+                            from_actor=actor("telegram-owner", "human"),
+                            to_actor=actor("grace", "grace"),
+                            status="observed",
+                            identifiers={
+                                "approval_message_id": approval_message_id,
+                            },
+                        )
+                    delegation = kb.reserve_grace_delegation(
+                        conn,
+                        contract_fingerprint=exact_fingerprint,
+                        request_instance_id=request_instance_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_key=session_key,
+                        session_id=session_id,
+                        resolved_route=contract["routing"]["resolved"],
+                        approval_required=True,
+                        challenge_token=approval_token,
+                        user_id_sha256=user_id_sha256,
+                        approved_message_id=message_id,
+                        origin_review_task_id=origin_review_id,
+                        origin_event_id=origin_event_id,
+                        objective_id=str(
+                            (contract.get("objective_ref") or {}).get(
+                                "objective_id"
+                            )
+                            or ""
+                        ),
+                        stage_key=str(
+                            (contract.get("objective_ref") or {}).get(
+                                "stage_key"
+                            )
+                            or ""
+                        ),
+                        telegram_message_path=approval_message_path,
+                    )
+                if challenge_row is None:
+                    raise ValueError("Approval challenge was not found.")
+                approval_provenance = {
+                    "source": "one_time_authenticated_owner_challenge",
+                    "platform": platform,
+                    "requested_message_id": challenge_row["requested_message_id"],
+                    "approved_message_id": delegation["approved_message_id"],
+                    "user_id_sha256": user_id_sha256,
+                    "internal": False,
+                    "challenge_token_sha256": hashlib.sha256(
+                        approval_token.encode("utf-8")
+                    ).hexdigest(),
+                    "contract_fingerprint": exact_fingerprint,
+                    "scope_binding": "exact_loop_contract_fingerprint",
+                }
+                effective_approved = True
         else:
             with kb.connect_closing(board=board) as conn:
                 delegation = kb.reserve_grace_delegation(
@@ -1063,6 +1616,13 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     callback_lease_owner=(
                         callback_lease_owner if internal_turn else ""
                     ),
+                    objective_id=str(
+                        (contract.get("objective_ref") or {}).get("objective_id") or ""
+                    ),
+                    stage_key=str(
+                        (contract.get("objective_ref") or {}).get("stage_key") or ""
+                    ),
+                    telegram_message_path=trusted_message_path,
                 )
         if approval_provenance:
             contract["approval_provenance"] = approval_provenance
@@ -1077,6 +1637,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 record_cron_functional_error("")
             return replay
         delegation_id = str(delegation["delegation_id"])
+        canonical_message_path = normalize_message_path(
+            delegation.get("telegram_message_path")
+        )
         build_owner = "builder_" + secrets.token_hex(12)
         with kb.connect_closing(board=board) as conn:
             if not kb.claim_grace_delegation_build(
@@ -1109,6 +1672,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 callback_lease_owner=(
                     callback_lease_owner if internal_turn else ""
                 ),
+                telegram_message_path=canonical_message_path,
             )
         except Exception:
             with kb.connect_closing(board=board) as conn:
@@ -1141,6 +1705,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             "topic_name": result.topic_name,
             "assigned_agent": result.assignee,
             "delegation_id": str(delegation["delegation_id"]),
+            "kanban_board": str(board or kb.DEFAULT_BOARD),
+            "trace_id": str(canonical_message_path.get("trace_id") or ""),
             "execution_task_id": result.execution_task_id,
             "grace_review_task_id": result.review_task_id,
             "progress_subscription": result.subscribed,

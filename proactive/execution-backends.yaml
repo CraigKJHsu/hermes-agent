@@ -1,6 +1,6 @@
 version: 1
 updated_at: "2026-07-27"
-shadow_mode: true
+shadow_mode: false
 
 policy:
   risk_order: [low, medium, high, critical]
@@ -10,7 +10,7 @@ policy:
   poll:
     initial_delay_seconds: 2
     max_delay_seconds: 30
-  selection_order: [openclaw, codex, hermes]
+  selection_order: [openclaw]
 
 backends:
   hermes:
@@ -55,18 +55,25 @@ backends:
 
   openclaw:
     enabled: true
-    semantic_classes: [browser_readonly, isolated_long_running]
+    semantic_classes: [browser_readonly, browser_write, isolated_long_running, research, local_code, local_files, content, analysis]
     capabilities:
       - browser_read
+      - browser_write
+      - code
+      - content
+      - analysis
+      - local_files
+      - research
+      - tests
       - isolated_credentials
       - isolated_session
       - isolated_workspace
       - long_running
-    risk_level_limit: low
+    risk_level_limit: critical
     credential_policy: agent_scoped
     workspace_policies: [dedicated]
     session_policies: [ephemeral, persistent]
     supports_async: true
-    max_runtime_seconds: 1200
+    max_runtime_seconds: 14400
     cost_tier: medium
-    fallback: [codex, hermes]
+    fallback: []

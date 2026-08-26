@@ -51,6 +51,7 @@ Usage:
 
 import atexit
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -231,6 +232,12 @@ DEFAULT_COMMAND_TIMEOUT = 30
 MIN_OPEN_TIMEOUT = 60
 MIN_FIRST_OPEN_TIMEOUT = 120
 
+# CDP overrides point multiple Hermes workers at one physical browser.  Keep
+# target creation / selection serial across processes and fail fast when the
+# browser process is reachable but its page renderer is not.
+CDP_OPERATION_LOCK_TIMEOUT = 5.0
+CDP_PAGE_HEALTH_TIMEOUT = 3.0
+
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
@@ -385,6 +392,310 @@ def _format_browser_timeout_error(
     if hints:
         parts.extend(hints)
     return "\n".join(parts)
+
+
+class _CDPBusyError(TimeoutError):
+    """The shared CDP endpoint is healthy but another operation owns it."""
+
+
+class _CDPRecoveryRequiredError(RuntimeError):
+    """The endpoint is quarantined after an unclean browser operation."""
+
+
+def _cdp_endpoint_state_path(cdp_url: str, suffix: str) -> str:
+    digest = hashlib.sha256(cdp_url.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(
+        _socket_safe_tmpdir(),
+        f"hermes-browser-cdp-{digest}.{suffix}",
+    )
+
+
+class _CDPOperationLock:
+    """Bounded cross-process lock for one physical CDP endpoint.
+
+    A unique ``agent-browser`` daemon is not enough to isolate tasks when all
+    daemons attach to the same Chrome debugging port.  Navigation and target
+    cleanup must therefore be serialized at the endpoint boundary.
+    """
+
+    def __init__(self, cdp_url: str, timeout: float = CDP_OPERATION_LOCK_TIMEOUT):
+        self.cdp_url = cdp_url
+        self.path = _cdp_endpoint_state_path(cdp_url, "lock")
+        self.timeout = max(float(timeout), 0.0)
+        self._handle = None
+
+    def __enter__(self):
+        self._handle = open(self.path, "a+b")
+        if os.name == "nt":
+            self._handle.seek(0, os.SEEK_END)
+            if self._handle.tell() == 0:
+                self._handle.write(b"0")
+                self._handle.flush()
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self._handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        self._handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                quarantine_reason = _cdp_quarantine_reason(self.cdp_url)
+                if quarantine_reason:
+                    self.__exit__(None, None, None)
+                    raise _CDPRecoveryRequiredError(quarantine_reason)
+                return self
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    self._handle.close()
+                    self._handle = None
+                    raise _CDPBusyError(
+                        "shared CDP browser is busy with another Hermes operation"
+                    )
+                time.sleep(0.05)
+
+    def __exit__(self, exc_type, exc, tb):
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return False
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+        return False
+
+
+def _cdp_browser_call(
+    cdp_url: str,
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout: float = CDP_PAGE_HEALTH_TIMEOUT,
+) -> Dict[str, Any]:
+    """Send one browser-level CDP command over a short-lived connection."""
+    from websockets.sync.client import connect
+
+    deadline = time.monotonic() + timeout
+    with connect(
+        cdp_url,
+        open_timeout=timeout,
+        close_timeout=1.0,
+        proxy=None,
+    ) as ws:
+        ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"CDP {method} timed out")
+            payload = json.loads(ws.recv(timeout=remaining))
+            if payload.get("id") != 1:
+                continue
+            if payload.get("error"):
+                raise RuntimeError(f"CDP {method} failed: {payload['error']}")
+            return payload.get("result", {})
+
+
+def _write_cdp_quarantine(cdp_url: str, reason: str) -> None:
+    """Persist fail-closed endpoint state while its operation lock is held."""
+    path = _cdp_endpoint_state_path(cdp_url, "quarantine")
+    payload = {
+        "reason": reason,
+        "created_at": int(time.time()),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _clear_cdp_quarantine(cdp_url: str) -> None:
+    """Clear one exact endpoint lease after a command completed cleanly."""
+    path = _cdp_endpoint_state_path(cdp_url, "quarantine")
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _cdp_quarantine_reason(cdp_url: str) -> Optional[str]:
+    """Return durable fail-closed state left by an unclean operation."""
+    path = _cdp_endpoint_state_path(cdp_url, "quarantine")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        reason = str(payload.get("reason") or "browser operation did not finish")
+        return (
+            "shared CDP browser is quarantined after an unclean operation "
+            f"({reason}); recycle the managed browser session before retrying"
+        )
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("Could not verify CDP quarantine state: %s", exc)
+        return (
+            "shared CDP browser quarantine state could not be verified; "
+            "recycle the managed browser session before retrying"
+        )
+
+
+def _close_health_target(cdp_url: str, target_id: str) -> Optional[str]:
+    """Close one owned health target, retrying once before failing closed."""
+    last_error = ""
+    for _attempt in range(2):
+        try:
+            result = _cdp_browser_call(
+                cdp_url,
+                "Target.closeTarget",
+                {"targetId": target_id},
+                timeout=1.5,
+            )
+            if result.get("success") is True:
+                return None
+            last_error = f"unexpected close response {result!r}"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+    return _sanitize_url_for_logs(
+        f"CDP health target cleanup failed: {last_error}"
+    )
+
+
+def _probe_cdp_page_health(
+    cdp_url: str,
+    *,
+    timeout: float = CDP_PAGE_HEALTH_TIMEOUT,
+) -> Optional[str]:
+    """Prove that a fresh page target can execute JavaScript, then close it."""
+    from websockets.sync.client import connect
+
+    target_id = ""
+    deadline = time.monotonic() + timeout
+    next_id = 1
+    probe_error: Optional[str] = None
+    try:
+        with connect(
+            cdp_url,
+            open_timeout=timeout,
+            close_timeout=1.0,
+            proxy=None,
+        ) as ws:
+            def call(
+                method: str,
+                params: Optional[Dict[str, Any]] = None,
+                *,
+                session_id: str = "",
+            ):
+                nonlocal next_id
+                call_id = next_id
+                next_id += 1
+                message: Dict[str, Any] = {
+                    "id": call_id,
+                    "method": method,
+                    "params": params or {},
+                }
+                if session_id:
+                    message["sessionId"] = session_id
+                ws.send(json.dumps(message))
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"CDP {method} timed out")
+                    payload = json.loads(ws.recv(timeout=remaining))
+                    if payload.get("id") != call_id:
+                        continue
+                    if payload.get("error"):
+                        raise RuntimeError(
+                            f"CDP {method} failed: {payload['error']}"
+                        )
+                    return payload.get("result", {})
+
+            created = call("Target.createTarget", {"url": "about:blank"})
+            target_id = str(created.get("targetId") or "")
+            if not target_id:
+                raise RuntimeError("CDP health target creation returned no targetId")
+            attached = call(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True},
+            )
+            session_id = str(attached.get("sessionId") or "")
+            if not session_id:
+                raise RuntimeError("CDP health target attach returned no sessionId")
+            evaluated = call(
+                "Runtime.evaluate",
+                {"expression": "1 + 1", "returnByValue": True},
+                session_id=session_id,
+            )
+            value = evaluated.get("result", {}).get("value")
+            if value != 2:
+                raise RuntimeError(
+                    f"CDP health evaluation returned unexpected value {value!r}"
+                )
+    except Exception as exc:
+        probe_error = _sanitize_url_for_logs(f"{type(exc).__name__}: {exc}")
+    finally:
+        if target_id:
+            cleanup_error = _close_health_target(cdp_url, target_id)
+            if cleanup_error:
+                probe_error = cleanup_error
+    return probe_error
+
+
+def _preflight_cdp_page_health(cdp_url: str) -> Optional[str]:
+    """Run one bounded renderer probe under the physical-endpoint lock."""
+    try:
+        with _CDPOperationLock(cdp_url):
+            error = _probe_cdp_page_health(cdp_url)
+            if error:
+                try:
+                    _write_cdp_quarantine(
+                        cdp_url,
+                        f"page health probe failed: {error}",
+                    )
+                except Exception as exc:
+                    return (
+                        f"{error}; endpoint quarantine could not be persisted: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            return error
+    except (_CDPBusyError, _CDPRecoveryRequiredError):
+        raise
+    except Exception as exc:
+        return _sanitize_url_for_logs(f"{type(exc).__name__}: {exc}")
+
+
+def _invalidate_timed_out_browser_session(
+    task_id: str,
+    session_info: Mapping[str, Any],
+) -> None:
+    """Forget a poisoned logical session without guessing daemon ownership."""
+    _stop_cdp_supervisor(task_id)
+    with _cleanup_lock:
+        if _active_sessions.get(task_id) is session_info:
+            _active_sessions.pop(task_id, None)
+        _session_last_activity.pop(task_id, None)
+    with _snapshot_ref_lock:
+        _snapshot_ref_contexts.pop(task_id, None)
+        _group_post_composer_contexts.pop(task_id, None)
+    for bare_task_id, session_key in list(_last_active_session_key.items()):
+        if session_key == task_id:
+            _last_active_session_key.pop(bare_task_id, None)
+
 
 
 def _get_vision_model() -> Optional[str]:
@@ -1827,7 +2138,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input field identified by its ref ID, or select one native HTML select option by its exact visible label. Clears an editable field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2325,7 +2636,15 @@ def _run_browser_command(
         command
     ] + args
 
+    cdp_lock = None
+    cdp_lease_active = False
+    task_socket_dir = ""
     try:
+        cdp_url = str(session_info.get("cdp_url") or "")
+        if cdp_url:
+            cdp_lock = _CDPOperationLock(cdp_url)
+            cdp_lock.__enter__()
+
         # Give each task its own socket directory to prevent concurrency conflicts.
         # Without this, parallel workers fight over the same default socket path,
         # causing "Failed to create socket directory: Permission denied" errors.
@@ -2337,6 +2656,18 @@ def _run_browser_command(
         # Record this hermes PID as the session owner (cross-process safe
         # orphan detection — see _write_owner_pid).
         _write_owner_pid(task_socket_dir, session_info['session_name'])
+        if cdp_url:
+            try:
+                _write_cdp_quarantine(
+                    cdp_url,
+                    f"browser command {command!r} is in progress",
+                )
+                cdp_lease_active = True
+            except Exception as exc:
+                raise _CDPRecoveryRequiredError(
+                    "shared CDP browser command was not started because its "
+                    f"fail-closed lease could not be persisted: {exc}"
+                ) from exc
         logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                      command, task_id, task_socket_dir, len(task_socket_dir))
 
@@ -2434,6 +2765,22 @@ def _run_browser_command(
                 "success": False,
                 "error": _format_browser_timeout_error(command, timeout, stdout, stderr),
             }
+            # The detached daemon cannot be identified safely from target
+            # timing or process-name heuristics.  Forget the poisoned logical
+            # session and leave the write-ahead endpoint lease in place.  The
+            # next worker then fails closed until the managed browser is
+            # recycled, without closing or terminating anything it does not
+            # provably own.
+            _invalidate_timed_out_browser_session(
+                task_id,
+                session_info,
+            )
+            if cdp_url:
+                result["browser_recovery_required"] = True
+                result["error"] += (
+                    " The shared CDP endpoint remains quarantined until the "
+                    "managed browser session is recycled."
+                )
             # Fall through to fallback check below
         else:
             with open(stdout_path, "r", encoding="utf-8") as f:
@@ -2515,9 +2862,37 @@ def _run_browser_command(
             else:
                 result = {"success": True, "data": {}}
 
+            if cdp_lease_active:
+                try:
+                    _clear_cdp_quarantine(cdp_url)
+                    cdp_lease_active = False
+                except Exception as exc:
+                    raise _CDPRecoveryRequiredError(
+                        "shared CDP browser command completed, but its "
+                        f"fail-closed lease could not be cleared: {exc}"
+                    ) from exc
+
+    except _CDPBusyError as e:
+        result = {
+            "success": False,
+            "error": str(e),
+            "browser_busy": True,
+            "retryable": True,
+        }
+    except _CDPRecoveryRequiredError as e:
+        result = {
+            "success": False,
+            "error": str(e),
+            "browser_recovery_required": True,
+        }
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+        if cdp_lease_active:
+            result["browser_recovery_required"] = True
+    finally:
+        if cdp_lock is not None:
+            cdp_lock.__exit__(None, None, None)
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
@@ -3096,6 +3471,12 @@ def _run_atomic_ref_action(
         try:
             with _kanban_db.connect_closing() as scope_conn:
                 task = _kanban_db.get_task(scope_conn, kanban_task_id)
+                group_posting_allowed = (
+                    _kanban_db.grace_task_allows_facebook_group_posting(
+                        scope_conn,
+                        kanban_task_id,
+                    )
+                )
             body = task.body if task is not None else ""
         except Exception as exc:
             return json.dumps({
@@ -3106,9 +3487,6 @@ def _run_atomic_ref_action(
                 ),
             }, ensure_ascii=False)
         allowed_group_ids = _kanban_db.grace_external_group_ids(body)
-        group_posting_allowed = (
-            _kanban_db.grace_allows_facebook_group_posting(body)
-        )
         group_id = group_match.group(1)
         if group_id not in allowed_group_ids:
             return json.dumps({
@@ -3660,6 +4038,43 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             return navigation_result
         return navigation_result
 
+    # A CDP discovery endpoint can remain responsive while every new page
+    # renderer is wedged.  Prove the renderer path only after URL safety and
+    # website-policy checks pass, and before the first destination navigation
+    # for this logical task.  This avoids a 120s ``open`` followed by stacked
+    # snapshot / screenshot timeouts on the same poisoned renderer.
+    cdp_override = _get_cdp_override()
+    if cdp_override and not auto_local_this_nav:
+        with _cleanup_lock:
+            needs_cdp_preflight = nav_session_key not in _active_sessions
+        if needs_cdp_preflight:
+            try:
+                health_error = _preflight_cdp_page_health(cdp_override)
+            except _CDPBusyError as exc:
+                return json.dumps({
+                    "success": False,
+                    "error": str(exc),
+                    "browser_busy": True,
+                    "retryable": True,
+                }, ensure_ascii=False)
+            except _CDPRecoveryRequiredError as exc:
+                return json.dumps({
+                    "success": False,
+                    "error": str(exc),
+                    "browser_recovery_required": True,
+                }, ensure_ascii=False)
+            if health_error:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "Shared CDP browser page health check failed before "
+                        f"navigation: {health_error}. No destination page was "
+                        "opened. Recycle the managed browser session before "
+                        "retrying this task."
+                    ),
+                    "browser_recovery_required": True,
+                }, ensure_ascii=False)
+
     if auto_local_this_nav:
         logger.info(
             "browser_navigate: auto-routing %s to local Chromium sidecar "
@@ -3709,12 +4124,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "error": result["_hermes_guard_error"],
         }, ensure_ascii=False)
 
-    # Remember which session served this nav so snapshot/click/fill/...
-    # on the same task_id hit it (critical when hybrid routing has both a
-    # cloud session and a local sidecar alive concurrently).
-    _last_active_session_key[effective_task_id] = nav_session_key
-
     if result.get("success"):
+        # Remember only a session that actually served the navigation.  A
+        # timed-out ``open`` may have left a detached daemon or half-created
+        # target; routing snapshot/click/fill to it compounds the failure.
+        _last_active_session_key[effective_task_id] = nav_session_key
         data = result.get("data", {})
         title = data.get("title", "")
         final_url = data.get("url", url)

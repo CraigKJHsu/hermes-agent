@@ -465,15 +465,15 @@ def _build_polling_app(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cold_connect_drops_pending_updates(monkeypatch):
-    """A cold first boot (is_reconnect=False) drops the stale Bot API queue."""
+async def test_cold_connect_preserves_pending_updates(monkeypatch):
+    """A cold process start preserves messages queued during its downtime."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     captured = _build_polling_app(monkeypatch)
 
     ok = await adapter.connect()  # default is_reconnect=False
 
     assert ok is True
-    assert captured["drop_pending_updates"] is True
+    assert captured["drop_pending_updates"] is False
     await _cancel_heartbeat(adapter)
 
 
@@ -598,4 +598,3 @@ async def test_conflict_callback_disarms_before_scheduling(monkeypatch):
     for _ in range(10):
         await asyncio.sleep(0)
     await _cancel_heartbeat(adapter)
-

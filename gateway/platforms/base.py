@@ -4697,6 +4697,48 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if self.platform == Platform.TELEGRAM:
+                    from gateway.telegram_interaction_labels import (
+                        METADATA_KEY as _INTERACTION_METADATA_KEY,
+                        merge_interaction_metadata,
+                    )
+
+                    _interaction = (
+                        getattr(event, "internal_context", None) or {}
+                    ).get(_INTERACTION_METADATA_KEY)
+                    _final_thread_metadata = merge_interaction_metadata(
+                        _final_thread_metadata,
+                        _interaction if isinstance(_interaction, dict) else None,
+                    )
+                    from hermes_cli.telegram_message_path import (
+                        METADATA_KEY as _MESSAGE_PATH_KEY,
+                    )
+
+                    _message_path = (
+                        getattr(event, "internal_context", None) or {}
+                    ).get(_MESSAGE_PATH_KEY)
+                    if isinstance(_message_path, dict):
+                        _final_thread_metadata = dict(
+                            _final_thread_metadata or {}
+                        )
+                        _final_thread_metadata[_MESSAGE_PATH_KEY] = _message_path
+                    if (
+                        getattr(event, "internal_context", None) or {}
+                    ).get("telegram_trace_pending_approval"):
+                        _final_thread_metadata = dict(
+                            _final_thread_metadata or {}
+                        )
+                        _final_thread_metadata[
+                            "telegram_trace_pending_approval"
+                        ] = True
+                    _kanban_board = (
+                        getattr(event, "internal_context", None) or {}
+                    ).get("kanban_board")
+                    if _kanban_board:
+                        _final_thread_metadata = dict(
+                            _final_thread_metadata or {}
+                        )
+                        _final_thread_metadata["kanban_board"] = _kanban_board
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

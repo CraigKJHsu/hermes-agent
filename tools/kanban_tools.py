@@ -384,6 +384,69 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
+            if str(task.body or "").startswith(
+                (
+                    "GRACE_LOOP_CONTRACT_STAGE: review",
+                    "GRACE_LOOP_CONTRACT_STAGE: grace_review",
+                )
+            ):
+                parent_evidence = []
+                for parent_id in parents:
+                    parent = kb.get_task(conn, parent_id)
+                    completed_runs = [
+                        run
+                        for run in kb.list_runs(conn, parent_id)
+                        if run.outcome == "completed"
+                    ]
+                    completed_runs.sort(key=lambda run: run.id, reverse=True)
+                    latest = completed_runs[0] if completed_runs else None
+                    metadata = latest.metadata if latest and latest.metadata else {}
+                    parent_evidence.append({
+                        "task_id": parent_id,
+                        "status": parent.status if parent else "missing",
+                        "summary": latest.summary if latest else None,
+                        "acceptance_evidence": (
+                            metadata.get("acceptance_evidence")
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
+                        "external_effects": (
+                            metadata.get("external_effects")
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
+                        "backend_run_id": latest.backend_run_id if latest else None,
+                        "run_id": latest.id if latest else None,
+                    })
+                return json.dumps({
+                    "task": {
+                        "id": task.id,
+                        "title": task.title,
+                        "status": task.status,
+                        "current_run_id": task.current_run_id,
+                    },
+                    "parent_evidence": parent_evidence,
+                    "comments": [
+                        {
+                            "author": comment.author,
+                            "body": comment.body,
+                            "created_at": comment.created_at,
+                        }
+                        for comment in comments[-10:]
+                    ],
+                    "recent_events": [
+                        {
+                            "kind": event.kind,
+                            "payload": event.payload,
+                            "created_at": event.created_at,
+                            "run_id": event.run_id,
+                        }
+                        for event in events[-10:]
+                    ],
+                    "runs": [_run_dict(run) for run in runs[-5:]],
+                    "view": "grace_review_compact",
+                }, ensure_ascii=False)
+
             return json.dumps({
                 "task": _task_dict(task),
                 "parents": parents,
@@ -599,7 +662,31 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            promotion_results: list[dict] = []
+            try:
+                from proactive.grace_memory_promotion import (
+                    process_due_promotions,
+                )
+
+                promotion_results = process_due_promotions(
+                    board=board,
+                    task_id=tid,
+                    limit=1,
+                )
+            except Exception:
+                # The transactional outbox already committed with the task.
+                # Heartbeat retry will resume it; completion itself remains valid.
+                logger.exception(
+                    "immediate Grace memory promotion failed for %s; queued for retry",
+                    tid,
+                )
+            payload = {
+                "task_id": tid,
+                "run_id": run.id if run else None,
+            }
+            if promotion_results:
+                payload["memory_promotion"] = promotion_results[0]
+            return _ok(**payload)
         finally:
             conn.close()
     except ValueError as e:
@@ -1356,8 +1443,11 @@ KANBAN_EXTERNAL_EFFECT_SCHEMA = {
             },
             "platform": {
                 "type": "string",
-                "enum": ["facebook", "shopee"],
-                "description": "Protected external platform.",
+                "description": (
+                    "Stable platform slug, such as facebook, shopee, tasker, "
+                    "openclaw, or generic. Facebook group effects still require "
+                    "platform=facebook and effect_key=group:<numeric-id>."
+                ),
             },
             "state": {
                 "type": "string",

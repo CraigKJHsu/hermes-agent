@@ -66,6 +66,37 @@ def _insert_loop_delegation(conn, execution_id, review_id):
     conn.commit()
 
 
+def _inline_commerce_report():
+    return {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": True,
+        "as_of": "2026-08-02 16:00 Asia/Taipei",
+        "observed_at": 1_785_657_600,
+        "rows": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "destination_id": "902016640291333",
+            "destination_name": "【大台北地區】二手家具、二手家電買賣",
+            "status": "public",
+            "status_label": "公開可見",
+            "observed_at": 1_785_657_600,
+            "verified_at": "2026-08-02 07:43 Asia/Taipei",
+            "evidence": "社團搜尋顯示商品卡。",
+        }],
+        "coverage": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "complete": True,
+            "named_count": 1,
+            "gap_count": 0,
+            "expected_total": 1,
+            "expected_total_label": "1",
+            "note": "完整",
+        }],
+    }
+
+
 def test_loop_task_context_requires_durable_binding_and_exact_header(tmp_path):
     db_path = tmp_path / "loop-context.db"
     kb.init_db(db_path)
@@ -169,6 +200,50 @@ def test_kanban_notifier_reports_claimed_and_spawned_progress(tmp_path, monkeypa
     assert "已啟動" in adapter.sent[0]["text"]
     assert "執行中" in adapter.sent[1]["text"]
     assert "pid=4321" in adapter.sent[1]["text"]
+
+
+def test_kanban_notifier_reports_cancellation_once_and_unsubscribes(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "cancel-notify.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="cancelled work",
+            assignee="clawops-review",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-2",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?",
+                (tid,),
+            )
+            kb._append_event(
+                conn,
+                tid,
+                "cancelled",
+                {"reason": "KJ 已要求停止執行。"},
+            )
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"]["thread_id"] == "topic-2"
+    assert "已依 KJ 指示停止" in adapter.sent[0]["text"]
+    assert "不會自動重試" in adapter.sent[0]["text"]
+    with kb.connect_closing() as conn:
+        assert kb.list_notify_subs(conn, tid) == []
 
 
 def test_kanban_notifier_delivers_loop_breaker_triage_to_original_chat(
@@ -323,6 +398,63 @@ def test_accepted_grace_review_delivers_parent_execution_artifact(
     delivered_path = Path(adapter.documents[0]["file_path"])
     assert delivered_path.name == artifact_path.name
     assert delivered_path.read_text(encoding="utf-8") == "verified"
+
+
+def test_inline_user_facing_report_keeps_markdown_artifact_audit_only(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "inline-only-artifact.db"
+    artifact_path = tmp_path / "audit-only.md"
+    artifact_path.write_text("# audit", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            assignee="clawops-browser",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _insert_loop_delegation(conn, execution_id, review_id)
+        kb.add_notify_sub(
+            conn,
+            task_id=review_id,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="inline table ready",
+            metadata={
+                "artifacts": [str(artifact_path)],
+                "user_facing_report": _inline_commerce_report(),
+            },
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="review accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "已完成驗收" in adapter.sent[0]["text"]
+    assert adapter.documents == []
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

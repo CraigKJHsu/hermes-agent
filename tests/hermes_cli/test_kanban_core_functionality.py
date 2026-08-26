@@ -2912,6 +2912,67 @@ def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
     assert missing["tool_checks"]["browser_upload_files"]["available"] is False
 
 
+def test_worker_capability_probe_retries_transient_timeout(monkeypatch, tmp_path):
+    completed = subprocess.CompletedProcess(
+        args=["python", "-c", "probe"],
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "declared_tools": ["browser_click"],
+                "required_runtime_tools": ["browser_click"],
+                "abstract_contract_tools": [],
+                "available_tools": ["browser_click"],
+                "missing_required_tools": [],
+                "tool_checks": {},
+            }
+        ),
+        stderr="",
+    )
+    calls = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = kb._probe_worker_capabilities(
+        declared_tools=["browser_click"],
+        toolsets=["browser-cdp"],
+        env=dict(os.environ),
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+
+    assert result["ok"] is True
+    assert result["probe_attempts"] == 2
+    assert calls == 2
+
+
+def test_worker_capability_probe_timeout_does_not_claim_tools_missing(
+    monkeypatch, tmp_path,
+):
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = kb._probe_worker_capabilities(
+        declared_tools=["browser_click", "contract_only_pseudo_tool"],
+        toolsets=["browser-cdp"],
+        env=dict(os.environ),
+        workspace=str(tmp_path),
+        timeout=1,
+    )
+
+    assert result["ok"] is False
+    assert result["missing_required_tools"] == []
+    assert result["probe_attempts"] == 2
+    assert result["probe_error"].startswith("TimeoutExpired:")
+
+
 def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
     kanban_home, monkeypatch,
 ):

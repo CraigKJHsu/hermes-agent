@@ -1,0 +1,82 @@
+- generic [ref=f1e5]:
+  - complementary "Navigation" [ref=f1e6]:
+    - generic [ref=f1e7]:
+      - generic [ref=f1e8]: HermesAgent
+      - button "Collapse" [ref=f1e10] [cursor=pointer]
+    - navigation "Navigation" [ref=f1e14]:
+      - list [ref=f1e15]:
+        - listitem [ref=f1e16]:
+          - link "Chat" [ref=f1e17] [cursor=pointer]:
+            - /url: /chat
+        - listitem [ref=f1e21]:
+          - link "Sessions" [ref=f1e22] [cursor=pointer]:
+            - /url: /sessions
+        - listitem [ref=f1e27]:
+          - link "Files" [ref=f1e28] [cursor=pointer]:
+            - /url: /files
+        - listitem [ref=f1e32]:
+          - link "Models" [ref=f1e33] [cursor=pointer]:
+            - /url: /models
+        - listitem [ref=f1e38]:
+          - link "Logs" [ref=f1e39] [cursor=pointer]:
+            - /url: /logs
+        - listitem [ref=f1e44]:
+          - link "Cron" [ref=f1e45] [cursor=pointer]:
+            - /url: /cron
+        - listitem [ref=f1e50]:
+          - link "Skills" [ref=f1e51] [cursor=pointer]:
+            - /url: /skills
+        - listitem [ref=f1e57]:
+          - link "Plugins" [ref=f1e58] [cursor=pointer]:
+            - /url: /plugins
+        - listitem [ref=f1e62]:
+          - link "MCP" [ref=f1e63] [cursor=pointer]:
+            - /url: /mcp
+        - listitem [ref=f1e67]:
+          - link "Channels" [ref=f1e68] [cursor=pointer]:
+            - /url: /channels
+        - listitem [ref=f1e76]:
+          - link "Webhooks" [ref=f1e77] [cursor=pointer]:
+            - /url: /webhooks
+        - listitem [ref=f1e83]:
+          - link "Pairing" [ref=f1e84] [cursor=pointer]:
+            - /url: /pairing
+        - listitem [ref=f1e89]:
+          - link "Profiles" [ref=f1e90] [cursor=pointer]:
+            - /url: /profiles
+        - listitem [ref=f1e97]:
+          - link "Config" [ref=f1e98] [cursor=pointer]:
+            - /url: /config
+        - listitem [ref=f1e103]:
+          - link "Keys" [ref=f1e104] [cursor=pointer]:
+            - /url: /env
+        - listitem [ref=f1e109]:
+          - link "System" [ref=f1e110] [cursor=pointer]:
+            - /url: /system
+        - listitem [ref=f1e114]:
+          - link "Documentation" [ref=f1e115] [cursor=pointer]:
+            - /url: /docs
+    - generic [ref=f1e119]:
+      - generic [ref=f1e120]: System
+      - status "Gateway"
+      - list [ref=f1e125]:
+        - listitem [ref=f1e126]:
+          - button "Restart Gateway" [ref=f1e127] [cursor=pointer]
+    - generic [ref=f1e133]:
+      - button "Switch theme" [ref=f1e136] [cursor=pointer]:
+        - generic [ref=f1e137]: Nous Blue
+      - button "Switch language" [ref=f1e147] [cursor=pointer]:
+        - generic [ref=f1e148]: EN
+    - generic [ref=f1e150]:
+      - generic [ref=f1e151]: …
+      - generic [ref=f1e152]:
+        - generic [ref=f1e153]: —
+        - link "Nous Research" [ref=f1e154] [cursor=pointer]:
+          - /url: https://nousresearch.com
+  - generic [ref=f1e155]:
+    - banner [ref=f1e156]:
+      - generic [ref=f1e157]:
+        - heading "Sessions" [level=1] [ref=f1e159]
+        - button [ref=f1e161] [cursor=pointer]
+    - main [ref=f1e166]:
+      - generic [ref=f1e167]: ⠋

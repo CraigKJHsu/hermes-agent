@@ -1,0 +1,290 @@
+"""Durable Grace objective regression tests."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from proactive.prompt_policy import active_objectives_prompt
+
+
+def _create_objective(conn, *, objective_id: str = "go_test") -> dict:
+    return kb.create_grace_objective(
+        conn,
+        objective_id=objective_id,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+        session_key="agent:main:telegram:group:chat-1:4641",
+        title="Publish Page then share to Group",
+        objective="Publish the accepted Page post and share that post to the Group.",
+        original_request_sha256="a" * 64,
+        required_stage_keys=("prepare_asset", "publish_page", "share_group"),
+        terminal_stage_key="share_group",
+        acceptance_criteria=("Page post id verified", "Group result verified"),
+        current_stage_key="prepare_asset",
+        next_action="Prepare the corrected asset.",
+    )
+
+
+def _bind_queued_delegation(conn, execution_id: str, review_id: str, *, suffix: str) -> None:
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO grace_delegations (
+            delegation_id, contract_fingerprint, request_instance_id,
+            platform, chat_id, thread_id, session_key, session_id,
+            resolved_route, approval_required, state,
+            execution_task_id, review_task_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 'telegram', 'chat-1', '4641', ?, ?, '{}', 0,
+                  'queued', ?, ?, ?, ?)
+        """,
+        (
+            f"gd-{suffix}",
+            (suffix.encode().hex() + "0" * 64)[:64],
+            f"request-{suffix}",
+            "agent:main:telegram:group:chat-1:4641",
+            "session-1",
+            execution_id,
+            review_id,
+            now,
+            now,
+        ),
+    )
+
+
+def _accepted_callback(conn, *, objective_id: str, stage_key: str, requested_mode: str):
+    execution_id = kb.create_task(conn, title=f"execute {stage_key}")
+    assert kb.complete_task(conn, execution_id, summary="done")
+    review_id = kb.create_task(conn, title=f"review {stage_key}", parents=(execution_id,))
+    kb.add_grace_loop_callback(
+        conn,
+        review_task_id=review_id,
+        execution_task_id=execution_id,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+        session_key="agent:main:telegram:group:chat-1:4641",
+        session_id="session-1",
+        contract_fingerprint="e" * 64,
+        completion_mode=requested_mode,
+        objective_id=objective_id,
+        stage_key=stage_key,
+    )
+    _bind_queued_delegation(conn, execution_id, review_id, suffix=stage_key)
+    assert kb.complete_task(
+        conn,
+        review_id,
+        summary="accepted",
+        metadata={"review_outcome": "accepted"},
+    )
+    callback = kb.list_due_grace_loop_callbacks(conn)[0]
+    assert kb.claim_grace_loop_callback(
+        conn,
+        review_task_id=review_id,
+        event_id=callback["event_id"],
+        lease_owner="owner-a",
+    )
+    return review_id, callback["event_id"]
+
+
+def test_objective_authoritatively_forces_intermediate_stage(tmp_path):
+    with kb.connect_closing(tmp_path / "objective.db") as conn:
+        _create_objective(conn)
+        review_id, _event_id = _accepted_callback(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset",
+            requested_mode="terminal",
+        )
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback["completion_mode"] == "intermediate"
+        assert callback["objective_id"] == "go_test"
+        assert callback["stage_key"] == "prepare_asset"
+
+
+def test_delegation_reservation_binds_declared_objective_stage(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-reserve.db") as conn:
+        _create_objective(conn)
+        delegation = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="b" * 64,
+            request_instance_id="request-objective-stage",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_test",
+            stage_key="prepare_asset",
+        )
+        assert delegation["objective_id"] == "go_test"
+        assert delegation["stage_key"] == "prepare_asset"
+        stage = conn.execute(
+            """
+            SELECT status, delegation_id FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        ).fetchone()
+        assert stage["status"] == "queued"
+        assert stage["delegation_id"] == delegation["delegation_id"]
+
+
+def test_terminal_stage_cannot_close_before_required_stages(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-close.db") as conn:
+        _create_objective(conn)
+        review_id, event_id = _accepted_callback(
+            conn,
+            objective_id="go_test",
+            stage_key="share_group",
+            requested_mode="intermediate",
+        )
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback["completion_mode"] == "terminal"
+        with pytest.raises(ValueError, match="required stages complete"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=event_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="4641",
+                session_id="session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "all done"},
+            )
+
+
+def test_terminal_stage_can_resume_existing_incomplete_objective_stage(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-resume-existing.db") as conn:
+        _create_objective(conn)
+        execution_id = kb.create_task(conn, title="existing publish execution")
+        review_id = kb.create_task(
+            conn,
+            title="existing publish review",
+            parents=(execution_id,),
+        )
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id, session_key, session_id,
+                resolved_route, approval_required, state,
+                execution_task_id, review_task_id, objective_id, stage_key,
+                created_at, updated_at
+            ) VALUES (
+                'gd-existing-publish', ?, 'request-existing-publish',
+                'telegram', 'chat-1', '4641', ?, 'session-old', '{}', 0,
+                'queued', ?, ?, 'go_test', 'publish_page', ?, ?
+            )
+            """,
+            (
+                "f" * 64,
+                "agent:main:telegram:group:chat-1:4641",
+                execution_id,
+                review_id,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET delegation_id = 'gd-existing-publish', status = 'queued',
+                   execution_task_id = ?, review_task_id = ?, updated_at = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'publish_page'
+            """,
+            (execution_id, review_id, now),
+        )
+        terminal_review_id, event_id = _accepted_callback(
+            conn,
+            objective_id="go_test",
+            stage_key="share_group",
+            requested_mode="terminal",
+        )
+
+        kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=terminal_review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_id="session-1",
+            lease_owner="owner-a",
+            outcome_kind="continued",
+            payload={
+                "delegation_id": "gd-existing-publish",
+                "execution_task_id": execution_id,
+                "review_task_id": review_id,
+                "next_action": "Resolve the existing Page verification blocker.",
+            },
+        )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        assert objective["status"] == "active"
+        assert objective["current_stage_key"] == "publish_page"
+        terminal_stage = conn.execute(
+            """
+            SELECT status, outcome_kind FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'share_group'
+            """
+        ).fetchone()
+        assert terminal_stage["status"] == "done"
+        assert terminal_stage["outcome_kind"] == "continued"
+
+
+def test_terminal_stage_closes_only_after_all_prior_stages(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-complete.db") as conn:
+        _create_objective(conn)
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'done', completed_at = ?, updated_at = ?
+             WHERE objective_id = 'go_test' AND stage_key IN ('prepare_asset', 'publish_page')
+            """,
+            (int(time.time()), int(time.time())),
+        )
+        review_id, event_id = _accepted_callback(
+            conn,
+            objective_id="go_test",
+            stage_key="share_group",
+            requested_mode="terminal",
+        )
+        kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_id="session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "Page and Group evidence verified"},
+        )
+        objective = kb.get_grace_objective(conn, "go_test")
+        assert objective["status"] == "completed"
+        assert objective["completed_at"] is not None
+
+
+def test_active_objective_is_injected_outside_compaction_history(tmp_path, monkeypatch):
+    db_path = tmp_path / "objective-prompt.db"
+    with kb.connect_closing(db_path) as conn:
+        _create_objective(conn, objective_id="go_prompt")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    prompt = active_objectives_prompt(
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+    )
+    assert "[Trusted active Grace objectives]" in prompt
+    assert "go_prompt" in prompt
+    assert "not historical compaction text" in prompt
+    assert '"current_stage_key": "prepare_asset"' in prompt
