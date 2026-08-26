@@ -7281,13 +7281,24 @@ def complete_task(
             (task_id,),
         ).fetchone()
         task_body = str(task_scope["body"] or "") if task_scope is not None else ""
-        if (
-            "GRACE_LOOP_CONTRACT_STAGE: grace_review" in task_body
-            and grace_review_accepted(metadata)
-        ):
+        if "GRACE_LOOP_CONTRACT_STAGE: grace_review" in task_body:
+            canonical_verdict = str(
+                metadata.get("review_outcome") or ""
+            ).strip().lower()
+            if canonical_verdict != "accepted":
+                raise ValueError(
+                    "Grace review completion requires canonical metadata."
+                    "review_outcome='accepted'. Keep the review task active "
+                    "and retry kanban_complete with the verified evidence."
+                )
+            if not grace_review_accepted(metadata):
+                raise ValueError(
+                    "Grace review completion metadata conflicts with its "
+                    "canonical accepted verdict."
+                )
             # Persist one canonical verdict at the write boundary. Models may
-            # express the same evidence in equivalent structured shapes, but
-            # every downstream consumer should observe the same accepted form.
+            # vary whitespace or case, but downstream consumers should observe
+            # one exact accepted form.
             metadata["review_outcome"] = "accepted"
         if "user_facing_report" in metadata:
             from hermes_cli.user_facing_report import (
