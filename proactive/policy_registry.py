@@ -467,6 +467,77 @@ def resolve_topic_policies_for_scope(
     }
 
 
+def resolve_task_policy_snapshots(task_body: str) -> dict[str, Any]:
+    """Resolve and verify the immutable policy refs pinned into a task body."""
+    binding, refs = _policy_context_from_task_body(task_body)
+    if binding is None and not refs:
+        raise PolicyRegistryError("task has no managed policy snapshot")
+
+    if binding is not None:
+        namespace = str(binding.get("namespace") or "")
+        canonical_path = _binding_path(namespace)
+        if str(binding.get("path") or "") != str(canonical_path):
+            raise PolicyRegistryError("policy snapshot Topic binding path is invalid")
+        if _sha256_file(canonical_path) != binding.get("sha256"):
+            raise PolicyRegistryError("policy_stale: Topic policy binding changed")
+        canonical_binding = _load_json(canonical_path, label="Topic policy binding")
+        if canonical_binding.get("namespace") != namespace:
+            raise PolicyRegistryError("policy snapshot Topic binding namespace mismatch")
+        bound_requirements = _normalize_requirements(
+            canonical_binding.get("requirements", [])
+        )
+        refs_by_id = {str(ref.get("policy_id") or ""): ref for ref in refs}
+        if len(refs_by_id) != len(refs):
+            raise PolicyRegistryError("policy snapshot refs contain invalid policy ids")
+        for requirement in bound_requirements:
+            ref = refs_by_id.get(requirement["policy_id"])
+            if ref is None:
+                raise PolicyRegistryError(
+                    "policy snapshot set does not include all Topic requirements"
+                )
+            if (
+                str(ref.get("resolution") or "latest_active")
+                != requirement["resolution"]
+                or list(ref.get("sections") or []) != requirement["sections"]
+                or (
+                    requirement["resolution"] == "fixed"
+                    and ref.get("version") != requirement.get("version")
+                )
+            ):
+                raise PolicyRegistryError(
+                    f"policy snapshot requirement mismatch: {requirement['policy_id']}"
+                )
+
+    policies: list[dict[str, Any]] = []
+    for ref in refs:
+        resolution = str(ref.get("resolution") or "latest_active")
+        requirement: dict[str, Any] = {
+            "policy_id": ref.get("policy_id"),
+            "resolution": resolution,
+            "sections": list(ref.get("sections") or []),
+        }
+        if resolution == "fixed":
+            requirement["version"] = ref.get("version")
+        current = _resolve_requirement(requirement)
+        for key in (
+            "version",
+            "sha256",
+            "sections",
+            "manifest_path",
+            "version_path",
+        ):
+            if current.get(key) != ref.get(key):
+                raise PolicyRegistryError(
+                    f"policy_stale: task snapshot {ref.get('policy_id')}.{key} differs"
+                )
+        policies.append(current)
+
+    return {
+        "binding": dict(binding) if binding is not None else None,
+        "policies": policies,
+    }
+
+
 def _normalize_requirements(requirements: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(requirements, (list, tuple)):
         raise PolicyRegistryError("policy_requirements must be a list")
@@ -647,6 +718,7 @@ def policy_snapshot_marker(contract: Mapping[str, Any]) -> str | None:
                 "resolution",
                 "version",
                 "sha256",
+                "sections",
                 "manifest_path",
                 "version_path",
                 "binding_namespace",
@@ -783,5 +855,6 @@ def validate_policy_completion(
                     )
             if receipt.get("latest_active_verified") is not True:
                 raise PolicyRegistryError(
-                    f"review must verify latest active policy: {item['policy_id']}"
+                    "review receipt must set latest_active_verified=true: "
+                    f"{item['policy_id']}"
                 )

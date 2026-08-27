@@ -401,6 +401,34 @@ def _handle_show(args: dict, **kw) -> str:
                     completed_runs.sort(key=lambda run: run.id, reverse=True)
                     latest = completed_runs[0] if completed_runs else None
                     metadata = latest.metadata if latest and latest.metadata else {}
+                    review_evidence_keys = (
+                        "artifacts",
+                        "deliverables_completed",
+                        "generated_images",
+                        "package",
+                        "policy_receipts",
+                        "verification",
+                        "external_actions_performed",
+                        "external_effects",
+                    )
+                    review_evidence = (
+                        {
+                            key: metadata[key]
+                            for key in review_evidence_keys
+                            if key in metadata
+                        }
+                        if isinstance(metadata, dict)
+                        else {}
+                    )
+                    attachments = [
+                        {
+                            "filename": attachment.filename,
+                            "stored_path": attachment.stored_path,
+                            "content_type": attachment.content_type,
+                            "size": attachment.size,
+                        }
+                        for attachment in kb.list_attachments(conn, parent_id)
+                    ]
                     parent_evidence.append({
                         "task_id": parent_id,
                         "status": parent.status if parent else "missing",
@@ -415,6 +443,8 @@ def _handle_show(args: dict, **kw) -> str:
                             if isinstance(metadata, dict)
                             else None
                         ),
+                        "review_evidence": review_evidence,
+                        "attachments": attachments,
                         "backend_run_id": latest.backend_run_id if latest else None,
                         "run_id": latest.id if latest else None,
                     })

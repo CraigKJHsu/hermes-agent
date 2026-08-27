@@ -18,6 +18,7 @@ from proactive.policy_registry import (
     create_policy_version,
     policy_status,
     resolve_topic_policies_for_scope,
+    resolve_task_policy_snapshots,
     topic_policy_binding_for_scope,
     topic_policy_binding,
     validate_policy_completion,
@@ -157,6 +158,66 @@ def test_topic_scope_fails_closed_for_ambiguous_bindings(tmp_path, monkeypatch):
 
     with pytest.raises(PolicyRegistryError, match="ambiguous"):
         topic_policy_binding_for_scope("telegram", "chat", "5000")
+
+
+def test_task_snapshot_resolves_without_messaging_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    namespace = "telegram:chat:5000/project"
+    _install_policy(namespace, "complete policy")
+    normalized = validate_loop_contract(_contract(namespace))
+    body = render_review_body(normalized, "t_parent")
+
+    resolved = resolve_task_policy_snapshots(body)
+
+    assert resolved["binding"]["namespace"] == namespace
+    assert resolved["policies"][0]["content"] == "complete policy"
+
+
+def test_task_snapshot_requires_every_topic_bound_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    namespace = "telegram:chat:5000/project"
+    _install_policy(namespace, "complete policy")
+    normalized = validate_loop_contract(_contract(namespace))
+    marker = json.loads(
+        render_review_body(normalized, "t_parent")
+        .split("GRACE_POLICY_SNAPSHOT: ", 1)[1]
+        .splitlines()[0]
+    )
+    marker["policies"] = []
+    body = "GRACE_POLICY_SNAPSHOT: " + json.dumps(marker, sort_keys=True)
+
+    with pytest.raises(PolicyRegistryError, match="all Topic requirements"):
+        resolve_task_policy_snapshots(body)
+
+
+def test_task_snapshot_preserves_topic_policy_sections(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    namespace = "telegram:chat:5000/project"
+    create_policy_version(
+        "brand-policy",
+        "v1",
+        "# Visual\n\nRules.\n",
+        owner_scope="brand",
+        owner_id="Example Brand",
+        activate=True,
+    )
+    bind_topic_policies(
+        namespace,
+        [
+            {
+                "policy_id": "brand-policy",
+                "resolution": "latest_active",
+                "sections": ["Visual"],
+            }
+        ],
+    )
+    normalized = validate_loop_contract(_contract(namespace))
+
+    resolved = resolve_task_policy_snapshots(
+        render_review_body(normalized, "t_parent")
+    )
+
+    assert resolved["policies"][0]["sections"] == ["Visual"]
 
 
 def test_policy_versions_are_immutable_and_activation_is_cas_guarded(tmp_path, monkeypatch):

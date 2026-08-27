@@ -215,6 +215,7 @@ def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
             "listing": {"listingId": "915975414881937"},
             "destinations": [{"name": f"group-{index}"} for index in range(10)],
         }
+        policy_receipts = [{"policy_id": "brand", "loaded": True}]
         assert kb.complete_task(
             conn,
             parent,
@@ -223,6 +224,8 @@ def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
             metadata={
                 "acceptance_evidence": evidence,
                 "external_effects": [],
+                "deliverables_completed": ["complete package"],
+                "policy_receipts": policy_receipts,
             },
             expected_run_id=int(claimed_parent.current_run_id),
         )
@@ -245,6 +248,11 @@ def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
     assert "worker_context" not in shown
     assert shown["parent_evidence"][0]["acceptance_evidence"] == evidence
     assert shown["parent_evidence"][0]["external_effects"] == []
+    assert shown["parent_evidence"][0]["review_evidence"] == {
+        "deliverables_completed": ["complete package"],
+        "policy_receipts": policy_receipts,
+        "external_effects": [],
+    }
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

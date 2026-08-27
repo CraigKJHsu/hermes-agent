@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from tools.registry import registry
 
@@ -14,6 +15,7 @@ def managed_policy_read(*, session_id: str | None) -> str:
     from hermes_state import SessionDB
     from proactive.policy_registry import (
         PolicyRegistryError,
+        resolve_task_policy_snapshots,
         resolve_topic_policies_for_scope,
     )
 
@@ -32,12 +34,54 @@ def managed_policy_read(*, session_id: str | None) -> str:
     source = str(session.get("source") or "").strip().lower()
     chat_id = str(session.get("chat_id") or "").strip()
     thread_id = str(session.get("thread_id") or "").strip()
-    if not source or not chat_id or not thread_id:
+
+    if not chat_id or not thread_id:
+        kanban_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        if not kanban_task_id:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "current session is not bound to a Topic or policy-pinned task",
+                }
+            )
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, kanban_task_id)
+        finally:
+            conn.close()
+        if task is None:
+            return json.dumps(
+                {"success": False, "error": "trusted Kanban task was not found"}
+            )
+        try:
+            result = resolve_task_policy_snapshots(str(task.body or ""))
+        except PolicyRegistryError as exc:
+            return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+        review_policy_receipts = [
+            {
+                "role": "review",
+                "policy_id": policy["policy_id"],
+                "version": policy["version"],
+                "sha256": policy["sha256"],
+                "loaded": True,
+                **(
+                    {"latest_active_verified": True}
+                    if policy.get("resolution") == "latest_active"
+                    else {}
+                ),
+            }
+            for policy in result["policies"]
+        ]
         return json.dumps(
             {
-                "success": False,
-                "error": "current session is not bound to a messaging Topic",
-            }
+                "success": True,
+                "scope": {"kind": "kanban_task", "task_id": kanban_task_id},
+                "review_policy_receipts": review_policy_receipts,
+                **result,
+            },
+            ensure_ascii=False,
         )
 
     try:
@@ -69,7 +113,10 @@ registry.register(
             "about formal instructions, brand/channel rules, active policy versions, "
             "or policy SHA values, and before compiling policy-governed work. Topic "
             "Memory or Mem0 summaries are not substitutes. This tool is read-only and "
-            "accepts no namespace; scope comes from the trusted current session."
+            "accepts no namespace; scope comes from the trusted current messaging "
+            "session or the current policy-pinned Kanban task. In Grace review tasks, "
+            "use this tool to verify the task's pinned snapshot and copy its exact "
+            "review_policy_receipts into kanban_complete metadata.policy_receipts."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
