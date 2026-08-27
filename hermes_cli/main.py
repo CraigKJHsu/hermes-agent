@@ -4259,6 +4259,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_policy(args):
+    """Manage versioned policies and Topic bindings."""
+    from hermes_cli.policy import policy_command
+
+    return policy_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -11708,7 +11715,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
-        "project", "proxy", "trace",
+        "policy", "project", "proxy", "trace",
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
@@ -12459,6 +12466,12 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # Versioned managed policies and Topic bindings.
+    from hermes_cli.policy import build_parser as _build_policy_parser
+
+    policy_parser = _build_policy_parser(subparsers)
+    policy_parser.set_defaults(func=cmd_policy)
 
     # Read-only end-to-end correlation lookup.
     from hermes_cli.telegram_trace import build_parser as _build_trace_parser

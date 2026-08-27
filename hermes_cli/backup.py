@@ -775,6 +775,7 @@ _QUICK_STATE_FILES = (
     "verification_evidence.db",         # agent verification audit trail
     "kanban.db",                        # default board (back-compat <root>/kanban.db)
     "kanban/boards",                    # non-default boards: each <slug>/kanban.db + board metadata (workspaces/ + attachments/ are skipped as regenerable)
+    "policies",                         # immutable managed policies + Topic bindings
     # Pairing stores (generic + per-platform JSONs outside state.db)
     "pairing",                          # legacy location (gateway/pairing.py)
     "platforms/pairing",                # new location (gateway/pairing.py)

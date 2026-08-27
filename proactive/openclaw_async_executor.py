@@ -2748,6 +2748,7 @@ def make_loop_contract_terminal_handler(
                         "result_digest": observation.get("result_digest"),
                         "acceptance_evidence": audited_result.get("acceptanceEvidence"),
                         "external_effects": audited_result.get("externalEffects"),
+                        "policy_receipts": audited_result.get("policyReceipts"),
                     },
                     expected_run_id=run.id,
                 ):

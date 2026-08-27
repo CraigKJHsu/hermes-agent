@@ -93,6 +93,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.grace_review_metadata import grace_review_accepted
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from proactive.policy_registry import serialize_with_policy_registry
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -7199,6 +7200,7 @@ def _persist_completion_artifacts(
     return preserved, records
 
 
+@serialize_with_policy_registry
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7266,6 +7268,22 @@ def complete_task(
     else:
         verified_cards = []
 
+    task_scope = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    task_body = str(task_scope["body"] or "") if task_scope is not None else ""
+    grace_loop_stage = _grace_loop_stage_header(task_body)
+    if "GRACE_POLICY_SNAPSHOT:" in task_body:
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Policy-governed task completion requires structured metadata.policy_receipts."
+            )
+        from proactive.policy_registry import validate_policy_completion
+
+        policy_role = "review" if grace_loop_stage == "review" else "execution"
+        validate_policy_completion(task_body, metadata, role=policy_role)
+
     cleaned_artifacts: list[str] = []
     preserved_artifacts: list[str] = []
     artifact_records: list[dict[str, Any]] = []
@@ -7276,12 +7294,7 @@ def complete_task(
         # Normalize into a fresh mapping so callers do not observe an in-place
         # rewrite of their metadata object.
         metadata = dict(metadata)
-        task_scope = conn.execute(
-            "SELECT body FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        task_body = str(task_scope["body"] or "") if task_scope is not None else ""
-        if "GRACE_LOOP_CONTRACT_STAGE: grace_review" in task_body:
+        if grace_loop_stage == "review":
             canonical_verdict = str(
                 metadata.get("review_outcome") or ""
             ).strip().lower()

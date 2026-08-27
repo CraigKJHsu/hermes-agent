@@ -17,6 +17,7 @@ from proactive.openclaw_async_executor import (
     start_loop_contract_execution,
     start_zero_effect_async_acceptance,
 )
+from proactive.policy_registry import bind_topic_policies, create_policy_version
 
 
 @pytest.fixture
@@ -141,6 +142,17 @@ def _pending_admission_result(task):
 def _loop_result(task, status):
     terminal = status == "succeeded"
     backend_agent_id = task.get("backend_agent_id") or "missioncrew-executor"
+    snapshots = (task.get("loop_contract") or {}).get("policy_snapshots") or []
+    policy_receipts = [
+        {
+            "role": "execution",
+            "policy_id": item["policy_id"],
+            "version": item["version"],
+            "sha256": item["sha256"],
+            "loaded": True,
+        }
+        for item in snapshots
+    ]
     return {
         "task_id": task["task_id"],
         "status": status,
@@ -158,6 +170,7 @@ def _loop_result(task, status):
                     "summary": "Loop Contract completed.",
                     "acceptanceEvidence": ["verified"],
                     "externalEffects": [],
+                    "policyReceipts": policy_receipts,
                 },
             },
         }] if terminal else []),
@@ -562,6 +575,55 @@ def test_loop_contract_terminal_result_releases_grace_review(kanban_home):
         review = kb.get_task(conn, started["review_task_id"])
     assert execution is not None and execution.status == "done"
     assert review is not None and review.status in {"ready", "todo"}
+
+
+def test_loop_contract_terminal_persists_topic_policy_receipts(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-terminal-policy-1"
+    namespace = contract["memory"]["namespace"]
+    create_policy_version(
+        "async-policy",
+        "v1",
+        "# Async policy\n",
+        owner_scope="topic",
+        owner_id=namespace,
+        activate=True,
+    )
+    bind_topic_policies(
+        namespace,
+        [{"policy_id": "async-policy", "resolution": "latest_active"}],
+    )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-terminal-policy-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    adapter = make_loop_contract_poll_adapter(
+        transport=lambda task: _loop_result(task, "succeeded")
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    handled = make_loop_contract_terminal_handler()(run, adapter(run))
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        completed_run = kb.latest_run(conn, started["execution_task_id"])
+    assert completed_run is not None
+    assert completed_run.metadata["policy_receipts"] == [
+        {
+            "role": "execution",
+            "policy_id": "async-policy",
+            "version": "v1",
+            "sha256": completed_run.metadata["loop_contract"]["policy_snapshots"][0][
+                "sha256"
+            ],
+            "loaded": True,
+        }
+    ]
 
 
 def test_loop_contract_terminal_accepts_result_text_json(kanban_home):
