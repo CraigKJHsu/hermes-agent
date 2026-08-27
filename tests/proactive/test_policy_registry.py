@@ -17,6 +17,8 @@ from proactive.policy_registry import (
     bind_topic_policies,
     create_policy_version,
     policy_status,
+    resolve_topic_policies_for_scope,
+    topic_policy_binding_for_scope,
     topic_policy_binding,
     validate_policy_completion,
 )
@@ -124,6 +126,37 @@ def test_same_policy_can_bind_multiple_topics_without_copying(tmp_path, monkeypa
     assert topic_policy_binding("topic:a")["requirements"] == topic_policy_binding(
         "topic:b"
     )["requirements"]
+
+
+def test_topic_scope_resolves_unique_complete_active_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    namespace = "telegram:-1003938559457:4641/topic-project"
+    content = "# Audio Brief\n\nFormal complete instructions.\n"
+    binding = _install_policy(namespace, content)
+
+    resolved = resolve_topic_policies_for_scope(
+        "telegram", "-1003938559457", "4641"
+    )
+
+    assert resolved["namespace"] == namespace
+    assert resolved["binding_sha256"] == binding["binding_sha256"]
+    assert resolved["policies"][0]["content"] == content
+    assert resolved["policies"][0]["version"] == "2026-08-27.1"
+    assert resolved["policies"][0]["sha256"] == hashlib.sha256(
+        content.encode()
+    ).hexdigest()
+
+
+def test_topic_scope_fails_closed_for_ambiguous_bindings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _install_policy("telegram:chat:5000/project-a")
+    bind_topic_policies(
+        "telegram:chat:5000/project-b",
+        [{"policy_id": "brand-policy", "resolution": "latest_active"}],
+    )
+
+    with pytest.raises(PolicyRegistryError, match="ambiguous"):
+        topic_policy_binding_for_scope("telegram", "chat", "5000")
 
 
 def test_policy_versions_are_immutable_and_activation_is_cas_guarded(tmp_path, monkeypatch):

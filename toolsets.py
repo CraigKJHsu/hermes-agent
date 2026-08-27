@@ -57,6 +57,8 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Context-bound, read-only managed Topic policy lookup.
+    "managed_policy_read",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -244,6 +246,12 @@ TOOLSETS = {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
         "includes": []
+    },
+
+    "managed_policy": {
+        "description": "Read current managed policies bound to the active Topic",
+        "tools": ["managed_policy_read"],
+        "includes": [],
     },
 
     "context_engine": {

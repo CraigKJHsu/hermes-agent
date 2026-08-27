@@ -412,6 +412,61 @@ def topic_policy_binding(namespace: str) -> dict[str, Any]:
     return result
 
 
+def topic_policy_binding_for_scope(
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Return the unique binding owned by one trusted messaging Topic scope."""
+    clean_platform = str(platform or "").strip().lower()
+    clean_chat_id = str(chat_id or "").strip()
+    clean_thread_id = str(thread_id or "").strip()
+    if not clean_platform or not clean_chat_id or not clean_thread_id:
+        raise PolicyRegistryError("platform, chat_id, and thread_id are required")
+
+    prefix = f"{clean_platform}:{clean_chat_id}:{clean_thread_id}/"
+    bindings_dir = _registry_root() / "topic-bindings"
+    matches: list[dict[str, Any]] = []
+    for path in sorted(bindings_dir.glob("*.json")):
+        value, binding_sha256 = _load_json_snapshot(
+            path, label="Topic policy binding"
+        )
+        namespace = str(value.get("namespace") or "")
+        if namespace == prefix[:-1] or namespace.startswith(prefix):
+            value["binding_path"] = str(path)
+            value["binding_sha256"] = binding_sha256
+            matches.append(value)
+    if not matches:
+        raise PolicyRegistryError(
+            f"no managed policy binding for Topic scope {prefix[:-1]}"
+        )
+    if len(matches) != 1:
+        raise PolicyRegistryError(
+            f"ambiguous managed policy bindings for Topic scope {prefix[:-1]}"
+        )
+    return matches[0]
+
+
+def resolve_topic_policies_for_scope(
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Resolve current, hash-verified policy content for one trusted Topic scope."""
+    binding = topic_policy_binding_for_scope(platform, chat_id, thread_id)
+    policies = [
+        _resolve_requirement(requirement)
+        for requirement in binding.get("requirements", [])
+    ]
+    return {
+        "namespace": binding["namespace"],
+        "binding_path": binding["binding_path"],
+        "binding_sha256": binding["binding_sha256"],
+        "requirements": binding.get("requirements", []),
+        "policies": policies,
+    }
+
+
 def _normalize_requirements(requirements: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(requirements, (list, tuple)):
         raise PolicyRegistryError("policy_requirements must be a list")
