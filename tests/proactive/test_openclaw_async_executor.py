@@ -71,6 +71,67 @@ def _contract():
     }
 
 
+def test_facebook_page_api_uses_dedicated_openclaw_capability(monkeypatch):
+    contract = _contract()
+    contract["routing"] = {
+        "task_type": "facebook_page_api_publish",
+        "resolved": {
+            "assignment": {
+                "assigned_worker": "clawops.facebook_page_api",
+                "allowed_tools": [
+                    "facebook_page_graph_status",
+                    "facebook_page_graph_publish",
+                ],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_existing_loop_agent_or_executor",
+        lambda agent_id: agent_id,
+    )
+
+    assert openclaw_async_executor._loop_allowed_tools(
+        "facebook_page_api_publish",
+        external_effects=True,
+        contract_tools=openclaw_async_executor._contract_runtime_tools(contract),
+    ) == ["facebook_page_graph_status", "facebook_page_graph_publish"]
+    assert openclaw_async_executor._loop_backend_agent_id(
+        contract,
+        task_type="facebook_page_api_publish",
+        external_effects=True,
+    ) == "missioncrew-facebook-page-operator"
+
+
+def test_facebook_page_preflight_uses_one_zero_effect_capability(monkeypatch):
+    contract = _contract()
+    contract["routing"] = {
+        "task_type": "facebook_page_publish_preflight",
+        "resolved": {
+            "assignment": {
+                "assigned_worker": "clawops.facebook_page_preflight",
+                "allowed_tools": ["facebook_page_publish_preflight"],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_existing_loop_agent_or_executor",
+        lambda agent_id: agent_id,
+    )
+
+    assert openclaw_async_executor._loop_allowed_tools(
+        "facebook_page_publish_preflight",
+        external_effects=False,
+        contract_tools=openclaw_async_executor._contract_runtime_tools(contract),
+    ) == ["facebook_page_publish_preflight"]
+    assert openclaw_async_executor._loop_backend_agent_id(
+        contract,
+        task_type="facebook_page_publish_preflight",
+        external_effects=False,
+    ) == "missioncrew-facebook-page-operator"
+
+
 def _result(task, status):
     terminal = status == "succeeded"
     return {
@@ -201,7 +262,7 @@ def test_loop_contract_routes_execution_to_openclaw_and_keeps_grace_review(
     contract["identity"]["request_instance_id"] = "loop-routing-1"
     started = start_loop_contract_execution(
         contract=contract,
-        task_type="research",
+        task_type="content_draft",
         risk_level="low",
         approved=False,
         delegation_id="delegation-loop-routing-1",
@@ -217,21 +278,21 @@ def test_loop_contract_routes_execution_to_openclaw_and_keeps_grace_review(
     assert execution.executor_backend == "openclaw"
     assert execution.executor_profile == "loop-contract"
     assert run is not None
-    assert run.metadata["backend_agent_id"] == "missioncrew-research"
+    assert run.metadata["backend_agent_id"] == "missioncrew-executor"
     role_card = run.metadata["loop_contract"]["routing"]["resolved"][
         "backend_role_card"
     ]
-    assert role_card["agent_id"] == "research"
-    assert role_card["agent_display_name"] == "Research Agent"
-    assert role_card["agent_role"] == "market_research_and_evidence"
-    assert role_card["primary_model"] == "codex"
-    assert role_card["fallback_model"] == "gemini-3.1-pro"
-    assert role_card["worker_id"] == "clawops.research"
-    assert role_card["worker_role"] == "research"
-    assert role_card["runtime_profile"] == "clawops-research"
-    assert role_card["approval_required"] is False
+    assert role_card["agent_id"] == "content_creator"
+    assert role_card["agent_display_name"] == "Content Creator Agent"
+    assert role_card["agent_role"] == "content_drafting"
+    assert role_card["primary_model"] == "openai/gpt-image-2"
+    assert role_card["fallback_model"] == "codex"
+    assert role_card["worker_id"] == "missioncrew.content"
+    assert role_card["worker_role"] == "content"
+    assert role_card["runtime_profile"] == "missioncrew-content"
+    assert role_card["approval_required"] is True
     assert role_card["output_format"] == "markdown"
-    assert "evidence" in role_card["required_sections"]
+    assert "draft" in role_card["required_sections"]
     assert "驗證 OpenClaw 真實非同步零副作用執行。" not in execution.body
     assert review is not None
     assert review.executor_backend == "hermes"
@@ -254,9 +315,16 @@ def test_external_loop_contract_requires_scoped_approval(kanban_home):
         )
 
 
-def test_image_generation_loop_contract_requires_matching_backend_capability(
+def test_image_generation_loop_contract_routes_with_backend_capability(
     kanban_home,
 ):
+    (
+        kanban_home.parent
+        / "my_agent_team"
+        / "openclaw-workspace"
+        / "agents"
+        / "missioncrew-content"
+    ).mkdir(parents=True)
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-image-generation-1"
     contract["goal"]["objective"] = "Generate and verify a 16:9 Hero image."
@@ -278,18 +346,25 @@ def test_image_generation_loop_contract_requires_matching_backend_capability(
         },
     }
 
-    with pytest.raises(RuntimeError, match="missing_capabilities:image_generate"):
-        start_loop_contract_execution(
-            contract=contract,
-            task_type="content_draft",
-            risk_level="low",
-            approved=True,
-            delegation_id="delegation-loop-image-generation-1",
-            transport=lambda task: _loop_result(task, "queued"),
-        )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=True,
+        delegation_id="delegation-loop-image-generation-1",
+        transport=lambda task: _loop_result(task, "queued", "missioncrew-content"),
+    )
 
     with kb.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        execution = kb.get_task(conn, started["execution_task_id"])
+        run = kb.get_run(conn, int(started["run_id"]))
+
+    assert execution is not None
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+    assert run is not None
+    assert run.metadata["backend_agent_id"] == "missioncrew-content"
+    assert "image_generate" in run.metadata["allowed_tools"]
 
 
 def test_internal_artifact_sentinel_has_no_external_effect_budget(kanban_home):
@@ -577,6 +652,127 @@ def test_loop_contract_terminal_result_releases_grace_review(kanban_home):
     assert review is not None and review.status in {"ready", "todo"}
 
 
+def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
+    kanban_home,
+):
+    page = kanban_home / "page.png"
+    cover = kanban_home / "cover.png"
+    page.write_bytes(b"page-image")
+    cover.write_bytes(b"cover-image")
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-content-package-1"
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "subject_keys": ["page-body", "page-hero", "audio-brief"],
+        "asset_filenames": [page.name, cover.name],
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-content-package-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"] = {
+        "telegram_user_facing_content_package": {
+            "facebook_page_body": "完整 Page 內文\n\n#FinalHashtag",
+            "group_discussion_copy": "Group 討論附文",
+            "gemini_notebook_audio_prompt": "Gemini prompt",
+            "podcast_title": "Podcast title",
+            "podcast_description": "Podcast description",
+            "image_attachments": [
+                {
+                    "filename": page.name,
+                    "path": str(page),
+                    "asset_family": "page_hero",
+                    "sha256": openclaw_async_executor.hashlib.sha256(
+                        page.read_bytes()
+                    ).hexdigest(),
+                },
+                {
+                    "filename": cover.name,
+                    "path": str(cover),
+                    "asset_family": "audio_brief",
+                    "sha256": openclaw_async_executor.hashlib.sha256(
+                        cover.read_bytes()
+                    ).hexdigest(),
+                },
+            ],
+        }
+    }
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "content-package-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        completed_run = kb.latest_run(conn, started["execution_task_id"])
+        attachments = kb.list_attachments(conn, started["execution_task_id"])
+    assert completed_run is not None
+    report = completed_run.metadata["user_facing_report"]
+    assert report["kind"] == "content_package"
+    assert "完整 Page 內文" in report["body"]
+    assert {item.filename for item in attachments} == {
+        f"{started['execution_task_id']}-content-package.md",
+        page.name,
+        cover.name,
+    }
+
+
+def test_loop_contract_terminal_defaults_missing_policy_receipts(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-terminal-no-policy-receipts"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-terminal-no-policy-receipts",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+
+    def succeeded_without_policy_receipts(task):
+        result = _loop_result(task, "succeeded")
+        payload = result["artifacts"][0]["value"]["result"]
+        payload.pop("policyReceipts")
+        return result
+
+    adapter = make_loop_contract_poll_adapter(
+        transport=succeeded_without_policy_receipts
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    handled = make_loop_contract_terminal_handler()(run, adapter(run))
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        completed_run = kb.latest_run(conn, started["execution_task_id"])
+    assert completed_run is not None
+    assert completed_run.metadata["policy_receipts"] == []
+
+
 def test_loop_contract_terminal_persists_topic_policy_receipts(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-terminal-policy-1"
@@ -626,6 +822,90 @@ def test_loop_contract_terminal_persists_topic_policy_receipts(kanban_home):
     ]
 
 
+def test_loop_contract_terminal_defaults_policy_receipts_with_internal_image_receipts(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-terminal-policy-image-1"
+    namespace = contract["memory"]["namespace"]
+    create_policy_version(
+        "async-image-policy",
+        "v1",
+        "# Async image policy\n",
+        owner_scope="topic",
+        owner_id=namespace,
+        activate=True,
+    )
+    bind_topic_policies(
+        namespace,
+        [{"policy_id": "async-image-policy", "resolution": "latest_active"}],
+    )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-terminal-policy-image-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    payload = terminal["artifacts"][0]["value"]["result"]
+    payload.pop("policyReceipts")
+    payload["externalEffects"] = [
+        {
+            "target": "openclaw.image_generate:hero",
+            "state": "verified",
+            "externalId": "session=image_generate:hero",
+            "readback": {
+                "path": "/Users/kj/.openclaw/media/tool-image-generation/hero.png",
+                "model": "openai/gpt-image-2",
+            },
+        },
+    ]
+
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-policy-image-digest",
+        },
+    )
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        completed_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "done"
+    assert completed_run is not None
+    assert completed_run.metadata["external_effects"] == []
+    assert len(completed_run.metadata["internal_tool_receipts"]) == 1
+    assert completed_run.metadata["policy_receipts"] == [
+        {
+            "role": "execution",
+            "policy_id": "async-image-policy",
+            "version": "v1",
+            "sha256": completed_run.metadata["loop_contract"]["policy_snapshots"][0][
+                "sha256"
+            ],
+            "loaded": True,
+        }
+    ]
+
+
 def test_loop_contract_terminal_accepts_result_text_json(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-terminal-result-text-1"
@@ -653,7 +933,11 @@ def test_loop_contract_terminal_accepts_result_text_json(kanban_home):
     )
     output = terminal["artifacts"][0]["value"]
     result = output.pop("result")
-    output["resultText"] = json.dumps(result, ensure_ascii=False)
+    output["resultText"] = (
+        "Complete.\n```json\n"
+        + json.dumps(result, ensure_ascii=False)
+        + "\n```\nNo further actions were performed."
+    )
     observation = {
         "status": "succeeded",
         "delegated_result": terminal,
@@ -757,6 +1041,7 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
             conn,
             started["execution_task_id"],
             result="incomplete evidence",
+            metadata={"policy_receipts": []},
             expected_run_id=run.id,
         )
         conn.execute(
@@ -820,6 +1105,7 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
             conn,
             started["execution_task_id"],
             result="still incomplete",
+            metadata={"policy_receipts": []},
             expected_run_id=corrected_run.id,
         )
         conn.execute(
@@ -850,6 +1136,111 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
     ] == ["candidate URLs are missing", "source timestamps are missing"]
 
 
+def test_loop_contract_from_execution_body_keeps_embedded_policy_fences():
+    from proactive.grace_task_compiler import render_execution_body
+    from proactive.openclaw_async_executor import _loop_contract_from_execution_body
+
+    contract = _contract()
+    contract["policy_snapshots"] = [
+        {
+            "policy_id": "ai-bizweek",
+            "version": "1",
+            "sha256": "abc123",
+            "content": "Policy text with an embedded fenced block:\n```json\n{\"ok\": true}\n```",
+        }
+    ]
+
+    parsed = _loop_contract_from_execution_body(render_execution_body(contract))
+
+    assert parsed["policy_snapshots"][0]["content"] == contract["policy_snapshots"][0]["content"]
+
+
+def test_quarantined_loop_contract_correction_is_recoverable(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-correction-quarantine-1"
+    contract["routing"] = {
+        "resolved": {
+            "assignment": {
+                "allowed_tools": ["image_generate"],
+                "assigned_worker": "missioncrew.content",
+                "required_agent_id": "missioncrew-content",
+            }
+        }
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-correction-quarantine-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="needs correction",
+            metadata={"policy_receipts": []},
+            expected_run_id=run.id,
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 1)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"missing visual hierarchy"}',
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'blocked', ?, 2)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"OpenClaw correction admission quarantined: Unterminated string","kind":"capability"}',
+            ),
+        )
+        conn.commit()
+
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    retried = retry_ready_loop_contract_execution(
+        started["execution_task_id"],
+        transport=transport,
+    )
+
+    assert retried["execution_task_id"] == started["execution_task_id"]
+    assert retried["status"] == "queued"
+    assert seen["loop_contract"]["verification"]["review_feedback"] == [
+        "missing visual hierarchy"
+    ]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        run = kb.get_run(conn, int(retried["run_id"]))
+    assert task is not None and task.status == "running"
+    assert run is not None
+    assert run.metadata["correction_admission"] is True
+    assert run.metadata["allowed_tools"] == [
+        "read",
+        "write",
+        "web_search",
+        "image_generate",
+    ]
+
+
 def test_grace_correction_does_not_auto_replay_external_effects(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-effect-correction-1"
@@ -873,10 +1264,23 @@ def test_grace_correction_does_not_auto_replay_external_effects(kanban_home):
                 "approval_grant_id": "original-scoped-grant",
             },
         )
+        policy_receipts = [
+            {
+                "role": "execution",
+                "policy_id": item["policy_id"],
+                "version": item["version"],
+                "sha256": item["sha256"],
+                "loaded": True,
+            }
+            for item in (run.metadata.get("loop_contract") or {}).get(
+                "policy_snapshots", []
+            )
+        ]
         assert kb.complete_task(
             conn,
             started["execution_task_id"],
             result="evidence incomplete",
+            metadata={"policy_receipts": policy_receipts},
             expected_run_id=run.id,
         )
         conn.execute(
@@ -936,6 +1340,321 @@ def test_zero_budget_terminal_rejects_reported_external_effect(kanban_home):
 
     assert handled["accepted"] is False
     assert len(handled["reason"]) <= 2000
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+
+
+def test_zero_budget_terminal_accepts_internal_image_generation_receipts(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-internal-image-effect-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-internal-image-effect-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["artifacts"][0]["value"]["result"]["externalEffects"] = [
+        {
+            "target": "openclaw.image_generate",
+            "state": "verified",
+            "externalId": "session=image_generate:hero",
+            "readback": {
+                "path": "/Users/kj/.openclaw/media/tool-image-generation/hero.png",
+                "model": "openai/gpt-image-2",
+            },
+        },
+        {
+            "target": "openclaw.image_generate",
+            "state": "verified",
+            "externalId": "session=image_generate:cover",
+            "readback": {
+                "path": "/Users/kj/.openclaw/media/tool-image-generation/cover.png",
+                "model": "openai/gpt-image-2",
+            },
+        },
+    ]
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-internal-image-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "done"
+    assert ended_run is not None
+    assert ended_run.metadata["external_effects"] == []
+    assert len(ended_run.metadata["internal_tool_receipts"]) == 2
+
+
+def test_zero_budget_terminal_reclassifies_media_generation_budget_error(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-media-generation-effect-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-media-generation-effect-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = (
+        "Loop Contract result exceeded its external effect budget."
+    )
+    output["result"]["externalEffects"] = [
+        {
+            "target": "media_generation_page_hero",
+            "state": "verified",
+            "externalId": (
+                "media:/Users/kj/.openclaw/media/tool-image-generation/"
+                "ep04_page_hero.png"
+            ),
+            "readback": {
+                "path": "/Users/kj/.openclaw/media/tool-image-generation/ep04_page_hero.png",
+                "asset_family": "page_hero",
+            },
+        },
+        {
+            "target": "media_generation_audio_brief",
+            "state": "verified",
+            "externalId": (
+                "media:/Users/kj/.openclaw/media/tool-image-generation/"
+                "ep04_audio_brief.png"
+            ),
+            "readback": {
+                "path": "/Users/kj/.openclaw/media/tool-image-generation/ep04_audio_brief.png",
+                "asset_family": "audio_brief",
+            },
+        },
+    ]
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-media-generation-digest",
+    })
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "done"
+    assert ended_run is not None
+    assert ended_run.metadata["external_effects"] == []
+    assert len(ended_run.metadata["internal_tool_receipts"]) == 2
+
+
+@pytest.mark.parametrize(
+    "effect_target",
+    [
+        "local openclaw.image_generate",
+        "openclaw.image_generate.local_media",
+        "openclaw.image_generate local managed media",
+    ],
+)
+def test_zero_budget_terminal_reclassifies_local_openclaw_image_generation(
+    kanban_home,
+    effect_target,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-local-openclaw-image-effect-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-local-openclaw-image-effect-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = (
+        "Loop Contract result exceeded its external effect budget."
+    )
+    output["result"]["externalEffects"] = [
+        {
+            "target": effect_target,
+            "state": "verified",
+            "readback": {
+                "path": (
+                    "/Users/kj/.openclaw/media/tool-image-generation/"
+                    "topic4641_carters_page_hero_16x9.png"
+                ),
+                "asset_family": "page_hero",
+            },
+        },
+    ]
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-local-openclaw-image-digest",
+    })
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "done"
+    assert ended_run is not None
+    assert ended_run.metadata["external_effects"] == []
+    assert len(ended_run.metadata["internal_tool_receipts"]) == 1
+
+
+def test_zero_budget_terminal_keeps_telegram_delivery_as_external_effect(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-telegram-delivery-effect-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-telegram-delivery-effect-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = (
+        "Loop Contract result exceeded its external effect budget."
+    )
+    output["result"]["externalEffects"] = [
+        {
+            "target": "telegram_inline_delivery",
+            "state": "verified",
+            "externalId": "tgtrace_b131ff86a5b0c85adb56cfa9c42691c8",
+            "readback": {"external_platform_action": False},
+        },
+    ]
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-telegram-delivery-digest",
+    })
+
+    assert handled["accepted"] is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+
+
+def test_internal_image_effect_requires_verified_state():
+    assert openclaw_async_executor._is_internal_image_generation_effect({
+        "target": "openclaw.image_generate local managed media",
+        "state": "running",
+        "readback": {
+            "path": "/Users/kj/.openclaw/media/tool-image-generation/pending.png",
+        },
+    }) is False
+
+
+def test_loop_terminal_rejects_failed_acceptance_evidence(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-failed-acceptance-evidence-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-failed-acceptance-evidence-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"] = [
+        {"check": "content source", "result": "failed"},
+    ]
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-failed-evidence-digest",
+    })
+
+    assert handled["accepted"] is False
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
     assert task is not None and task.status == "blocked"

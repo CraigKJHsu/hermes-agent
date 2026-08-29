@@ -348,15 +348,32 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         else:
             if user_facing_delivery.get("required") is not True:
                 errors.append("user_facing_delivery.required must be true")
-            if user_facing_delivery.get("kind") != "commerce_group_status":
+            delivery_kind = user_facing_delivery.get("kind")
+            delivery_mode = user_facing_delivery.get("delivery")
+            if delivery_kind not in {"commerce_group_status", "content_package"}:
                 errors.append(
-                    "user_facing_delivery.kind must be commerce_group_status"
+                    "user_facing_delivery.kind must be commerce_group_status "
+                    "or content_package"
                 )
-            if user_facing_delivery.get("delivery") != "inline_only":
+            elif delivery_kind == "commerce_group_status":
+                if delivery_mode != "inline_only":
+                    errors.append(
+                        "commerce_group_status user_facing_delivery.delivery "
+                        "must be inline_only"
+                    )
+                required_list("user_facing_delivery.subject_keys")
+            elif delivery_kind == "content_package":
+                if delivery_mode != "inline_with_attachment":
+                    errors.append(
+                        "content_package user_facing_delivery.delivery must be "
+                        "inline_with_attachment"
+                    )
+                required_list("user_facing_delivery.asset_filenames")
+            if delivery_mode not in {"inline_only", "inline_with_attachment"}:
                 errors.append(
-                    "user_facing_delivery.delivery must be inline_only"
+                    "user_facing_delivery.delivery must be inline_only or "
+                    "inline_with_attachment"
                 )
-            required_list("user_facing_delivery.subject_keys")
 
     max_iterations = value.get("stop_rules", {}).get("max_iterations")
     if not isinstance(max_iterations, int) or not 1 <= max_iterations <= 20:

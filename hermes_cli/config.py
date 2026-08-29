@@ -7631,6 +7631,12 @@ def _inject_profile_env_vars() -> None:
     if _profile_env_vars_injected:
         return
     _profile_env_vars_injected = True
+    if os.getenv("HERMES_SKIP_PROVIDER_ENV_INJECTION", "").strip() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return
     try:
         from providers import list_providers
         for _pp in list_providers():

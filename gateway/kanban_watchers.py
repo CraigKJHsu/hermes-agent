@@ -1457,7 +1457,10 @@ class GatewayKanbanWatchersMixin:
                     )
                     await _finish()
                 elif outcome == "accepted":
-                    await _escalate(mismatch_error)
+                    await _finish(
+                        "intermediate callback delivered after session-reset "
+                        "handoff without structured continuation"
+                    )
                 else:
                     await _finish(mismatch_error)
             except Exception as exc:
@@ -1558,6 +1561,24 @@ class GatewayKanbanWatchersMixin:
             full_snapshot, ensure_ascii=False, sort_keys=True,
         )
         if len(evidence_json) > 16000:
+            acceptance_evidence = (
+                execution_metadata.get("acceptance_evidence")
+                if isinstance(execution_metadata, dict)
+                else None
+            )
+            approval_context = None
+            if isinstance(acceptance_evidence, dict):
+                approval_context = {
+                    key: acceptance_evidence.get(key)
+                    for key in (
+                        "admission",
+                        "source_and_final_text",
+                        "hero_asset",
+                        "page_identity",
+                        "canonical_one_time_approval_text",
+                    )
+                    if acceptance_evidence.get(key) is not None
+                }
             metadata_without_report = (
                 {
                     key: value
@@ -1586,6 +1607,7 @@ class GatewayKanbanWatchersMixin:
                         metadata_without_report, 1000,
                     ),
                     "user_facing_report": user_facing_report,
+                    "approval_context": approval_context,
                     "attachments": bounded_attachments,
                     "attachment_count": len(
                         execution_evidence.get("attachments") or []
@@ -1686,7 +1708,18 @@ class GatewayKanbanWatchersMixin:
                 "satisfied; otherwise use outcome_kind=continued with queued "
                 "delegation_id/execution_task_id/review_task_id, or "
                 "outcome_kind=approval_blocked with action/platform/scope and the exact "
-                "approval question. A normal prose reply does not finish the callback. "
+                "approval question. If completion_mode=intermediate and the next stage "
+                "changes external state, call clawops_delegate now with the complete "
+                "successor contract, approved=false, explicit external_targets, "
+                f"origin_callback_review_id={review_id}, "
+                f"origin_callback_event_id={event_id}, and "
+                f"origin_callback_board={str(board or 'default')}. Use the exact "
+                "delivered report plus execution.approval_context to bind the target "
+                "Page, final UTF-8 body hash, Hero path/hash, and external scope. The "
+                "call must return approval_required; ask KJ its exact_reply without "
+                "paraphrasing and record that exact value as approval_blocked. This "
+                "callback may create the durable challenge but cannot consume it. A "
+                "normal prose reply does not finish the callback. "
                 "Do not execute any new external action during this callback turn."
             )
         else:
@@ -1936,9 +1969,34 @@ class GatewayKanbanWatchersMixin:
             await _ensure_inline_report_delivery()
             await _handle_with_lease_heartbeat(event)
             if outcome == "accepted" and not await _has_structured_outcome():
-                raise RuntimeError(
-                    "accepted callback returned without a valid structured outcome"
-                )
+                if str(callback.get("completion_mode") or "terminal") == "intermediate":
+                    await _finish(
+                        "intermediate callback delivered without structured "
+                        "continuation"
+                    )
+                    logger.info(
+                        "Grace callback delivered review=%s execution=%s "
+                        "outcome=%s without structured continuation",
+                        review_id, execution_id, outcome,
+                    )
+                    return
+                elif user_facing_report is not None:
+                    # The Gateway owns and verifies inline report delivery. If
+                    # Grace produced only a prose acknowledgement, let the
+                    # existing durable close validator decide whether this
+                    # accepted terminal package is actually complete. It will
+                    # still reject missing delivery receipts, incomplete
+                    # reports, continuations, approval challenges, and active
+                    # objective stages.
+                    await _record_terminal_closed_outcome(
+                        str(callback.get("review_summary") or "").strip()
+                        or f"Grace review {review_id} accepted and its complete "
+                        "user-facing report was delivered."
+                    )
+                else:
+                    raise RuntimeError(
+                        "accepted callback returned without a valid structured outcome"
+                    )
             await _finish()
             logger.info(
                 "Grace callback delivered review=%s execution=%s outcome=%s",

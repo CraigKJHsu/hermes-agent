@@ -441,6 +441,7 @@ _MAX_BASE64_BYTES = 20 * 1024 * 1024
 # shrink target in agent.conversation_compression so behaviour is consistent
 # whether we resize proactively or reactively.
 _EMBED_TARGET_BYTES = 4 * 1024 * 1024
+_KANBAN_EMBED_TARGET_BYTES = 768 * 1024
 
 # Proactive embed dimension cap (px, longest side).  Anthropic enforces an
 # 8000px per-side ceiling INDEPENDENTLY of the 5 MB byte cap — a tall full-page
@@ -450,10 +451,40 @@ _EMBED_TARGET_BYTES = 4 * 1024 * 1024
 # 7900 (headroom under 8000) so the proactive resize shrinks tall small-byte
 # images before they are embedded.
 _EMBED_MAX_DIMENSION = 7900
+_KANBAN_EMBED_MAX_DIMENSION = 1800
 
 # Target size when auto-resizing on API failure (5 MB).  After a provider
 # rejects an image, we downscale to this target and retry once.
 _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
+
+
+def _positive_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected positive integer", name, raw)
+        return None
+    return value if value > 0 else None
+
+
+def _native_vision_embed_limits() -> tuple[int, int]:
+    """Return base64 byte and dimension caps for native vision tool results."""
+    if os.getenv("HERMES_KANBAN_TASK", "").strip():
+        return (
+            _positive_int_env("HERMES_KANBAN_VISION_EMBED_TARGET_BYTES")
+            or _KANBAN_EMBED_TARGET_BYTES,
+            _positive_int_env("HERMES_KANBAN_VISION_EMBED_MAX_DIMENSION")
+            or _KANBAN_EMBED_MAX_DIMENSION,
+        )
+    return (
+        _positive_int_env("HERMES_NATIVE_VISION_EMBED_TARGET_BYTES")
+        or _EMBED_TARGET_BYTES,
+        _positive_int_env("HERMES_NATIVE_VISION_EMBED_MAX_DIMENSION")
+        or _EMBED_MAX_DIMENSION,
+    )
 
 
 def _is_image_size_error(error: Exception) -> bool:
@@ -879,6 +910,8 @@ async def _vision_analyze_native(
             temp_image_path, mime_type=detected_mime_type,
         )
 
+        embed_target_bytes, embed_max_dimension = _native_vision_embed_limits()
+
         # Proactive embed cap: this image gets baked into conversation
         # history and re-sent on every subsequent turn.  Anthropic rejects
         # any single base64 image over 5 MB OR over 8000px per side with a
@@ -887,16 +920,16 @@ async def _vision_analyze_native(
         # pixels) that are already in the request.  Resize DOWN to the embed
         # target (4 MB / 7900px, headroom under both ceilings) whenever the
         # payload exceeds either limit, not just at the 20 MB hard ceiling.
-        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+        _over_bytes = len(image_data_url) > embed_target_bytes
         _over_dims = await _run_encode_on_cpu_executor(
-            _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
+            _image_exceeds_dimension, temp_image_path, embed_max_dimension,
         )
         if _over_bytes or _over_dims:
             image_data_url = await _run_encode_on_cpu_executor(
                 _resize_image_for_vision,
                 temp_image_path, mime_type=detected_mime_type,
-                max_base64_bytes=_EMBED_TARGET_BYTES,
-                max_dimension=_EMBED_MAX_DIMENSION,
+                max_base64_bytes=embed_target_bytes,
+                max_dimension=embed_max_dimension,
             )
             # If even resizing can't get under the absolute hard ceiling,
             # there's nothing more we can do — reject rather than embed a

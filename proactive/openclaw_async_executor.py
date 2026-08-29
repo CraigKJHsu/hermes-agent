@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -54,8 +55,10 @@ LOOP_CONTRACT_AGENT_BY_WORKER = {
     "clawops.facebook_marketplace_readonly": "missioncrew-browser-readonly",
     "clawops.research": "missioncrew-research",
     "clawops.content": "missioncrew-content",
+    "missioncrew.content": "missioncrew-content",
     "clawops.ops": "missioncrew-ops",
-    "clawops.facebook_page_api": "missioncrew-ops",
+    "clawops.facebook_page_api": "missioncrew-facebook-page-operator",
+    "clawops.facebook_page_preflight": "missioncrew-facebook-page-operator",
     "clawops.dev": "missioncrew-devops",
     "clawops.browser": "missioncrew-browser-operator",
     "clawops.facebook_marketplace_group": "missioncrew-browser-operator",
@@ -71,6 +74,8 @@ LOOP_CONTRACT_AGENT_BY_TASK_TYPE = {
     "campaign": "missioncrew-content",
     "product_marketing": "missioncrew-content",
     "ops": "missioncrew-ops",
+    "facebook_page_api_publish": "missioncrew-facebook-page-operator",
+    "facebook_page_publish_preflight": "missioncrew-facebook-page-operator",
     "devops": "missioncrew-devops",
     "local_code": "missioncrew-devops",
     "implementation": "missioncrew-devops",
@@ -86,6 +91,7 @@ LOOP_CONTRACT_AGENT_BY_TASK_TYPE = {
 _READ_ONLY_EXTERNAL_TARGET_TASK_TYPES = frozenset(
     {
         "content_draft",
+        "facebook_page_publish_preflight",
         "facebook_marketplace_readonly",
         "secondhand_commerce_group_status",
     }
@@ -102,8 +108,20 @@ def _openclaw_result_payload(output: Mapping[str, Any]) -> Optional[Mapping[str,
     try:
         parsed = json.loads(result_text)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return None
+        parsed = _extract_json_object(result_text)
     return parsed if isinstance(parsed, Mapping) else None
+
+
+def _extract_json_object(text: str) -> Optional[Mapping[str, Any]]:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            parsed, _end = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, Mapping):
+            return parsed
+    return None
 
 
 def _loop_external_effect_budget(
@@ -132,7 +150,12 @@ def _contract_runtime_tools(contract: Mapping[str, Any]) -> list[str]:
     seen: set[str] = set()
     for item in declared:
         name = str(item or "").strip()
-        if name in {"image_generate"} and name not in seen:
+        if name in {
+            "image_generate",
+            "facebook_page_graph_status",
+            "facebook_page_graph_publish",
+            "facebook_page_publish_preflight",
+        } and name not in seen:
             seen.add(name)
             result.append(name)
     return result
@@ -144,21 +167,36 @@ def _loop_allowed_tools(
     external_effects: bool,
     contract_tools: Optional[list[str]] = None,
 ) -> list[str]:
+    if task_type == "facebook_page_api_publish":
+        return [
+            "facebook_page_graph_status",
+            "facebook_page_graph_publish",
+        ]
+    if task_type == "facebook_page_publish_preflight":
+        return ["facebook_page_publish_preflight"]
     if external_effects:
         return ["browser"]
     direct_tools = list(contract_tools or [])
     if task_type == "zero_effect_smoke":
         return []
-    if task_type in {"browser_publish", "browser_ops", "facebook_page_api_publish"}:
+    if task_type in {"browser_publish", "browser_ops"}:
         return ["browser"]
     if task_type in {"local_code", "implementation", "deployment"}:
-        return ["read", "write", "edit", "apply_patch", "exec", "process"]
+        allowed = ["read", "write", "edit", "apply_patch", "exec", "process"]
+        for tool in direct_tools:
+            if tool not in allowed:
+                allowed.append(tool)
+        return allowed
     if task_type in {
         "research",
         "facebook_marketplace_readonly",
             "secondhand_commerce_group_status",
     }:
-        return ["read", "web_search", "browser"]
+        allowed = ["read", "web_search", "browser"]
+        for tool in direct_tools:
+            if tool not in allowed:
+                allowed.append(tool)
+        return allowed
     allowed = ["read", "write", "web_search"]
     for tool in direct_tools:
         if tool not in allowed:
@@ -172,6 +210,13 @@ def _loop_backend_agent_id(
     task_type: str,
     external_effects: bool,
 ) -> str:
+    if task_type in {
+        "facebook_page_api_publish",
+        "facebook_page_publish_preflight",
+    }:
+        return _existing_loop_agent_or_executor(
+            "missioncrew-facebook-page-operator"
+        )
     if external_effects:
         return "missioncrew-browser-operator"
     routing = contract.get("routing")
@@ -240,6 +285,7 @@ def _loop_delegation_args(
         "workspace_policy": "dedicated",
         "session_policy": "ephemeral",
         "credential_refs": list(metadata.get("credential_refs") or []),
+        "kanban_board": str(metadata.get("kanban_board") or ""),
         "idempotency_key": idempotency_key,
         "openclaw_task_id": openclaw_task_id,
         "dry_run": False,
@@ -311,13 +357,55 @@ def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> bool:
+    """Detect contracts where the source text is itself the worker input."""
+    text_parts: list[str] = []
+    original = str(contract.get("original_request") or "")
+    for key in ("scope", "verification", "goal", "grace_interpretation"):
+        value = contract.get(key)
+        if isinstance(value, str):
+            text_parts.append(value)
+        elif isinstance(value, Mapping):
+            text_parts.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    text = "\n".join(text_parts)
+    mentions_original_request = re.search(
+        r"original_request", text, flags=re.IGNORECASE
+    ) is not None
+    mentions_source_material = re.search(
+        r"SOURCE|source material|source of truth|source facts|底稿|來源|內嵌",
+        text,
+        flags=re.IGNORECASE,
+    ) is not None
+    mentions_current_message_source = re.search(
+        r"(?:KJ|使用者|user|本訊息|這則訊息|current\s+message)"
+        r".{0,80}?"
+        r"(?:提供|貼上|provided|posted|pasted|source[- ]of[- ]truth|唯一事實|唯一來源|完整(?:貼文|Page|內容))",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ) is not None
+    requests_source_fidelity = re.search(
+        r"preserv(?:e|ing)|保留|保真|忠於|faithful",
+        text,
+        flags=re.IGNORECASE,
+    ) is not None and re.search(
+        r"source|original|原文|來源|底稿",
+        text,
+        flags=re.IGNORECASE,
+    ) is not None
+    return (
+        (mentions_original_request and mentions_source_material)
+        or (bool(original.strip()) and mentions_current_message_source)
+        or requests_source_fidelity
+    )
+
+
 def _worker_safe_loop_contract(
     contract: Mapping[str, Any],
     *,
     telegram_message_path: Optional[Mapping[str, Any]] = None,
     external_effect_budget: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Keep the approval fingerprint while withholding raw user wording."""
+    """Keep the approval fingerprint while limiting raw wording exposure."""
     safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
     if external_effect_budget == 0:
         safe.pop("external_targets", None)
@@ -331,13 +419,18 @@ def _worker_safe_loop_contract(
             safe["external_targets"] = external_targets
         else:
             safe.pop("external_targets", None)
-    original = str(safe.pop("original_request", "") or "")
+    original = str(safe.get("original_request", "") or "")
+    expose_original = _contract_requires_backend_original_request(safe)
+    if not expose_original:
+        safe.pop("original_request", None)
     audit = safe.setdefault("audit", {})
     audit["original_request_sha256"] = hashlib.sha256(
         original.encode("utf-8")
     ).hexdigest()
     audit["original_request_location"] = (
-        "Grace session history only; not disclosed to OpenClaw"
+        "Embedded in worker contract as original_request"
+        if expose_original
+        else "Grace session history only; not disclosed to OpenClaw"
     )
     projected_path = backend_projection(telegram_message_path)
     if projected_path:
@@ -1479,6 +1572,50 @@ def make_zero_effect_async_terminal_handler(
     return handle
 
 
+def _loop_admission_rejection_reason(
+    result: Mapping[str, Any],
+    *,
+    expected_backend_agent_id: str,
+) -> str:
+    reasons: list[str] = []
+    status = str(result.get("status") or "").strip().lower()
+    if status not in {"queued", "running", "succeeded"}:
+        reasons.append(f"status={status or 'missing'}")
+    if not str(result.get("backend_run_id") or "").strip():
+        reasons.append("missing backend_run_id")
+    backend_agent_id = str(result.get("backend_agent_id") or "").strip()
+    if backend_agent_id != expected_backend_agent_id:
+        reasons.append(
+            f"backend_agent_id={backend_agent_id or 'missing'} expected={expected_backend_agent_id}"
+        )
+    if not str(result.get("backend_session_key") or "").strip():
+        reasons.append("missing backend_session_key")
+    protocol_version = str(result.get("protocol_version") or "").strip()
+    if protocol_version != "2.0":
+        reasons.append(f"protocol_version={protocol_version or 'missing'}")
+    if result.get("protocol_correlated") is not True:
+        reasons.append("protocol_correlated=false")
+
+    error = result.get("error")
+    if isinstance(error, Mapping):
+        error_type = str(error.get("type") or "").strip()
+        error_message = str(error.get("message") or "").strip()
+        if error_type or error_message:
+            reasons.append(
+                "openclaw_error="
+                + ":".join(part for part in (error_type, error_message) if part)
+            )
+    errors = result.get("errors")
+    if isinstance(errors, list) and errors:
+        reasons.append("openclaw_errors=" + ",".join(str(item) for item in errors[:3]))
+
+    suffix = "; ".join(reasons) if reasons else "unknown mismatch"
+    return (
+        "OpenClaw Loop Contract admission returned incomplete or uncorrelated "
+        f"evidence: {suffix}."
+    )
+
+
 def _admit_loop_contract_run(
     *,
     run: kb.Run,
@@ -1498,6 +1635,9 @@ def _admit_loop_contract_run(
     attempt_id = str(metadata["attempt_id"])
     fingerprint = str(metadata["contract_fingerprint"])
     start_key = str(metadata["start_idempotency_key"])
+    expected_backend_agent_id = str(
+        metadata.get("backend_agent_id") or LOOP_CONTRACT_AGENT
+    )
     try:
         result = delegate_loop_contract_to_openclaw(
             _loop_delegation_args(
@@ -1546,6 +1686,7 @@ def _admit_loop_contract_run(
             "review_task_id": review_task_id,
             "run_id": run_id,
             "status": "retrying" if ambiguous else "blocked",
+            "backend_agent_id": expected_backend_agent_id,
             "deduplicated": deduplicated,
         }
     if _ambiguous_transport_result(result) or _loop_admission_pending(result):
@@ -1575,6 +1716,7 @@ def _admit_loop_contract_run(
             "review_task_id": review_task_id,
             "run_id": run_id,
             "status": "retrying",
+            "backend_agent_id": expected_backend_agent_id,
             "routing_decision": dict(routing_decision),
             "delegated_result": result,
             "deduplicated": deduplicated,
@@ -1604,7 +1746,10 @@ def _admit_loop_contract_run(
                 kb.block_task(
                     conn,
                     task_id,
-                    reason="OpenClaw Loop Contract admission returned incomplete or uncorrelated evidence.",
+                    reason=_loop_admission_rejection_reason(
+                        result,
+                        expected_backend_agent_id=expected_backend_agent_id,
+                    ),
                     kind="capability",
                     expected_run_id=run_id,
                 )
@@ -1612,6 +1757,7 @@ def _admit_loop_contract_run(
                     "execution_task_id": task_id,
                     "review_task_id": review_task_id,
                     "status": "blocked",
+                    "backend_agent_id": expected_backend_agent_id,
                     "delegated_result": result,
                 }
             admitted_path = bind_message_path(
@@ -1702,6 +1848,7 @@ def _admit_loop_contract_run(
         "run_id": run_id,
         "status": status,
         "backend_run_id": backend_run_id,
+        "backend_agent_id": backend_agent_id,
         "routing_decision": dict(routing_decision),
         "delegated_result": result,
         "deduplicated": deduplicated,
@@ -1809,6 +1956,9 @@ def start_loop_contract_execution(
                     else (existing_task.status if existing_task else "blocked")
                 ),
                 "backend_run_id": existing_run.backend_run_id if existing_run else None,
+                "backend_agent_id": str(
+                    existing_metadata.get("backend_agent_id") or backend_agent_id
+                ),
                 "deduplicated": True,
             }
     with kb.connect_closing(board=board) as conn:
@@ -1831,6 +1981,10 @@ def start_loop_contract_execution(
                     "run_id": run.id if run else None,
                     "status": "succeeded" if task and task.status == "done" else (task.status if task else "blocked"),
                     "backend_run_id": run.backend_run_id if run else None,
+                    "backend_agent_id": str(
+                        (run.metadata if run else {}).get("backend_agent_id")
+                        or backend_agent_id
+                    ),
                     "deduplicated": True,
                 }
             routing_decision = route_execution_backend(
@@ -1956,7 +2110,15 @@ def start_loop_contract_execution(
                 "external_effect_budget": external_effect_budget,
                 "allowed_tools": allowed_tools,
                 "backend_agent_id": backend_agent_id,
-                "credential_refs": (["hermes-controlled-browser"] if external_effect_budget else []),
+                "credential_refs": (
+                    ["missioncrew-facebook-page"]
+                    if task_type in {
+                        "facebook_page_api_publish",
+                        "facebook_page_publish_preflight",
+                    }
+                    else (["hermes-controlled-browser"] if external_effect_budget else [])
+                ),
+                "kanban_board": str(board or ""),
                 "loop_contract": {},
                 "start_idempotency_key": start_key,
                 "review_task_id": review_task_id,
@@ -2028,9 +2190,11 @@ def _loop_contract_from_execution_body(body: str) -> dict[str, Any]:
     if start < 0:
         raise ValueError("OpenClaw correction card has no embedded Loop Contract.")
     start += len(marker)
-    end = str(body).find("```", start)
+    end = str(body).rfind("```")
     if end < 0:
         raise ValueError("OpenClaw correction card has an unterminated Loop Contract.")
+    if end <= start:
+        raise ValueError("OpenClaw correction card has an empty Loop Contract.")
     parsed = json.loads(str(body)[start:end].strip())
     if not isinstance(parsed, Mapping):
         raise ValueError("OpenClaw correction Loop Contract must be an object.")
@@ -2051,20 +2215,72 @@ def retry_ready_loop_contract_execution(
             if task is None:
                 raise ValueError(f"Unknown OpenClaw correction task: {task_id}")
             replaying_admission = False
-            if task.status not in {"ready", "running"}:
-                run = kb.latest_run(conn, task_id)
-                return {
-                    "execution_task_id": task_id,
-                    "run_id": run.id if run else None,
-                    "status": task.status,
-                    "deduplicated": True,
-                }
             if task.executor_backend != "openclaw" or task.executor_profile != "loop-contract":
                 raise ValueError(f"Task {task_id} is not an OpenClaw Loop Contract card.")
             previous_run = kb.latest_run(conn, task_id)
             previous_metadata = previous_run.metadata if previous_run else {}
             if not isinstance(previous_metadata, Mapping):
                 previous_metadata = {}
+            if not isinstance(previous_metadata.get("loop_contract"), Mapping):
+                historical = conn.execute(
+                    """
+                    SELECT metadata
+                      FROM task_runs
+                     WHERE task_id = ?
+                       AND json_extract(metadata, '$.loop_contract') IS NOT NULL
+                     ORDER BY id DESC
+                     LIMIT 1
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if historical is not None:
+                    try:
+                        historical_metadata = json.loads(historical["metadata"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        historical_metadata = {}
+                    if isinstance(historical_metadata, Mapping):
+                        previous_metadata = historical_metadata
+            blocked_reason_row = conn.execute(
+                """
+                SELECT payload
+                  FROM task_events
+                 WHERE task_id = ? AND kind = 'blocked'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            blocked_reason = ""
+            if blocked_reason_row is not None:
+                try:
+                    blocked_payload = json.loads(blocked_reason_row["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    blocked_payload = {}
+                if isinstance(blocked_payload, Mapping):
+                    blocked_reason = str(blocked_payload.get("reason") or "").strip()
+            recovering_quarantined_correction = (
+                task.status == "blocked"
+                and blocked_reason.startswith(
+                    "OpenClaw correction admission quarantined:"
+                )
+            )
+            recovering_correction_admission_fault = (
+                task.status == "blocked"
+                and (
+                    blocked_reason.startswith(
+                        "OpenClaw Loop Contract admission returned incomplete or uncorrelated evidence:"
+                    )
+                    or blocked_reason.startswith(
+                        "OpenClaw Loop Contract correction admission returned incomplete or uncorrelated evidence:"
+                    )
+                    or blocked_reason.startswith(
+                        "OpenClaw Loop Contract correction admission raised:"
+                    )
+                    or blocked_reason.startswith(
+                        "OpenClaw Loop Contract was blocked before verified completion:"
+                    )
+                )
+            )
             if task.status == "running":
                 replaying_admission = bool(
                     previous_run
@@ -2080,6 +2296,18 @@ def retry_ready_loop_contract_execution(
                         "status": task.status,
                         "deduplicated": True,
                     }
+            if (
+                task.status not in {"ready", "running"}
+                and not recovering_quarantined_correction
+                and not recovering_correction_admission_fault
+            ):
+                run = kb.latest_run(conn, task_id)
+                return {
+                    "execution_task_id": task_id,
+                    "run_id": run.id if run else None,
+                    "status": task.status,
+                    "deduplicated": True,
+                }
             correction = conn.execute(
                 """
                 SELECT payload
@@ -2206,6 +2434,19 @@ def retry_ready_loop_contract_execution(
                 metadata = dict(previous_metadata)
                 metadata["backend_agent_id"] = backend_agent_id
             else:
+                if recovering_quarantined_correction or recovering_correction_admission_fault:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status = 'ready',
+                               claim_lock = NULL,
+                               claim_expires = NULL,
+                               current_run_id = NULL,
+                               completed_at = NULL
+                         WHERE id = ?
+                        """,
+                        (task_id,),
+                    )
                 claimed = kb.claim_task(
                     conn,
                     task_id,
@@ -2232,10 +2473,16 @@ def retry_ready_loop_contract_execution(
                     "allowed_tools": _loop_allowed_tools(
                         task_type,
                         external_effects=external_effect_budget > 0,
+                        contract_tools=(
+                            _contract_runtime_tools(normalized)
+                            or list(previous_metadata.get("allowed_tools") or [])
+                        ),
                     ),
                     "backend_agent_id": backend_agent_id,
                     "credential_refs": (
-                        ["hermes-controlled-browser"] if external_effect_budget else []
+                        ["missioncrew-facebook-page"]
+                        if task_type == "facebook_page_publish_preflight"
+                        else (["hermes-controlled-browser"] if external_effect_budget else [])
                     ),
                     "loop_contract": _worker_safe_loop_contract(
                         normalized,
@@ -2515,6 +2762,137 @@ def retry_ready_loop_contract_execution(
     }
 
 
+def retry_ready_approved_loop_contract_after_capability_repair(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    transport: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    policy_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Re-admit an approved Page publish after a proven pre-effect fault."""
+    with kb.connect_closing(board=board) as conn:
+        with kb.write_txn(conn):
+            task = kb.get_task(conn, task_id)
+            if task is None:
+                raise ValueError(f"Unknown OpenClaw task: {task_id}")
+            if (
+                task.status not in {"ready", "triage"}
+                or task.executor_backend != "openclaw"
+                or task.executor_profile != "loop-contract"
+            ):
+                raise ValueError(
+                    "Approved capability recovery requires one ready or triaged OpenClaw Loop Contract card."
+                )
+            previous_run = kb.latest_run(conn, task_id)
+            previous_metadata = previous_run.metadata if previous_run else None
+            if not isinstance(previous_metadata, Mapping):
+                raise ValueError("Approved capability recovery lacks prior run metadata.")
+            if (
+                int(previous_metadata.get("external_effect_budget") or 0) != 1
+                or not str(previous_metadata.get("approval_grant_id") or "").strip()
+                or str(previous_metadata.get("task_type") or "")
+                != "facebook_page_api_publish"
+            ):
+                raise ValueError(
+                    "Approved capability recovery is limited to one Facebook Page publish effect."
+                )
+            if kb.grace_task_facebook_page_post_contract(conn, task_id) is None:
+                raise ValueError(
+                    "Approved capability recovery cannot verify the sealed owner approval."
+                )
+            if conn.execute(
+                "SELECT 1 FROM task_external_effects WHERE task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone() is not None:
+                raise ValueError(
+                    "Approved capability recovery refuses a task with any durable external effect."
+                )
+            if task.status == "triage":
+                promoted = conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'triage'",
+                    (task_id,),
+                )
+                if promoted.rowcount != 1:
+                    raise RuntimeError(
+                        "Approved capability recovery could not release the triage card."
+                    )
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "approved_capability_recovery",
+                    {
+                        "reason": "sealed approval valid and external effect ledger empty",
+                        "previous_status": "triage",
+                    },
+                )
+            claimed = kb.claim_task(
+                conn,
+                task_id,
+                claimer="openclaw-approved-capability-recovery",
+            )
+            if claimed is None or claimed.current_run_id is None:
+                raise RuntimeError("Approved capability recovery could not claim the task.")
+            run_id = int(claimed.current_run_id)
+            attempt_id = f"{task_id}:run:{run_id}"
+            metadata = dict(previous_metadata)
+            for key in (
+                "backend_session_key",
+                "backend_terminal_observation",
+                "backend_token_usage",
+                "last_poll_error",
+                "same_poll_error_count",
+                "admission_ambiguous",
+            ):
+                metadata.pop(key, None)
+            metadata.update(
+                {
+                    "attempt_id": attempt_id,
+                    "start_idempotency_key": f"{attempt_id}:start",
+                    "capability_recovery": True,
+                }
+            )
+            backend_agent_id = str(metadata.get("backend_agent_id") or "").strip()
+            recovery_path = begin_backend_attempt(
+                merge_message_paths(
+                    kb.telegram_message_path_for_task(conn, task_id),
+                    previous_metadata.get("telegram_message_path"),
+                ),
+                run_id=run_id,
+                backend_agent_id=backend_agent_id,
+            )
+            if recovery_path:
+                metadata["telegram_message_path"] = recovery_path
+                metadata["backend_telegram_message_path"] = backend_projection(
+                    recovery_path
+                )
+            if not kb.merge_active_run_metadata(
+                conn,
+                task_id,
+                expected_run_id=run_id,
+                metadata=metadata,
+            ):
+                raise RuntimeError("Approved capability recovery metadata could not be saved.")
+            run = kb.get_run(conn, run_id)
+    if run is None or previous_run is None:
+        raise RuntimeError("Approved capability recovery run disappeared before admission.")
+    loop_contract = previous_metadata.get("loop_contract")
+    objective = "Resume the exact approved Facebook Page publish after capability repair."
+    if isinstance(loop_contract, Mapping):
+        goal = loop_contract.get("goal")
+        if isinstance(goal, Mapping):
+            objective = str(goal.get("objective") or objective)
+    return _admit_loop_contract_run(
+        run=run,
+        review_task_id=str(previous_metadata.get("review_task_id") or ""),
+        objective=objective,
+        routing_decision=(previous_run.routing_decision or {}),
+        board=board,
+        transport=transport,
+        policy_path=policy_path,
+        deduplicated=False,
+    )
+
+
 def start_ready_loop_contract_corrections(
     *,
     board: Optional[str] = None,
@@ -2589,14 +2967,77 @@ def start_ready_loop_contract_corrections(
 
 def make_loop_contract_poll_adapter(
     *,
+    board: Optional[str] = None,
     transport: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     policy_path: Optional[str] = None,
 ) -> Callable[[kb.Run], Mapping[str, Any]]:
     def poll(run: kb.Run) -> Mapping[str, Any]:
         metadata = run.metadata or {}
         start_key = str(metadata.get("start_idempotency_key") or "")
-        if not run.backend_run_id or not start_key:
+        if not start_key:
             raise ValueError("OpenClaw Loop Contract run lacks durable correlation.")
+        if not run.backend_run_id:
+            if metadata.get("admission_ambiguous") is not True:
+                raise ValueError("OpenClaw Loop Contract run lacks durable correlation.")
+            result = delegate_loop_contract_to_openclaw(
+                _loop_delegation_args(
+                    run,
+                    openclaw_task_id="openclaw.agent.loop_contract_start",
+                    idempotency_key=start_key,
+                    objective="Reconcile the ambiguous OpenClaw Loop Contract admission.",
+                ),
+                transport=transport,
+                policy_path=policy_path,
+            )
+            if _ambiguous_transport_result(result) or _loop_admission_pending(result):
+                return {
+                    "status": str(result.get("status") or "queued").strip().lower() or "queued",
+                    "backend_run_id": "",
+                    "backend_agent_id": str(metadata.get("backend_agent_id") or ""),
+                    "protocol_version": str(result.get("protocol_version") or "2.0"),
+                    "result_digest": _digest(result),
+                    "delegated_result": result,
+                }
+            status = str(result.get("status") or "").strip().lower()
+            backend_run_id = str(result.get("backend_run_id") or "").strip()
+            backend_agent_id = str(result.get("backend_agent_id") or "").strip()
+            backend_session_key = str(result.get("backend_session_key") or "").strip()
+            expected_backend_agent = str(metadata.get("backend_agent_id") or "")
+            if (
+                status not in {"queued", "running", "succeeded"}
+                or not _identity_matches(
+                    result,
+                    delegation_id=str(metadata.get("delegation_id") or ""),
+                    attempt_id=str(metadata.get("attempt_id") or ""),
+                    fingerprint=str(metadata.get("contract_fingerprint") or ""),
+                )
+                or not backend_run_id
+                or backend_agent_id != expected_backend_agent
+                or not backend_session_key
+                or str(result.get("protocol_version") or "") != "2.0"
+                or result.get("protocol_correlated") is not True
+            ):
+                raise ValueError("OpenClaw Loop Contract admission replay returned incomplete or uncorrelated evidence.")
+            with kb.connect_closing(board=board) as conn:
+                with kb.write_txn(conn):
+                    kb.merge_active_run_metadata(
+                        conn,
+                        run.task_id,
+                        expected_run_id=run.id,
+                        metadata={
+                            "backend_session_key": backend_session_key,
+                            "backend_agent_id": backend_agent_id,
+                            "admission_ambiguous": False,
+                        },
+                    )
+            return {
+                "status": status,
+                "backend_run_id": backend_run_id,
+                "backend_agent_id": backend_agent_id,
+                "protocol_version": "2.0",
+                "result_digest": _digest(result),
+                "delegated_result": result,
+            }
         result = delegate_loop_contract_to_openclaw(
             _loop_delegation_args(
                 run,
@@ -2644,6 +3085,246 @@ def make_loop_contract_poll_adapter(
     return poll
 
 
+def _is_internal_image_generation_effect(effect: Any) -> bool:
+    if not isinstance(effect, Mapping):
+        return False
+    target = str(effect.get("target") or "").strip()
+    if str(effect.get("state") or "").strip().casefold() != "verified":
+        return False
+    target_is_local_image = target.startswith(
+        "/Users/kj/.openclaw/media/tool-image-generation/"
+    )
+    external_id = str(effect.get("externalId") or effect.get("external_id") or "").strip()
+    external_id_is_local_image = external_id.startswith(
+        "media:/Users/kj/.openclaw/media/tool-image-generation/"
+    )
+    target_is_media_generation = target.startswith("media_generation_")
+    target_is_openclaw_local_image_generation = target in {
+        "local openclaw.image_generate",
+        "local_openclaw_image_generate",
+        "openclaw.image_generate.local_media",
+    } or (
+        "openclaw" in target.casefold()
+        and "image_generate" in target.casefold()
+        and "local" in target.casefold()
+    )
+    if (
+        target not in {"openclaw.image_generate", "image_generate"}
+        and not target.startswith("openclaw.image_generate:")
+        and not target_is_local_image
+        and not target_is_openclaw_local_image_generation
+        and not (target_is_media_generation and external_id_is_local_image)
+    ):
+        return False
+    readback = effect.get("readback")
+    readback_path = (
+        str(readback.get("path") or "").strip()
+        if isinstance(readback, Mapping)
+        else ""
+    )
+    readback_local_path = ""
+    if isinstance(readback, Mapping):
+        for key, value in readback.items():
+            if (
+                str(key).endswith("_path")
+                and isinstance(value, str)
+                and value.strip().startswith(
+                    "/Users/kj/.openclaw/media/tool-image-generation/"
+                )
+            ):
+                readback_local_path = value.strip()
+                break
+    readback_model = (
+        str(readback.get("model") or "").strip()
+        if isinstance(readback, Mapping)
+        else ""
+    )
+    effect_key = (
+        str(
+            effect.get("effectKey")
+            or effect.get("deterministicEffectKey")
+            or effect.get("deterministic_effectKey")
+            or effect.get("deterministic_effect_key")
+            or ""
+        )
+        .strip()
+    )
+    key_identifies_local_image_generation = (
+        "image_generate" in effect_key
+        and (
+            "openai/gpt-image-2" in effect_key
+            or "gpt-image-2" in effect_key
+            or "openai_gpt_image_2" in effect_key
+        )
+    )
+    return (
+        readback_path.startswith("/Users/kj/.openclaw/media/tool-image-generation/")
+        or readback_local_path.startswith(
+            "/Users/kj/.openclaw/media/tool-image-generation/"
+        )
+        or target_is_local_image
+        or external_id_is_local_image
+    ) and (
+        not (target_is_local_image or target_is_media_generation)
+        or readback_model in {"gpt-image-2", "openai/gpt-image-2"}
+        or key_identifies_local_image_generation
+        or external_id_is_local_image
+        or target_is_openclaw_local_image_generation
+    )
+
+
+def _result_contract_budget_failure_reclassified(
+    evidence: Mapping[str, Any],
+    *,
+    external_effects: Any,
+    external_effect_budget: int,
+) -> bool:
+    """Accept only an OpenClaw budget error fully explained by local tool receipts."""
+    if evidence.get("resultContractValid") is True:
+        return True
+    error = str(evidence.get("resultContractError") or "").strip()
+    if error != "Loop Contract result exceeded its external effect budget.":
+        return False
+    return isinstance(external_effects, list) and len(external_effects) <= external_effect_budget
+
+
+def _acceptance_evidence_has_failure(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        result = str(
+            value.get("result")
+            or value.get("status")
+            or value.get("outcome")
+            or ""
+        ).strip().casefold()
+        if result in {"failed", "fail", "blocked", "rejected", "not_applicable"}:
+            return True
+        return any(_acceptance_evidence_has_failure(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_acceptance_evidence_has_failure(item) for item in value)
+    return False
+
+
+def _split_internal_tool_effects(
+    effects: Any,
+) -> tuple[list[Any] | None, list[Any]]:
+    if not isinstance(effects, list):
+        return None, []
+    internal: list[Any] = []
+    external: list[Any] = []
+    for effect in effects:
+        if _is_internal_image_generation_effect(effect):
+            internal.append(effect)
+        else:
+            external.append(effect)
+    return external, internal
+
+
+def _default_execution_policy_receipts(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    loop_contract = metadata.get("loop_contract")
+    snapshots = (
+        loop_contract.get("policy_snapshots")
+        if isinstance(loop_contract, Mapping)
+        else None
+    )
+    if not isinstance(snapshots, list):
+        return []
+    receipts: list[dict[str, Any]] = []
+    for item in snapshots:
+        if not isinstance(item, Mapping):
+            continue
+        policy_id = str(item.get("policy_id") or "").strip()
+        version = str(item.get("version") or "").strip()
+        sha256 = str(item.get("sha256") or "").strip()
+        if not policy_id or not version or not sha256:
+            continue
+        receipts.append({
+            "role": "execution",
+            "policy_id": policy_id,
+            "version": version,
+            "sha256": sha256,
+            "loaded": True,
+        })
+    return receipts
+
+
+def _content_package_completion_metadata(
+    audited_result: Mapping[str, Any],
+    *,
+    task_id: str,
+    board: Optional[str],
+) -> dict[str, Any]:
+    """Promote a verified OpenClaw chat package into durable Kanban artifacts."""
+    acceptance = audited_result.get("acceptanceEvidence")
+    if not isinstance(acceptance, Mapping):
+        return {}
+    package = acceptance.get("telegram_user_facing_content_package")
+    if not isinstance(package, Mapping):
+        return {}
+    section_fields = (
+        ("Facebook Page 內文", "facebook_page_body"),
+        ("Facebook Group 討論附文", "group_discussion_copy"),
+        ("Gemini Notebook Audio Prompt", "gemini_notebook_audio_prompt"),
+        ("Podcast 標題", "podcast_title"),
+        ("Podcast 說明", "podcast_description"),
+    )
+    sections = []
+    for label, key in section_fields:
+        value = str(package.get(key) or "").strip()
+        if not value:
+            return {}
+        sections.append(f"## {label}\n\n{value}")
+    raw_assets = package.get("image_attachments")
+    if not isinstance(raw_assets, list) or not raw_assets:
+        return {}
+    assets: list[dict[str, str]] = []
+    artifact_paths: list[str] = []
+    for raw_asset in raw_assets:
+        if not isinstance(raw_asset, Mapping):
+            return {}
+        filename = str(raw_asset.get("filename") or "").strip()
+        path = Path(str(raw_asset.get("path") or "").strip()).expanduser()
+        expected_sha = str(raw_asset.get("sha256") or "").strip().lower()
+        if (
+            not filename
+            or not path.is_file()
+            or path.name != filename
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None
+        ):
+            return {}
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_sha != expected_sha:
+            return {}
+        family = str(raw_asset.get("asset_family") or "").strip()
+        label = {
+            "page_hero": "Page Hero 主圖",
+            "audio_brief": "Audio Brief 封面",
+        }.get(family, filename)
+        assets.append({
+            "filename": filename,
+            "label": label,
+            "path": str(path.resolve()),
+            "sha256": actual_sha,
+        })
+        artifact_paths.append(str(path.resolve()))
+    body = "\n\n".join(sections)
+    staging_dir = kb.attachments_root(board=board).parent / "artifacts"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    body_path = staging_dir / f"{task_id}-content-package.md"
+    body_path.write_text(body + "\n", encoding="utf-8")
+    return {
+        "artifacts": [str(body_path), *artifact_paths],
+        "user_facing_report": {
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "complete": True,
+            "title": str(package.get("title") or "完整內容發布包").strip(),
+            "body": body,
+            "observed_at": int(time.time()),
+            "assets": assets,
+        },
+    }
+
+
 def make_loop_contract_terminal_handler(
     *, board: Optional[str] = None,
 ) -> Callable[[kb.Run, Mapping[str, Any]], Mapping[str, Any]]:
@@ -2668,10 +3349,23 @@ def make_loop_contract_terminal_handler(
             else None
         )
         metadata = run.metadata or {}
-        external_effects = (
+        raw_external_effects = (
             audited_result.get("externalEffects")
             if isinstance(audited_result, Mapping)
             else None
+        )
+        external_effects, internal_tool_receipts = _split_internal_tool_effects(
+            raw_external_effects
+        )
+        raw_policy_receipts = (
+            audited_result.get("policyReceipts")
+            if isinstance(audited_result, Mapping)
+            else None
+        )
+        policy_receipts = (
+            raw_policy_receipts
+            if isinstance(raw_policy_receipts, list)
+            else _default_execution_policy_receipts(metadata)
         )
         external_effect_budget = int(metadata.get("external_effect_budget") or 0)
         valid = (
@@ -2695,10 +3389,17 @@ def make_loop_contract_terminal_handler(
             and result.get("backend_session_key") == metadata.get("backend_session_key")
             and isinstance(evidence, Mapping)
             and evidence.get("terminal") is True
-            and evidence.get("resultContractValid") is True
+            and _result_contract_budget_failure_reclassified(
+                evidence,
+                external_effects=external_effects,
+                external_effect_budget=external_effect_budget,
+            )
             and evidence.get("externalEffectBudget") == metadata.get("external_effect_budget")
             and isinstance(audited_result, Mapping)
             and audited_result.get("status") == "succeeded"
+            and not _acceptance_evidence_has_failure(
+                audited_result.get("acceptanceEvidence")
+            )
             and isinstance(external_effects, list)
             and len(external_effects) <= external_effect_budget
         )
@@ -2719,7 +3420,7 @@ def make_loop_contract_terminal_handler(
                 "OpenClaw Loop Contract was blocked before verified completion: "
                 + " Worker report: ".join(details)
             )
-        if not external_effects:
+        if not external_effects and not internal_tool_receipts:
             validation_reason += " No external effect was verified or recorded."
         validation_reason = validation_reason[:2000]
         with kb.connect_closing(board=board) as conn:
@@ -2737,6 +3438,11 @@ def make_loop_contract_terminal_handler(
                         "reason": validation_reason,
                     }
                 summary = str(audited_result.get("summary") or "OpenClaw Loop Contract completed.")
+                content_package_metadata = _content_package_completion_metadata(
+                    audited_result,
+                    task_id=run.task_id,
+                    board=board,
+                )
                 if not kb.complete_task(
                     conn,
                     run.task_id,
@@ -2747,8 +3453,10 @@ def make_loop_contract_terminal_handler(
                         "terminal": True,
                         "result_digest": observation.get("result_digest"),
                         "acceptance_evidence": audited_result.get("acceptanceEvidence"),
-                        "external_effects": audited_result.get("externalEffects"),
-                        "policy_receipts": audited_result.get("policyReceipts"),
+                        "external_effects": external_effects,
+                        "internal_tool_receipts": internal_tool_receipts,
+                        "policy_receipts": policy_receipts,
+                        **content_package_metadata,
                     },
                     expected_run_id=run.id,
                 ):

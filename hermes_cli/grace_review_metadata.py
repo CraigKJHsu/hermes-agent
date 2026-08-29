@@ -28,6 +28,72 @@ def _structured_checks(value: Any) -> bool:
     return _nonempty_string_list(value)
 
 
+def _parse_dimensions(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, dict):
+        for key in ("dimensions", "dimensions_px", "pixel_dimensions", "size"):
+            parsed = _parse_dimensions(value.get(key))
+            if parsed is not None:
+                return parsed
+        width = value.get("width") or value.get("pixel_width")
+        height = value.get("height") or value.get("pixel_height")
+        if isinstance(width, int) and isinstance(height, int):
+            return width, height
+        return None
+    if not isinstance(value, str):
+        return None
+    clean = value.strip().lower().replace("×", "x")
+    parts = clean.split("x", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        width, height = int(parts[0].strip()), int(parts[1].strip())
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _matches_ratio(dimensions: tuple[int, int], ratio: tuple[int, int]) -> bool:
+    width, height = dimensions
+    ratio_width, ratio_height = ratio
+    return width * ratio_height == height * ratio_width
+
+
+def _asset_declarations_valid(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return True
+    page_hero = value.get("page_hero")
+    if page_hero is not None:
+        dimensions = _parse_dimensions(page_hero)
+        if dimensions is None or not _matches_ratio(dimensions, (16, 9)):
+            return False
+    audio_brief = value.get("audio_brief")
+    if audio_brief is not None:
+        dimensions = _parse_dimensions(audio_brief)
+        if dimensions is None or not _matches_ratio(dimensions, (1, 1)):
+            return False
+    return True
+
+
+def _page_hero_visual_safety_valid(metadata: dict[str, Any]) -> bool:
+    declarations = metadata.get("asset_declarations")
+    declares_page_hero = (
+        str(metadata.get("asset_family") or "").strip().lower() == "page_hero"
+        or (isinstance(declarations, dict) and declarations.get("page_hero") is not None)
+    )
+    if not declares_page_hero:
+        return True
+    visual_review = metadata.get("visual_review")
+    return (
+        isinstance(visual_review, dict)
+        and visual_review.get("all_required_text_readable") is True
+        and visual_review.get("text_occlusion_free") is True
+        and visual_review.get("disclosure_non_obstructive") is True
+        and visual_review.get("defects_found") == []
+    )
+
+
 def grace_review_accepted(metadata: Any) -> bool:
     review_metadata = metadata if isinstance(metadata, dict) else {}
     if (
@@ -35,13 +101,26 @@ def grace_review_accepted(metadata: Any) -> bool:
         or review_metadata.get("accepted") is False
     ):
         return False
-    explicit_verdicts = [
+    if not _asset_declarations_valid(review_metadata.get("asset_declarations")):
+        return False
+    if not _page_hero_visual_safety_valid(review_metadata):
+        return False
+    canonical_verdict = str(
+        review_metadata.get("review_outcome") or ""
+    ).strip().lower()
+    legacy_verdicts = [
         str(review_metadata.get(field) or "").strip().lower()
-        for field in ("review_outcome", "review_result", "review_verdict")
+        for field in ("review_result", "review_verdict")
     ]
-    explicit_verdicts = [value for value in explicit_verdicts if value]
-    if explicit_verdicts:
-        return all(value == "accepted" for value in explicit_verdicts)
+    legacy_verdicts = [value for value in legacy_verdicts if value]
+    rejected_verdicts = {"rejected", "rejected_incomplete", "blocked", "failed"}
+    if canonical_verdict:
+        return (
+            canonical_verdict == "accepted"
+            and not any(value in rejected_verdicts for value in legacy_verdicts)
+        )
+    if legacy_verdicts:
+        return all(value == "accepted" for value in legacy_verdicts)
 
     criteria = review_metadata.get("acceptance_criteria_met")
     evidence = review_metadata.get("evidence")

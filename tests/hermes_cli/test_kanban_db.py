@@ -540,6 +540,31 @@ def test_grace_review_completion_normalizes_equivalent_accepted_metadata(tmp_pat
     assert json.loads(row["metadata"])["review_outcome"] == "accepted"
 
 
+def test_grace_review_completion_accepts_structured_approved_metadata(tmp_path):
+    db_path = tmp_path / "structured-approved-review-metadata.db"
+    with kb.connect_closing(db_path) as conn:
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={
+                "approved": True,
+                "acceptance_criteria_met": True,
+                "verification_notes": ["source package and cover reviewed"],
+            },
+        )
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (review_id,),
+        ).fetchone()
+    assert json.loads(row["metadata"])["review_outcome"] == "accepted"
+
+
 def test_grace_review_completion_rejects_noncanonical_accepted_alias(tmp_path):
     db_path = tmp_path / "rejected-review-accepted-alias.db"
     with kb.connect_closing(db_path) as conn:
@@ -582,6 +607,52 @@ def test_grace_review_completion_rejects_conflicting_canonical_verdict(tmp_path)
                     "approved": False,
                 },
             )
+
+
+def test_policy_stale_review_block_does_not_reopen_completed_execution(tmp_path):
+    db_path = tmp_path / "policy-stale-review-does-not-reopen.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\nPolicy governed execution.",
+        )
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
+            parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="policy-stale-review",
+        )
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "ready"
+
+        assert kb.block_task(
+            conn,
+            review_id,
+            reason="policy_stale: ai-bizweek-page-hero active version changed",
+            kind="dependency",
+        )
+
+        execution = kb.get_task(conn, execution_id)
+        review = kb.get_task(conn, review_id)
+        assert execution is not None
+        assert execution.status == "done"
+        assert execution.completed_at is not None
+        assert review is not None
+        assert review.status == "todo"
+
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'grace_correction_skipped'",
+            (execution_id,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["mode"] == "policy_stale_review_snapshot"
 
 
 def test_callback_outcome_accepts_approved_review_evidence_metadata(tmp_path):

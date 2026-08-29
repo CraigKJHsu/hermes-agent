@@ -9,6 +9,8 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
+import struct
 from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
 
@@ -45,6 +47,18 @@ class FacebookPageConfig:
 
 class FacebookGraphError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class OpenClawCapabilityScope:
+    task_id: str
+    run_id: int
+    delegation_id: str
+    contract_fingerprint: str
+    approval_grant_id: str
+    backend_agent_id: str
+    board: str = ""
+    task_type: str = "facebook_page_api_publish"
 
 
 def _load_page_config() -> FacebookPageConfig:
@@ -231,6 +245,189 @@ def _authorized_execution_contract() -> tuple[Optional[dict[str, str]], str]:
     return contract, ""
 
 
+def _authorized_openclaw_contract(
+    scope: OpenClawCapabilityScope,
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Validate a bridge-owned OpenClaw capability against the active run."""
+    from hermes_cli import kanban_db as kb
+
+    if scope.backend_agent_id != "missioncrew-facebook-page-operator":
+        return None, "Facebook Page capability requires the dedicated OpenClaw operator."
+    with kb.connect_closing(board=scope.board or None) as conn:
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (scope.task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "running"
+            or int(task["current_run_id"] or 0) != scope.run_id
+        ):
+            return None, "Facebook Page capability requires the active Kanban run."
+        run = conn.execute(
+            "SELECT status, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (scope.run_id, scope.task_id),
+        ).fetchone()
+        if run is None or run["status"] != "running":
+            return None, "Facebook Page capability worker run is not active."
+        try:
+            metadata = json.loads(str(run["metadata"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None, "Facebook Page capability run metadata is invalid."
+        preflight = scope.task_type == "facebook_page_publish_preflight"
+        expected_tools = (
+            {"facebook_page_publish_preflight"}
+            if preflight
+            else {"facebook_page_graph_status", "facebook_page_graph_publish"}
+        )
+        if (
+            str(metadata.get("delegation_id") or "") != scope.delegation_id
+            or str(metadata.get("contract_fingerprint") or "")
+            != scope.contract_fingerprint
+            or str(metadata.get("approval_grant_id") or "") != scope.approval_grant_id
+            or (not preflight and not scope.approval_grant_id)
+            or (preflight and bool(scope.approval_grant_id))
+            or str(metadata.get("backend_agent_id") or "")
+            != scope.backend_agent_id
+            or set(metadata.get("allowed_tools") or []) != expected_tools
+            or int(metadata.get("external_effect_budget") or 0) != (0 if preflight else 1)
+            or str(metadata.get("task_type") or "") != scope.task_type
+            or list(metadata.get("credential_refs") or [])
+            != ["missioncrew-facebook-page"]
+        ):
+            return None, "Facebook Page capability does not match the active Loop Contract."
+        contract = (
+            metadata.get("loop_contract")
+            if preflight
+            else kb.grace_task_facebook_page_post_contract(conn, scope.task_id)
+        )
+    if not isinstance(contract, Mapping):
+        return None, (
+            "Facebook Page capability requires an exact active Loop Contract."
+        )
+    return dict(contract), ""
+
+
+def _contract_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [item for child in value.values() for item in _contract_strings(child)]
+    if isinstance(value, list):
+        return [item for child in value for item in _contract_strings(child)]
+    return []
+
+
+def _embedded_page_source(contract: Mapping[str, Any]) -> tuple[str, str]:
+    original = str(contract.get("original_request") or "")
+    match = re.search(
+        r"sha256=([0-9a-f]{64})\s*\nBEGIN_FACEBOOK_PAGE_SOURCE_TEXT\n(.*?)\nEND_FACEBOOK_PAGE_SOURCE_TEXT",
+        original,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise ValueError("Loop Contract has no canonical embedded Facebook Page source.")
+    return match.group(2), match.group(1)
+
+
+def _authorized_page_body(source: str, final_message: str) -> dict[str, Any]:
+    headings = ("💬 Group 討論題：", "Page → Group 導流：")
+    positions = []
+    for heading in headings:
+        marker = f"\n\n{heading}\n"
+        if source.count(marker) != 1:
+            raise ValueError(f"Source must contain exactly one authorized section: {heading}")
+        positions.append(source.index(marker))
+    if positions != sorted(positions):
+        raise ValueError("Authorized source sections are out of order.")
+    preserved = source[: positions[0]].rstrip()
+    if final_message == preserved:
+        hashtags = ""
+    elif final_message.startswith(preserved + "\n\n"):
+        hashtags = final_message[len(preserved) + 2 :]
+        if "\n\n" in hashtags or not hashtags.strip():
+            raise ValueError("Hashtags must be one final non-empty paragraph.")
+        tokens = hashtags.split()
+        if not tokens or any(not token.startswith("#") or len(token) == 1 for token in tokens):
+            raise ValueError("Only a case-customized hashtag paragraph may be appended.")
+    else:
+        raise ValueError("Final Page text changes content outside the two authorized removals.")
+    return {
+        "removed_sections": list(headings),
+        "preserved_prefix_sha256": hashlib.sha256(preserved.encode("utf-8")).hexdigest(),
+        "hashtags": hashtags,
+        "hashtags_are_final_paragraph": bool(hashtags),
+    }
+
+
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        raise ValueError("Image is not a canonical PNG.")
+    return struct.unpack(">II", data[16:24])
+
+
+def _handle_publish_preflight(
+    args: dict[str, Any], *, capability_scope: OpenClawCapabilityScope
+) -> str:
+    contract, scope_error = _authorized_openclaw_contract(capability_scope)
+    if contract is None:
+        return json.dumps({"success": False, "published": False, "error": scope_error}, ensure_ascii=False)
+    final_message = str(args.get("final_message") or "")
+    image_path_raw = str(args.get("image_path") or "").strip()
+    try:
+        source, expected_source_hash = _embedded_page_source(contract)
+        source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        if source_hash != expected_source_hash:
+            raise ValueError("Embedded source SHA-256 does not match its evidence header.")
+        diff = _authorized_page_body(source, final_message)
+        strings = _contract_strings(contract)
+        if not image_path_raw or not any(image_path_raw in item for item in strings):
+            raise ValueError("Image path is not bound in the Loop Contract.")
+        image_path = Path(image_path_raw).expanduser()
+        image_bytes = image_path.read_bytes()
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        if not any(image_hash in item for item in strings):
+            raise ValueError("Image SHA-256 is not bound in the Loop Contract.")
+        width, height = _png_dimensions(image_bytes)
+        dimension_tokens = {f"{width}×{height}", f"{width}x{height}", f"{width} X {height}"}
+        if not any(any(token in item for token in dimension_tokens) for item in strings):
+            raise ValueError("Actual image dimensions are not bound in the Loop Contract.")
+        if width * 9 != height * 16:
+            raise ValueError("Page Hero is not exact 16:9.")
+        page_status = json.loads(_handle_status({}))
+        if not page_status.get("identity_verified"):
+            raise ValueError("Configured Facebook Page identity did not pass Graph read-only verification.")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return json.dumps(
+            {"success": False, "published": False, "error": str(exc)},
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "published": False,
+            "external_actions_performed": False,
+            "final_message": final_message,
+            "manifest": {
+                "source_sha256": source_hash,
+                "message_sha256": hashlib.sha256(final_message.encode("utf-8")).hexdigest(),
+                "image_path": str(image_path),
+                "image_sha256": image_hash,
+                "image_format": "PNG",
+                "image_width": width,
+                "image_height": height,
+                "image_ratio": "16:9",
+                "page_id": page_status.get("page_id"),
+                "page_name": page_status.get("page_name"),
+                "page_url": page_status.get("page_url"),
+            },
+            "evidence": diff,
+            "external_effects": [],
+        },
+        ensure_ascii=False,
+    )
+
+
 def _handle_status(_args: dict[str, Any], **_kwargs: Any) -> str:
     config = _load_page_config()
     if config.missing:
@@ -264,14 +461,121 @@ def _readback_attachment(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
+def _accepted_preflight_message(
+    conn: Any,
+    *,
+    message_sha256: str,
+    image_sha256: str,
+) -> Optional[str]:
+    """Resolve exact bytes from a completed, Grace-accepted Page preflight."""
+    rows = conn.execute(
+        """
+        SELECT parent.result AS execution_result,
+               review_run.metadata AS review_metadata
+          FROM tasks AS parent
+          JOIN task_links AS link ON link.parent_id = parent.id
+          JOIN tasks AS review ON review.id = link.child_id
+          JOIN task_runs AS review_run
+            ON review_run.id = (
+                SELECT MAX(candidate.id)
+                  FROM task_runs AS candidate
+                 WHERE candidate.task_id = review.id
+            )
+         WHERE parent.status = 'done'
+           AND review.status = 'done'
+           AND INSTR(COALESCE(parent.result, ''), ?) > 0
+           AND INSTR(COALESCE(parent.result, ''), ?) > 0
+        """,
+        (message_sha256, image_sha256),
+    ).fetchall()
+    accepted_messages: set[str] = set()
+    for row in rows:
+        try:
+            result = json.loads(str(row["execution_result"] or "{}"))
+            review = json.loads(str(row["review_metadata"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        review_evidence = review.get("evidence") if isinstance(review, Mapping) else None
+        review_copy = (
+            review_evidence.get("page_copy")
+            if isinstance(review_evidence, Mapping)
+            else None
+        )
+        review_visual = (
+            review_evidence.get("visual_review")
+            if isinstance(review_evidence, Mapping)
+            else None
+        )
+        if (
+            review.get("accepted") is not True
+            or review.get("acceptance_criteria_met") is not True
+            or not isinstance(review_copy, Mapping)
+            or not isinstance(review_visual, Mapping)
+            or str(review_copy.get("final_message_sha256") or "") != message_sha256
+            or str(review_visual.get("image_sha256") or "") != image_sha256
+        ):
+            continue
+        artifacts = result.get("artifacts") if isinstance(result, Mapping) else None
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in artifacts:
+            value = artifact.get("value") if isinstance(artifact, Mapping) else None
+            delegated = value.get("result") if isinstance(value, Mapping) else None
+            evidence = (
+                delegated.get("acceptanceEvidence")
+                if isinstance(delegated, Mapping)
+                else None
+            )
+            source_and_final = (
+                evidence.get("source_and_final_text")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            hero = evidence.get("hero_asset") if isinstance(evidence, Mapping) else None
+            admission = evidence.get("admission") if isinstance(evidence, Mapping) else None
+            message = (
+                str(evidence.get("final_facebook_page_body") or "")
+                if isinstance(evidence, Mapping)
+                else ""
+            )
+            if (
+                isinstance(source_and_final, Mapping)
+                and isinstance(hero, Mapping)
+                and isinstance(admission, Mapping)
+                and admission.get("published") is False
+                and admission.get("external_actions_performed") is False
+                and str(source_and_final.get("final_message_sha256") or "")
+                == message_sha256
+                and str(hero.get("image_sha256") or "") == image_sha256
+                and hashlib.sha256(message.encode("utf-8")).hexdigest()
+                == message_sha256
+            ):
+                accepted_messages.add(message)
+    if len(accepted_messages) != 1:
+        return None
+    return next(iter(accepted_messages))
+
+
+def _handle_publish(
+    args: dict[str, Any],
+    *,
+    capability_scope: Optional[OpenClawCapabilityScope] = None,
+    **_kwargs: Any,
+) -> str:
     from hermes_cli import kanban_db as kb
 
-    contract, scope_error = _authorized_execution_contract()
+    if capability_scope is None:
+        contract, scope_error = _authorized_execution_contract()
+        task_id, run_id, board = _worker_scope()
+    else:
+        contract, scope_error = _authorized_openclaw_contract(capability_scope)
+        task_id = capability_scope.task_id
+        run_id = capability_scope.run_id
+        board = capability_scope.board
     if contract is None:
         return json.dumps({"success": False, "published": False, "error": scope_error})
     page_url = _canonical_page_url(str(args.get("page_url") or ""))
-    message = str(args.get("message") or "")
+    supplied_message = str(args.get("message") or "")
     try:
         image_path = Path(str(args.get("image_path") or "")).expanduser()
     except (OSError, RuntimeError, ValueError) as exc:
@@ -280,8 +584,9 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
             "published": False,
             "error": f"Approved image path is invalid: {type(exc).__name__}",
         }, ensure_ascii=False)
-    message_bytes = message.encode("utf-8")
-    message_sha256 = hashlib.sha256(message_bytes).hexdigest()
+    supplied_message_sha256 = hashlib.sha256(
+        supplied_message.encode("utf-8")
+    ).hexdigest()
     try:
         if not image_path.is_file():
             raise OSError("path is not a regular file")
@@ -293,17 +598,39 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
             "error": f"Approved image is unavailable: {type(exc).__name__}: {exc}",
         }, ensure_ascii=False)
     image_sha256 = hashlib.sha256(image_bytes).hexdigest()
-    if (
-        page_url != contract["page_url"]
-        or message_sha256 != contract["message_sha256"]
-        or image_sha256 != contract["image_sha256"]
-    ):
+    if page_url != contract["page_url"] or image_sha256 != contract["image_sha256"]:
         return json.dumps({
             "success": False,
             "published": False,
             "error": "Target URL or exact payload hashes do not match the approved contract.",
-            "message_sha256": message_sha256,
+            "message_sha256": supplied_message_sha256,
             "image_sha256": image_sha256,
+        }, ensure_ascii=False)
+    message = supplied_message
+    if supplied_message_sha256 != contract["message_sha256"]:
+        with kb.connect_closing(board=board or None) as conn:
+            message = _accepted_preflight_message(
+                conn,
+                message_sha256=contract["message_sha256"],
+                image_sha256=contract["image_sha256"],
+            ) or ""
+        if not message:
+            return json.dumps({
+                "success": False,
+                "published": False,
+                "error": (
+                    "Supplied message does not match the approved contract and no unique "
+                    "Grace-accepted preflight body could be resolved."
+                ),
+                "message_sha256": supplied_message_sha256,
+                "image_sha256": image_sha256,
+            }, ensure_ascii=False)
+    message_sha256 = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    if message_sha256 != contract["message_sha256"]:
+        return json.dumps({
+            "success": False,
+            "published": False,
+            "error": "Resolved Page body does not match the approved message SHA-256.",
         }, ensure_ascii=False)
     config = _load_page_config()
     if config.missing:
@@ -313,11 +640,15 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
             "error": "Facebook Page Graph configuration is incomplete.",
             "missing_configuration": config.missing,
         }, ensure_ascii=False)
-    if page_url != config.page_url:
+    approved_page_id = str(contract.get("page_id") or "").strip()
+    if (
+        (approved_page_id and approved_page_id != config.page_id)
+        or (not approved_page_id and page_url != config.page_url)
+    ):
         return json.dumps({
             "success": False,
             "published": False,
-            "error": "Approved Page URL does not match configured Page URL.",
+            "error": "Approved Page identity does not match configured Page identity.",
         })
     try:
         status = _fetch_page_status(config)
@@ -335,7 +666,6 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
             "page_status": status,
         }, ensure_ascii=False)
 
-    task_id, run_id, board = _worker_scope()
     with kb.connect_closing(board=board or None) as conn:
         reserve_error = kb.reserve_facebook_page_create(
             conn,
@@ -428,7 +758,16 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
             },
         )
         attachment = _readback_attachment(readback)
-        message_verified = str(readback.get("message") or "") == message
+        readback_message = str(readback.get("message") or "")
+        readback_message_sha256 = hashlib.sha256(
+            readback_message.encode("utf-8")
+        ).hexdigest()
+        readback_message_final_paragraph = (
+            readback_message.rstrip().split("\n")[-1]
+            if readback_message
+            else ""
+        )
+        message_verified = readback_message == message
         image_verified = bool(photo_id) and attachment["target_id"] == photo_id
         verified = message_verified and image_verified
         warning = None
@@ -440,6 +779,10 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
             **base_details,
             "permalink_url": str(readback.get("permalink_url") or ""),
             "created_time": str(readback.get("created_time") or ""),
+            "readback_message": readback_message,
+            "readback_message_length": len(readback_message),
+            "readback_message_sha256": readback_message_sha256,
+            "readback_message_final_paragraph": readback_message_final_paragraph,
             "readback_attachment": attachment,
             "verified": verified,
             "readback_warning": warning,
@@ -476,10 +819,39 @@ def _handle_publish(args: dict[str, Any], **_kwargs: Any) -> str:
         "permalink_url": details.get("permalink_url"),
         "created_time": details.get("created_time"),
         "attachment": details.get("readback_attachment"),
+        "readback_message_length": details.get("readback_message_length"),
+        "readback_message_sha256": details.get("readback_message_sha256"),
+        "readback_message_final_paragraph": details.get(
+            "readback_message_final_paragraph"
+        ),
         "message_sha256": message_sha256,
         "image_sha256": image_sha256,
         "retry_permitted": False,
     }, ensure_ascii=False)
+
+
+def execute_openclaw_facebook_page_capability(
+    operation: str,
+    args: Mapping[str, Any],
+    scope: OpenClawCapabilityScope,
+) -> str:
+    """Execute one bridge-bound Facebook Page capability without exposing credentials."""
+    contract, scope_error = _authorized_openclaw_contract(scope)
+    if contract is None:
+        return json.dumps(
+            {"success": False, "published": False, "error": scope_error},
+            ensure_ascii=False,
+        )
+    if operation == "status":
+        return _handle_status(dict(args))
+    if operation == "preflight":
+        return _handle_publish_preflight(dict(args), capability_scope=scope)
+    if operation == "publish":
+        return _handle_publish(dict(args), capability_scope=scope)
+    return json.dumps(
+        {"success": False, "published": False, "error": "Unsupported capability operation."},
+        ensure_ascii=False,
+    )
 
 
 FACEBOOK_PAGE_GRAPH_STATUS_SCHEMA = {

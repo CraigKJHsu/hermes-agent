@@ -39,6 +39,32 @@ def test_complete_loop_contract_is_accepted():
     assert validate_loop_contract(_contract())["contract_version"] == "1.0"
 
 
+def test_content_package_user_facing_delivery_is_accepted():
+    contract = _contract()
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "asset_filenames": ["page_hero.png", "audio_brief.png"],
+    }
+
+    accepted = validate_loop_contract(contract)
+
+    assert accepted["user_facing_delivery"]["kind"] == "content_package"
+
+
+def test_content_package_user_facing_delivery_requires_assets():
+    contract = _contract()
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+    }
+
+    with pytest.raises(LoopContractError, match="asset_filenames"):
+        validate_loop_contract(contract)
+
+
 def test_internal_only_target_accepts_explicit_zh_no_action_scope():
     assert is_internal_only_target(
         "Gemini Notebook（僅產出貼入用 Prompt，不登入或操作）"
@@ -131,6 +157,39 @@ def test_kj_profile_traditional_chinese_writing_loads_human_polish_skill():
     assert "automatic_post_run_summary" in execution
     assert "language_polish_summary" in review
     assert "must not become achieved" in review
+
+
+def test_review_body_explains_canonical_verdict_for_fail_closed_parent():
+    review = render_review_body(_contract(), "t_execution")
+
+    assert "metadata review_outcome=accepted" in review
+    assert "Do not set approved=false" in review
+    assert "review_outcome=blocked" in review
+    assert "parent_verdict" in review
+
+
+def test_ai_bizweek_guidance_uses_operational_readiness_evidence():
+    contract = _contract()
+    contract["identity"]["project"] = "ai_bizweek"
+    contract["goal"]["objective"] = "產製 Carter's Junk Away EP04 完整發布包"
+    contract["policy_snapshots"] = [
+        {
+            "policy_id": "ai-bizweek-page-hero",
+            "version": "2026-08-28.2",
+        }
+    ]
+
+    execution = render_execution_body(contract)
+    review = render_review_body(contract, "t_execution")
+
+    assert "managed_policy_read.operational_readiness_evidence when available" in execution
+    assert "managed_policy_read.operational_readiness_evidence when available" in review
+    assert "equivalent embedded evidence is present" in execution
+    assert "do not ask KJ to provide t_70bf2afe evidence" in execution
+    assert "do not treat obsolete stale-review tasks as current blockers" in review
+    assert "managed_policy_read.content_source_evidence.available=true or equivalent embedded" in execution
+    assert "facebook_page_source_text" in review
+    assert "Do not ask KJ to repost the same source text" in execution
 
 
 @pytest.mark.parametrize(

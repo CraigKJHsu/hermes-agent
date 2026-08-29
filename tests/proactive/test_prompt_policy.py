@@ -1,4 +1,5 @@
 from proactive.prompt_policy import (
+    approval_attempt_candidate,
     approval_token_candidate,
     approval_turn_prompt,
     ensure_active_policy_prompt,
@@ -148,6 +149,24 @@ def test_approval_token_candidate_accepts_harmless_framing():
         == "fe341e4c447cde20"
     )
     assert approval_token_candidate("核准 short") == ""
+
+
+def test_long_work_instruction_discussing_approval_is_not_protocol_turn():
+    message = """請建立全新的預發布流程。
+
+只有在我另行明確核准精確 message SHA-256、image SHA-256 與 Page URL 後，
+才建立發布任務。來源 SHA-256：
+6bfffca4227fe64ddfb966d4f50e5c6beeda95e2e23fd194ebcfe02efa0eda48
+"""
+
+    assert approval_attempt_candidate(message) == ""
+    assert approval_token_candidate(message) == ""
+    assert approval_turn_prompt(message) == ""
+
+
+def test_standalone_malformed_approval_remains_fail_closed():
+    assert approval_attempt_candidate("核准 short") == "short"
+    assert "MUST call clawops_delegate now" in approval_turn_prompt("核准 short")
 
 
 def test_runtime_prompt_cache_fails_closed_when_policy_check_raises(

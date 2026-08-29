@@ -287,6 +287,221 @@ def test_scoped_loop_contract_approval_passes_browser_confirmation_policy():
     assert payload["input"]["messagePath"]["trace_id"] == "tgtrace-loop"
 
 
+@pytest.mark.parametrize(
+    "openclaw_task_id",
+    [
+        "openclaw.agent.loop_contract_start",
+        "openclaw.agent.loop_contract_poll",
+    ],
+)
+def test_zero_effect_missioncrew_content_loop_allows_content_tools_confirmation(
+    openclaw_task_id,
+):
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "OpenClaw accepted the Loop Contract execution.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll the OpenClaw run.",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-content-read",
+            "attempt_id": "attempt-content-read",
+            "contract_fingerprint": "fingerprint-content-read",
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "run-content-read",
+            "backend_agent_id": "missioncrew-content",
+            "backend_session_key": "agent:missioncrew-content:subagent:test",
+        }
+
+    result = tools.delegate_loop_contract_to_openclaw(
+        {
+            "task_id": "task-content-read",
+            "objective": "Correlate admission receipt for a zero-effect content Loop Contract.",
+            "risk_level": "medium",
+            "allowed_tools": ["read", "write", "web_search", "image_generate"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-content-read",
+            "attempt_id": "attempt-content-read",
+            "contract_fingerprint": "fingerprint-content-read",
+            "project": "ai_bizweek",
+            "topic_id": "4641",
+            "task_type": "content_draft",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-content",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-content-read:start",
+            "openclaw_task_id": openclaw_task_id,
+            "start_idempotency_key": "attempt-content-read:start",
+            "backend_run_id": "run-content-read",
+            "backend_session_key": "agent:missioncrew-content:subagent:test",
+            "dry_run": False,
+            "loop_contract": {
+                "trace": {"telegram_message_path": {"trace_id": "tgtrace-content-read"}},
+                "routing": {
+                    "task_type": "content_draft",
+                    "resolved": {
+                        "assignment": {
+                            "assigned_worker": "missioncrew.content",
+                            "runtime_profile": "missioncrew-content",
+                        }
+                    },
+                },
+                "external_targets": [],
+            },
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert result["backend_agent_id"] == "missioncrew-content"
+    assert result["protocol_correlated"] is True
+    assert len(seen) == 1
+    assert seen[0]["backend_agent_id"] == "missioncrew-content"
+    assert seen[0]["allowed_tools"] == [
+        "read",
+        "write",
+        "web_search",
+        "image_generate",
+    ]
+
+
+def test_zero_effect_facebook_page_preflight_needs_no_read_confirmation():
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "Dedicated preflight accepted.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll.",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-preflight",
+            "attempt_id": "attempt-preflight",
+            "contract_fingerprint": "fingerprint-preflight",
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "run-preflight",
+            "backend_agent_id": "missioncrew-facebook-page-operator",
+            "backend_session_key": "agent:missioncrew-facebook-page-operator:subagent:test",
+        }
+
+    result = tools.delegate_loop_contract_to_openclaw(
+        {
+            "task_id": "task-preflight",
+            "objective": "Verify a Facebook Page publish manifest without publishing.",
+            "risk_level": "medium",
+            "allowed_tools": ["facebook_page_publish_preflight"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-preflight",
+            "attempt_id": "attempt-preflight",
+            "contract_fingerprint": "fingerprint-preflight",
+            "project": "ai_bizweek",
+            "topic_id": "4641",
+            "task_type": "facebook_page_publish_preflight",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-facebook-page-operator",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": ["missioncrew-facebook-page"],
+            "idempotency_key": "attempt-preflight:start",
+            "openclaw_task_id": "openclaw.agent.loop_contract_start",
+            "dry_run": False,
+            "loop_contract": {
+                "trace": {"telegram_message_path": {"trace_id": "tgtrace-preflight"}},
+                "routing": {"task_type": "facebook_page_publish_preflight"},
+                "external_targets": [],
+            },
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert result["protocol_correlated"] is True
+    assert seen[0]["allowed_tools"] == ["facebook_page_publish_preflight"]
+
+
+def test_facebook_page_preflight_builds_verified_protocol_v2_live_payload():
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "task-preflight-payload",
+            "objective": "Verify a Facebook Page manifest without publishing.",
+            "risk_level": "low",
+            "allowed_tools": ["facebook_page_publish_preflight"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-preflight-payload",
+            "attempt_id": "task-preflight-payload:run:1",
+            "contract_fingerprint": "f" * 64,
+            "project": "ai_bizweek",
+            "topic_id": "4641",
+            "task_type": "facebook_page_publish_preflight",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-facebook-page-operator",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": ["missioncrew-facebook-page"],
+            "idempotency_key": "task-preflight-payload:run:1:start",
+            "openclaw_task_id": "openclaw.agent.loop_contract_start",
+            "dry_run": False,
+            "loop_contract": {
+                "routing": {"task_type": "facebook_page_publish_preflight"},
+                "external_targets": [],
+            },
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    payload = tools._openclaw_payload(
+        task,
+        config,
+        live_async_capability=tools._LOOP_CONTRACT_ASYNC_CAPABILITY,
+    )
+
+    assert payload["protocolVersion"] == "2.0"
+    assert payload["dryRun"] is False
+    assert payload["taskId"] == "openclaw.agent.loop_contract_start"
+    assert payload["routing"]["backendAgentId"] == "missioncrew-facebook-page-operator"
+    assert payload["allowedTools"] == ["facebook_page_publish_preflight"]
+
+
 def test_low_risk_task_builds_valid_delegated_task_and_uses_transport():
     from plugins.openclaw_bridge.tools import delegate_to_openclaw
 

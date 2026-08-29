@@ -7,7 +7,9 @@ import json
 import os
 import re
 import secrets
+import struct
 import time
+from pathlib import Path
 from typing import Any
 
 from gateway.session_context import (
@@ -23,6 +25,7 @@ from hermes_cli.telegram_message_path import (
 )
 from proactive.grace_task_compiler import compile_and_delegate
 from proactive.hubops_routing import (
+    normalize_clawops_task_type,
     registered_worker_task_types,
     resolved_route_binding,
     route_requires_owner_approval,
@@ -46,7 +49,116 @@ _TASK_TYPES = [
     *registered_worker_task_types(),
     "secondhand_commerce_group_status",
 ]
-_APPROVAL_ATTEMPT = re.compile(r"核准[ \t\u3000]+([^ \t\u3000，,。.!！？?、:：;；]+)")
+
+
+def _is_facebook_page_publish_preflight(
+    goal: dict[str, Any],
+    scope: dict[str, Any],
+    verification: dict[str, Any],
+) -> bool:
+    """Recognize the exact zero-effect Page manifest workflow."""
+    text = json.dumps(
+        {"goal": goal, "scope": scope, "verification": verification},
+        ensure_ascii=False,
+    )
+    return (
+        "facebook_page_graph_status" in text
+        and "facebook_page_graph_publish" not in text
+        and ("Page Hero" in text or ".png" in text)
+        and ("發布前" in text or "preflight" in text.casefold())
+        and any(term in text for term in ("不得發布", "不發布", "無外部寫入"))
+    )
+
+
+def _bind_facebook_page_preflight_asset(
+    delivery: dict[str, Any],
+) -> dict[str, Any]:
+    filenames = list(delivery.get("asset_filenames") or [])
+    if len(filenames) != 1:
+        raise ValueError(
+            "facebook_page_publish_preflight requires exactly one Page Hero asset filename."
+        )
+    filename = str(filenames[0] or "").strip()
+    if not filename or Path(filename).name != filename:
+        raise ValueError(
+            "facebook_page_publish_preflight asset filename must not contain a path."
+        )
+    path = (
+        Path.home()
+        / ".openclaw"
+        / "media"
+        / "tool-image-generation"
+        / filename
+    ).resolve()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            "facebook_page_publish_preflight Page Hero asset is unavailable."
+        ) from exc
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        raise ValueError(
+            "facebook_page_publish_preflight Page Hero asset must be a valid PNG."
+        )
+    width, height = struct.unpack(">II", data[16:24])
+    if (width, height) != (1664, 936) or width * 9 != height * 16:
+        raise ValueError(
+            "facebook_page_publish_preflight Page Hero must be exactly 1664x936 (16:9)."
+        )
+    return {
+        "filename": filename,
+        "path": str(path),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "format": "PNG",
+        "dimensions": f"{width}×{height}",
+        "ratio": "16:9",
+    }
+
+
+def _bind_facebook_page_publish_manifest(
+    scope: dict[str, Any],
+    external_targets: list[str],
+) -> dict[str, str]:
+    """Compile exact Page payload identity into the approval fingerprint."""
+    targets = {str(item or "").strip().rstrip("/") for item in external_targets}
+    if len(targets) != 1:
+        raise ValueError(
+            "facebook_page_api_publish requires exactly one external Page target."
+        )
+    allowed = list(scope.get("allowed") or [])
+    message_pattern = re.compile(
+        r"^僅使用已驗證的精確正文，SHA-256=([0-9a-fA-F]{64})$"
+    )
+    image_pattern = re.compile(
+        r"^僅使用\s+.+，SHA-256=([0-9a-fA-F]{64})$"
+    )
+    message_hashes = {
+        match.group(1).lower()
+        for item in allowed
+        if (match := message_pattern.fullmatch(str(item or "").strip()))
+    }
+    image_hashes = {
+        match.group(1).lower()
+        for item in allowed
+        if (match := image_pattern.fullmatch(str(item or "").strip()))
+    }
+    page_ids = {
+        match.group(1)
+        for item in allowed
+        if (match := re.search(r"Page ID\s+(\d+)", str(item or "")))
+    }
+    if len(message_hashes) != 1 or len(image_hashes) != 1 or len(page_ids) != 1:
+        raise ValueError(
+            "facebook_page_api_publish requires one exact Page ID, message SHA-256, and image SHA-256 in scope.allowed."
+        )
+    return {
+        "action": "create_post",
+        "transport": "graph_api",
+        "page_url": next(iter(targets)),
+        "message_sha256": next(iter(message_hashes)),
+        "image_sha256": next(iter(image_hashes)),
+        "page_id": next(iter(page_ids)),
+    }
 
 
 def _is_safe_approval_message(message_text: str, approval_token: str) -> bool:
@@ -86,8 +198,9 @@ def _is_safe_approval_message(message_text: str, approval_token: str) -> bool:
 
 
 def _approval_token_candidate(message_text: str) -> str:
-    match = _APPROVAL_ATTEMPT.search(str(message_text or ""))
-    return match.group(1) if match is not None else ""
+    from proactive.prompt_policy import approval_attempt_candidate
+
+    return approval_attempt_candidate(message_text)
 
 
 _GOAL = {
@@ -141,11 +254,18 @@ _USER_FACING_DELIVERY = {
     "type": "object",
     "properties": {
         "required": {"type": "boolean", "const": True},
-        "kind": {"type": "string", "enum": ["commerce_group_status"]},
-        "delivery": {"type": "string", "enum": ["inline_only"]},
+        "kind": {
+            "type": "string",
+            "enum": ["commerce_group_status", "content_package"],
+        },
+        "delivery": {
+            "type": "string",
+            "enum": ["inline_only", "inline_with_attachment"],
+        },
         "subject_keys": _LIST,
+        "asset_filenames": _LIST,
     },
-    "required": ["required", "kind", "delivery", "subject_keys"],
+    "required": ["required", "kind", "delivery"],
     "additionalProperties": False,
 }
 _OBJECTIVE_REF = {
@@ -497,6 +617,17 @@ _CANCEL_META_CONTEXT = re.compile(
     r"(?:流程|功能|機制|邏輯|程式(?:碼)?|介面|按鈕|API)",
     re.IGNORECASE,
 )
+_CANCEL_DIAGNOSTIC_MENTION = re.compile(
+    r"(?:"
+    r"An explicit stop request cannot create another delegated task\."
+    r"\s*Use clawops_cancel for the existing task id\.|"
+    r"(?:誤判|錯誤(?:拒絕|判斷)?).{0,32}"
+    r"(?:取消(?:意圖|指令)?|stop request|cancel)|"
+    r"(?:不是|非).{0,40}"
+    r"(?:取消(?:意圖|指令)?|cancel(?:lation)?|stop request)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 _APPROVAL_CHECKPOINT_STOP = re.compile(
     r"(?:task[-_ ]scoped\s+)?approval\s+challenge\s*"
     r"(?:後|then)\s*(?P<stop>停止|\bstop\b)"
@@ -505,6 +636,73 @@ _APPROVAL_CHECKPOINT_STOP = re.compile(
     r"(?:等待|wait(?:ing)?(?:\s+for)?)"
     r".{0,16}?(?:核准|approval)",
     re.IGNORECASE | re.DOTALL,
+)
+_FAIL_CLOSED_GUARD_STOP = re.compile(
+    r"(?:"
+    r"(?:任一|任何(?:一項)?|上述|以上|這些|所有)?"
+    r"(?:條件|要求|項目|一項|路徑|模型|工具|執行者|架構|admission|gate|receipt|evidence)"
+    r".{0,24}?"
+    r"(?:無法|不能|不(?:被)?滿足|未(?:被)?滿足|不符合|失敗|不完整|缺(?:少|欄位)?)"
+    r".{0,24}?"
+    r"(?P<stop_zh>停止|停下)"
+    r"(?:並)?(?:用.{0,8})?(?:回報|報告|告知|告訴)"
+    r"|"
+    r"(?P<stop_zh_first>停止|停下)"
+    r"(?:並)?(?:用.{0,8})?(?:回報|報告|告知|告訴)"
+    r".{0,40}?"
+    r"(?:if|若|如果|當|需要|禁止|外部|executor|model|route|tool|subject|污染)"
+    r"|"
+    r"(?:兩次|[2二]次|連續|相同)"
+    r".{0,40}?"
+    r"(?:錯誤|失敗|修正|污染|不可讀|不符合|no[-_ ]?progress|runtime)"
+    r".{0,40}?"
+    r"(?P<stop_zh_no_progress>停止|停下)"
+    r"|"
+    r"(?:if\s+)?(?:any|the|these|all)?\s*"
+    r"(?:condition|requirement|constraint|route|model|tool|executor|architecture|admission|gate|receipt|evidence)s?"
+    r".{0,40}?"
+    r"(?:cannot|can't|can\s+not|is\s+not|are\s+not|fail(?:s|ed)?|unmet|incomplete|missing)"
+    r".{0,40}?"
+    r"(?P<stop_en>\bstop\b)"
+    r"(?:\s+and\s+)?(?:report|return|respond)"
+    r"|"
+    r"(?P<stop_en_first>\bstop\b)"
+    r"(?:\s+and\s+)?(?:report|return|respond)"
+    r".{0,60}?"
+    r"(?:if|only\s+if|when|unless)"
+    r".{0,80}?"
+    r"(?:external|forbidden|executor|model|route|tool|subject|contamination|require(?:d|ment)?)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_DELEGATION_CREATION_INTENT = re.compile(
+    r"(?:"
+    r"新任務|建立(?:新)?任務|重新提交|重新建立|重新執行|生成|產生|重做|"
+    r"loop\s*contract|create|generate|new\s+task|fresh\s+task"
+    r")",
+    re.IGNORECASE,
+)
+_DELEGATION_NOT_CANCEL_CONTEXT = re.compile(
+    r"(?:"
+    r"非取消|不是取消|不(?:是)?要取消|不取消任何|"
+    r"not\s+(?:a\s+)?cancel(?:lation)?|do\s+not\s+cancel|no\s+cancel"
+    r")",
+    re.IGNORECASE,
+)
+_ZERO_EXTERNAL_EFFECT_CONSTRAINT = re.compile(
+    r"(?:"
+    r"零外部|zero[-\s]*external|no\s+external|"
+    r"禁止.{0,24}(?:外部|發布|上架|publish|publishing)|"
+    r"不得.{0,24}(?:外部|發布|上架|publish|publishing)|"
+    r"不(?:登入|編輯|發布|上架|操作)|"
+    r"without\s+(?:external|publishing|posting)|"
+    r"do\s+not\s+(?:publish|post|submit|send|operate)"
+    r")",
+    re.IGNORECASE,
+)
+_FORBIDDEN_EXTERNAL_EFFECT = re.compile(
+    r"(?:外部|發布|上架|刊登|傳送|publish|publishing|post|submit|send|external)",
+    re.IGNORECASE,
 )
 
 
@@ -519,10 +717,41 @@ def _without_approval_checkpoint_stop(message_text: str) -> str:
     return _APPROVAL_CHECKPOINT_STOP.sub(_mask, message_text)
 
 
+def _without_fail_closed_guard_stop(message_text: str) -> str:
+    """Remove only the stop token bound to an execution-constraint guard."""
+
+    def _mask(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        group = next(
+            name
+            for name in (
+                "stop_zh",
+                "stop_zh_first",
+                "stop_zh_no_progress",
+                "stop_en",
+                "stop_en_first",
+            )
+            if match.group(name) is not None
+        )
+        start, end = match.span(group)
+        offset = match.start()
+        return matched[: start - offset] + matched[end - offset :]
+
+    return _FAIL_CLOSED_GUARD_STOP.sub(_mask, message_text)
+
+
+def _without_cancel_diagnostic_mentions(message_text: str) -> str:
+    return _CANCEL_DIAGNOSTIC_MENTION.sub("", message_text)
+
+
 def _is_explicit_cancel_message(message_text: str) -> bool:
     """Fail closed unless the authenticated turn clearly asks to stop work."""
     clean = str(message_text or "").strip()
-    cancel_candidate = _without_approval_checkpoint_stop(clean)
+    cancel_candidate = _without_fail_closed_guard_stop(
+        _without_approval_checkpoint_stop(
+            _without_cancel_diagnostic_mentions(clean)
+        )
+    )
     if (
         not cancel_candidate
         or any(phrase in cancel_candidate for phrase in _CANCEL_NEGATIONS)
@@ -530,6 +759,111 @@ def _is_explicit_cancel_message(message_text: str) -> bool:
     ):
         return False
     return _CANCEL_INTENT.search(cancel_candidate) is not None
+
+
+def _iter_text_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        collected: list[str] = []
+        for nested in value.values():
+            collected.extend(_iter_text_values(nested))
+        return collected
+    if isinstance(value, (list, tuple)):
+        collected = []
+        for nested in value:
+            collected.extend(_iter_text_values(nested))
+        return collected
+    return []
+
+
+def _is_explicit_new_delegation_not_cancel(
+    args: dict[str, Any],
+    message_text: str,
+) -> bool:
+    """Recognize a new Loop Contract that contains fail-closed stop rules."""
+    text = "\n".join(
+        [
+            str(message_text or ""),
+            *(
+                item
+                for key in (
+                    "original_request",
+                    "grace_interpretation",
+                    "trigger",
+                    "goal",
+                    "scope",
+                    "verification",
+                    "stop_rules",
+                )
+                for item in _iter_text_values(args.get(key))
+            ),
+        ]
+    )
+    return (
+        _DELEGATION_CREATION_INTENT.search(text) is not None
+        and _DELEGATION_NOT_CANCEL_CONTEXT.search(text) is not None
+    )
+
+
+_CURRENT_MESSAGE_SOURCE_CONTEXT = re.compile(
+    r"(?:KJ|使用者|user|本訊息|這則訊息|current\s+message)"
+    r".{0,80}?"
+    r"(?:提供|貼上|provided|posted|pasted|source[- ]of[- ]truth|唯一事實|唯一來源|完整(?:貼文|Page|內容))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _promote_authenticated_message_source(
+    args: dict[str, Any],
+    message_text: str,
+) -> None:
+    """Use the bound Telegram message body when Grace summarized the source."""
+    current = str(message_text or "").strip()
+    if len(current) < 500:
+        return
+    existing = str(args.get("original_request") or "").strip()
+    if len(existing) >= len(current):
+        return
+    context = "\n".join(
+        item
+        for key in (
+            "original_request",
+            "grace_interpretation",
+            "trigger",
+            "goal",
+            "scope",
+            "verification",
+        )
+        for item in _iter_text_values(args.get(key))
+    )
+    if _CURRENT_MESSAGE_SOURCE_CONTEXT.search(context):
+        args["original_request"] = current
+
+
+def _has_zero_external_effect_constraint(
+    args: dict[str, Any],
+    goal: dict[str, Any],
+    scope: dict[str, Any],
+) -> bool:
+    forbidden_context = [
+        *list(scope.get("forbidden") or []),
+        *list(goal.get("non_goals") or []),
+    ]
+    if any(
+        _FORBIDDEN_EXTERNAL_EFFECT.search(str(item or "")) is not None
+        for item in forbidden_context
+    ):
+        return True
+    text = "\n".join(
+        [
+            str(args.get("original_request") or ""),
+            str(args.get("grace_interpretation") or ""),
+            str(args.get("trigger") or ""),
+            *[str(item or "") for item in forbidden_context],
+        ]
+    )
+    return _ZERO_EXTERNAL_EFFECT_CONSTRAINT.search(text) is not None
 
 
 def _resolve_cancel_board(
@@ -601,6 +935,20 @@ def handle_clawops_cancel(
     ).strip()
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
+    trusted_message_path = normalize_message_path(
+        get_session_env("HERMES_TELEGRAM_MESSAGE_PATH", "")
+    )
+    if trusted_message_path:
+        platform = platform or str(
+            trusted_message_path.get("platform") or ""
+        ).strip().lower()
+        chat_id = chat_id or str(trusted_message_path.get("chat_id") or "").strip()
+        thread_id = thread_id or str(
+            trusted_message_path.get("thread_id") or ""
+        ).strip()
+        message_id = message_id or str(
+            trusted_message_path.get("inbound_message_id") or ""
+        ).strip()
     internal_turn = (
         get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower()
         == "true"
@@ -720,6 +1068,7 @@ def _queued_delegation_replay(
     with kb.connect_closing(board=board) as conn:
         execution = kb.get_task(conn, str(delegation["execution_task_id"]))
         review = kb.get_task(conn, str(delegation["review_task_id"]))
+        latest_run = kb.latest_run(conn, str(delegation["execution_task_id"]))
         subscriptions = kb.list_notify_subs(
             conn, str(delegation["execution_task_id"]),
         )
@@ -732,7 +1081,12 @@ def _queued_delegation_replay(
             "status": "queued",
             "project": project,
             "topic_name": topic_name,
-            "assigned_agent": execution.assignee,
+            "assigned_agent": _response_assigned_agent(
+                execution_backend=execution.executor_backend,
+                task_assignee=execution.assignee,
+                run_metadata=latest_run.metadata if latest_run else {},
+            ),
+            "execution_backend": execution.executor_backend,
             "delegation_id": str(delegation["delegation_id"]),
             "kanban_board": str(board or kb.DEFAULT_BOARD),
             "trace_id": str(
@@ -752,6 +1106,18 @@ def _queued_delegation_replay(
         },
         ensure_ascii=False,
     )
+
+
+def _response_assigned_agent(
+    *,
+    execution_backend: str,
+    task_assignee: str,
+    run_metadata: dict[str, Any],
+) -> str:
+    backend_agent_id = str(run_metadata.get("backend_agent_id") or "").strip()
+    if str(execution_backend or "").strip() == "openclaw" and backend_agent_id:
+        return backend_agent_id
+    return str(task_assignee or "").strip()
 
 
 def _stable_contract_discriminator(
@@ -797,9 +1163,102 @@ def _stable_contract_discriminator(
     ).hexdigest()
 
 
+def _append_unique_text(values: list[Any], text: str) -> None:
+    if text and text not in {str(item) for item in values}:
+        values.append(text)
+
+
+def _contract_requests_ai_bizweek_source(contract: dict[str, Any]) -> bool:
+    text = json.dumps(contract, ensure_ascii=False, sort_keys=True).casefold()
+    return (
+        "ai bizweek" in text
+        or "aibizweek" in text
+        or "carter's junk away" in text
+        or "carter’s junk away" in text
+        or "facebook page" in text and "source" in text
+    )
+
+
+def _augment_ai_bizweek_source_evidence(
+    contract: dict[str, Any],
+    *,
+    session_id: str,
+) -> dict[str, Any]:
+    """Embed managed Page source text before fingerprinting worker contracts."""
+    if not session_id or not _contract_requests_ai_bizweek_source(contract):
+        return contract
+    try:
+        from tools.managed_policy_tool import managed_policy_read
+
+        payload = json.loads(managed_policy_read(session_id=session_id))
+    except Exception:
+        return contract
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return contract
+    source = payload.get("content_source_evidence")
+    if not isinstance(source, dict):
+        return contract
+    page_text = str(source.get("facebook_page_source_text") or "").strip()
+    if not page_text:
+        return contract
+    digest = hashlib.sha256(page_text.encode("utf-8")).hexdigest()
+    augmented = json.loads(json.dumps(contract, ensure_ascii=False))
+    original = str(augmented.get("original_request") or "").strip()
+    source_block = (
+        "\n\nTASK-SCOPED SOURCE MATERIAL: facebook_page_source_text\n"
+        f"source=session:{session_id}\n"
+        f"message_id={source.get('message_id') or ''}\n"
+        f"length={len(page_text)}\n"
+        f"sha256={digest}\n"
+        "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT\n"
+        f"{page_text}\n"
+        "END_FACEBOOK_PAGE_SOURCE_TEXT"
+    )
+    if page_text not in original:
+        augmented["original_request"] = f"{original}{source_block}".strip()
+    augmented["grace_interpretation"] = " ".join(
+        entry
+        for entry in (
+            str(augmented.get("grace_interpretation") or "").strip(),
+            "Use the original_request embedded SOURCE MATERIAL facebook_page_source_text as the exact Facebook Page body source of truth; do not summarize, shorten, rewrite, or reorder it unless explicit KJ/Grace authorization is cited.",
+        )
+        if entry
+    )
+    scope = augmented.get("scope")
+    if isinstance(scope, dict):
+        allowed = scope.setdefault("allowed", [])
+        if isinstance(allowed, list):
+            _append_unique_text(
+                allowed,
+                "Use original_request embedded SOURCE MATERIAL facebook_page_source_text as the exact Page body source of truth.",
+            )
+    verification = augmented.get("verification")
+    if isinstance(verification, dict):
+        checks = verification.setdefault("checks", [])
+        evidence_required = verification.setdefault("evidence_required", [])
+        acceptance = verification.setdefault("acceptance_criteria", [])
+        if isinstance(checks, list):
+            _append_unique_text(
+                checks,
+                "Compare the final Facebook Page body against embedded facebook_page_source_text and prove exact preservation before CTA/hashtags.",
+            )
+        if isinstance(evidence_required, list):
+            _append_unique_text(
+                evidence_required,
+                f"Embedded facebook_page_source_text length={len(page_text)} sha256={digest} and source-vs-output preservation proof.",
+            )
+        if isinstance(acceptance, list):
+            _append_unique_text(
+                acceptance,
+                "Final Facebook Page body preserves embedded facebook_page_source_text exactly unless explicit KJ/Grace edit authorization is cited.",
+            )
+    return augmented
+
+
 def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) -> str:
     """Create execution + Grace-review cards only after a complete contract exists."""
     args = dict(args or {})
+    supplied_approval_args = dict(args)
     approval_refresh_token = str(
         args.pop("_approval_refresh_token", "") or ""
     ).strip()
@@ -880,11 +1339,13 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     if not notifier_profile:
         notifier_profile = "default"
     try:
+        _promote_authenticated_message_source(args, message_text)
         approval_candidate = _approval_token_candidate(message_text)
         if (
             not internal_turn
             and not scheduled_turn
             and _is_explicit_cancel_message(message_text)
+            and not _is_explicit_new_delegation_not_cancel(args, message_text)
         ):
             raise ValueError(
                 "An explicit stop request cannot create another delegated "
@@ -958,6 +1419,38 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             board = (
                 None if approval_board == kb.DEFAULT_BOARD else approval_board
             )
+            raw_bound_args = approval_challenge.get("delegation_args")
+            if raw_bound_args:
+                try:
+                    bound_args = json.loads(str(raw_bound_args))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise ValueError(
+                        "Approval challenge contains invalid durable delegation args."
+                    )
+                if not isinstance(bound_args, dict):
+                    raise ValueError(
+                        "Approval challenge durable delegation args must be an object."
+                    )
+                replay_only_keys = {
+                    "approval_token",
+                    "approved",
+                    "request_instance_id",
+                    "origin_callback_review_id",
+                    "origin_callback_event_id",
+                    "origin_callback_board",
+                    "_approval_refresh_token",
+                    "_approval_compiled_contract",
+                }
+                for key, value in supplied_approval_args.items():
+                    if key in replay_only_keys:
+                        continue
+                    if key not in bound_args or bound_args[key] != value:
+                        raise ValueError(
+                            "Approval token cannot authorize a non-approval "
+                            "route and is bound to another contract when replay "
+                            "arguments change from the durable challenge."
+                        )
+                args = bound_args
         if platform and platform not in {"cron", "codex"}:
             context = resolve_thread_context(
                 platform=platform, chat_id=chat_id, thread_id=thread_id,
@@ -1017,6 +1510,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             session_id = session_id or f"cron:{project}"
         goal, scope, verification, stop_rules, memory = _canonical_sections(args)
         task_type = str(args.get("task_type") or "")
+        if _is_facebook_page_publish_preflight(goal, scope, verification):
+            task_type = "facebook_page_publish_preflight"
+        normalized_task_type = normalize_clawops_task_type(task_type)
         if (
             task_type == "secondhand_commerce_group_status"
             and not isinstance(args.get("user_facing_delivery"), dict)
@@ -1026,17 +1522,34 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "user_facing_delivery"
             )
         risk_level = str(args.get("risk_level") or "")
+        supplied_request_instance = str(
+            args.get("request_instance_id") or ""
+        ).strip()
         supplied_external_targets = [
             str(item).strip()
             for item in list(args.get("external_targets") or [])
             if str(item).strip()
         ]
-        internal_only_contract = bool(supplied_external_targets) and all(
-            _is_internal_only_target(item)
-            for item in supplied_external_targets
+        internal_only_contract = (
+            bool(supplied_external_targets)
+            and all(
+                _is_internal_only_target(item)
+                for item in supplied_external_targets
+            )
+        ) or (
+            not supplied_external_targets
+            and normalized_task_type
+            not in {"browser_publish", "browser_ops", "facebook_page_api_publish"}
+            and _has_zero_external_effect_constraint(args, goal, scope)
         )
         external_targets = (
             [] if internal_only_contract else supplied_external_targets
+        )
+        supervised_internal_artifact = (
+            internal_turn
+            and bool(supplied_request_instance)
+            and internal_only_contract
+            and not bool(args.get("approved"))
         )
         if fresh_callback_origin_kind == "human_blocker" and (
             bool(args.get("approved")) or external_targets
@@ -1045,9 +1558,6 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "A human-blocker follow-up may create only an unapproved, "
                 "zero-external-effect continuation."
             )
-        supplied_request_instance = str(
-            args.get("request_instance_id") or ""
-        ).strip()
         if approval_token or approval_refresh_token:
             if approval_challenge is None:
                 with kb.connect_closing(board=board) as conn:
@@ -1079,9 +1589,23 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 ).encode("utf-8")
             ).hexdigest()[:32]
         elif not scheduled_turn and not codex_local_operator and message_id:
+            chat_contract_discriminator = _stable_contract_discriminator(
+                identity=source_bound_identity,
+                board=str(board or "default"),
+                args=args,
+                goal=goal,
+                scope=scope,
+                verification=verification,
+                stop_rules=stop_rules,
+                memory=memory,
+                task_type=task_type,
+                risk_level=risk_level,
+                external_targets=external_targets,
+            )
             request_instance_id = "gri_" + hashlib.sha256(
                 (
-                    f"message:{session_platform}:{session_key}:{message_id}"
+                    f"message:{session_platform}:{session_key}:{message_id}:"
+                    f"{chat_contract_discriminator}"
                 ).encode("utf-8")
             ).hexdigest()[:32]
             if (
@@ -1156,6 +1680,13 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             # Compatibility for direct scheduled callers that predate the
             # trusted HERMES_SESSION_SOURCE/session-id binding.
             request_instance_id = supplied_request_instance
+        elif supervised_internal_artifact:
+            # Grace may need to supervise a zero-external-effect artifact task
+            # from an internal follow-up after the user has already delegated
+            # the lane in Telegram. Keep this path scoped to unapproved internal
+            # artifacts; any external action still requires the normal bound
+            # user/callback approval flow.
+            request_instance_id = supplied_request_instance
         else:
             raise ValueError(
                 "Delegation requires a stable request_instance_id when no "
@@ -1175,6 +1706,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     if scheduled_turn
                     else "codex_local_operator"
                     if codex_local_operator
+                    else "internal_supervisor"
+                    if internal_turn
                     else "authenticated_user"
                 ),
                 "compiled_by": "Grace",
@@ -1201,8 +1734,17 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             contract["user_facing_delivery"] = dict(
                 args["user_facing_delivery"]
             )
+            if task_type == "facebook_page_publish_preflight":
+                contract["preflight_asset"] = _bind_facebook_page_preflight_asset(
+                    contract["user_facing_delivery"]
+                )
         if external_targets:
             contract["external_targets"] = external_targets
+        if task_type == "facebook_page_api_publish":
+            contract["facebook_page_post"] = _bind_facebook_page_publish_manifest(
+                scope,
+                external_targets,
+            )
         objective_ref = args.get("objective_ref")
         if isinstance(objective_ref, dict):
             clean_objective_ref = {
@@ -1221,6 +1763,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     thread_id=thread_id,
                 )
             contract["objective_ref"] = clean_objective_ref
+        contract = _augment_ai_bizweek_source_evidence(
+            contract,
+            session_id=session_id,
+        )
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -1241,6 +1787,40 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         contract["routing"]["resolved"] = resolved_route_binding(routing_preview)
         normalized_contract = validate_loop_contract(contract)
         exact_fingerprint = contract_fingerprint(normalized_contract)
+        sealed_contract = args.get("_approval_compiled_contract")
+        if approval_token and sealed_contract is not None:
+            if not isinstance(sealed_contract, dict):
+                raise ValueError(
+                    "Approval challenge sealed contract must be an object."
+                )
+            sealed_contract = validate_loop_contract(sealed_contract)
+            sealed_fingerprint = contract_fingerprint(sealed_contract)
+            if sealed_fingerprint != str(
+                approval_challenge.get("contract_fingerprint") or ""
+            ):
+                raise ValueError(
+                    "Approval challenge sealed contract fingerprint is invalid."
+                )
+            sealed_identity = sealed_contract.get("identity") or {}
+            sealed_routing = sealed_contract.get("routing") or {}
+            if (
+                sealed_identity.get("platform") != platform
+                or sealed_identity.get("chat_id") != chat_id
+                or sealed_identity.get("thread_id") != thread_id
+                or sealed_identity.get("request_instance_id")
+                != request_instance_id
+                or list(sealed_contract.get("external_targets") or [])
+                != external_targets
+                or sealed_routing.get("resolved")
+                != contract.get("routing", {}).get("resolved")
+            ):
+                raise ValueError(
+                    "Approval token is bound to another contract because the "
+                    "sealed identity, targets, or resolved route changed."
+                )
+            contract = json.loads(json.dumps(sealed_contract))
+            normalized_contract = sealed_contract
+            exact_fingerprint = sealed_fingerprint
         approval_needed = (
             route_requires_owner_approval(routing_preview)
             and not internal_only_contract
@@ -1384,7 +1964,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 raise ValueError(
                     "Approval refresh requires a fresh authenticated message."
                 )
-        if internal_turn:
+        if internal_turn and not supervised_internal_artifact:
             if not origin_review_id or origin_event_id is None:
                 raise ValueError(
                     "Internal continuation requires the active callback review "
@@ -1518,6 +2098,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         action_summary=str(goal.get("objective") or "").strip(),
                         approval_platform=approval_platform,
                         approval_scope=approval_scope_json,
+                        delegation_args=args,
+                        compiled_contract=normalized_contract,
                         origin_review_task_id=origin_review_id,
                         origin_event_id=origin_event_id,
                         telegram_message_path=trusted_message_path,
@@ -1602,6 +2184,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         action_summary=str(goal.get("objective") or "").strip(),
                         approval_platform=approval_platform,
                         approval_scope=approval_scope_json,
+                        delegation_args=args,
+                        compiled_contract=normalized_contract,
                         origin_review_task_id=origin_review_id,
                         origin_event_id=origin_event_id,
                         callback_lease_owner=(
@@ -1817,7 +2401,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             "status": "queued",
             "project": result.project,
             "topic_name": result.topic_name,
-            "assigned_agent": result.assignee,
+            "assigned_agent": result.backend_agent_id,
+            "execution_backend": result.execution_backend,
             "delegation_id": str(delegation["delegation_id"]),
             "kanban_board": str(board or kb.DEFAULT_BOARD),
             "trace_id": str(canonical_message_path.get("trace_id") or ""),

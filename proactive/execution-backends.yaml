@@ -61,6 +61,11 @@ backends:
       - browser_write
       - code
       - content
+      - image_generate
+      - facebook_page_graph
+      - facebook_page_graph_status
+      - facebook_page_graph_publish
+      - facebook_page_publish_preflight
       - analysis
       - local_files
       - research

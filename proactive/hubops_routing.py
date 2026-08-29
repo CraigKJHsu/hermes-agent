@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
+import json
 from typing import Any, Iterable, Mapping
 
 import yaml
@@ -28,8 +29,15 @@ TASK_TYPE_ALIASES = {
     "facebook_existing_listing_group_distribution": "browser_publish",
     "group_distribution": "browser_publish",
 }
-ALWAYS_APPROVAL_TASK_TYPES = {"browser_publish", "browser_ops"}
+ALWAYS_APPROVAL_TASK_TYPES = {
+    "browser_publish",
+    "browser_ops",
+    "facebook_page_api_publish",
+}
 TASK_REQUIRED_CALLABLE_TOOLS = {
+    "facebook_page_publish_preflight": frozenset(
+        {"facebook_page_publish_preflight"}
+    ),
     "facebook_page_api_publish": frozenset(
         {
             "facebook_page_graph_status",
@@ -37,6 +45,48 @@ TASK_REQUIRED_CALLABLE_TOOLS = {
         }
     ),
 }
+OPENCLAW_FACEBOOK_PAGE_PROFILE = "missioncrew-facebook-page-operator"
+
+
+def _probe_openclaw_facebook_page_tools(required_tools: set[str]) -> dict[str, Any]:
+    """Verify the dedicated agent and bridge plugin declare the exact tools."""
+    config_path = Path.home() / ".openclaw" / "openclaw.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        agents = ((config.get("agents") or {}).get("list") or [])
+        agent = next(
+            item
+            for item in agents
+            if isinstance(item, Mapping)
+            and str(item.get("id") or "") == OPENCLAW_FACEBOOK_PAGE_PROFILE
+        )
+        agent_tools = {
+            str(item or "").strip()
+            for item in ((agent.get("tools") or {}).get("allow") or [])
+        }
+        plugin = (
+            ((config.get("plugins") or {}).get("entries") or {}).get("hermes-bridge")
+            or {}
+        )
+        plugin_tools = {
+            str(item or "").strip()
+            for item in ((plugin.get("config") or {}).get("allowedTools") or [])
+        }
+        available = agent_tools & plugin_tools
+        missing = sorted(required_tools - available)
+        return {
+            "ok": not missing and plugin.get("enabled") is True,
+            "available_tools": sorted(available),
+            "missing_required_tools": missing,
+            "probe_error": "" if not missing else "OpenClaw agent/plugin tool allowlist mismatch",
+        }
+    except (FileNotFoundError, OSError, ValueError, StopIteration, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "available_tools": [],
+            "missing_required_tools": sorted(required_tools),
+            "probe_error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def normalize_clawops_task_type(value: str) -> str:
@@ -174,12 +224,17 @@ def route_clawops_objective(
     )
     if required_callable_tools:
         if runtime_callable_tools is None:
-            from hermes_cli.kanban_db import probe_profile_callable_tools
+            if runtime_profile == OPENCLAW_FACEBOOK_PAGE_PROFILE:
+                capability = _probe_openclaw_facebook_page_tools(
+                    required_callable_tools
+                )
+            else:
+                from hermes_cli.kanban_db import probe_profile_callable_tools
 
-            capability = probe_profile_callable_tools(
-                profile=runtime_profile,
-                required_tools=sorted(required_callable_tools),
-            )
+                capability = probe_profile_callable_tools(
+                    profile=runtime_profile,
+                    required_tools=sorted(required_callable_tools),
+                )
             available_callable_tools = {
                 str(tool or "").strip()
                 for tool in capability.get("available_tools") or []

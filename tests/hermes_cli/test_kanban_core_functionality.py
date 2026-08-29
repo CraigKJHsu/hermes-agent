@@ -2912,6 +2912,30 @@ def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
     assert available["ok"] is True
     assert "read_file" in available["required_runtime_tools"]
     assert "contract_only_pseudo_tool" in available["abstract_contract_tools"]
+    assert available["plugin_discovery_attempted"] is False
+
+    abstract_only = kb._probe_worker_capabilities(
+        declared_tools=[
+            "kanban",
+            "status_check",
+            "scheduler_read",
+            "logs_read",
+            "report_generate",
+        ],
+        toolsets=["file"],
+        env=env,
+        workspace=str(tmp_path),
+    )
+    assert abstract_only["ok"] is True
+    assert abstract_only["required_runtime_tools"] == []
+    assert abstract_only["abstract_contract_tools"] == [
+        "kanban",
+        "status_check",
+        "scheduler_read",
+        "logs_read",
+        "report_generate",
+    ]
+    assert abstract_only["plugin_discovery_attempted"] is False
 
     disabled = kb._probe_worker_capabilities(
         declared_tools=["read_file"],

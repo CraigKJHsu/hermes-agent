@@ -82,9 +82,39 @@ def _route_image_contract(contract: dict) -> tuple[dict, str]:
     return normalized, contract_fingerprint(normalized)
 
 
-def test_image_generation_loop_contract_routes_to_clawops_content(tmp_path, monkeypatch):
+def _openclaw_loop_result(task: dict, backend_agent_id: str = "missioncrew-content") -> dict:
+    return {
+        "task_id": task["task_id"],
+        "status": "queued",
+        "summary": "OpenClaw loop contract queued.",
+        "artifacts": [],
+        "tool_calls": [{"name": "openclaw_bridge_http"}],
+        "audit_log": ["accepted"],
+        "errors": [],
+        "requires_human_review": False,
+        "recommended_next_action": "Poll.",
+        "protocol_version": "2.0",
+        "protocol_correlated": True,
+        "delegation_id": task["delegation_id"],
+        "attempt_id": task["attempt_id"],
+        "contract_fingerprint": task["contract_fingerprint"],
+        "identity_correlated": True,
+        "backend_run_id": "openclaw-loop-run-image-1",
+        "backend_agent_id": backend_agent_id,
+        "backend_session_key": f"agent:{backend_agent_id}:subagent:test-loop",
+    }
+
+
+def test_image_generation_loop_contract_routes_to_openclaw_content(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    from proactive import openclaw_async_executor
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "delegate_loop_contract_to_openclaw",
+        lambda args, **_kw: _openclaw_loop_result(args),
+    )
 
     contract = _image_contract()
     _normalized, fingerprint = _route_image_contract(contract)
@@ -166,11 +196,21 @@ def test_image_generation_loop_contract_routes_to_clawops_content(tmp_path, monk
             (result.execution_task_id, result.review_task_id),
         ).fetchall()
 
-    assert result.assignee == "clawops-content"
+    run = None
+    if execution is not None and execution.current_run_id is not None:
+        with kb.connect() as conn:
+            run = kb.get_run(conn, int(execution.current_run_id))
+
+    assert result.assignee == "openclaw"
     assert execution is not None
-    assert execution.executor_backend == "hermes"
-    assert execution.executor_profile == "clawops-content"
-    assert "Image generation capability contract" in execution.body
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+    assert "image_generate" in execution.body
+    assert "Do not call this a content blocker solely because the status is running" in execution.body
+    assert run is not None
+    assert run.metadata["backend_agent_id"] == "missioncrew-content"
+    assert run.metadata["task_type"] == "content_draft"
+    assert "image_generate" in run.metadata["allowed_tools"]
     assert review is not None
     assert review.executor_profile == "grace-policy-review"
     assert len(callbacks) == 1
@@ -182,6 +222,13 @@ def test_internal_only_image_generation_contract_uses_content_runtime_without_to
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    from proactive import openclaw_async_executor
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "delegate_loop_contract_to_openclaw",
+        lambda args, **_kw: _openclaw_loop_result(args),
+    )
 
     contract = _image_contract()
     contract["identity"]["request_instance_id"] = "image-contract-internal-1"
@@ -242,14 +289,219 @@ def test_internal_only_image_generation_contract_uses_content_runtime_without_to
             delegation_id=delegation["delegation_id"],
         )
 
-    assert result.assignee == "clawops-content"
+    run = None
+    if execution is not None and execution.current_run_id is not None:
+        with kb.connect() as conn:
+            run = kb.get_run(conn, int(execution.current_run_id))
+
+    assert result.assignee == "openclaw"
     assert execution is not None
-    assert execution.executor_backend == "hermes"
-    assert execution.executor_profile == "clawops-content"
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+    assert run is not None
+    assert run.metadata["backend_agent_id"] == "missioncrew-content"
+    assert run.metadata["external_effect_budget"] == 0
     assert stored["approval_required"] == 0
 
 
-def test_facebook_page_api_contract_uses_hermes_ops_runtime():
+def test_source_bound_content_contract_exposes_original_request_to_openclaw(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db()
+    from proactive import openclaw_async_executor
+
+    seen: dict[str, dict] = {}
+
+    def fake_delegate(args, **_kw):
+        seen["args"] = args
+        return _openclaw_loop_result(args)
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "delegate_loop_contract_to_openclaw",
+        fake_delegate,
+    )
+
+    contract = _image_contract()
+    contract["identity"]["request_instance_id"] = "source-bound-content-1"
+    contract["original_request"] = (
+        "SOURCE MATERIAL:\n"
+        "Carter’s Junk Away is a Colorado junk removal service. "
+        "Peak season reaches about US$15K/month."
+    )
+    contract["grace_interpretation"] = (
+        "Use the original_request embedded SOURCE MATERIAL as the only source."
+    )
+    contract["scope"]["allowed"] = [
+        "只使用original_request內嵌SOURCE MATERIAL",
+        "OpenClaw loop-contract missioncrew-content",
+    ]
+    contract["verification"]["checks"].append(
+        "Confirm original_request is embedded for the backend worker"
+    )
+    _normalized, fingerprint = _route_image_contract(contract)
+    session_key = "agent:main:telegram:group:chat-1:4641"
+    session_id = "session-source-1"
+
+    with kb.connect() as conn:
+        delegation = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint=fingerprint,
+            request_instance_id=contract["identity"]["request_instance_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key=session_key,
+            session_id=session_id,
+            resolved_route=contract["routing"]["resolved"],
+            approval_required=False,
+        )
+        assert kb.claim_grace_delegation_build(
+            conn,
+            delegation_id=delegation["delegation_id"],
+            build_owner="builder-source-1",
+        )
+
+    result = compile_and_delegate(
+        contract,
+        context={
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "4641",
+            "topic_name": "Topic 4641",
+            "project": "telegram_1003938559457_4641_bff429b6e587",
+            "memory_namespace": "telegram:-1003938559457:4641/topic",
+        },
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id=delegation["delegation_id"],
+        delegation_build_owner="builder-source-1",
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+        session_key=session_key,
+        session_id=session_id,
+        message_id="message-source-1",
+        notifier_profile="default",
+    )
+
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, result.execution_task_id)
+        run = kb.get_run(conn, int(execution.current_run_id))
+
+    assert execution is not None
+    assert "Carter’s Junk Away is a Colorado junk removal service" in execution.body
+    assert run is not None
+    worker_contract = run.metadata["loop_contract"]
+    assert worker_contract["original_request"] == contract["original_request"]
+    assert (
+        worker_contract["audit"]["original_request_location"]
+        == "Embedded in worker contract as original_request"
+    )
+    assert (
+        seen["args"]["loop_contract"]["audit"]["original_request_location"]
+        == "Embedded in worker contract as original_request"
+    )
+
+
+def test_source_truth_content_contract_exposes_original_request_to_openclaw(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db()
+    from proactive import openclaw_async_executor
+
+    seen: dict[str, dict] = {}
+
+    def fake_delegate(args, **_kw):
+        seen["args"] = args
+        return _openclaw_loop_result(args)
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "delegate_loop_contract_to_openclaw",
+        fake_delegate,
+    )
+
+    contract = _image_contract()
+    contract["identity"]["request_instance_id"] = "source-truth-content-1"
+    contract["original_request"] = (
+        "Carter’s Junk Away is the source of truth. "
+        "The article is about quote-system scaling in Colorado, not decluttering."
+    )
+    contract["grace_interpretation"] = (
+        "Preserve Carter source facts and keep the source of truth visible to "
+        "the backend worker."
+    )
+    contract["goal"]["deliverables"].append(
+        "Facebook Page copy preserving source facts"
+    )
+    _normalized, fingerprint = _route_image_contract(contract)
+    session_key = "agent:main:telegram:group:chat-1:4641"
+    session_id = "session-source-truth-1"
+
+    with kb.connect() as conn:
+        delegation = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint=fingerprint,
+            request_instance_id=contract["identity"]["request_instance_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key=session_key,
+            session_id=session_id,
+            resolved_route=contract["routing"]["resolved"],
+            approval_required=False,
+        )
+        assert kb.claim_grace_delegation_build(
+            conn,
+            delegation_id=delegation["delegation_id"],
+            build_owner="builder-source-truth-1",
+        )
+
+    result = compile_and_delegate(
+        contract,
+        context={
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "4641",
+            "topic_name": "Topic 4641",
+            "project": "telegram_1003938559457_4641_bff429b6e587",
+            "memory_namespace": "telegram:-1003938559457:4641/topic",
+        },
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id=delegation["delegation_id"],
+        delegation_build_owner="builder-source-truth-1",
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+        session_key=session_key,
+        session_id=session_id,
+        message_id="message-source-truth-1",
+        notifier_profile="default",
+    )
+
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, result.execution_task_id)
+        run = kb.get_run(conn, int(execution.current_run_id))
+
+    assert execution is not None
+    assert run is not None
+    worker_contract = run.metadata["loop_contract"]
+    assert worker_contract["original_request"] == contract["original_request"]
+    assert (
+        seen["args"]["loop_contract"]["audit"]["original_request_location"]
+        == "Embedded in worker contract as original_request"
+    )
+
+
+def test_facebook_page_api_contract_uses_openclaw_operator_runtime():
     contract = _image_contract()
     contract["routing"] = {
         "task_type": "facebook_page_api_publish",
@@ -264,7 +516,7 @@ def test_facebook_page_api_contract_uses_hermes_ops_runtime():
         approved=True,
         contract_fingerprint=contract_fingerprint(preliminary),
         runtime_callable_tools={
-            "clawops-ops": {
+            "missioncrew-facebook-page-operator": {
                 "facebook_page_graph_status",
                 "facebook_page_graph_publish",
             }
@@ -277,7 +529,11 @@ def test_facebook_page_api_contract_uses_hermes_ops_runtime():
     assert contract_internal_hermes_runtime(
         normalized,
         task_type="facebook_page_api_publish",
-    ) == "clawops-ops"
+    ) == ""
+    assert (
+        normalized["routing"]["resolved"]["assignment"]["runtime_profile"]
+        == "missioncrew-facebook-page-operator"
+    )
     unsafe = json.loads(json.dumps(normalized))
     unsafe["routing"]["resolved"]["assignment"]["allowed_tools"].append(
         "browser_click"
@@ -285,6 +541,17 @@ def test_facebook_page_api_contract_uses_hermes_ops_runtime():
     assert contract_internal_hermes_runtime(
         unsafe,
         task_type="facebook_page_api_publish",
+    ) == ""
+
+
+def test_image_generation_contract_does_not_use_internal_hermes_runtime():
+    contract = _image_contract()
+    normalized, _fingerprint = _route_image_contract(contract)
+
+    assert contract_requires_image_generation(normalized) is True
+    assert contract_internal_hermes_runtime(
+        normalized,
+        task_type="content_draft",
     ) == ""
 
 

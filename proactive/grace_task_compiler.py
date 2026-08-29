@@ -20,6 +20,8 @@ class DelegationResult:
     execution_task_id: str
     review_task_id: str
     assignee: str
+    backend_agent_id: str
+    execution_backend: str
     project: str
     topic_name: str
     subscribed: bool
@@ -62,14 +64,6 @@ _INTERNAL_OPS_TOOLS = frozenset(
         "report_generate",
     }
 )
-_FACEBOOK_PAGE_GRAPH_TOOLS = frozenset(
-    {"facebook_page_graph_status", "facebook_page_graph_publish"}
-)
-_FACEBOOK_PAGE_ALLOWED_TOOLS = _FACEBOOK_PAGE_GRAPH_TOOLS | frozenset(
-    {"memory_read", "docs_read", "kanban", "status_check", "report_generate"}
-)
-
-
 def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
     """Select narrowly scoped, deterministic skills for a Loop Contract.
 
@@ -114,8 +108,6 @@ def contract_internal_hermes_runtime(
     task_type: str,
 ) -> str:
     """Return the trusted Hermes profile for a zero-effect internal route."""
-    if contract_requires_image_generation(contract):
-        return "clawops-content"
     routing = contract.get("routing")
     resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
     assignment = (
@@ -140,16 +132,6 @@ def contract_internal_hermes_runtime(
         and allowed_tools <= _INTERNAL_OPS_TOOLS
         and assignment.get("approval_required") is False
     )
-    facebook_page_route = bool(
-        task_type == "facebook_page_api_publish"
-        and runtime_profile == "clawops-ops"
-        and _FACEBOOK_PAGE_GRAPH_TOOLS <= allowed_tools
-        and allowed_tools <= _FACEBOOK_PAGE_ALLOWED_TOOLS
-        and str(assignment.get("assigned_worker") or "")
-        == "clawops.facebook_page_api"
-    )
-    if facebook_page_route:
-        return runtime_profile
     if (
         task_type == "ops"
         and runtime_profile == "clawops-ops"
@@ -211,6 +193,45 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
             "Independently read every policy version_path, verify its SHA-256 and compare the "
             "parent deliverable against the complete policy content. Then read each manifest_path; "
             "for latest_active requirements reject with policy_stale if the active version changed.",
+            "For AI BizWeek image deliverables, use managed_policy_read output when available; "
+            "otherwise use the embedded Loop Contract policy_snapshots, policy_requirements, "
+            "policy_binding_snapshot, and task-scoped source evidence as the trusted policy "
+            "readback. Reject if Page Hero and Audio Brief rules are mixed, if the actual "
+            "image is not inspected, or if dimensions/SHA-256/AI disclosure/visual checklist "
+            "evidence is missing.",
+            "For AI BizWeek asset declarations, reject unless Page Hero has machine-read "
+            "actual dimensions in exact 16:9 ratio and Audio Brief has machine-read actual "
+            "dimensions in exact 1:1 ratio. Requested aspect ratio text, prompt receipts, "
+            "or 'dimensions unavailable' notes are not acceptance evidence.",
+            "For every Page Hero, inspect the actual pixels for overlapping text, labels, "
+            "watermarks, disclosure overlays, or clipped content. Reject any image where a "
+            "foreground label obscures the headline, flow, case facts, risk, or action area. "
+            "Accepted metadata for asset_family=page_hero must include visual_review with "
+            "all_required_text_readable=true, text_occlusion_free=true, "
+            "disclosure_non_obstructive=true, and defects_found=[]. A prose claim that the "
+            "image was visually inspected is insufficient.",
+            "For AI BizWeek direct delivery back to KJ, reject if the parent claims worker-side "
+            "Telegram delivery in externalEffects instead of providing metadata.user_facing_report "
+            "kind=content_package for Gateway post-review delivery.",
+            "For AI BizWeek Carter's Junk Away / EP04 readiness checks, use "
+            "managed_policy_read.operational_readiness_evidence when available; otherwise use "
+            "the embedded active policy/source evidence compiled by Grace/Hermes. If complete=true "
+            "or equivalent embedded evidence is present, do not delegate a restricted OpenClaw "
+            "DB audit, do not request KJ to provide t_70bf2afe evidence, and do not treat "
+            "obsolete stale-review tasks as current blockers.",
+            "For AI BizWeek Facebook Page copy, use managed_policy_read content_policy_guidance "
+            "when available; otherwise use the embedded source-fidelity policy and task-scoped "
+            "source evidence. Reject if KJ-provided Page text was summarized, shortened, "
+            "rewritten, or restructured without explicit KJ/Grace discussion; accepted review "
+            "evidence must include a source-vs-output diff or equivalent proof that the Page "
+            "body was preserved. The original Page order still applies: case body, "
+            "Page-to-Group CTA when needed, then case-customized hashtags as the final "
+            "paragraph with nothing after them.",
+            "For AI BizWeek Carter's Junk Away / EP04 Page source text, if "
+            "managed_policy_read.content_source_evidence.available=true or equivalent embedded "
+            "source evidence is present, require the parent to use that exact "
+            "facebook_page_source_text as task-scoped source material. Reject if the parent "
+            "asks KJ to repost the same source instead of using the available source evidence.",
             "Accepted kanban_complete metadata must include policy_receipts: one object per policy "
             "with role=review, policy_id, version, sha256, loaded=true, and "
             "latest_active_verified=true for latest_active policies. The database validates these "
@@ -225,10 +246,71 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         f"Mandatory policy snapshots: {refs}.",
         "Read and obey the complete content of every policy snapshot before work. Topic memory is "
         "only a binding hint and never substitutes for these policies.",
+        "For AI BizWeek image deliverables, use embedded Loop Contract policy_snapshots, "
+        "policy_requirements, policy_binding_snapshot, and task-scoped source evidence as the "
+        "trusted policy readback. If managed_policy_read is available, call it too; if it is "
+        "not available in the worker runtime, do not block solely for that missing tool. Use "
+        "the available asset guidance and policy snapshots to choose exactly one asset_family "
+        "per image, expand only that family's rules into the generation prompt, keep content "
+        "drafting separate from image generation, and record actual file dimensions, SHA-256, "
+        "AI disclosure, and the family-specific checklist evidence.",
+        "For AI BizWeek publishing packages delivered back to KJ, do not record Telegram "
+        "inline delivery as an execution externalEffect and do not claim Telegram delivery "
+        "from the worker. Put the copyable text body and both image assets in "
+        "metadata.user_facing_report kind=content_package so Gateway delivers them only "
+        "after Grace Review accepts the package.",
+        "For AI BizWeek asset evidence, literal requested ratios are not enough: record "
+        "machine-read actual dimensions. Page Hero must be exact 16:9, Audio Brief must "
+        "be exact 1:1. If dimensions are unavailable or mismatched, regenerate before "
+        "kanban_complete.",
+        "For a Page Hero, never put AI disclosure wording or disclosure placement instructions "
+        "into the image-model prompt; the model may turn them into an obstructive label. Generate "
+        "the base PNG with no disclosure text, then use the local deterministic helper: "
+        "/Users/kj/my_agent_team/hermes-agent/.venv312/bin/python "
+        "/Users/kj/my_agent_team/hermes-agent/tools/add_ai_visual_disclosure.py "
+        "<base_png> <final_png>. Submit only <final_png>. This helper places the single required "
+        "mixed-case disclosure in the bottom-left margin while preserving pixel dimensions. "
+        "The action, risk, flow, and case-information regions must remain unobstructed.",
+        "For AI BizWeek image generation, image_generate may return a background task "
+        "that stays queued/running before the local file is attached. Do not call this "
+        "a content blocker solely because the status is running. Use action=status and "
+        "wait for the completion event or a terminal failed/cancelled status for at least "
+        "300 seconds per required image, within the Loop Contract runtime limit, before "
+        "declaring missing path/dimensions/SHA evidence.",
+        "For AI BizWeek Carter's Junk Away / EP04 readiness checks, use "
+        "managed_policy_read.operational_readiness_evidence when available; otherwise use the "
+        "embedded active policy/source evidence compiled by Grace/Hermes. If complete=true or "
+        "equivalent embedded evidence is present, continue with a fresh package-production task "
+        "from the current Topic policies; do not delegate a restricted OpenClaw DB audit and "
+        "do not ask KJ to provide t_70bf2afe evidence.",
+        "For AI BizWeek Facebook Page copy, KJ-provided Page text is the source of truth. "
+        "Unless KJ and Grace explicitly discussed specific edits, preserve the full Page body "
+        "without summarizing, shortening, rewriting, restructuring, or replacing it with a "
+        "template. If changes were authorized, record the authorization and provide a "
+        "source-vs-output diff in completion metadata. Keep the original Page order: case "
+        "body, Page-to-Group CTA when needed, then case-customized hashtags as the final "
+        "paragraph with nothing after them.",
+        "For AI BizWeek Carter's Junk Away / EP04 Page source text, if "
+        "managed_policy_read.content_source_evidence.available=true or equivalent embedded "
+        "source evidence is present, use that exact facebook_page_source_text for "
+        "source-vs-output diff. Do not ask KJ to repost the same source text.",
         "kanban_complete metadata must include policy_receipts: one object per policy with "
         "role=execution, policy_id, version, sha256, and loaded=true. The database rejects missing "
         "or mismatched receipts. When the execution backend returns a structured OpenClaw result "
         "instead of calling kanban_complete directly, return the identical list as policyReceipts.",
+    ]
+
+
+def _render_image_generation_guidance(contract: Mapping[str, Any]) -> list[str]:
+    if not contract_requires_image_generation(contract):
+        return []
+    return [
+        "For image_generate background tasks, queued/running status is not missing evidence "
+        "by itself. After each generate call, wait for the completion event or call "
+        "action=status until terminal success/failure. Do not call this a content blocker "
+        "solely because the status is running; wait at least 300 seconds per required image, "
+        "within the Loop Contract runtime limit, before treating missing local path, actual "
+        "dimensions, or SHA-256 as blocked.",
     ]
 
 
@@ -246,6 +328,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "Use working memory only inside the declared namespace.",
             "Before completion, provide every required verification item and evidence.",
             *_render_policy_guidance(worker_contract, review=False),
+            *_render_image_generation_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=False),
             "For each external draft/object you find or create, call kanban_external_effect "
             "immediately after readback. Also include the same records in "
@@ -292,7 +375,21 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "criterion. Evidence from earlier runs, parent comments, and the external-effect "
             "ledger remains valid until contradicted by a newer readback; never infer absence "
             "from a correction run merely saying it did not touch that platform.",
-            "If accepted, complete with metadata review_outcome=accepted and list verified evidence.",
+            "For regenerated assets, the newest successful parent run supersedes every older "
+            "asset path. Inspect and report the exact newest file path, dimensions, and SHA-256; "
+            "never accept or deliver an older image merely because its evidence remains cumulative.",
+            "If accepted, complete with metadata review_outcome=accepted and list verified evidence. "
+            "Do not set approved=false, accepted=false, review_result=blocked, "
+            "review_verdict=blocked, or review_outcome=blocked on an accepted Grace review. "
+            "When accepting that a parent correctly stopped fail-closed, keep the Grace "
+            "review verdict accepted and record the parent's stop/reject/block conclusion "
+            "under parent_verdict or evidence instead.",
+            "For an accepted asset_family=page_hero review, canonical completion metadata must also "
+            "include visual_review.all_required_text_readable=true, "
+            "visual_review.text_occlusion_free=true, "
+            "visual_review.disclosure_non_obstructive=true, and visual_review.defects_found=[]. "
+            "Include asset_family=page_hero or asset_declarations.page_hero with exact dimensions. "
+            "These fields report the actual pixel review; do not infer them from worker prose.",
             *_render_policy_guidance(worker_contract, review=True),
             *_render_language_polish_guidance(worker_contract, review=True),
             "For a requested user-facing status, inventory, or destination list, reject the "
@@ -351,13 +448,62 @@ def _render_authorization_guidance(contract: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> bool:
+    """Detect contracts where the source text is itself the worker input."""
+    text_parts: list[str] = []
+    original = str(contract.get("original_request") or "")
+    for key in ("scope", "verification", "goal", "grace_interpretation"):
+        value = contract.get(key)
+        if isinstance(value, str):
+            text_parts.append(value)
+        elif isinstance(value, Mapping):
+            text_parts.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    text = "\n".join(text_parts)
+    mentions_original_request = re.search(
+        r"original_request", text, flags=re.IGNORECASE
+    ) is not None
+    mentions_source_material = re.search(
+        r"SOURCE|source material|source of truth|source facts|底稿|來源|內嵌",
+        text,
+        flags=re.IGNORECASE,
+    ) is not None
+    mentions_current_message_source = re.search(
+        r"(?:KJ|使用者|user|本訊息|這則訊息|current\s+message)"
+        r".{0,80}?"
+        r"(?:提供|貼上|provided|posted|pasted|source[- ]of[- ]truth|唯一事實|唯一來源|完整(?:貼文|Page|內容))",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ) is not None
+    requests_source_fidelity = re.search(
+        r"preserv(?:e|ing)|保留|保真|忠於|faithful",
+        text,
+        flags=re.IGNORECASE,
+    ) is not None and re.search(
+        r"source|original|原文|來源|底稿",
+        text,
+        flags=re.IGNORECASE,
+    ) is not None
+    return (
+        (mentions_original_request and mentions_source_material)
+        or (bool(original.strip()) and mentions_current_message_source)
+        or requests_source_fidelity
+    )
+
+
 def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove KJ's raw wording before either delegated model sees the contract."""
+    """Remove raw wording unless the contract explicitly makes it source material."""
     safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
-    original = str(safe.pop("original_request", "") or "")
+    original = str(safe.get("original_request", "") or "")
+    expose_original = _contract_requires_backend_original_request(safe)
+    if not expose_original:
+        safe.pop("original_request", None)
     audit = safe.setdefault("audit", {})
     audit["original_request_sha256"] = hashlib.sha256(original.encode("utf-8")).hexdigest()
-    audit["original_request_location"] = "Grace session history only; not disclosed to ClawOps"
+    audit["original_request_location"] = (
+        "Embedded in worker contract as original_request"
+        if expose_original
+        else "Grace session history only; not disclosed to ClawOps"
+    )
     return safe
 
 
@@ -452,6 +598,8 @@ def compile_and_delegate(
             execution_task_id=execution_task_id,
             review_task_id=review_task_id,
             assignee="clawops-browser",
+            backend_agent_id="clawops-browser",
+            execution_backend="openclaw",
             project=str(identity["project"]),
             topic_name=str(identity["topic_name"]),
             subscribed=True,
@@ -553,6 +701,8 @@ def compile_and_delegate(
             execution_task_id=execution_task_id,
             review_task_id=review_task_id,
             assignee=execution.assignee,
+            backend_agent_id=execution.assignee,
+            execution_backend="hermes",
             project=str(identity["project"]),
             topic_name=str(identity["topic_name"]),
             subscribed=bool(platform and chat_id),
@@ -586,6 +736,8 @@ def compile_and_delegate(
         execution_task_id=execution_task_id,
         review_task_id=review_task_id,
         assignee="openclaw",
+        backend_agent_id=str(delegated.get("backend_agent_id") or "openclaw"),
+        execution_backend="openclaw",
         project=str(identity["project"]),
         topic_name=str(identity["topic_name"]),
         subscribed=bool(platform and chat_id),

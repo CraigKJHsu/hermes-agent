@@ -12,9 +12,15 @@ _PATTERN = re.compile(r"GRACE_CLAWOPS_POLICY_VERSION:\s*([A-Za-z0-9._-]+)")
 _SECTION = re.compile(
     r"(?ms)^## Grace to ClawOps Delegation Contract\s*$.*?(?=^##\s|\Z)"
 )
-_APPROVAL_TOKEN = re.compile(r"核准[ \t\u3000]+")
 _VALID_APPROVAL_TOKEN = re.compile(
-    r"核准[ \t\u3000]+([0-9a-f]{16})(?=$|[ \t\u3000，,。.!！？?、:：;；])"
+    r"核准[ \t\u3000]+([0-9a-f]{16})(?=$|[\s，,。.!！？?、:：;；])"
+)
+_STANDALONE_APPROVAL_ATTEMPT = re.compile(
+    r"^(?:(?:好吧|好的?|可以|沒問題|收到)[ \t\u3000]*"
+    r"(?:[，,、:：][ \t\u3000]*)?)?"
+    r"核准[ \t\u3000]+([^ \t\u3000，,。.!！？?、:：;；]+)"
+    r"(?:[ \t\u3000]*(?:[，,、][ \t\u3000]*)?(?:謝謝|麻煩了))?"
+    r"[ \t\u3000]*[。.!！]?$"
 )
 
 
@@ -78,8 +84,7 @@ def ensure_active_policy_prompt(prompt: str) -> str:
 
 def approval_turn_prompt(message_text: str) -> str:
     """Force token-shaped approval turns through the authoritative tool."""
-    match = _APPROVAL_TOKEN.search(str(message_text or ""))
-    if match is None:
+    if not approval_attempt_candidate(message_text):
         return ""
     return (
         "[Trusted approval-turn routing]\n"
@@ -99,6 +104,22 @@ def approval_turn_prompt(message_text: str) -> str:
 def approval_token_candidate(message_text: str) -> str:
     """Return a syntactically valid challenge token from an approval turn."""
     match = _VALID_APPROVAL_TOKEN.search(str(message_text or ""))
+    return match.group(1) if match else ""
+
+
+def approval_attempt_candidate(message_text: str) -> str:
+    """Return a valid token or one standalone malformed approval attempt.
+
+    Long-form work instructions may legitimately discuss approval checkpoints,
+    hashes, or future approval requirements. They are not protocol replies.
+    """
+    text = str(message_text or "").strip()
+    valid = approval_token_candidate(text)
+    if valid:
+        return valid
+    if any(character in text for character in "\r\n"):
+        return ""
+    match = _STANDALONE_APPROVAL_ATTEMPT.fullmatch(text)
     return match.group(1) if match else ""
 
 

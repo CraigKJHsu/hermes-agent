@@ -17,6 +17,7 @@ from unittest.mock import patch
 from tools.vision_tools import (
     _build_native_vision_tool_result,
     _handle_vision_analyze,
+    _native_vision_embed_limits,
     _supports_media_in_tool_results,
     _vision_analyze_native,
 )
@@ -97,6 +98,31 @@ class TestBuildNativeVisionToolResult:
 
 
 class TestVisionAnalyzeNative:
+    def test_native_embed_limits_default_to_interactive_caps(self, monkeypatch):
+        from tools.vision_tools import _EMBED_MAX_DIMENSION, _EMBED_TARGET_BYTES
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_NATIVE_VISION_EMBED_TARGET_BYTES", raising=False)
+        monkeypatch.delenv("HERMES_NATIVE_VISION_EMBED_MAX_DIMENSION", raising=False)
+        assert _native_vision_embed_limits() == (
+            _EMBED_TARGET_BYTES,
+            _EMBED_MAX_DIMENSION,
+        )
+
+    def test_native_embed_limits_shrink_for_kanban_workers(self, monkeypatch):
+        from tools.vision_tools import (
+            _KANBAN_EMBED_MAX_DIMENSION,
+            _KANBAN_EMBED_TARGET_BYTES,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_example")
+        monkeypatch.delenv("HERMES_KANBAN_VISION_EMBED_TARGET_BYTES", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_VISION_EMBED_MAX_DIMENSION", raising=False)
+        assert _native_vision_embed_limits() == (
+            _KANBAN_EMBED_TARGET_BYTES,
+            _KANBAN_EMBED_MAX_DIMENSION,
+        )
+
     def test_local_file_returns_multimodal_envelope(self, tmp_path):
         img = tmp_path / "test.png"
         img.write_bytes(_TINY_PNG)

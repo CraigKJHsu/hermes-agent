@@ -197,6 +197,29 @@ def test_delegation_persists_and_binds_the_canonical_path(tmp_path):
         assert merged["outbound_message_ids"] == ["out-1", "out-2"]
 
 
+def test_delegation_preserves_existing_trace_session_when_active_session_changed(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    with kb.connect_closing(db_path) as conn:
+        delegation = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="b" * 64,
+            request_instance_id="message-9001-contract-b",
+            platform="telegram",
+            chat_id="123456",
+            thread_id="42",
+            session_key="agent:main:telegram:private:123456:42",
+            session_id="session-compressed",
+            telegram_message_path_session_id="session-compressed",
+            resolved_route={"assignment": {"agent": "openclaw"}},
+            approval_required=False,
+            telegram_message_path=_path(),
+        )
+
+    stored = normalize_message_path(delegation["telegram_message_path"])
+    assert stored["session_id"] == "session-1"
+    assert stored["delegation_id"] == delegation["delegation_id"]
+
+
 def test_existing_delegation_table_gets_additive_message_path_migration(tmp_path):
     db_path = tmp_path / "legacy.db"
     kb.init_db(db_path)

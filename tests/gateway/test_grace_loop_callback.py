@@ -186,6 +186,238 @@ def test_legacy_telegram_content_package_is_delivered_before_callback_closes(
     )
 
 
+def test_complete_content_package_auto_closes_after_verified_inline_delivery(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "content-package-auto-close.db"
+    markdown = tmp_path / "package.md"
+    page = tmp_path / "page.png"
+    cover = tmp_path / "cover.png"
+    markdown.write_text("# Complete package\n\nBody.", encoding="utf-8")
+    page.write_bytes(b"page-image")
+    cover.write_bytes(b"cover-image")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 0 "
+            "WHERE singleton_id = 1"
+        )
+        conn.commit()
+    contract = {
+        "routing": {"task_type": "content_draft"},
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "subject_keys": ["page-body", "page-hero", "audio-brief"],
+            "asset_filenames": ["page.png", "cover.png"],
+        },
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Complete Telegram package",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps(contract),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="package ready",
+            metadata={"artifacts": [str(markdown), str(page), str(cover)]},
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="content-package-auto-close",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="c" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        receipt = kb.get_grace_loop_callback(conn, review_id)
+    assert receipt["state"] == "delivered"
+    assert receipt["outcome_kind"] == "closed"
+    assert receipt["outcome_event_id"] == receipt["last_event_id"]
+    assert receipt["user_report_delivered_at"] is not None
+    assert [item[2] for item in adapter.sent_images] == ["page.png", "cover.png"]
+    assert not any("callback 已重試 3 次" in sent[1] for sent in adapter.sent)
+
+
+def test_page_preflight_evidence_delivers_body_and_verified_hero(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "page-preflight-package.db"
+    hero = tmp_path / "page.png"
+    hero.write_bytes(b"verified-page-image")
+    body = "完整 Page 正文\n\n#AIBizWeek"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "subject_keys": ["page-preflight"],
+            "asset_filenames": [hero.name],
+        },
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook Page preflight",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps(contract),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="preflight complete",
+            metadata={
+                "acceptance_evidence": {
+                    "admission": {
+                        "task_type": "facebook_page_publish_preflight",
+                        "allowed_tool_used": "facebook_page_publish_preflight",
+                        "external_effect_budget": 0,
+                        "published": False,
+                        "external_actions_performed": False,
+                    },
+                    "source_and_final_text": {
+                        "final_message_sha256": hashlib.sha256(
+                            body.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "final_facebook_page_body": body,
+                    "hero_asset": {
+                        "image_path": str(hero),
+                        "image_sha256": hashlib.sha256(
+                            hero.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "page_identity": {
+                        "page_id": "531289396730654",
+                        "page_name": "AI BizWeek",
+                        "page_url": "https://www.facebook.com/531289396730654",
+                    },
+                    "canonical_one_time_approval_text": "確認發布。",
+                },
+            },
+        )
+        report = kb.grace_inline_content_package_report(conn, execution_id)
+
+    assert report is not None
+    assert report["body"] == body
+    assert report["assets"] == [{
+        "filename": hero.name,
+        "label": "Facebook Page Hero 主圖",
+        "path": str(hero.resolve()),
+        "sha256": hashlib.sha256(hero.read_bytes()).hexdigest(),
+    }]
+
+
+def test_page_preflight_evidence_rejects_changed_hero(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "page-preflight-changed-hero.db"
+    hero = tmp_path / "page.png"
+    hero.write_bytes(b"changed")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "asset_filenames": [hero.name],
+        },
+    }
+    body = "Page body"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook Page preflight",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps(contract),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="preflight complete",
+            metadata={
+                "acceptance_evidence": {
+                    "admission": {
+                        "task_type": "facebook_page_publish_preflight",
+                        "allowed_tool_used": "facebook_page_publish_preflight",
+                        "external_effect_budget": 0,
+                        "published": False,
+                        "external_actions_performed": False,
+                    },
+                    "source_and_final_text": {
+                        "final_message_sha256": hashlib.sha256(
+                            body.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "final_facebook_page_body": body,
+                    "hero_asset": {
+                        "image_path": str(hero),
+                        "image_sha256": "0" * 64,
+                    },
+                    "page_identity": {
+                        "page_id": "1",
+                        "page_name": "Page",
+                        "page_url": "https://www.facebook.com/1",
+                    },
+                    "canonical_one_time_approval_text": "確認發布。",
+                },
+            },
+        )
+        assert kb.grace_inline_content_package_report(
+            conn, execution_id,
+        ) is None
+
+
 def test_legacy_text_only_telegram_draft_does_not_require_package_delivery(
     tmp_path, monkeypatch,
 ):
@@ -345,11 +577,83 @@ def test_grace_review_accepts_ep04_verified_check_list():
             "external actions were not performed",
         ],
         "asset_declarations": {
-            "page_hero": {"dimensions": "1664x936"},
+            "page_hero": {"dimensions": "1600x900"},
             "audio_brief": {"dimensions": "1254x1254"},
+        },
+        "visual_review": {
+            "all_required_text_readable": True,
+            "text_occlusion_free": True,
+            "disclosure_non_obstructive": True,
+            "defects_found": [],
         },
         "publication_approved": False,
     }) is True
+
+
+def test_grace_review_rejects_ep04_wrong_or_missing_asset_dimensions():
+    assert _grace_review_accepted({
+        "approved": True,
+        "verified_checks": [
+            "seven deliverables verified",
+            "page hero and audio brief visually inspected",
+            "external actions were not performed",
+        ],
+        "asset_declarations": {
+            "page_hero": {"dimensions": "1003x1568"},
+            "audio_brief": {"dimensions": "1254x1254"},
+        },
+    }) is False
+    assert _grace_review_accepted({
+        "approved": True,
+        "verified_checks": [
+            "seven deliverables verified",
+            "page hero and audio brief visually inspected",
+            "external actions were not performed",
+        ],
+        "asset_declarations": {
+            "page_hero": {"dimensions_px": "未直接讀回"},
+            "audio_brief": {"dimensions": "1254x1254"},
+        },
+    }) is False
+
+
+def test_grace_review_rejects_page_hero_with_obstructive_disclosure():
+    assert _grace_review_accepted({
+        "review_outcome": "accepted",
+        "asset_family": "page_hero",
+        "reviewed_image": {"dimensions": "1664x936"},
+        "visual_review": {
+            "all_required_text_readable": False,
+            "text_occlusion_free": False,
+            "disclosure_non_obstructive": False,
+            "defects_found": ["AI disclosure overlay obscures the action area"],
+        },
+    }) is False
+
+
+def test_grace_review_canonical_acceptance_allows_non_rejecting_legacy_alias():
+    assert _grace_review_accepted({
+        "review_outcome": "accepted",
+        "review_result": "pass",
+        "asset_family": "page_hero",
+        "visual_review": {
+            "all_required_text_readable": True,
+            "text_occlusion_free": True,
+            "disclosure_non_obstructive": True,
+            "defects_found": [],
+        },
+    }) is True
+    assert _grace_review_accepted({
+        "review_outcome": "accepted",
+        "review_verdict": "blocked",
+        "asset_family": "page_hero",
+        "visual_review": {
+            "all_required_text_readable": True,
+            "text_occlusion_free": True,
+            "disclosure_non_obstructive": True,
+            "defects_found": [],
+        },
+    }) is False
 
 
 def test_grace_review_accepts_evidence_backed_accepted_alias():
@@ -502,7 +806,13 @@ def test_orphan_callback_cannot_be_listed_or_claimed(tmp_path, monkeypatch):
         )
 
 
-def _review_chain(db_path, *, event_kind="completed", accepted=True):
+def _review_chain(
+    db_path,
+    *,
+    event_kind="completed",
+    accepted=True,
+    completion_mode="terminal",
+):
     with kb.connect_closing(db_path) as conn:
         execution_id = kb.create_task(
             conn, title="execution", assignee="clawops-content",
@@ -529,6 +839,7 @@ def _review_chain(db_path, *, event_kind="completed", accepted=True):
             session_id="grace-session-1",
             message_id="42",
             contract_fingerprint="a" * 64,
+            completion_mode=completion_mode,
         )
         if event_kind == "blocked":
             assert kb.block_task(conn, review_id, reason="KJ must choose a price")
@@ -724,6 +1035,39 @@ def test_accepted_review_without_structured_outcome_escalates_without_cursor(
     assert callback["delivered_at"] is None
     assert "structured outcome" in callback["last_error"]
     assert any("callback 已重試 3 次" in sent[1] for sent in adapter.sent)
+
+
+def test_intermediate_accepted_review_without_structured_outcome_delivers_without_retry(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "intermediate-missing-outcome.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id = _review_chain(
+        db_path,
+        completion_mode="intermediate",
+    )
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert len(adapter.handled) == 1
+    assert callback["state"] == "delivered"
+    assert callback["last_event_id"] > 0
+    assert callback["outcome_kind"] is None
+    assert callback["outcome_payload"] is None
+    assert "intermediate callback delivered without structured continuation" in (
+        callback["last_error"] or ""
+    )
+    assert adapter.sent == []
 
 
 def test_failed_fallback_notice_does_not_consume_callback(tmp_path, monkeypatch):

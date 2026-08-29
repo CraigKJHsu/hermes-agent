@@ -33,6 +33,7 @@ _LOOP_CONTRACT_AGENT_IDS = frozenset(
         "missioncrew-ops",
         "missioncrew-devops",
         "missioncrew-browser-operator",
+        "missioncrew-facebook-page-operator",
         "missioncrew-review",
         "missioncrew-executor",
     }
@@ -614,6 +615,7 @@ def _openclaw_payload(
             "objective": task["objective"],
             "contextRefs": list(task.get("context_refs") or []),
             "delegatedTaskId": task["task_id"],
+            "kanbanBoard": str(task.get("kanban_board") or ""),
             "outputFormat": task["output_format"],
             **(
                 {"loopContract": dict(task["loop_contract"])}
@@ -1304,6 +1306,29 @@ def delegate_to_openclaw(
             "Create the task through Grace's validated Loop Contract compiler.",
         )
 
+    zero_effect_missioncrew_content_loop = (
+        is_loop_contract_async
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+        and int(task.get("external_effect_budget") or 0) == 0
+        and task.get("backend_agent_id") == "missioncrew-content"
+    )
+    zero_effect_facebook_page_preflight = (
+        is_loop_contract_async
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+        and int(task.get("external_effect_budget") or 0) == 0
+        and task.get("backend_agent_id") == "missioncrew-facebook-page-operator"
+        and task.get("allowed_tools") == ["facebook_page_publish_preflight"]
+    )
     policy = load_tool_policy(policy_path)
     for action in task["allowed_tools"]:
         decision = decide_action(action, policy)
@@ -1313,6 +1338,14 @@ def delegate_to_openclaw(
             decision.level is PolicyLevel.CONFIRM_FIRST
             and risk != "low"
             and not (is_loop_contract_async and scoped_approval)
+            and not (
+                zero_effect_missioncrew_content_loop
+                and action in {"read", "write", "web_search", "image_generate"}
+            )
+            and not (
+                zero_effect_facebook_page_preflight
+                and action == "facebook_page_publish_preflight"
+            )
         ):
             return _blocked_result(task, f"Delegated action requires confirmation: {action}")
 

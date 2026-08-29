@@ -46,6 +46,88 @@ def test_routes_isolated_readonly_browser_to_openclaw_with_audit_evidence():
     }
 
 
+def test_routes_image_generation_loop_contract_to_openclaw():
+    requirements = ExecutionRequirements.build(
+        capabilities=[
+            "isolated_session",
+            "long_running",
+            "image_generate",
+        ],
+        risk_level="low",
+        credential_policy="agent_scoped",
+        workspace_policy="dedicated",
+        session_policy="ephemeral",
+        preferred_backend="openclaw",
+        max_runtime_seconds=600,
+    )
+
+    decision = route_execution_backend(
+        requirements,
+        registry=load_backend_registry(),
+        now=124,
+    )
+
+    assert decision["selected_backend"] == "openclaw"
+    assert decision["mode"] == "enforced"
+    assert decision["candidates"][0]["eligible"] is True
+
+
+def test_routes_facebook_page_publish_preflight_to_openclaw():
+    requirements = ExecutionRequirements.build(
+        capabilities=[
+            "isolated_session",
+            "long_running",
+            "facebook_page_publish_preflight",
+        ],
+        semantic_class="isolated_long_running",
+        risk_level="medium",
+        credential_policy="agent_scoped",
+        workspace_policy="dedicated",
+        session_policy="ephemeral",
+        preferred_backend="openclaw",
+        max_runtime_seconds=900,
+    )
+
+    decision = route_execution_backend(
+        requirements,
+        registry=load_backend_registry(),
+        now=125,
+    )
+
+    assert decision["selected_backend"] == "openclaw"
+    assert decision["selection_reason"].endswith("openclaw")
+    assert decision["candidates"][0]["reasons"] == ["requirements_matched"]
+
+
+def test_routes_facebook_page_graph_publish_to_openclaw():
+    requirements = ExecutionRequirements.build(
+        capabilities=[
+            "browser_write",
+            "facebook_page_graph_publish",
+            "facebook_page_graph_status",
+            "isolated_session",
+            "long_running",
+        ],
+        semantic_class="browser_write",
+        risk_level="high",
+        credential_policy="agent_scoped",
+        workspace_policy="dedicated",
+        session_policy="ephemeral",
+        preferred_backend="openclaw",
+        max_runtime_seconds=900,
+    )
+
+    decision = route_execution_backend(
+        requirements,
+        registry=load_backend_registry(),
+        now=126,
+    )
+
+    assert decision["selected_backend"] == "openclaw"
+    assert decision["candidates"][0]["eligible"] is True
+    assert decision["candidates"][0]["reasons"] == ["requirements_matched"]
+
+
 def test_open_circuit_produces_deterministic_no_backend_decision():
     requirements = ExecutionRequirements.build(
         capabilities=["browser_read", "isolated_session"],

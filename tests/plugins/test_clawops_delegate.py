@@ -234,6 +234,47 @@ def test_delegate_rejects_explicit_stop_instead_of_creating_cancel_task(
         ("建立 task-scoped approval challenge 後停止，並等待我核准", False),
         ("create an approval challenge then stop waiting for approval", True),
         (
+            "如果任何一項無法滿足，請停止並回報，不要 fallback 到 clawops-content 或 Hermes legacy。",
+            False,
+        ),
+        (
+            "若任一條件無法滿足即停止並回報；不得改走其他模型。",
+            False,
+        ),
+        (
+            "Grace，請以這個新 session 中我剛貼上的 Carter’s Junk Away Facebook Page "
+            "完整貼文內容為唯一案例 source-of-truth，重新執行 AI BizWeek 圖像任務。"
+            "硬性要求：missioncrew-content、image_generate、openai/gpt-image-2；"
+            "禁止 clawops-content、Hermes legacy、任何 fallback；零外部發布。"
+            "若任一硬性條件無法滿足，停止並用白話告訴我卡在哪。",
+            False,
+        ),
+        (
+            "If any requirement cannot be satisfied, stop and report; do not fallback.",
+            False,
+        ),
+        (
+            "Do not ask KJ to reapprove internal-only admission/evidence writes needed only "
+            "to create/correlate the Protocol v2 receipt; stop and report only if an "
+            "external effect, forbidden executor/model, or subject contamination would be required.",
+            False,
+        ),
+        (
+            "兩次相同runtime錯誤即停止回報；兩次修正仍有污染或不可讀文字即停止",
+            False,
+        ),
+        (
+            "新任務仍無法建立；入口錯誤拒絕：An explicit stop request cannot create another "
+            "delegated task. Use clawops_cancel for the existing task id. 這不是 admission "
+            "receipt 缺欄位，也不是模型驗證失敗；它是 Loop Contract 建立器仍把 "
+            "「admission 不完整就停止並回報」這類 fail-closed 條件誤判成取消意圖。",
+            False,
+        ),
+        (
+            "如果任何一項無法滿足，請停止並回報；另外請停止目前任務",
+            True,
+        ),
+        (
             "建立 task-scoped approval challenge\n後停止，等待我核准",
             False,
         ),
@@ -354,6 +395,195 @@ def test_delegate_accepts_canonical_nested_loop_contract(tmp_path, monkeypatch):
     assert result["grace_review_task_id"]
 
 
+def test_delegate_accepts_fail_closed_constraint_without_canceling(
+    tmp_path,
+    monkeypatch,
+):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '4641'\n"
+        "    topic_name: AI BizWeek\n    project: ai_bizweek\n"
+        "    memory_namespace: topic:4641/ai_bizweek\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "4641",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:4641",
+        "HERMES_SESSION_ID": "grace-session-bizweek",
+        "HERMES_SESSION_MESSAGE_ID": "msg-bizweek-regenerate",
+        "HERMES_SESSION_MESSAGE_TEXT": (
+            "如果任何一項無法滿足，請停止並回報，不要 fallback 到 "
+            "clawops-content 或 Hermes legacy。"
+        ),
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(_nested_args()))
+
+    assert result["status"] == "queued"
+    assert result["project"] == "ai_bizweek"
+    assert result["execution_task_id"]
+    assert result["grace_review_task_id"]
+    with kb.connect_closing(db_path) as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+
+
+def test_delegate_accepts_new_task_not_cancel_fail_closed_contract(
+    tmp_path,
+    monkeypatch,
+):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '4641'\n"
+        "    topic_name: AI BizWeek\n    project: ai_bizweek\n"
+        "    memory_namespace: topic:4641/ai_bizweek\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    message = (
+        "新任務建立，非取消任何既有任務。若任一條件無法滿足即停止並回報；"
+        "使用 OpenClaw loop-contract、missioncrew-content、image_generate、"
+        "openai/gpt-image-2，禁止 clawops-content 與 Hermes legacy。"
+    )
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "4641",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:4641",
+        "HERMES_SESSION_ID": "grace-session-bizweek",
+        "HERMES_SESSION_MESSAGE_ID": "msg-bizweek-new-task-not-cancel",
+        "HERMES_SESSION_MESSAGE_TEXT": message,
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    args = _nested_args()
+    args["original_request"] = message
+    args["goal"]["objective"] = "重新生成 AI BizWeek 主圖與 Episode 封面圖"
+    args["goal"]["deliverables"] = ["主圖", "Episode 封面圖"]
+    args["scope"]["allowed"] = [
+        "OpenClaw loop-contract",
+        "missioncrew-content",
+        "image_generate",
+        "openai/gpt-image-2",
+    ]
+    args["scope"]["forbidden"] = [
+        "clawops-content",
+        "Hermes legacy",
+        "external publishing",
+    ]
+    args["verification"]["checks"] = [
+        "確認 executor 為 missioncrew-content",
+        "確認 executor_backend 為 openclaw",
+    ]
+    args["stop_rules"]["blocked"] = [
+        "任何指定 executor、工具、模型或架構無法滿足時停止並回報"
+    ]
+    args["task_type"] = "content_draft"
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    assert result["project"] == "ai_bizweek"
+    assert result["assigned_agent"] == "missioncrew-content"
+    assert result["execution_backend"] == "openclaw"
+    with kb.connect_closing(db_path) as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+        run = kb.latest_run(conn, result["execution_task_id"])
+    assert execution.assignee == "openclaw"
+    assert execution.executor_backend == "openclaw"
+    assert execution.executor_profile == "loop-contract"
+    assert run.metadata["backend_agent_id"] == "missioncrew-content"
+    route = run.metadata["loop_contract"]["routing"]["resolved"]
+    assert route["assignment"]["assigned_worker"] == "missioncrew.content"
+    assert route["assignment"]["runtime_profile"] == "missioncrew-content"
+
+
+def test_delegate_promotes_current_telegram_message_when_it_is_source_material(
+    tmp_path,
+    monkeypatch,
+):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '4641'\n"
+        "    topic_name: AI BizWeek\n    project: ai_bizweek\n"
+        "    memory_namespace: topic:4641/ai_bizweek\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    source_message = (
+        "🇺🇸 Carter’s Junk Away：做到府清運，真正先 Scale 的不是車隊，而是「報價系統」\n\n"
+        "最新資料：2026/8/23｜Colorado｜實體到府服務｜旺季最高約 US$15K/月。\n\n"
+        "Carter Grandbois 經營的 Carter’s Junk Away 是非常傳統的實體服務："
+        "到客戶家搬走家具、垃圾與大型廢棄物，每單約 US$125–1,000。"
+        "真正讓這門生意開始變得可擴張的轉折，不是再買一台車，而是把報價、"
+        "Lead tracking 與營運數據變成系統。"
+        * 8
+    )
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "4641",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:4641",
+        "HERMES_SESSION_ID": "grace-session-bizweek",
+        "HERMES_SESSION_MESSAGE_ID": "msg-carter-source",
+        "HERMES_SESSION_MESSAGE_TEXT": source_message,
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    args = _nested_args()
+    args["original_request"] = (
+        "KJ 提供 Carter’s Junk Away 完整 Page 內容，要求提供完整發布包。"
+    )
+    args["grace_interpretation"] = (
+        "你已提供 Carter’s Junk Away 的完整 Page 貼文，並要求以它為唯一事實基準交付。"
+    )
+    args["goal"]["objective"] = (
+        "以 KJ 本訊息提供的 Carter’s Junk Away Page 完整貼文為唯一 source-of-truth。"
+    )
+    args["task_type"] = "content_draft"
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    with kb.connect_closing(db_path) as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+    worker_contract = run.metadata["loop_contract"]
+    assert worker_contract["original_request"] == source_message
+    assert (
+        worker_contract["audit"]["original_request_location"]
+        == "Embedded in worker contract as original_request"
+    )
+
+
 def test_codex_local_operator_authorizes_external_action_without_telegram_spoof(
     tmp_path,
     monkeypatch,
@@ -396,7 +626,8 @@ def test_codex_local_operator_authorizes_external_action_without_telegram_spoof(
     result = json.loads(handle_clawops_delegate(args))
 
     assert result["status"] == "queued"
-    assert result["assigned_agent"] == "openclaw"
+    assert result["assigned_agent"] == "missioncrew-browser-operator"
+    assert result["execution_backend"] == "openclaw"
     with kb.connect_closing(db_path) as conn:
         execution = kb.get_task(conn, result["execution_task_id"])
         review = kb.get_task(conn, result["grace_review_task_id"])
@@ -526,6 +757,37 @@ def test_identical_new_request_message_creates_a_new_delegation(
     assert second["grace_review_task_id"] != first["grace_review_task_id"]
     with kb.connect_closing(tmp_path / "kanban.db") as conn:
         assert len(kb.list_tasks(conn)) == 4
+
+
+def test_same_authenticated_message_can_queue_distinct_contracts(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "request-1",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    first_args = _nested_args()
+    second_args = _nested_args()
+    second_args["goal"]["objective"] = "完成 AI BizWeek EP04 發布包產製"
+    second_args["goal"]["deliverables"] = ["Page Hero", "Audio Brief", "貼文文字"]
+
+    first = json.loads(handle_clawops_delegate(first_args))
+    second = json.loads(handle_clawops_delegate(second_args))
+
+    assert first["status"] == "queued", first
+    assert second["status"] == "queued", second
+    assert second["delegation_id"] != first["delegation_id"]
+    assert second["execution_task_id"] != first["execution_task_id"]
+    assert second["grace_review_task_id"] != first["grace_review_task_id"]
 
 
 def test_delegate_internal_callback_can_create_but_not_consume_external_approval(
@@ -1078,6 +1340,84 @@ def test_internal_instructions_artifact_does_not_request_public_approval(
     assert delegation["approval_required"] == 0
 
 
+def test_supervised_internal_artifact_allows_explicit_request_instance(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "",
+        "HERMES_SESSION_MESSAGE_TEXT": "",
+        "HERMES_SESSION_INTERNAL": "true",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args.update({
+        "task_type": "content_draft",
+        "request_instance_id": "ai-bizweek-carters-ep04-supervised",
+        "approved": False,
+        "external_targets": [
+            "Internal AI BizWeek image and copy artifacts only — no external platform action"
+        ],
+    })
+    args["goal"]["objective"] = "Generate internal Carter's Junk Away AI BizWeek assets"
+    args["scope"]["forbidden"] = ["No external publishing, posting, sending, or platform operation"]
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued", result
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=result["delegation_id"]
+        )
+    assert run is not None
+    assert run.metadata["external_effect_budget"] == 0
+    assert delegation is not None
+    assert delegation["request_instance_id"] == "ai-bizweek-carters-ep04-supervised"
+    assert delegation["approval_required"] == 0
+
+
+def test_supervised_internal_artifact_rejects_external_targets(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "",
+        "HERMES_SESSION_MESSAGE_TEXT": "",
+        "HERMES_SESSION_INTERNAL": "true",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args.update({
+        "task_type": "content_draft",
+        "request_instance_id": "ai-bizweek-carters-ep04-supervised",
+        "approved": False,
+        "external_targets": ["Facebook Page"],
+    })
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "rejected"
+    assert result["task_created"] is False
+    assert "stable request_instance_id" in result["reason"]
+
+
 def test_explicit_zh_internal_targets_do_not_request_public_approval(
     tmp_path,
     monkeypatch,
@@ -1118,7 +1458,12 @@ def test_explicit_zh_internal_targets_do_not_request_public_approval(
         )
     assert run is not None
     assert run.metadata["external_effect_budget"] == 0
-    assert run.metadata["allowed_tools"] == ["read", "write", "web_search"]
+    assert run.metadata["allowed_tools"] == [
+        "read",
+        "write",
+        "web_search",
+        "image_generate",
+    ]
     assert delegation is not None
     assert delegation["approval_required"] == 0
 
@@ -1228,6 +1573,57 @@ def test_delegate_token_is_bound_to_resolved_worker_route(
     assert "bound to another contract" in result["reason"]
 
 
+def test_approval_replays_sealed_contract_when_dynamic_source_drifts(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-source-request",
+        "HERMES_SESSION_MESSAGE_TEXT": "準備上架核准",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    from plugins.openclaw_bridge import clawops_delegate as delegate
+
+    source_revision = {"value": 0}
+
+    def drifting_source(contract, *, session_id):
+        changed = json.loads(json.dumps(contract))
+        source_revision["value"] += 1
+        changed["grace_interpretation"] += (
+            f" source-revision-{source_revision['value']}"
+        )
+        return changed
+
+    monkeypatch.setattr(
+        delegate,
+        "_augment_ai_bizweek_source_evidence",
+        drifting_source,
+    )
+    args = _external_listing_args()
+    challenge = json.loads(delegate.handle_clawops_delegate(args))
+    token = challenge["approval_token"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        stored = kb.get_grace_approval_challenge(conn, token)
+    durable_args = json.loads(stored["delegation_args"])
+    assert durable_args["_approval_compiled_contract"]
+
+    values["HERMES_SESSION_MESSAGE_ID"] = "msg-source-approval"
+    values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
+    args["approval_token"] = token
+    queued = json.loads(delegate.handle_clawops_delegate(args))
+
+    assert queued["status"] == "queued"
+    assert queued["execution_task_id"]
+
+
 def test_delegate_rejects_route_drift_between_authorization_and_enqueue(
     tmp_path,
     monkeypatch,
@@ -1330,6 +1726,96 @@ def test_model_visible_schema_exposes_required_nested_parameters():
     assert "user_facing_delivery" in CLAWOPS_DELEGATE_PARAMETERS["properties"]
     assert "listing" not in CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"]
     validate(_nested_args(), CLAWOPS_DELEGATE_PARAMETERS)
+
+
+def test_facebook_page_preflight_binds_exact_page_hero_asset(
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+    import struct
+
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _bind_facebook_page_preflight_asset,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    media = tmp_path / ".openclaw" / "media" / "tool-image-generation"
+    media.mkdir(parents=True)
+    image = media / "page-hero.png"
+    data = b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", 1664, 936)
+    image.write_bytes(data)
+
+    assert _bind_facebook_page_preflight_asset(
+        {"asset_filenames": [image.name]}
+    ) == {
+        "filename": image.name,
+        "path": str(image.resolve()),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "format": "PNG",
+        "dimensions": "1664×936",
+        "ratio": "16:9",
+    }
+
+
+def test_facebook_page_preflight_rejects_asset_path_instead_of_filename():
+    import pytest
+
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _bind_facebook_page_preflight_asset,
+    )
+
+    with pytest.raises(ValueError, match="must not contain a path"):
+        _bind_facebook_page_preflight_asset(
+            {"asset_filenames": ["/tmp/page-hero.png"]}
+        )
+
+
+def test_facebook_page_publish_binds_structured_manifest():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _bind_facebook_page_publish_manifest,
+    )
+
+    message_hash = "a" * 64
+    image_hash = "b" * 64
+    assert _bind_facebook_page_publish_manifest(
+        {
+            "allowed": [
+                "唯一目標：Facebook Page https://www.facebook.com/testpage（Page ID 123）",
+                f"僅使用已驗證的精確正文，SHA-256={message_hash}",
+                f"僅使用 /tmp/hero.png，SHA-256={image_hash}",
+            ]
+        },
+        ["https://www.facebook.com/testpage"],
+    ) == {
+        "action": "create_post",
+        "transport": "graph_api",
+        "page_url": "https://www.facebook.com/testpage",
+        "message_sha256": message_hash,
+        "image_sha256": image_hash,
+        "page_id": "123",
+    }
+
+
+def test_facebook_page_publish_rejects_ambiguous_manifest():
+    import pytest
+
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _bind_facebook_page_publish_manifest,
+    )
+
+    with pytest.raises(ValueError, match="one exact Page ID"):
+        _bind_facebook_page_publish_manifest(
+            {
+                "allowed": [
+                    "唯一目標：Facebook Page https://www.facebook.com/testpage（Page ID 123）",
+                    f"僅使用已驗證的精確正文，SHA-256={'a' * 64}",
+                    f"僅使用已驗證的精確正文，SHA-256={'c' * 64}",
+                    f"僅使用 /tmp/hero.png，SHA-256={'b' * 64}",
+                ]
+            },
+            ["https://www.facebook.com/testpage"],
+        )
 
 
 def test_callback_outcome_requires_active_internal_callback(
@@ -2150,6 +2636,114 @@ def test_scheduled_delegate_resolves_explicit_context_alias(tmp_path, monkeypatc
     assert recovered["status"] == "queued"
     assert recovered["execution_task_id"] == result["execution_task_id"]
     assert get_cron_functional_error() == ""
+
+
+def test_ai_bizweek_delegate_embeds_managed_facebook_page_source(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '4641'\n"
+        "    topic_name: Topic 4641\n"
+        "    project: telegram_1003938559457_4641_bff429b6e587\n"
+        "    memory_namespace: telegram:chat-1:4641/topic\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    session_values = {
+        "HERMES_SESSION_INTERNAL": "true",
+        "HERMES_GRACE_CALLBACK_BOARD": "default",
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_SOURCE": "codex_local_operator",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "4641",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:4641",
+        "HERMES_SESSION_ID": "session-carter",
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": session_values.get(key, default),
+    )
+
+    import tools.managed_policy_tool as managed_policy_tool
+    from proactive import openclaw_async_executor
+
+    page_source = "第一段 Carter Page 原文\n第二段不得改寫\n#Carter #AIBizWeek"
+    monkeypatch.setattr(
+        managed_policy_tool,
+        "managed_policy_read",
+        lambda *, session_id: json.dumps(
+            {
+                "success": True,
+                "content_source_evidence": {
+                    "message_id": "m-source",
+                    "facebook_page_source_text": page_source,
+                },
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    seen: dict[str, dict] = {}
+
+    def fake_delegate(args, **_kw):
+        seen["args"] = args
+        return {
+            "task_id": args["task_id"],
+            "status": "queued",
+            "summary": "accepted",
+            "artifacts": [],
+            "tool_calls": [{"name": "openclaw_bridge_http"}],
+            "audit_log": ["accepted"],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll.",
+            "protocol_version": "2.0",
+            "protocol_correlated": True,
+            "delegation_id": args["delegation_id"],
+            "attempt_id": args["attempt_id"],
+            "contract_fingerprint": args["contract_fingerprint"],
+            "identity_correlated": True,
+            "backend_run_id": "openclaw-loop-test-run",
+            "backend_agent_id": args["backend_agent_id"],
+            "backend_session_key": "agent:missioncrew-content:subagent:test",
+        }
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "delegate_loop_contract_to_openclaw",
+        fake_delegate,
+    )
+
+    args = _nested_args()
+    args["original_request"] = "請產製 Carter's Junk Away AI BizWeek 完整發布包"
+    args["grace_interpretation"] = "Use source material for Facebook Page source fidelity."
+    args["goal"]["objective"] = "產製 Carter's Junk Away EP04 AI BizWeek 完整發布包"
+    args["scope"]["allowed"].append("OpenClaw loop-contract missioncrew-content")
+    args["scope"]["forbidden"].append("不要重寫 Facebook Page source")
+    args["verification"]["checks"].append("Facebook Page source-vs-output proof")
+    args["task_type"] = "content_draft"
+    args["request_instance_id"] = "ai-bizweek-source-embed-test"
+
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued"
+    loop_contract = seen["args"]["loop_contract"]
+    assert page_source in loop_contract["original_request"]
+    assert "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT" in loop_contract["original_request"]
+    assert (
+        loop_contract["audit"]["original_request_location"]
+        == "Embedded in worker contract as original_request"
+    )
+    assert "facebook_page_source_text" in json.dumps(
+        loop_contract["verification"],
+        ensure_ascii=False,
+    )
 
 
 def test_scheduled_high_risk_browser_delegate_gets_task_scoped_authorization(
