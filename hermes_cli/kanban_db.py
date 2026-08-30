@@ -4707,6 +4707,42 @@ def commerce_group_reconciliation_ready(conn: sqlite3.Connection) -> bool:
     return state is not None and int(state["reconciled"] or 0) == 1
 
 
+def _commerce_report_has_current_subject_coverage(
+    conn: sqlite3.Connection,
+    *,
+    execution_task_id: str,
+    report: Mapping[str, Any],
+) -> bool:
+    """Return whether this task owns complete coverage for each report subject."""
+    if (
+        report.get("kind") != "commerce_group_status"
+        or report.get("complete") is not True
+    ):
+        return False
+    observed_at = int(report.get("observed_at") or 0)
+    execution_id = execution_task_id.strip()
+    for item in report.get("coverage") or []:
+        subject_key = str(item.get("subject_key") or "").strip()
+        if not subject_key:
+            return False
+        row = conn.execute(
+            """
+            SELECT complete, source_task_id, observed_at
+              FROM commerce_group_coverage
+             WHERE subject_key = ?
+            """,
+            (subject_key,),
+        ).fetchone()
+        if (
+            row is None
+            or int(row["complete"] or 0) != 1
+            or str(row["source_task_id"] or "").strip() != execution_id
+            or int(row["observed_at"] or 0) != observed_at
+        ):
+            return False
+    return True
+
+
 def _upsert_commerce_user_facing_report(
     conn: sqlite3.Connection,
     *,
@@ -15335,6 +15371,7 @@ def reserve_grace_user_facing_report_chunk(
     report: Mapping[str, Any],
     chunk_index: int,
     total_chunks: int,
+    allow_report_scoped_reconciliation: bool = False,
 ) -> dict[str, Any]:
     """Reserve one external send; an old pending row requires reconciliation."""
     from hermes_cli.user_facing_report import user_facing_report_digest
@@ -15374,13 +15411,29 @@ def reserve_grace_user_facing_report_chunk(
                      WHERE singleton_id = 1
                     """
                 ).fetchone()
-                if migration is None or int(migration["reconciled"] or 0) != 1:
+                global_reconciled = bool(
+                    migration is not None
+                    and int(migration["reconciled"] or 0) == 1
+                )
+                report_scoped_reconciled = (
+                    allow_report_scoped_reconciliation
+                    and _commerce_report_has_current_subject_coverage(
+                        conn,
+                        execution_task_id=str(
+                            callback.get("execution_task_id") or ""
+                        ),
+                        report=report,
+                    )
+                )
+                if not (global_reconciled or report_scoped_reconciled):
                     raise ValueError(
                         "Complete commerce report delivery requires current "
                         "historical Facebook group reconciliation."
                     )
                 reconciliation_effect_at = int(
                     migration["latest_group_effect_at"] or 0
+                    if migration is not None
+                    else 0
                 )
             else:
                 if (

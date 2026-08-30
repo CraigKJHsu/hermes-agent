@@ -1866,6 +1866,7 @@ class GatewayKanbanWatchersMixin:
                     conn,
                     execution_id,
                 )
+            derived_delivery_contract = not isinstance(delivery_contract, dict)
             if not isinstance(delivery_contract, dict):
                 delivery_contract = delivery_contract_from_report(user_facing_report)
             if not report_matches_user_facing_delivery(
@@ -1929,6 +1930,7 @@ class GatewayKanbanWatchersMixin:
                         report=user_facing_report,
                         chunk_index=chunk_index,
                         total_chunks=len(delivery_items),
+                        allow_report_scoped_reconciliation=derived_delivery_contract,
                     )
                 if reservation["state"] == "pending" and not reservation[
                     "should_send"
