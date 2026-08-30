@@ -4719,11 +4719,12 @@ def _commerce_report_has_current_subject_coverage(
     *,
     execution_task_id: str,
     report: Mapping[str, Any],
+    require_complete: bool = True,
 ) -> bool:
-    """Return whether this task owns complete coverage for each report subject."""
+    """Return whether this task owns current coverage for each report subject."""
     if (
         report.get("kind") != "commerce_group_status"
-        or report.get("complete") is not True
+        or (require_complete and report.get("complete") is not True)
     ):
         return False
     observed_at = int(report.get("observed_at") or 0)
@@ -4742,7 +4743,7 @@ def _commerce_report_has_current_subject_coverage(
         ).fetchone()
         if (
             row is None
-            or int(row["complete"] or 0) != 1
+            or (require_complete and int(row["complete"] or 0) != 1)
             or str(row["source_task_id"] or "").strip() != execution_id
             or int(row["observed_at"] or 0) != observed_at
         ):
@@ -16160,7 +16161,20 @@ def record_grace_loop_callback_outcome(
                 "SELECT reconciled FROM commerce_group_migration_state "
                 "WHERE singleton_id = 1"
             ).fetchone()
-            if migration is None or int(migration["reconciled"] or 0) != 1:
+            report_scoped_reconciled = (
+                kind == "terminal_blocked"
+                and isinstance(user_facing_report, Mapping)
+                and _commerce_report_has_current_subject_coverage(
+                    conn,
+                    execution_task_id=execution_task_id,
+                    report=user_facing_report,
+                    require_complete=False,
+                )
+            )
+            if (
+                not report_scoped_reconciled
+                and (migration is None or int(migration["reconciled"] or 0) != 1)
+            ):
                 raise ValueError(
                     "Historical Facebook group destinations must be reconciled "
                     "before a commerce group status outcome can close."

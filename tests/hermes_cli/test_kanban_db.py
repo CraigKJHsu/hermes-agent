@@ -1107,6 +1107,20 @@ def test_terminal_blocked_callback_accepts_delivered_incomplete_report(tmp_path)
             chunk_count=1,
             chunk_index=0,
         )
+        conn.execute(
+            """
+            INSERT INTO commerce_group_migration_state (
+                singleton_id, reconciled, latest_group_effect_at,
+                reconciled_report_observed_at, note, updated_at
+            ) VALUES (1, 0, ?, 0, 'new group effect requires reconciliation', ?)
+            ON CONFLICT(singleton_id) DO UPDATE SET
+                reconciled = 0,
+                latest_group_effect_at = excluded.latest_group_effect_at,
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            """,
+            (int(time.time()), int(time.time())),
+        )
 
         receipt = kb.record_grace_loop_callback_outcome(
             conn,
