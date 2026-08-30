@@ -15903,13 +15903,13 @@ def record_grace_loop_callback_outcome(
             )
         if user_facing_report is not None:
             from hermes_cli.user_facing_report import (
+                delivery_contract_from_report,
                 report_satisfies_user_facing_delivery,
             )
 
             if not isinstance(user_facing_delivery, Mapping):
-                raise ValueError(
-                    "Commerce user-facing report cannot close without an exact "
-                    "user_facing_delivery contract."
+                user_facing_delivery = delivery_contract_from_report(
+                    user_facing_report
                 )
             report_allows_close = report_satisfies_user_facing_delivery(
                 user_facing_report,

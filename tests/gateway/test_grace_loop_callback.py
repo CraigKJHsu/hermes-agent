@@ -278,6 +278,108 @@ def test_complete_content_package_auto_closes_after_verified_inline_delivery(
     assert not any("callback 已重試 3 次" in sent[1] for sent in adapter.sent)
 
 
+def test_legacy_commerce_report_without_contract_is_delivered_and_closed(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "legacy-commerce-report.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    now = int(time.time())
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": True,
+        "as_of": "2026-08-30 14:33 Asia/Taipei",
+        "observed_at": now,
+        "rows": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "destination_id": "902016640291333",
+            "destination_name": "【大台北地區】二手家具、二手家電買賣",
+            "status": "public",
+            "status_label": "公開可見",
+            "observed_at": now,
+            "verified_at": "2026-08-30 14:33 Asia/Taipei",
+            "evidence": "社團搜尋顯示賣家的 Kolin 商品卡。",
+            "source_listing_id": "37276725125275496",
+            "source_task_id": "t_prior",
+        }],
+        "coverage": [{
+            "subject_key": "kolin-kd291m06",
+            "subject_label": "Kolin KD-291M06",
+            "complete": True,
+            "named_count": 1,
+            "gap_count": 0,
+            "expected_total": 1,
+            "expected_total_label": "1 個已提交目的地",
+            "note": "清單完整。",
+        }],
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Legacy evidence report",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps({"routing": {"task_type": "ops"}}),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="report ready",
+            metadata={"user_facing_report": report},
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="legacy-commerce-report",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="d" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    delivered_text = "\n".join(text for _, text, _ in adapter.sent)
+    assert "Kolin KD-291M06" in delivered_text
+    assert "【大台北地區】二手家具、二手家電買賣" in delivered_text
+    assert "公開可見" in delivered_text
+    with kb.connect_closing(db_path) as conn:
+        receipt = kb.get_grace_loop_callback(conn, review_id)
+    assert receipt["state"] == "delivered"
+    assert receipt["outcome_kind"] == "closed"
+    assert receipt["user_report_delivered_at"] is not None
+
+
 def test_page_preflight_evidence_delivers_body_and_verified_hero(
     tmp_path, monkeypatch,
 ):

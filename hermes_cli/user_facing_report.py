@@ -377,6 +377,32 @@ def normalize_user_facing_report(raw: Any) -> dict[str, Any]:
     )
 
 
+def delivery_contract_from_report(report: Any) -> dict[str, Any]:
+    """Build the minimal inline delivery contract implied by a valid report.
+
+    This keeps legacy execution cards deliverable when they recorded a valid
+    user-facing payload before the explicit contract field was present.
+    """
+    normalized = normalize_user_facing_report(report)
+    if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
+        return {
+            "required": True,
+            "kind": CONTENT_PACKAGE_REPORT_KIND,
+            "delivery": normalized["delivery"],
+            "asset_filenames": [
+                asset["filename"] for asset in normalized["assets"]
+            ],
+        }
+    return {
+        "required": True,
+        "kind": COMMERCE_GROUP_REPORT_KIND,
+        "delivery": normalized["delivery"],
+        "subject_keys": [
+            item["subject_key"] for item in normalized["coverage"]
+        ],
+    }
+
+
 def report_satisfies_user_facing_delivery(
     report: Any,
     delivery_contract: Any,

@@ -1855,6 +1855,7 @@ class GatewayKanbanWatchersMixin:
             ):
                 return
             from hermes_cli.user_facing_report import (
+                delivery_contract_from_report,
                 report_matches_user_facing_delivery,
                 render_user_facing_report_chunks,
                 user_facing_report_digest,
@@ -1865,6 +1866,8 @@ class GatewayKanbanWatchersMixin:
                     conn,
                     execution_id,
                 )
+            if not isinstance(delivery_contract, dict):
+                delivery_contract = delivery_contract_from_report(user_facing_report)
             if not report_matches_user_facing_delivery(
                 user_facing_report,
                 delivery_contract,
