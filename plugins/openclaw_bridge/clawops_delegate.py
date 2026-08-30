@@ -704,6 +704,21 @@ _FORBIDDEN_EXTERNAL_EFFECT = re.compile(
     r"(?:外部|發布|上架|刊登|傳送|publish|publishing|post|submit|send|external)",
     re.IGNORECASE,
 )
+_EXTERNAL_ACTION_OBJECTIVE = re.compile(
+    r"(?:"
+    r"重新刊登(?:至|到)|刊登(?:至|到)|發布(?:至|到)|跨貼(?:至|到)|"
+    r"提交(?:至|到)|上架(?:至|到)|傳送(?:至|到)|"
+    r"\b(?:publish|post|submit|send|cross[-\s]?post)\s+(?:to|into)\b"
+    r")",
+    re.IGNORECASE,
+)
+_PREPARATORY_OR_TEXT_ONLY_OBJECTIVE = re.compile(
+    r"(?:"
+    r"唯讀|只讀|盤點|查核|檢查|候選|清單|格式|重整|整理|摘要|報告|"
+    r"read[-\s]?only|inventory|audit|candidate|format|summary|report"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _without_approval_checkpoint_stop(message_text: str) -> str:
@@ -864,6 +879,53 @@ def _has_zero_external_effect_constraint(
         ]
     )
     return _ZERO_EXTERNAL_EFFECT_CONSTRAINT.search(text) is not None
+
+
+def _guard_external_action_objective_downgrade(
+    args: dict[str, Any],
+    contract: dict[str, Any],
+    *,
+    internal_only_contract: bool,
+) -> None:
+    """Reject silent conversion of an external-action request into prep work."""
+    if isinstance(contract.get("objective_ref"), dict):
+        return
+    original_request = str(args.get("original_request") or "").strip()
+    if _EXTERNAL_ACTION_OBJECTIVE.search(original_request) is None:
+        return
+    goal = contract.get("goal") if isinstance(contract.get("goal"), dict) else {}
+    scope = contract.get("scope") if isinstance(contract.get("scope"), dict) else {}
+    verification = (
+        contract.get("verification")
+        if isinstance(contract.get("verification"), dict)
+        else {}
+    )
+    routing = contract.get("routing") if isinstance(contract.get("routing"), dict) else {}
+    compiled_text = "\n".join(
+        str(item or "")
+        for item in (
+            routing.get("task_type"),
+            goal.get("objective"),
+            goal.get("deliverables"),
+            goal.get("non_goals"),
+            scope.get("allowed"),
+            scope.get("forbidden"),
+            verification.get("checks"),
+            verification.get("acceptance_criteria"),
+        )
+    )
+    if not (
+        internal_only_contract
+        or _ZERO_EXTERNAL_EFFECT_CONSTRAINT.search(compiled_text)
+        or _PREPARATORY_OR_TEXT_ONLY_OBJECTIVE.search(compiled_text)
+    ):
+        return
+    raise ValueError(
+        "External-action objective was downgraded into preparatory/text-only "
+        "work without objective_ref. Create or reuse a durable Grace objective "
+        "and bind this contract to its current stage, or ask KJ to explicitly "
+        "replace/cancel the original external-action goal."
+    )
 
 
 def _resolve_cancel_board(
@@ -1763,6 +1825,11 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     thread_id=thread_id,
                 )
             contract["objective_ref"] = clean_objective_ref
+        _guard_external_action_objective_downgrade(
+            args,
+            contract,
+            internal_only_contract=internal_only_contract,
+        )
         contract = _augment_ai_bizweek_source_evidence(
             contract,
             session_id=session_id,

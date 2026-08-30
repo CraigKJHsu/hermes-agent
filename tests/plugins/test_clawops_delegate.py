@@ -296,6 +296,77 @@ def test_cancel_classifier_masks_only_approval_checkpoint_stop(
     assert _is_explicit_cancel_message(message) is is_cancel
 
 
+def test_external_action_request_cannot_be_silently_downgraded_to_readonly_stage():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _guard_external_action_objective_downgrade,
+    )
+
+    args = _nested_args()
+    args["original_request"] = (
+        "請將 Kolin KD-291M06 重新刊登至最多 20 個原本已刊登過的 Facebook 社團"
+    )
+    contract = {
+        "goal": {
+            "objective": "唯讀盤點原本已刊登過的 Facebook 社團，最多 20 個目的地",
+            "deliverables": ["歷史目的地清單"],
+            "non_goals": ["不發布", "不變更任何外部狀態"],
+        },
+        "scope": {
+            "allowed": ["只讀查核歷史社團目的地"],
+            "forbidden": ["不得發布、提交、勾選或改變 Facebook 狀態"],
+        },
+        "verification": {
+            "checks": ["列出可驗證目的地"],
+            "acceptance_criteria": ["external_effects=[]"],
+        },
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+    }
+
+    with pytest.raises(ValueError, match="downgraded into preparatory/text-only"):
+        _guard_external_action_objective_downgrade(
+            args,
+            contract,
+            internal_only_contract=True,
+        )
+
+
+def test_objective_ref_allows_preparatory_stage_for_external_action_request():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _guard_external_action_objective_downgrade,
+    )
+
+    args = _nested_args()
+    args["original_request"] = (
+        "請將 Kolin KD-291M06 重新刊登至最多 20 個原本已刊登過的 Facebook 社團"
+    )
+    contract = {
+        "objective_ref": {
+            "objective_id": "go_kolin_repost_20",
+            "stage_key": "recover_original_groups",
+        },
+        "goal": {
+            "objective": "唯讀盤點原本已刊登過的 Facebook 社團，最多 20 個目的地",
+            "deliverables": ["歷史目的地清單"],
+            "non_goals": ["不發布", "不變更任何外部狀態"],
+        },
+        "scope": {
+            "allowed": ["只讀查核歷史社團目的地"],
+            "forbidden": ["不得發布、提交、勾選或改變 Facebook 狀態"],
+        },
+        "verification": {
+            "checks": ["列出可驗證目的地"],
+            "acceptance_criteria": ["external_effects=[]"],
+        },
+        "routing": {"task_type": "secondhand_commerce_group_status"},
+    }
+
+    _guard_external_action_objective_downgrade(
+        args,
+        contract,
+        internal_only_contract=True,
+    )
+
+
 def test_delegate_creates_execution_and_terra_review_cards(tmp_path, monkeypatch):
     registry = tmp_path / "registry.yaml"
     registry.write_text(
