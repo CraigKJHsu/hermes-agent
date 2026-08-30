@@ -4720,6 +4720,7 @@ def _commerce_report_has_current_subject_coverage(
     execution_task_id: str,
     report: Mapping[str, Any],
     require_complete: bool = True,
+    owner_task_ids: Optional[Iterable[str]] = None,
 ) -> bool:
     """Return whether this task owns current coverage for each report subject."""
     if (
@@ -4728,7 +4729,13 @@ def _commerce_report_has_current_subject_coverage(
     ):
         return False
     observed_at = int(report.get("observed_at") or 0)
-    execution_id = execution_task_id.strip()
+    owner_ids = {
+        str(task_id or "").strip()
+        for task_id in (owner_task_ids or [execution_task_id])
+        if str(task_id or "").strip()
+    }
+    if not owner_ids:
+        return False
     for item in report.get("coverage") or []:
         subject_key = str(item.get("subject_key") or "").strip()
         if not subject_key:
@@ -4744,7 +4751,7 @@ def _commerce_report_has_current_subject_coverage(
         if (
             row is None
             or (require_complete and int(row["complete"] or 0) != 1)
-            or str(row["source_task_id"] or "").strip() != execution_id
+            or str(row["source_task_id"] or "").strip() not in owner_ids
             or int(row["observed_at"] or 0) != observed_at
         ):
             return False
@@ -15645,6 +15652,10 @@ def reserve_grace_user_facing_report_chunk(
                             callback.get("execution_task_id") or ""
                         ),
                         report=report,
+                        owner_task_ids=[
+                            str(callback.get("execution_task_id") or ""),
+                            review_task_id,
+                        ],
                     )
                 )
                 if not (global_reconciled or report_scoped_reconciled):
@@ -16207,6 +16218,7 @@ def record_grace_loop_callback_outcome(
                     execution_task_id=execution_task_id,
                     report=user_facing_report,
                     require_complete=False,
+                    owner_task_ids=[execution_task_id, review_task_id],
                 )
             )
             if (
@@ -16271,6 +16283,7 @@ def record_grace_loop_callback_outcome(
                 report_observed_at = int(
                     user_facing_report.get("observed_at") or 0
                 )
+                commerce_owner_task_ids = {execution_task_id, review_task_id}
                 requested_subjects = {
                     item["subject_key"]
                     for item in user_facing_report.get("coverage") or []
@@ -16285,7 +16298,7 @@ def record_grace_loop_callback_outcome(
                 if (
                     len(durable_coverage) != len(requested_subjects)
                     or any(
-                        row["source_task_id"] != execution_task_id
+                        row["source_task_id"] not in commerce_owner_task_ids
                         or int(row["observed_at"] or 0) != report_observed_at
                         or (kind == "closed" and not row["complete"])
                         for row in durable_coverage
@@ -16308,8 +16321,8 @@ def record_grace_loop_callback_outcome(
                 }
                 compared_fields = (
                     "subject_label", "destination_name", "source_listing_id",
-                    "status", "status_label", "evidence", "source_task_id",
-                    "observed_at", "verified_at",
+                    "status", "status_label", "evidence", "observed_at",
+                    "verified_at",
                 )
                 if (
                     report_rows.keys() != ledger_rows.keys()

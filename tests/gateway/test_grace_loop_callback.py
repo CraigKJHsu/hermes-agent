@@ -469,11 +469,16 @@ def test_contract_single_destination_commerce_status_report_is_delivered(
             message_id="42",
             contract_fingerprint="e" * 64,
         )
+        review_report = json.loads(json.dumps(report))
+        review_report["rows"][0]["source_task_id"] = review_id
         assert kb.complete_task(
             conn,
             review_id,
             summary="accepted",
-            metadata={"review_outcome": "accepted"},
+            metadata={
+                "review_outcome": "accepted",
+                "user_facing_report": review_report,
+            },
         )
 
     adapter = CallbackAdapter()
