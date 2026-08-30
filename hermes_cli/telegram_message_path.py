@@ -204,6 +204,7 @@ def bind_message_path(value: Any, **identifiers: Any) -> dict[str, Any]:
         "openclaw_backend_session_key",
     }
     repeatable = {
+        "session_id": "session_ids",
         "run_id": "run_ids",
         "openclaw_backend_agent_id": "openclaw_backend_agent_ids",
         "openclaw_backend_run_id": "openclaw_backend_run_ids",
@@ -265,6 +266,7 @@ def merge_message_paths(current: Any, incoming: Any) -> dict[str, Any]:
         ):
             base[key] = copy.deepcopy(value)
     repeatable_fields = {
+        "session_id": "session_ids",
         "run_id": "run_ids",
         "openclaw_backend_agent_id": "openclaw_backend_agent_ids",
         "openclaw_backend_run_id": "openclaw_backend_run_ids",
@@ -298,6 +300,7 @@ def merge_message_paths(current: Any, incoming: Any) -> dict[str, Any]:
     )
     for history_key in (
         "run_ids",
+        "session_ids",
         "openclaw_backend_agent_ids",
         "openclaw_backend_run_ids",
         "openclaw_backend_session_keys",

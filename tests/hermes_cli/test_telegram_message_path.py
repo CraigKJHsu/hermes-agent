@@ -100,6 +100,18 @@ def test_repeatable_backend_ids_advance_without_stale_delivery_regression():
     assert "late-outbound" in merged["outbound_message_ids"]
 
 
+def test_session_id_can_advance_with_history_for_same_trace():
+    first = _path()
+    second = bind_message_path(first, session_id="session-2")
+
+    assert second["session_id"] == "session-2"
+    assert second["session_ids"] == ["session-1", "session-2"]
+
+    merged = merge_message_paths(first, second)
+    assert merged["session_id"] == "session-2"
+    assert merged["session_ids"] == ["session-1", "session-2"]
+
+
 def test_hops_are_immutable_and_backend_agent_failover_is_historicized():
     original = append_hop(
         _path(),
