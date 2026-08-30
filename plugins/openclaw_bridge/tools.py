@@ -714,6 +714,73 @@ def _with_protocol_failure_correlation(
     return result
 
 
+_USAGE_LIMIT_PATTERNS = (
+    "codex subscription usage limit",
+    "usage limit",
+    "quota",
+    "rate limit",
+    "rate-limit",
+    "rate_limit",
+)
+
+
+def _usage_limit_message(payload: Mapping[str, Any]) -> str:
+    candidates: list[Any] = [
+        payload.get("promptError"),
+        payload.get("prompt_error"),
+        payload.get("modelError"),
+        payload.get("model_error"),
+        payload.get("summary"),
+    ]
+    error = payload.get("error")
+    if isinstance(error, Mapping):
+        candidates.extend([error.get("message"), error.get("code")])
+    else:
+        candidates.append(error)
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text and any(pattern in text.lower() for pattern in _USAGE_LIMIT_PATTERNS):
+            return text
+    return ""
+
+
+def _loop_contract_usage_limit_output(
+    task: Mapping[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    result = {
+        "status": "blocked",
+        "summary": (
+            "OpenClaw Loop Contract blocked before execution because the "
+            f"Codex usage limit was reached: {message}"
+        ),
+        "acceptanceEvidence": [
+            {
+                "kind": "runtime_blocker",
+                "reason": "codex_usage_limit",
+                "message": message,
+            }
+        ],
+        "externalEffects": [],
+        "blocker": {
+            "kind": "quota",
+            "reason": "codex_usage_limit",
+            "message": message,
+        },
+    }
+    return {
+        "evidence": {
+            "terminal": True,
+            "resultContractValid": True,
+            "externalEffectBudget": int(task.get("external_effect_budget") or 0),
+            "runtimeBlocker": "codex_usage_limit",
+            "promptError": message,
+        },
+        "result": result,
+        "resultText": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+    }
+
+
 def _protocol_label(protocol_version: str) -> str:
     if protocol_version == "2.0":
         return "v2"
@@ -859,6 +926,15 @@ def post_to_openclaw_bridge(
     *,
     live_async_capability: object | None = None,
 ) -> dict[str, Any]:
+    is_loop_contract_async = (
+        live_async_capability is _LOOP_CONTRACT_ASYNC_CAPABILITY
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+    )
     payload = _openclaw_payload(
         task,
         config,
@@ -1080,13 +1156,40 @@ def post_to_openclaw_bridge(
         ok = False
         status = "failed"
         active = False
+    usage_limit_message = (
+        _usage_limit_message(openclaw_result)
+        if is_loop_contract_async
+        else ""
+    )
     if "output" in openclaw_result:
+        output = openclaw_result["output"]
+        if usage_limit_message and isinstance(output, Mapping):
+            output = {
+                **dict(output),
+                **_loop_contract_usage_limit_output(task, usage_limit_message),
+            }
+            status = "blocked"
+            ok = False
+            active = False
         returned_artifacts.append(
             {
                 "type": "openclaw_result",
-                "value": openclaw_result["output"],
+                "value": output,
             }
         )
+    elif usage_limit_message:
+        returned_artifacts.append(
+            {
+                "type": "openclaw_result",
+                "value": _loop_contract_usage_limit_output(
+                    task,
+                    usage_limit_message,
+                ),
+            }
+        )
+        status = "blocked"
+        ok = False
+        active = False
     if request_packet is not None:
         returned_artifacts.append(
             {
@@ -1138,6 +1241,36 @@ def post_to_openclaw_bridge(
         ok = False
         status = "failed"
         active = False
+    if protocol_errors:
+        errors = list(protocol_errors)
+    elif usage_limit_message:
+        errors = ["codex_usage_limit"]
+    elif request_packet is not None:
+        errors = [requested_interruption]
+    elif ok or active:
+        errors = []
+    else:
+        errors = [
+            str(
+                (openclaw_result.get("error") or {}).get("message")
+                if isinstance(openclaw_result.get("error"), dict)
+                else openclaw_result.get("error")
+                or "openclaw_bridge_failed"
+            )
+        ]
+    if requested_interruption == "request_context":
+        recommended_next_action = "Ask Grace for scoped context and resume the OpenClaw run."
+    elif requested_interruption == "request_confirmation":
+        recommended_next_action = "Ask KJ for explicit approval through Grace before resuming."
+    elif usage_limit_message:
+        recommended_next_action = (
+            "Wait for Codex usage reset or apply an authorized usage reset before "
+            "retrying the Loop Contract."
+        )
+    elif not ok:
+        recommended_next_action = "Review OpenClaw result."
+    else:
+        recommended_next_action = "Return summarized result to KJ."
     delegated_result = {
         "task_id": task["task_id"],
         "status": status,
@@ -1145,26 +1278,7 @@ def post_to_openclaw_bridge(
         "artifacts": returned_artifacts,
         "tool_calls": [{"name": "openclaw_bridge_http", "url": url, "template": payload["taskId"]}],
         "audit_log": audit if isinstance(audit, list) else [audit],
-        "errors": (
-            protocol_errors
-            if protocol_errors
-            else (
-                [requested_interruption]
-                if request_packet is not None
-                else (
-                    []
-                    if ok or active
-                    else [
-                        str(
-                            (openclaw_result.get("error") or {}).get("message")
-                            if isinstance(openclaw_result.get("error"), dict)
-                            else openclaw_result.get("error")
-                            or "openclaw_bridge_failed"
-                        )
-                    ]
-                )
-            )
-        ),
+        "errors": errors,
         "requires_human_review": (
             True
             if request_packet is not None
@@ -1181,20 +1295,7 @@ def post_to_openclaw_bridge(
             )
         ),
         "recommended_next_action": str(
-            openclaw_result.get("recommendedNextAction")
-            or (
-                "Ask Grace for scoped context and resume the OpenClaw run."
-                if requested_interruption == "request_context"
-                else (
-                    "Ask KJ for explicit approval through Grace before resuming."
-                    if requested_interruption == "request_confirmation"
-                    else (
-                        "Review OpenClaw result."
-                        if not ok
-                        else "Return summarized result to KJ."
-                    )
-                )
-            )
+            openclaw_result.get("recommendedNextAction") or recommended_next_action
         ),
     }
     if actions_taken or "actionsTaken" in openclaw_result or "actions_taken" in openclaw_result:

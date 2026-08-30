@@ -2228,6 +2228,103 @@ def test_protocol_v2_http_response_maps_matching_execution_identity(monkeypatch)
     assert result["identity_correlated"] is True
 
 
+def test_loop_contract_usage_limit_response_gets_structured_blocked_result(monkeypatch):
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "loop-quota",
+            "objective": "Run a read-only Loop Contract.",
+            "risk_level": "low",
+            "allowed_tools": ["read", "browser"],
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-quota",
+            "attempt_id": "attempt-quota",
+            "contract_fingerprint": "sha256:quota",
+            "project": "secondhand_commerce",
+            "topic_id": "2",
+            "task_type": "facebook_marketplace_readonly",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-quota",
+            "openclaw_task_id": "openclaw.agent.loop_contract_poll",
+            "start_idempotency_key": "start-quota",
+            "backend_run_id": "backend-run-quota",
+            "backend_session_key": "agent:missioncrew-browser-readonly:subagent:test",
+            "dry_run": False,
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+    usage_message = (
+        "You've reached your Codex subscription usage limit. "
+        "Next reset in 3 days, Sep 1 at 9:56 PM GMT+8."
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "status": "failed",
+                    "protocolVersion": "2.0",
+                    "summary": "OpenClaw Loop Contract run ended with status=error.",
+                    "promptError": usage_message,
+                    "executionIdentity": {
+                        "delegationId": "delegation-quota",
+                        "attemptId": "attempt-quota",
+                        "contractFingerprint": "sha256:quota",
+                    },
+                    "backendExecution": {
+                        "backendRunId": "backend-run-quota",
+                        "backendAgentId": "missioncrew-browser-readonly",
+                        "sessionKey": "agent:missioncrew-browser-readonly:subagent:test",
+                    },
+                    "output": {
+                        "evidence": {
+                            "terminal": True,
+                            "resultContractValid": False,
+                            "resultContractError": "Loop Contract result is not valid JSON.",
+                            "externalEffectBudget": 0,
+                        },
+                        "resultText": "",
+                    },
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr(tools, "urlopen", lambda _request, timeout: Response())
+
+    result = tools.post_to_openclaw_bridge(
+        task,
+        config,
+        live_async_capability=tools._LOOP_CONTRACT_ASYNC_CAPABILITY,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["errors"] == ["codex_usage_limit"]
+    output = result["artifacts"][0]["value"]
+    assert output["evidence"]["runtimeBlocker"] == "codex_usage_limit"
+    assert output["result"]["status"] == "blocked"
+    assert output["result"]["blocker"]["reason"] == "codex_usage_limit"
+    assert output["result"]["externalEffects"] == []
+    assert json.loads(output["resultText"])["status"] == "blocked"
+
+
 def test_protocol_v2_http_response_preserves_backend_token_usage(monkeypatch):
     from plugins.openclaw_bridge import tools
 

@@ -16236,6 +16236,103 @@ def record_grace_loop_callback_outcome(
     return dict(row)
 
 
+def record_grace_loop_callback_blocker_outcome(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+    outcome_kind: str,
+    payload: Mapping[str, Any],
+) -> dict:
+    """Persist a structured outcome for a machine-classified execution blocker."""
+    kind = str(outcome_kind or "").strip()
+    if kind not in {"quota_blocked"}:
+        raise ValueError("Unsupported blocker callback outcome.")
+    payload_json = json.dumps(
+        dict(payload or {}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT c.*, e.task_id AS event_task_id, e.kind AS event_kind
+              FROM grace_loop_callbacks AS c
+              JOIN task_events AS e ON e.id = ?
+             WHERE c.review_task_id = ?
+               AND c.state = 'delivering'
+               AND c.lease_event_id = ?
+               AND c.lease_owner = ?
+               AND c.lease_expires > ?
+            """,
+            (
+                int(event_id),
+                review_task_id.strip(),
+                int(event_id),
+                lease_owner.strip(),
+                now,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "Structured blocker outcome is not owned by this callback lease."
+            )
+        current = dict(row)
+        if (
+            current.get("event_task_id") != current.get("execution_task_id")
+            or current.get("event_kind") != "blocked"
+        ):
+            raise ValueError(
+                "Structured blocker outcomes are allowed only for execution blocked events."
+            )
+        if current.get("outcome_event_id") is not None:
+            if (
+                int(current.get("outcome_event_id") or 0) == int(event_id)
+                and current.get("outcome_kind") == kind
+                and current.get("outcome_payload") == payload_json
+            ):
+                return current
+            raise ValueError(
+                "Grace callback outcome is write-once and another outcome is already recorded."
+            )
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET outcome_event_id = ?, outcome_kind = ?,
+                   outcome_payload = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ?
+               AND lease_owner = ?
+               AND lease_expires > ?
+               AND outcome_event_id IS NULL
+               AND outcome_kind IS NULL
+               AND outcome_payload IS NULL
+            """,
+            (
+                int(event_id),
+                kind,
+                payload_json,
+                review_task_id.strip(),
+                int(event_id),
+                lease_owner.strip(),
+                now,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(
+                "Grace callback outcome is write-once and another outcome is already recorded."
+            )
+        updated = conn.execute(
+            "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
+            (review_task_id.strip(),),
+        ).fetchone()
+        return dict(updated) if updated is not None else current
+
+
 def grace_loop_callback_has_outcome(
     conn: sqlite3.Connection,
     *,

@@ -1259,6 +1259,79 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     assert "validated_outcome=accepted" in review_event.text
 
 
+def test_quota_blocked_execution_records_structured_callback_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "execution-quota-blocked-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    usage_message = (
+        "OpenClaw execution is blocked by codex_usage_limit: "
+        "You've reached your Codex subscription usage limit."
+    )
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            assignee="openclaw",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="execution-quota-blocked",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="a" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason=usage_message,
+            kind="capability",
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        review = kb.get_task(conn, review_id)
+    assert len(adapter.handled) == 1
+    assert "validated_outcome=quota_blocked" in adapter.handled[0].text
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "quota_blocked"
+    payload = json.loads(callback["outcome_payload"])
+    assert payload["reason"] == "codex_usage_limit"
+    assert "Codex subscription usage limit" in payload["message"]
+    assert review is not None and review.status == "todo"
+
+
 def test_callback_bounds_worker_authored_trigger_payload(tmp_path, monkeypatch):
     db_path = tmp_path / "bounded-trigger.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

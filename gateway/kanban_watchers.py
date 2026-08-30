@@ -35,6 +35,35 @@ from hermes_cli.grace_review_metadata import (
 logger = logging.getLogger("gateway.run")
 
 
+_CALLBACK_QUOTA_PATTERNS = (
+    "codex_usage_limit",
+    "codex subscription usage limit",
+    "usage limit",
+    "quota",
+    "rate limit",
+    "rate-limit",
+)
+
+
+def _quota_blocker_message(value: Any) -> str:
+    if isinstance(value, dict):
+        for item in value.values():
+            message = _quota_blocker_message(item)
+            if message:
+                return message
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            message = _quota_blocker_message(item)
+            if message:
+                return message
+        return ""
+    text = str(value or "").strip()
+    if text and any(pattern in text.lower() for pattern in _CALLBACK_QUOTA_PATTERNS):
+        return text
+    return ""
+
+
 def _confirmed_grace_provider_message_id(send_result: Any) -> Optional[str]:
     """Return an ID only for an explicit, non-ambiguous provider receipt."""
     if (
@@ -1132,6 +1161,28 @@ class GatewayKanbanWatchersMixin:
                     conn.close()
             await asyncio.to_thread(_sync_record_terminal_closed_outcome)
 
+        async def _record_quota_blocked_outcome(message: str) -> None:
+            def _sync_record_quota_blocked_outcome() -> None:
+                conn = kb_module.connect(board=board)
+                try:
+                    kb_module.record_grace_loop_callback_blocker_outcome(
+                        conn,
+                        review_task_id=review_id,
+                        event_id=event_id,
+                        lease_owner=lease_owner,
+                        outcome_kind="quota_blocked",
+                        payload={
+                            "summary": "OpenClaw execution is blocked by Codex usage limits.",
+                            "reason": "codex_usage_limit",
+                            "message": message,
+                            "execution_task_id": execution_id,
+                            "review_task_id": review_id,
+                        },
+                    )
+                finally:
+                    conn.close()
+            await asyncio.to_thread(_sync_record_quota_blocked_outcome)
+
         async def _escalate(error: str) -> None:
             def _sync_escalate() -> None:
                 conn = kb_module.connect(board=board)
@@ -1269,6 +1320,13 @@ class GatewayKanbanWatchersMixin:
             outcome = "blocked"
         else:
             outcome = "invalid_completion_metadata"
+        quota_blocker_message = ""
+        if event_stage == "execution" and event_kind == "blocked":
+            quota_blocker_message = _quota_blocker_message(
+                callback.get("event_payload") or {}
+            )
+            if quota_blocker_message:
+                outcome = "quota_blocked"
 
         stored_session_key = str(callback.get("session_key") or "").strip()
         expected_session_id = str(callback.get("session_id") or "")
@@ -1968,6 +2026,8 @@ class GatewayKanbanWatchersMixin:
             callback["attempts"] = await _record_attempt()
             await _ensure_inline_report_delivery()
             await _handle_with_lease_heartbeat(event)
+            if quota_blocker_message:
+                await _record_quota_blocked_outcome(quota_blocker_message)
             if outcome == "accepted" and not await _has_structured_outcome():
                 if str(callback.get("completion_mode") or "terminal") == "intermediate":
                     await _finish(
