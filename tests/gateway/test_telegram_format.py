@@ -37,6 +37,7 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import (  # noqa: E402
     TelegramAdapter,
+    _decode_html_entities_outside_code,
     _escape_mdv2,
     _strip_mdv2,
     _wrap_markdown_tables,
@@ -109,6 +110,18 @@ class TestFormatMessageBasic:
     def test_plain_text_no_markdown(self, adapter):
         result = adapter.format_message("Hello world")
         assert result == "Hello world"
+
+    def test_decodes_html_entities_in_display_text(self, adapter):
+        result = adapter.format_message("證據時間：&#x32;026-08-14 15:41 UTC")
+        assert "2026\\-08\\-14" in result
+        assert "&#x32;026" not in result
+
+    def test_keeps_html_entities_inside_code(self):
+        text = "Display &amp; text, keep `&lt;tag&gt;` and:\n```html\n&lt;b&gt;x&lt;/b&gt;\n```"
+        result = _decode_html_entities_outside_code(text)
+        assert result.startswith("Display & text")
+        assert "`&lt;tag&gt;`" in result
+        assert "```html\n&lt;b&gt;x&lt;/b&gt;\n```" in result
 
 
 # =========================================================================

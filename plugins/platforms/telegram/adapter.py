@@ -216,6 +216,16 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
     return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
 
 
+def _decode_html_entities_outside_code(text: str) -> str:
+    """Decode display-text HTML entities without changing code snippets."""
+    if not text or "&" not in text:
+        return text
+    parts = re.split(r'(```[\s\S]*?```|`[^`\n]+`)', text)
+    for index in range(0, len(parts), 2):
+        parts[index] = _html.unescape(parts[index])
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Markdown table → Telegram-friendly row groups
 # ---------------------------------------------------------------------------
@@ -6078,7 +6088,7 @@ class TelegramAdapter(BasePlatformAdapter):
             placeholders[key] = value
             return key
 
-        text = content
+        text = _decode_html_entities_outside_code(content)
 
         # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
         #    before the normal MarkdownV2 conversions run.
