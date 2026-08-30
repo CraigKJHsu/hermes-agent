@@ -91,7 +91,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from hermes_cli.grace_review_metadata import grace_review_accepted
+from hermes_cli.grace_review_metadata import (
+    grace_review_acceptance_error,
+    grace_review_accepted,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from proactive.policy_registry import serialize_with_policy_registry
 from toolsets import get_toolset_names
@@ -7431,13 +7434,7 @@ def complete_task(
                     "and retry kanban_complete with the verified evidence."
                 )
             if not accepted_by_metadata:
-                raise ValueError(
-                    "Grace review completion metadata conflicts with its "
-                    "canonical accepted verdict. For page_hero, include "
-                    "visual_review.all_required_text_readable=true, "
-                    "text_occlusion_free=true, disclosure_non_obstructive=true, "
-                    "and defects_found=[]."
-                )
+                raise ValueError(grace_review_acceptance_error(metadata))
             # Persist one canonical verdict at the write boundary. Models may
             # vary whitespace or case, but downstream consumers should observe
             # one exact accepted form.

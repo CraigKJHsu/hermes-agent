@@ -103,6 +103,36 @@ def contract_requires_image_generation(contract: Mapping[str, Any]) -> bool:
     return any(str(tool).strip() == "image_generate" for tool in allowed_tools or [])
 
 
+def contract_declares_page_hero(contract: Mapping[str, Any]) -> bool:
+    """Return True only when a review contract explicitly includes page_hero."""
+    def _walk(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            asset_family = str(value.get("asset_family") or "").strip().lower()
+            if asset_family == "page_hero":
+                return True
+            declarations = value.get("asset_declarations")
+            if (
+                isinstance(declarations, Mapping)
+                and declarations.get("page_hero") is not None
+            ):
+                return True
+            policy_id = str(value.get("policy_id") or "").strip().lower()
+            if "page-hero" in policy_id or "page_hero" in policy_id:
+                return True
+            filenames = value.get("asset_filenames")
+            if isinstance(filenames, list) and any(
+                "page_hero" in str(item).lower() or "page-hero" in str(item).lower()
+                for item in filenames
+            ):
+                return True
+            return any(_walk(item) for item in value.values())
+        if isinstance(value, list):
+            return any(_walk(item) for item in value)
+        return False
+
+    return _walk(contract)
+
+
 def contract_internal_hermes_runtime(
     contract: Mapping[str, Any],
     *,
@@ -367,6 +397,22 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
     policy_marker = policy_snapshot_marker(worker_contract)
+    page_hero_guidance = (
+        [
+            "For an accepted asset_family=page_hero review, canonical completion metadata must also "
+            "include visual_review.all_required_text_readable=true, "
+            "visual_review.text_occlusion_free=true, "
+            "visual_review.disclosure_non_obstructive=true, and visual_review.defects_found=[]. "
+            "Include asset_family=page_hero or asset_declarations.page_hero with exact dimensions. "
+            "These fields report the actual pixel review; do not infer them from worker prose.",
+        ]
+        if contract_declares_page_hero(worker_contract)
+        else [
+            "This contract does not declare asset_family=page_hero. Do not invent page_hero, "
+            "asset_declarations.page_hero, reviewed_image, or visual_review metadata for a "
+            "text-only review; use text evidence fields instead.",
+        ]
+    )
     return "\n".join(
         [
             "GRACE_LOOP_CONTRACT_STAGE: grace_review",
@@ -387,12 +433,7 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "When accepting that a parent correctly stopped fail-closed, keep the Grace "
             "review verdict accepted and record the parent's stop/reject/block conclusion "
             "under parent_verdict or evidence instead.",
-            "For an accepted asset_family=page_hero review, canonical completion metadata must also "
-            "include visual_review.all_required_text_readable=true, "
-            "visual_review.text_occlusion_free=true, "
-            "visual_review.disclosure_non_obstructive=true, and visual_review.defects_found=[]. "
-            "Include asset_family=page_hero or asset_declarations.page_hero with exact dimensions. "
-            "These fields report the actual pixel review; do not infer them from worker prose.",
+            *page_hero_guidance,
             *_render_policy_guidance(worker_contract, review=True),
             *_render_language_polish_guidance(worker_contract, review=True),
             "For a requested user-facing status, inventory, or destination list, reject the "

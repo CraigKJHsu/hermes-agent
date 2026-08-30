@@ -10,6 +10,7 @@ from proactive.loop_contract import (
 )
 from proactive.grace_task_compiler import (
     contract_execution_skills,
+    contract_declares_page_hero,
     render_execution_body,
     render_review_body,
 )
@@ -166,6 +167,26 @@ def test_review_body_explains_canonical_verdict_for_fail_closed_parent():
     assert "Do not set approved=false" in review
     assert "review_outcome=blocked" in review
     assert "parent_verdict" in review
+
+
+def test_text_only_review_body_does_not_require_page_hero_visual_review():
+    review = render_review_body(_contract(), "t_execution")
+
+    assert contract_declares_page_hero(_contract()) is False
+    assert "This contract does not declare asset_family=page_hero" in review
+    assert "Do not invent page_hero" in review
+    assert "For an accepted asset_family=page_hero review" not in review
+
+
+def test_page_hero_review_body_keeps_visual_review_gate():
+    contract = _contract()
+    contract["asset_family"] = "page_hero"
+
+    review = render_review_body(contract, "t_execution")
+
+    assert contract_declares_page_hero(contract) is True
+    assert "For an accepted asset_family=page_hero review" in review
+    assert "visual_review.all_required_text_readable=true" in review
 
 
 def test_loop_contract_bodies_include_evidence_first_answering_gate():

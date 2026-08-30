@@ -76,13 +76,16 @@ def _asset_declarations_valid(value: Any) -> bool:
     return True
 
 
-def _page_hero_visual_safety_valid(metadata: dict[str, Any]) -> bool:
+def _declares_page_hero(metadata: dict[str, Any]) -> bool:
     declarations = metadata.get("asset_declarations")
-    declares_page_hero = (
+    return (
         str(metadata.get("asset_family") or "").strip().lower() == "page_hero"
         or (isinstance(declarations, dict) and declarations.get("page_hero") is not None)
     )
-    if not declares_page_hero:
+
+
+def _page_hero_visual_safety_valid(metadata: dict[str, Any]) -> bool:
+    if not _declares_page_hero(metadata):
         return True
     visual_review = metadata.get("visual_review")
     return (
@@ -168,6 +171,41 @@ def grace_review_accepted(metadata: Any) -> bool:
                 or has_review_evidence
             )
         )
+    )
+
+
+def grace_review_acceptance_error(metadata: Any) -> str:
+    """Return the precise completion error for non-accepted review metadata."""
+    review_metadata = metadata if isinstance(metadata, dict) else {}
+    if (
+        review_metadata.get("approved") is False
+        or review_metadata.get("accepted") is False
+    ):
+        return (
+            "Grace review completion metadata contains an explicit rejected "
+            "approval flag."
+        )
+    if not _asset_declarations_valid(review_metadata.get("asset_declarations")):
+        return (
+            "Grace review asset_declarations are invalid. For page_hero use "
+            "exact 16:9 dimensions; for audio_brief use exact 1:1 dimensions."
+        )
+    if _declares_page_hero(review_metadata) and not _page_hero_visual_safety_valid(
+        review_metadata
+    ):
+        return (
+            "Grace review completion metadata conflicts with its canonical "
+            "accepted verdict. For page_hero, include "
+            "visual_review.all_required_text_readable=true, "
+            "text_occlusion_free=true, disclosure_non_obstructive=true, "
+            "and defects_found=[]."
+        )
+    return (
+        "Grace review completion metadata conflicts with its canonical "
+        "accepted verdict. For text-only reviews, do not add page_hero or "
+        "visual_review fields; include review_outcome='accepted' plus "
+        "evidence, verification_notes, verified_checks, evidence_lines, "
+        "reviewed_file, or verification_artifact."
     )
 
 

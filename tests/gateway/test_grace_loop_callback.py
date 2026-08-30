@@ -12,6 +12,7 @@ from gateway.kanban_watchers import (
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
+from hermes_cli.grace_review_metadata import grace_review_acceptance_error
 
 
 class CallbackAdapter:
@@ -776,6 +777,24 @@ def test_grace_review_rejects_unsupported_accepted_alias():
         "review_outcome": "rejected",
         "verified_facts": {"dimensions": "1600x900"},
     }) is False
+
+
+def test_grace_review_text_only_error_does_not_require_page_hero():
+    message = grace_review_acceptance_error({"accepted": True})
+
+    assert "text-only reviews" in message
+    assert "do not add page_hero" in message
+    assert "visual_review.all_required_text_readable" not in message
+
+
+def test_grace_review_page_hero_error_keeps_visual_requirements():
+    message = grace_review_acceptance_error({
+        "review_outcome": "accepted",
+        "asset_family": "page_hero",
+    })
+
+    assert "For page_hero" in message
+    assert "visual_review.all_required_text_readable=true" in message
 
 
 def test_grace_review_rejects_malformed_verified_check_list():
