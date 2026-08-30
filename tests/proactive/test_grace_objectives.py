@@ -134,6 +134,72 @@ def test_delegation_reservation_binds_declared_objective_stage(tmp_path):
         assert stage["delegation_id"] == delegation["delegation_id"]
 
 
+def test_delegation_reservation_declares_retry_stage_when_requested_stage_is_bound(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-reserve-retry.db") as conn:
+        _create_objective(conn)
+        first = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="b" * 64,
+            request_instance_id="request-objective-stage",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_test",
+            stage_key="publish_page",
+        )
+
+        second = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="c" * 64,
+            request_instance_id="request-objective-stage-recovery",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-2",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_test",
+            stage_key="publish_page",
+        )
+        replay = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="c" * 64,
+            request_instance_id="request-objective-stage-recovery",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-2",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_test",
+            stage_key="publish_page",
+        )
+
+        assert first["stage_key"] == "publish_page"
+        assert second["stage_key"] == "publish_page_r2"
+        assert replay["delegation_id"] == second["delegation_id"]
+        assert replay["stage_key"] == "publish_page_r2"
+        rows = conn.execute(
+            """
+            SELECT stage_key, delegation_id, status FROM grace_objective_stages
+             WHERE objective_id = 'go_test'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+        assert [(row["stage_key"], row["delegation_id"], row["status"]) for row in rows] == [
+            ("prepare_asset", None, "planned"),
+            ("publish_page", first["delegation_id"], "queued"),
+            ("publish_page_r2", second["delegation_id"], "queued"),
+            ("share_group", None, "planned"),
+        ]
+
+
 def test_objective_can_append_recovery_stage_before_terminal(tmp_path):
     with kb.connect_closing(tmp_path / "objective-append-stage.db") as conn:
         _create_objective(conn)

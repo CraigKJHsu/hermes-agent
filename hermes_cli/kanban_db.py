@@ -14089,6 +14089,18 @@ def available_grace_objective_stage_key(
     raise ValueError("No available Grace objective retry stage key")
 
 
+def _grace_objective_stage_matches_request(actual: Any, requested: str) -> bool:
+    actual_stage = str(actual or "").strip()
+    requested_stage = str(requested or "").strip()
+    if actual_stage == requested_stage:
+        return True
+    prefix = f"{requested_stage}_r"
+    if not actual_stage.startswith(prefix):
+        return False
+    suffix = actual_stage[len(prefix) :]
+    return suffix.isdigit()
+
+
 def grace_objective_stage_mode(
     conn: sqlite3.Connection,
     *,
@@ -14154,6 +14166,43 @@ def _bind_grace_objective_stage(
         """,
         (stage_key, now, objective_id),
     )
+
+
+def _resolve_grace_objective_stage_for_delegation(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    stage_key: str,
+    delegation_id: str,
+) -> str:
+    if not objective_id:
+        return stage_key
+    stage = conn.execute(
+        """
+        SELECT delegation_id
+          FROM grace_objective_stages
+         WHERE objective_id = ? AND stage_key = ?
+        """,
+        (objective_id, stage_key),
+    ).fetchone()
+    if stage is None:
+        return stage_key
+    if not stage["delegation_id"] or stage["delegation_id"] == delegation_id:
+        return stage_key
+
+    retry_stage_key = available_grace_objective_stage_key(
+        conn,
+        objective_id=objective_id,
+        stage_key=stage_key,
+    )
+    if retry_stage_key != stage_key:
+        ensure_grace_objective_stage(
+            conn,
+            objective_id=objective_id,
+            stage_key=retry_stage_key,
+            next_action="Retry objective stage after the previous delegation could not finish.",
+        )
+    return retry_stage_key
 
 
 def cancel_grace_objective(
@@ -14348,7 +14397,20 @@ def reserve_grace_delegation(
                 "objective_id": clean_objective_id or None,
                 "stage_key": clean_stage_key or None,
             }
-            if any(row.get(key) != value for key, value in expected.items()):
+            mismatched = [
+                key
+                for key, value in expected.items()
+                if row.get(key) != value
+                and not (
+                    key == "stage_key"
+                    and row.get("objective_id") == clean_objective_id
+                    and _grace_objective_stage_matches_request(
+                        row.get("stage_key"),
+                        clean_stage_key,
+                    )
+                )
+            ]
+            if mismatched:
                 raise ValueError(
                     "Existing Grace delegation is bound to another route, "
                     "session, approval mode, or callback origin."
@@ -14422,6 +14484,14 @@ def reserve_grace_delegation(
                     "Approval token is invalid, expired, already used, from the "
                     "same message that requested it, or bound to another contract."
                 )
+
+        if clean_objective_id:
+            clean_stage_key = _resolve_grace_objective_stage_for_delegation(
+                conn,
+                objective_id=clean_objective_id,
+                stage_key=clean_stage_key,
+                delegation_id=delegation_id,
+            )
 
         conn.execute(
             """
