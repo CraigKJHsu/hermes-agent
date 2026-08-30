@@ -1147,7 +1147,6 @@ def _find_durable_clawops_approval_args(
         return None
     recovered = dict(args)
     recovered.pop("approval_token", None)
-    recovered["_approval_compiled_contract"] = None
     recovered["approved"] = False
     return recovered
 

@@ -2004,7 +2004,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         normalized_contract = validate_loop_contract(contract)
         exact_fingerprint = contract_fingerprint(normalized_contract)
         sealed_contract = args.get("_approval_compiled_contract")
-        if approval_token and sealed_contract is not None:
+        if (approval_token or approval_refresh_token) and sealed_contract is not None:
             if not isinstance(sealed_contract, dict):
                 raise ValueError(
                     "Approval challenge sealed contract must be an object."
