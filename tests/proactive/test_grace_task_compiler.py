@@ -8,6 +8,7 @@ from proactive.grace_task_compiler import (
     compile_and_delegate,
     contract_internal_hermes_runtime,
     contract_requires_image_generation,
+    render_execution_body,
 )
 from proactive.hubops_routing import resolved_route_binding, route_clawops_objective
 from proactive.loop_contract import contract_fingerprint, validate_loop_contract
@@ -80,6 +81,34 @@ def _route_image_contract(contract: dict) -> tuple[dict, str]:
     contract["routing"]["resolved"] = resolved_route_binding(preview)
     normalized = validate_loop_contract(contract)
     return normalized, contract_fingerprint(normalized)
+
+
+def test_approved_execution_body_hides_grace_callback_envelope() -> None:
+    contract = _image_contract()
+    contract["original_request"] = (
+        "[SYSTEM: Grace Loop callback]\n"
+        "source of truth: callback delivery envelope, not worker source material"
+    )
+    contract["approval_provenance"] = {
+        "approval_grant_id": "gd_test",
+        "approval_token": "token-test",
+        "approved_message_id": "message-2",
+    }
+    contract["scope"]["allowed"] = [
+        "Use the already-approved exact external action only"
+    ]
+    contract["goal"]["objective"] = (
+        "Use source facts from the approved contract, but do not reinterpret callback text."
+    )
+
+    body = render_execution_body(contract)
+
+    assert "already backed by a consumed, one-time owner approval" in body
+    assert "Do not create another approval checkpoint" in body
+    assert "clawops_delegate, grace_callback_outcome" in body
+    assert "[SYSTEM: Grace Loop callback]" not in body
+    assert '"original_request_sha256"' in body
+    assert "Grace session history only; not disclosed to ClawOps" in body
 
 
 def _openclaw_loop_result(task: dict, backend_agent_id: str = "missioncrew-content") -> dict:

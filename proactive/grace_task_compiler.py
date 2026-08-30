@@ -345,6 +345,21 @@ def _render_image_generation_guidance(contract: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _render_approved_external_execution_guidance(contract: Mapping[str, Any]) -> list[str]:
+    provenance = contract.get("approval_provenance")
+    if not isinstance(provenance, Mapping):
+        return []
+    return [
+        "This execution card is already backed by a consumed, one-time owner approval. "
+        "Do not create another approval checkpoint and do not call or wait for "
+        "clawops_delegate, grace_callback_outcome, or any callback-only tool.",
+        "Execute only the approved external action inside the compiled contract. If live UI "
+        "no longer satisfies the exact approved source listing or destination constraints, "
+        "block with a precise live-readback reason instead of asking for another approval "
+        "inside this worker.",
+    ]
+
+
 def render_execution_body(contract: Mapping[str, Any]) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
@@ -360,6 +375,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "Before completion, provide every required verification item and evidence.",
             evidence_first_answering_prompt(),
             *_render_policy_guidance(worker_contract, review=False),
+            *_render_approved_external_execution_guidance(worker_contract),
             *_render_image_generation_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=False),
             "For each external draft/object you find or create, call kanban_external_effect "
@@ -496,6 +512,8 @@ def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> 
     """Detect contracts where the source text is itself the worker input."""
     text_parts: list[str] = []
     original = str(contract.get("original_request") or "")
+    if original.lstrip().startswith("[SYSTEM: Grace Loop callback]"):
+        return False
     for key in ("scope", "verification", "goal", "grace_interpretation"):
         value = contract.get(key)
         if isinstance(value, str):
