@@ -182,8 +182,8 @@ def grace_review_acceptance_error(metadata: Any) -> str:
         or review_metadata.get("accepted") is False
     ):
         return (
-            "Grace review completion metadata contains an explicit rejected "
-            "approval flag."
+            "Grace review completion metadata conflicts with its canonical "
+            "accepted verdict: it contains an explicit rejected approval flag."
         )
     if not _asset_declarations_valid(review_metadata.get("asset_declarations")):
         return (

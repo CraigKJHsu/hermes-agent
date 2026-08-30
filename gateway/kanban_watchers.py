@@ -1161,6 +1161,26 @@ class GatewayKanbanWatchersMixin:
                     conn.close()
             await asyncio.to_thread(_sync_record_terminal_closed_outcome)
 
+        async def _record_terminal_blocked_outcome(summary: str, reason: str) -> None:
+            def _sync_record_terminal_blocked_outcome() -> None:
+                conn = kb_module.connect(board=board)
+                try:
+                    kb_module.record_grace_loop_callback_outcome(
+                        conn,
+                        review_task_id=review_id,
+                        event_id=event_id,
+                        platform=platform_name,
+                        chat_id=str(callback.get("chat_id") or ""),
+                        thread_id=str(callback.get("thread_id") or ""),
+                        session_id=str(callback.get("session_id") or ""),
+                        lease_owner=lease_owner,
+                        outcome_kind="terminal_blocked",
+                        payload={"summary": summary, "reason": reason},
+                    )
+                finally:
+                    conn.close()
+            await asyncio.to_thread(_sync_record_terminal_blocked_outcome)
+
         async def _record_quota_blocked_outcome(message: str) -> None:
             def _sync_record_quota_blocked_outcome() -> None:
                 conn = kb_module.connect(board=board)
@@ -1758,7 +1778,9 @@ class GatewayKanbanWatchersMixin:
                 "audit mechanics. For delivery=inline_only, do not mention or upload "
                 "the artifact unless KJ explicitly asks for it. If report.complete is "
                 "false or any coverage item is incomplete, state the exact gap and MUST "
-                "NOT record outcome_kind=closed. completion_mode=intermediate is a "
+                "NOT record outcome_kind=closed; for a terminal stage with no legal "
+                "continuation, record outcome_kind=terminal_blocked with a concise "
+                "summary and reason. completion_mode=intermediate is a "
                 "durable statement that another stage or approval checkpoint remains: "
                 "MUST NOT record closed for it. Before ending this callback, call "
                 "grace_callback_outcome exactly once: use outcome_kind=closed with a "
@@ -1766,7 +1788,9 @@ class GatewayKanbanWatchersMixin:
                 "satisfied; otherwise use outcome_kind=continued with queued "
                 "delegation_id/execution_task_id/review_task_id, or "
                 "outcome_kind=approval_blocked with action/platform/scope and the exact "
-                "approval question. If completion_mode=intermediate and the next stage "
+                "approval question, or outcome_kind=terminal_blocked when verified "
+                "terminal evidence proves the originating outcome is not complete and "
+                "no scoped continuation can legally proceed. If completion_mode=intermediate and the next stage "
                 "changes external state, call clawops_delegate now with the complete "
                 "successor contract, approved=false, explicit external_targets, "
                 f"origin_callback_review_id={review_id}, "
@@ -1795,7 +1819,9 @@ class GatewayKanbanWatchersMixin:
             "lead with task ids, file paths, line counts, byte counts, or audit mechanics. "
             "For delivery=inline_only, do not mention or upload the artifact unless KJ "
             "explicitly asks for it. If report.complete is false or any coverage item is "
-            "incomplete, state the exact gap and MUST NOT record outcome_kind=closed. "
+            "incomplete, state the exact gap and MUST NOT record outcome_kind=closed; "
+            "for a terminal stage with no legal continuation, record "
+            "outcome_kind=terminal_blocked with a concise summary and reason. "
             "Then determine whether a safe read-only continuation is available or an exact "
             "approval checkpoint is required, then explicitly determine whether the originating "
             "user outcome is satisfied. completion_mode=intermediate is a "
@@ -2065,18 +2091,27 @@ class GatewayKanbanWatchersMixin:
                     )
                     return
                 elif user_facing_report is not None:
-                    # The Gateway owns and verifies inline report delivery. If
-                    # Grace produced only a prose acknowledgement, let the
-                    # existing durable close validator decide whether this
-                    # accepted terminal package is actually complete. It will
-                    # still reject missing delivery receipts, incomplete
-                    # reports, continuations, approval challenges, and active
-                    # objective stages.
-                    await _record_terminal_closed_outcome(
-                        str(callback.get("review_summary") or "").strip()
-                        or f"Grace review {review_id} accepted and its complete "
-                        "user-facing report was delivered."
-                    )
+                    summary = str(callback.get("review_summary") or "").strip()
+                    if user_facing_report.get("complete") is False:
+                        await _record_terminal_blocked_outcome(
+                            summary
+                            or f"Grace review {review_id} accepted an incomplete "
+                            "terminal user-facing report.",
+                            "user_facing_report.complete=false",
+                        )
+                    else:
+                        # The Gateway owns and verifies inline report delivery. If
+                        # Grace produced only a prose acknowledgement, let the
+                        # existing durable close validator decide whether this
+                        # accepted terminal package is actually complete. It will
+                        # still reject missing delivery receipts, incomplete
+                        # reports, continuations, approval challenges, and active
+                        # objective stages.
+                        await _record_terminal_closed_outcome(
+                            summary
+                            or f"Grace review {review_id} accepted and its complete "
+                            "user-facing report was delivered."
+                        )
                 else:
                     raise RuntimeError(
                         "accepted callback returned without a valid structured outcome"

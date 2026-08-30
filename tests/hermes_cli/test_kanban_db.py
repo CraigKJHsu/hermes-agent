@@ -1008,6 +1008,137 @@ def test_incomplete_user_facing_report_cannot_close_callback(tmp_path):
             )
 
 
+def test_terminal_blocked_callback_accepts_delivered_incomplete_report(tmp_path):
+    db_path = tmp_path / "terminal-blocked-incomplete-report.db"
+    with kb.connect_closing(db_path) as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go-terminal-blocked",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            title="Relist original destinations",
+            objective="Relist to every original destination.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["execute_external_action"],
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=["all destinations have a terminal status"],
+        )
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body=_required_single_subject_report_body(),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="partial group inventory",
+            metadata={"user_facing_report": _commerce_report(complete=False)},
+        )
+        stored_report = kb.latest_run(
+            conn, execution_id,
+        ).metadata["user_facing_report"]
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+            objective_id="go-terminal-blocked",
+            stage_key="execute_external_action",
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="terminal-blocked",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="evidence accepted but target incomplete",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        reservation = kb.reserve_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=1,
+        )
+        assert reservation["should_send"] is True
+        kb.confirm_grace_user_facing_report_chunk(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            report=stored_report,
+            chunk_index=0,
+            total_chunks=1,
+            message_id="telegram-partial-1",
+        )
+        kb.record_grace_user_facing_report_delivery(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            report=stored_report,
+            chunk_count=1,
+            chunk_index=0,
+        )
+
+        receipt = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="terminal_blocked",
+            payload={
+                "summary": "Only one of two expected destinations is named.",
+                "reason": "user_facing_report.complete=false",
+            },
+        )
+        objective = kb.get_grace_objective(conn, "go-terminal-blocked")
+        stage = conn.execute(
+            """
+            SELECT status, outcome_kind
+              FROM grace_objective_stages
+             WHERE objective_id = 'go-terminal-blocked'
+               AND stage_key = 'execute_external_action'
+            """
+        ).fetchone()
+
+    assert receipt["outcome_kind"] == "terminal_blocked"
+    assert objective is not None and objective["status"] == "blocked"
+    assert stage["status"] == "done"
+    assert stage["outcome_kind"] == "terminal_blocked"
+
+
 def test_required_user_facing_report_cannot_be_omitted_on_close(tmp_path):
     db_path = tmp_path / "missing-required-user-facing-report.db"
     with kb.connect_closing(db_path) as conn:

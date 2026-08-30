@@ -3219,6 +3219,151 @@ def _split_internal_tool_effects(
     return external, internal
 
 
+_FACEBOOK_GROUP_EFFECT_RE = re.compile(r"\bgroup:([1-9][0-9]*)\b", re.IGNORECASE)
+_MARKETPLACE_LISTING_EFFECT_RE = re.compile(
+    r"\b(?:marketplace(?: listing)?|listing)[: ]+([1-9][0-9]*)\b",
+    re.IGNORECASE,
+)
+
+
+def _contract_external_target_ids(
+    metadata: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    contract = metadata.get("loop_contract")
+    targets = (
+        contract.get("external_targets")
+        if isinstance(contract, Mapping)
+        else None
+    )
+    group_ids: set[str] = set()
+    listing_ids: set[str] = set()
+    if not isinstance(targets, list):
+        return group_ids, listing_ids
+    for target in targets:
+        normalized = str(target or "").strip()
+        group_match = _FACEBOOK_GROUP_EFFECT_RE.search(normalized)
+        if group_match is not None:
+            group_ids.add(group_match.group(1))
+        listing_match = _MARKETPLACE_LISTING_EFFECT_RE.search(normalized)
+        if listing_match is not None:
+            listing_ids.add(listing_match.group(1))
+    return group_ids, listing_ids
+
+
+def _normalize_openclaw_external_effects(
+    effects: list[Any] | None,
+    *,
+    metadata: Mapping[str, Any],
+) -> list[dict[str, Any]] | None:
+    if effects is None:
+        return None
+    allowed_group_ids, allowed_listing_ids = _contract_external_target_ids(metadata)
+    normalized_effects: list[dict[str, Any]] = []
+    for raw_effect in effects:
+        if not isinstance(raw_effect, Mapping):
+            return None
+        target = str(raw_effect.get("target") or "").strip()
+        external_id = str(
+            raw_effect.get("external_id")
+            or raw_effect.get("externalId")
+            or ""
+        ).strip()
+        state = str(raw_effect.get("state") or "").strip().lower()
+        if state not in {"existing", "created", "verified", "joined", "pending_approval"}:
+            return None
+        raw_effect_key = str(
+            raw_effect.get("effect_key")
+            or raw_effect.get("effectKey")
+            or raw_effect.get("deterministicEffectKey")
+            or raw_effect.get("deterministic_effect_key")
+            or ""
+        ).strip()
+        group_match = _FACEBOOK_GROUP_EFFECT_RE.search(target)
+        if group_match is None and external_id.isdigit():
+            if external_id in allowed_group_ids:
+                group_match = re.match(r"([1-9][0-9]*)", external_id)
+        listing_match = _MARKETPLACE_LISTING_EFFECT_RE.search(target)
+        if listing_match is None and external_id.isdigit():
+            if external_id in allowed_listing_ids:
+                listing_match = re.match(r"([1-9][0-9]*)", external_id)
+        if group_match is not None:
+            group_id = group_match.group(1)
+            if group_id not in allowed_group_ids:
+                return None
+            if external_id and external_id != group_id:
+                return None
+            platform = "facebook"
+            effect_key = f"group:{group_id}"
+            external_id = group_id
+        elif listing_match is not None:
+            listing_id = listing_match.group(1)
+            if allowed_listing_ids and listing_id not in allowed_listing_ids:
+                return None
+            if external_id and external_id != listing_id:
+                return None
+            platform = "facebook"
+            effect_key = f"marketplace:{listing_id}"
+            external_id = listing_id
+        else:
+            platform = kb._normalize_external_effect_platform(
+                raw_effect.get("platform"),
+                raw_effect,
+            )
+            effect_key = raw_effect_key or "create"
+            if effect_key.startswith("group:"):
+                return None
+        details = raw_effect.get("details")
+        if details is None:
+            details = {
+                key: raw_effect[key]
+                for key in (
+                    "target",
+                    "readback",
+                    "deterministicEffectKey",
+                    "deterministic_effect_key",
+                )
+                if key in raw_effect
+            } or None
+        if details is not None and not isinstance(details, Mapping):
+            details = {"readback": str(details)}
+        normalized_effects.append({
+            "platform": platform,
+            "effect_key": effect_key,
+            "state": state,
+            "external_id": external_id or None,
+            "details": details,
+        })
+    return normalized_effects
+
+
+def _external_effect_evidence_reclassified(
+    evidence: Mapping[str, Any],
+    *,
+    external_effects: list[Any] | None,
+    normalized_external_effects: list[dict[str, Any]] | None,
+    external_effect_budget: int,
+) -> bool:
+    if evidence.get("resultContractValid") is True:
+        return True
+    error = str(evidence.get("resultContractError") or "").strip()
+    if error == "Loop Contract result exceeded its external effect budget.":
+        return (
+            isinstance(external_effects, list)
+            and len(external_effects) <= external_effect_budget
+        )
+    if error != (
+        "Loop Contract external effect evidence is incomplete or outside "
+        "the approved targets."
+    ):
+        return False
+    return (
+        isinstance(normalized_external_effects, list)
+        and isinstance(external_effects, list)
+        and len(normalized_external_effects) == len(external_effects)
+        and len(normalized_external_effects) <= external_effect_budget
+    )
+
+
 def _default_execution_policy_receipts(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
     loop_contract = metadata.get("loop_contract")
     snapshots = (
@@ -3368,8 +3513,28 @@ def make_loop_contract_terminal_handler(
             else _default_execution_policy_receipts(metadata)
         )
         external_effect_budget = int(metadata.get("external_effect_budget") or 0)
+        normalized_external_effects = _normalize_openclaw_external_effects(
+            external_effects,
+            metadata=metadata,
+        )
+        reclassified_external_effect_error = (
+            isinstance(evidence, Mapping)
+            and evidence.get("resultContractValid") is not True
+            and str(evidence.get("resultContractError") or "").strip()
+            == (
+                "Loop Contract external effect evidence is incomplete or outside "
+                "the approved targets."
+            )
+            and normalized_external_effects is not None
+        )
         valid = (
-            observation.get("status") == "succeeded"
+            (
+                observation.get("status") == "succeeded"
+                or (
+                    reclassified_external_effect_error
+                    and observation.get("status") == "failed"
+                )
+            )
             and isinstance(result, Mapping)
             and _identity_matches(
                 result,
@@ -3384,14 +3549,24 @@ def make_loop_contract_terminal_handler(
             and str(result.get("backend_agent_id") or "")
             == str(metadata.get("backend_agent_id") or "")
             and str(result.get("protocol_version") or "") == "2.0"
-            and result.get("errors") in (None, [])
-            and result.get("requires_human_review") is False
+            and (
+                result.get("errors") in (None, [])
+                or (
+                    reclassified_external_effect_error
+                    and result.get("errors") == ["openclaw_bridge_failed"]
+                )
+            )
+            and (
+                result.get("requires_human_review") is False
+                or reclassified_external_effect_error
+            )
             and result.get("backend_session_key") == metadata.get("backend_session_key")
             and isinstance(evidence, Mapping)
             and evidence.get("terminal") is True
-            and _result_contract_budget_failure_reclassified(
+            and _external_effect_evidence_reclassified(
                 evidence,
                 external_effects=external_effects,
+                normalized_external_effects=normalized_external_effects,
                 external_effect_budget=external_effect_budget,
             )
             and evidence.get("externalEffectBudget") == metadata.get("external_effect_budget")
@@ -3402,6 +3577,7 @@ def make_loop_contract_terminal_handler(
             )
             and isinstance(external_effects, list)
             and len(external_effects) <= external_effect_budget
+            and normalized_external_effects is not None
         )
         validation_error = (
             str(evidence.get("resultContractError") or "").strip()
@@ -3453,7 +3629,8 @@ def make_loop_contract_terminal_handler(
                         "terminal": True,
                         "result_digest": observation.get("result_digest"),
                         "acceptance_evidence": audited_result.get("acceptanceEvidence"),
-                        "external_effects": external_effects,
+                        "external_effects": normalized_external_effects,
+                        "raw_external_effects": external_effects,
                         "internal_tool_receipts": internal_tool_receipts,
                         "policy_receipts": policy_receipts,
                         **content_package_metadata,

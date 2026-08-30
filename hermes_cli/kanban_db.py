@@ -441,6 +441,10 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
     group_ids: set[str] = set()
     for target in targets:
         normalized = str(target or "").strip()
+        scoped_match = re.fullmatch(r"group:([1-9][0-9]*)", normalized, flags=re.IGNORECASE)
+        if scoped_match is not None:
+            group_ids.add(scoped_match.group(1))
+            continue
         match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
         if match is not None:
             group_id = match.group("group_id")
@@ -15887,6 +15891,39 @@ def _apply_grace_objective_callback_outcome(
             (stage_key, now, now, objective_id),
         )
         return
+    if kind == "terminal_blocked":
+        if stage_key != objective["terminal_stage_key"]:
+            raise ValueError("Only the declared terminal objective stage may block the outcome")
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'done', outcome_kind = 'terminal_blocked',
+                   evidence = ?, completed_at = ?, updated_at = ?
+             WHERE objective_id = ? AND stage_key = ?
+            """,
+            (evidence, now, now, objective_id, stage_key),
+        )
+        conn.execute(
+            """
+            UPDATE grace_objectives
+               SET status = 'blocked', current_stage_key = ?,
+                   next_action = ?, waiting_for = ?, updated_at = ?
+             WHERE objective_id = ?
+            """,
+            (
+                stage_key,
+                str(payload.get("next_action") or "").strip(),
+                str(
+                    payload.get("waiting_for")
+                    or payload.get("reason")
+                    or payload.get("summary")
+                    or ""
+                ).strip(),
+                now,
+                objective_id,
+            ),
+        )
+        return
     if kind == "continued":
         successor_id = str((successor or {}).get("objective_id") or "").strip()
         successor_stage = str((successor or {}).get("stage_key") or "").strip()
@@ -16037,9 +16074,9 @@ def record_grace_loop_callback_outcome(
             "Grace-review completion event."
         )
     kind = str(outcome_kind or "").strip()
-    if kind not in {"closed", "continued", "approval_blocked"}:
+    if kind not in {"closed", "continued", "approval_blocked", "terminal_blocked"}:
         raise ValueError(
-            "Callback outcome must be closed, continued, or approval_blocked."
+            "Callback outcome must be closed, continued, approval_blocked, or terminal_blocked."
         )
     clean_payload = dict(payload or {})
     payload_json = json.dumps(
@@ -16059,7 +16096,7 @@ def record_grace_loop_callback_outcome(
             "Grace callback outcome is write-once and another outcome "
             "is already recorded."
         )
-    if kind == "closed":
+    if kind in {"closed", "terminal_blocked"}:
         if callback.get("completion_mode") == "intermediate":
             raise ValueError(
                 "Intermediate callback cannot close the complete user outcome; "
@@ -16145,6 +16182,7 @@ def record_grace_loop_callback_outcome(
         if user_facing_report is not None:
             from hermes_cli.user_facing_report import (
                 delivery_contract_from_report,
+                report_matches_user_facing_delivery,
                 report_satisfies_user_facing_delivery,
             )
 
@@ -16152,11 +16190,26 @@ def record_grace_loop_callback_outcome(
                 user_facing_delivery = delivery_contract_from_report(
                     user_facing_report
                 )
+            report_matches_contract = report_matches_user_facing_delivery(
+                user_facing_report,
+                user_facing_delivery,
+            )
             report_allows_close = report_satisfies_user_facing_delivery(
                 user_facing_report,
                 user_facing_delivery,
             )
-            if not report_allows_close:
+            if kind == "terminal_blocked":
+                if report_allows_close:
+                    raise ValueError(
+                        "Terminal-blocked callback outcome conflicts with a "
+                        "complete user-facing report; close the outcome instead."
+                    )
+                if not report_matches_contract:
+                    raise ValueError(
+                        "Incomplete user-facing report does not match the "
+                        "delivery contract."
+                    )
+            elif not report_allows_close:
                 raise ValueError(
                     "Incomplete user-facing report cannot close the complete "
                     "user outcome; continue the read-only reconciliation or "
@@ -16180,14 +16233,14 @@ def record_grace_loop_callback_outcome(
                 if (
                     len(durable_coverage) != len(requested_subjects)
                     or any(
-                        not row["complete"]
-                        or row["source_task_id"] != execution_task_id
+                        row["source_task_id"] != execution_task_id
                         or int(row["observed_at"] or 0) != report_observed_at
+                        or (kind == "closed" and not row["complete"])
                         for row in durable_coverage
                     )
                 ):
                     raise ValueError(
-                        "Durable commerce coverage does not match this complete "
+                        "Durable commerce coverage does not match this "
                         "user-facing report; continue reconciliation."
                     )
                 report_rows = {
@@ -16232,6 +16285,10 @@ def record_grace_loop_callback_outcome(
                 )
         if not str(clean_payload.get("summary") or "").strip():
             raise ValueError("Closed callback outcome requires a summary.")
+        if kind == "terminal_blocked" and not str(
+            clean_payload.get("reason") or ""
+        ).strip():
+            raise ValueError("Terminal-blocked callback outcome requires a reason.")
     elif kind == "approval_blocked":
         required = ("action", "platform", "scope", "exact_question")
         missing = [
@@ -16743,7 +16800,7 @@ def grace_loop_callback_has_outcome(
            AND lease_event_id = ?
            AND lease_owner = ?
            AND outcome_event_id = ?
-           AND outcome_kind IN ('closed', 'continued', 'approval_blocked')
+           AND outcome_kind IN ('closed', 'continued', 'approval_blocked', 'terminal_blocked')
            AND outcome_payload IS NOT NULL
         """,
         (
