@@ -2787,6 +2787,15 @@ def retry_ready_approved_loop_contract_after_capability_repair(
             previous_metadata = previous_run.metadata if previous_run else None
             if not isinstance(previous_metadata, Mapping):
                 raise ValueError("Approved capability recovery lacks prior run metadata.")
+            try:
+                recovery_contract = _loop_contract_from_execution_body(task.body or "")
+            except Exception:
+                previous_contract = previous_metadata.get("loop_contract")
+                recovery_contract = (
+                    dict(previous_contract)
+                    if isinstance(previous_contract, Mapping)
+                    else {}
+                )
             if (
                 int(previous_metadata.get("external_effect_budget") or 0) < 1
                 or not str(previous_metadata.get("approval_grant_id") or "").strip()
@@ -2858,6 +2867,14 @@ def retry_ready_approved_loop_contract_after_capability_repair(
                 metadata["telegram_message_path"] = recovery_path
                 metadata["backend_telegram_message_path"] = backend_projection(
                     recovery_path
+                )
+            if recovery_contract:
+                metadata["loop_contract"] = _worker_safe_loop_contract(
+                    recovery_contract,
+                    telegram_message_path=recovery_path,
+                    external_effect_budget=int(
+                        previous_metadata.get("external_effect_budget") or 0
+                    ),
                 )
             if not kb.merge_active_run_metadata(
                 conn,
