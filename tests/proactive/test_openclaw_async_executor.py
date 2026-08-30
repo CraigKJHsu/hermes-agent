@@ -1525,6 +1525,79 @@ def test_loop_contract_terminal_rejects_openclaw_external_effect_outside_allowli
     assert effects == []
 
 
+def test_loop_contract_terminal_synthesizes_commerce_status_report(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-commerce-status-report-1"
+    contract["routing"] = {"task_type": "secondhand_commerce_group_status"}
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "subject_keys": ["kolin-kd-291m06:37276725125275496:1333742673375089"],
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="secondhand_commerce_group_status",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-commerce-status-report-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["result"]["acceptanceEvidence"] = {
+        "inlineReport": {
+            "listing_id": "37276725125275496",
+            "group_numeric_id": "1333742673375089",
+            "group_name": "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
+            "status": "not_posted",
+            "observed_at": 1_788_094_528,
+            "evidence_url": "https://www.facebook.com/marketplace/you/selling",
+            "evidence": (
+                "The listing-bound chooser shows the target group as an "
+                "available destination; no checkbox was selected."
+            ),
+        }
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-commerce-status-report-digest",
+    })
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+        coverage = kb.list_commerce_group_coverage(
+            conn,
+            subject_key="kolin-kd-291m06:37276725125275496:1333742673375089",
+        )
+    assert ended_run is not None
+    report = ended_run.metadata["user_facing_report"]
+    assert report["kind"] == "commerce_group_status"
+    assert report["complete"] is True
+    assert report["coverage"][0]["expected_total"] == 1
+    assert report["coverage"][0]["named_count"] == 1
+    assert report["coverage"][0]["gap_count"] == 0
+    assert report["rows"][0]["status"] == "not_posted"
+    assert len(coverage) == 1
+    assert coverage[0]["complete"] == 1
+
+
 def test_zero_budget_terminal_accepts_internal_image_generation_receipts(
     kanban_home,
 ):

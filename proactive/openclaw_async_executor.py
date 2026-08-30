@@ -3392,6 +3392,125 @@ def _default_execution_policy_receipts(metadata: Mapping[str, Any]) -> list[dict
     return receipts
 
 
+def _commerce_status_report_metadata(
+    audited_result: Mapping[str, Any],
+    *,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    contract = metadata.get("loop_contract")
+    delivery = (
+        contract.get("user_facing_delivery")
+        if isinstance(contract, Mapping)
+        else None
+    )
+    if (
+        not isinstance(delivery, Mapping)
+        or delivery.get("required") is not True
+        or delivery.get("kind") != "commerce_group_status"
+        or delivery.get("delivery") != "inline_only"
+    ):
+        return {}
+    subject_keys = delivery.get("subject_keys")
+    if not isinstance(subject_keys, list) or len(subject_keys) != 1:
+        return {}
+    subject_key = str(subject_keys[0] or "").strip()
+    if not subject_key:
+        return {}
+    acceptance = audited_result.get("acceptanceEvidence")
+    if not isinstance(acceptance, Mapping):
+        return {}
+    inline_report = acceptance.get("inlineReport") or acceptance.get("inline_report")
+    if not isinstance(inline_report, Mapping):
+        return {}
+    listing_id = str(
+        inline_report.get("listing_id")
+        or inline_report.get("source_listing_id")
+        or ""
+    ).strip()
+    group_id = str(
+        inline_report.get("group_numeric_id")
+        or inline_report.get("destination_id")
+        or ""
+    ).strip()
+    group_name = str(
+        inline_report.get("group_name")
+        or inline_report.get("destination_name")
+        or ""
+    ).strip()
+    status = str(inline_report.get("status") or "").strip().lower()
+    observed_at = inline_report.get("observed_at")
+    evidence = str(inline_report.get("evidence") or "").strip()
+    if not (
+        listing_id
+        and re.fullmatch(r"[1-9][0-9]*", group_id)
+        and group_name
+        and status
+        and isinstance(observed_at, int)
+        and evidence
+    ):
+        return {}
+    status_labels = {
+        "public": "公開可見",
+        "pending_approval": "已送出，待審或待確認",
+        "rejected": "已拒絕",
+        "not_found": "未找到",
+        "ambiguous_after_submit": "已提交但無法確認接受",
+        "not_posted": "未刊登",
+        "unknown": "狀態不明",
+    }
+    if status not in status_labels:
+        return {}
+    subject_label = str(
+        inline_report.get("subject_label")
+        or f"Kolin KD-291M06 / {listing_id} / group {group_id}"
+    ).strip()
+    complete = status not in {"unknown", "ambiguous_after_submit"}
+    verified_at = time.strftime(
+        "%Y-%m-%d %H:%M:%S UTC",
+        time.gmtime(int(observed_at)),
+    )
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": complete,
+        "as_of": verified_at,
+        "observed_at": int(observed_at),
+        "rows": [{
+            "subject_key": subject_key,
+            "subject_label": subject_label,
+            "destination_id": group_id,
+            "destination_name": group_name,
+            "status": status,
+            "status_label": status_labels[status],
+            "observed_at": int(observed_at),
+            "verified_at": verified_at,
+            "evidence": evidence,
+            "source_listing_id": listing_id,
+            "evidence_url": str(inline_report.get("evidence_url") or "").strip(),
+        }],
+        "coverage": [{
+            "subject_key": subject_key,
+            "subject_label": subject_label,
+            "complete": complete,
+            "named_count": 1,
+            "gap_count": 0,
+            "expected_total": 1,
+            "expected_total_label": "1 個指定 Facebook 社團目的地",
+            "note": (
+                "已完成單一指定社團的唯讀狀態分類。"
+                if complete
+                else "已回報單一指定社團的目前缺口，但狀態仍未能確認。"
+            ),
+        }],
+    }
+    try:
+        from hermes_cli.user_facing_report import normalize_user_facing_report
+
+        return {"user_facing_report": normalize_user_facing_report(report)}
+    except ValueError:
+        return {}
+
+
 def _content_package_completion_metadata(
     audited_result: Mapping[str, Any],
     *,
@@ -3614,6 +3733,10 @@ def make_loop_contract_terminal_handler(
                         "reason": validation_reason,
                     }
                 summary = str(audited_result.get("summary") or "OpenClaw Loop Contract completed.")
+                commerce_report_metadata = _commerce_status_report_metadata(
+                    audited_result,
+                    metadata=metadata,
+                )
                 content_package_metadata = _content_package_completion_metadata(
                     audited_result,
                     task_id=run.task_id,
@@ -3633,6 +3756,7 @@ def make_loop_contract_terminal_handler(
                         "raw_external_effects": external_effects,
                         "internal_tool_receipts": internal_tool_receipts,
                         "policy_receipts": policy_receipts,
+                        **commerce_report_metadata,
                         **content_package_metadata,
                     },
                     expected_run_id=run.id,
