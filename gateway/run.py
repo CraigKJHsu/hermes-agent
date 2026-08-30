@@ -1096,6 +1096,62 @@ def _find_bound_clawops_approval_args(
     return None
 
 
+def _find_durable_clawops_approval_args(
+    approval_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Recover approval args from the durable challenge row."""
+    token = str(approval_token or "").strip()
+    if not token:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb_module
+
+        boards: list[Any] = [None]
+        try:
+            boards.extend(
+                str(item.get("slug") or kb_module.DEFAULT_BOARD)
+                for item in kb_module.list_boards(include_archived=False)
+            )
+        except Exception:
+            pass
+        challenge = None
+        seen_paths: set[str] = set()
+        for board in boards:
+            try:
+                db_path = str(kb_module.kanban_db_path(board=board).resolve())
+            except Exception:
+                db_path = f"board:{board or kb_module.DEFAULT_BOARD}"
+            if db_path in seen_paths:
+                continue
+            seen_paths.add(db_path)
+            with kb_module.connect_closing(board=board) as conn:
+                challenge = kb_module.get_grace_approval_challenge(
+                    conn,
+                    token,
+                )
+            if challenge:
+                break
+    except Exception:
+        logger.debug("Durable approval challenge lookup failed", exc_info=True)
+        return None
+    if not challenge:
+        return None
+    raw_args = challenge.get("delegation_args")
+    if not raw_args:
+        return None
+    try:
+        args = json.loads(str(raw_args))
+    except Exception:
+        return None
+    if not isinstance(args, dict):
+        return None
+    recovered = dict(args)
+    recovered.pop("approval_token", None)
+    recovered["_approval_compiled_contract"] = None
+    recovered["approved"] = False
+    return recovered
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -11209,8 +11265,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _approval_token = approval_token_candidate(str(event.text or ""))
         if _approval_token:
-            recovered_args = _find_bound_clawops_approval_args(
-                history, _approval_token,
+            recovered_args = _find_durable_clawops_approval_args(
+                _approval_token,
+            ) or _find_bound_clawops_approval_args(
+                history,
+                _approval_token,
             )
             _approval_records: List[
                 tuple[str, Dict[str, Any], Dict[str, Any]]

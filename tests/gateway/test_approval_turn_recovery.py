@@ -1,8 +1,10 @@
 import json
 
 from gateway.run import (
+    _find_durable_clawops_approval_args,
     _find_bound_clawops_approval_args,
 )
+from hermes_cli import kanban_db as kb
 
 
 def _tool_call(call_id, arguments):
@@ -70,3 +72,48 @@ def test_recovery_ignores_unrelated_token():
         )
         is None
     )
+
+
+def test_recovers_contract_from_durable_approval_challenge(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    contract = {
+        "approved": False,
+        "task_type": "facebook_marketplace_group_publish",
+        "external_targets": ["37276725125275496", "1333742673375089"],
+        "goal": {"objective": "精確重刊"},
+        "scope": {"allowed": ["唯一目的地 1333742673375089"]},
+    }
+    with kb.connect_closing(db_path) as conn:
+        challenge = kb.create_grace_approval_challenge(
+            conn,
+            contract_fingerprint="a" * 64,
+            platform="telegram",
+            chat_id="-1003938559457",
+            thread_id="2",
+            session_key="agent:main:telegram:group:-1003938559457:2",
+            session_id="grace-session-1",
+            user_id_sha256="b" * 64,
+            requested_message_id="7443",
+            request_instance_id="gri-test",
+            action_summary="精確重刊",
+            approval_platform="37276725125275496、1333742673375089",
+            approval_scope=json.dumps(
+                ["唯一目的地 1333742673375089"],
+                ensure_ascii=False,
+            ),
+            delegation_args=contract,
+        )
+
+    recovered = _find_durable_clawops_approval_args(challenge["token"])
+
+    assert recovered is not None
+    assert recovered["approved"] is False
+    assert recovered["task_type"] == "facebook_marketplace_group_publish"
+    assert recovered["external_targets"] == [
+        "37276725125275496",
+        "1333742673375089",
+    ]
