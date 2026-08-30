@@ -13,6 +13,7 @@ from proactive.openclaw_async_executor import (
     make_loop_contract_terminal_handler,
     make_zero_effect_async_poll_adapter,
     make_zero_effect_async_terminal_handler,
+    retry_ready_approved_loop_contract_after_capability_repair,
     retry_ready_loop_contract_execution,
     start_loop_contract_execution,
     start_zero_effect_async_acceptance,
@@ -313,6 +314,66 @@ def test_external_loop_contract_requires_scoped_approval(kanban_home):
             delegation_id="delegation-loop-external-1",
             transport=lambda task: _loop_result(task, "queued"),
         )
+
+
+def test_approved_external_capability_recovery_supports_browser_write_topics(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-external-recovery-1"
+    contract["external_targets"] = ["Facebook group: 1333742673375089"]
+    contract["routing"] = {
+        "resolved": {
+            "assignment": {
+                "allowed_tools": ["browser"],
+                "assigned_worker": "missioncrew.browser",
+                "required_agent_id": "missioncrew-browser-operator",
+            }
+        }
+    }
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_group_relist",
+        risk_level="high",
+        approved=True,
+        delegation_id="delegation-loop-external-recovery-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        assert kb.block_task(
+            conn,
+            started["execution_task_id"],
+            reason="OpenClaw Loop Contract admission raised: missing browser capability",
+            kind="capability",
+            expected_run_id=run.id,
+        )
+        assert kb.unblock_task(conn, started["execution_task_id"])
+
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    retried = retry_ready_approved_loop_contract_after_capability_repair(
+        started["execution_task_id"],
+        transport=transport,
+    )
+
+    assert retried["execution_task_id"] == started["execution_task_id"]
+    assert retried["status"] == "queued"
+    assert seen["external_effect_budget"] == 1
+    assert seen["task_type"] == "facebook_group_relist"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        run = kb.get_run(conn, int(retried["run_id"]))
+    assert task is not None and task.status == "running"
+    assert run is not None
+    assert run.metadata["capability_recovery"] is True
+    assert run.metadata["approval_grant_id"] == "delegation-loop-external-recovery-1"
 
 
 def test_image_generation_loop_contract_routes_with_backend_capability(

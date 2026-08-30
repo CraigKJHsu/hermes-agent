@@ -2769,7 +2769,7 @@ def retry_ready_approved_loop_contract_after_capability_repair(
     transport: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     policy_path: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Re-admit an approved Page publish after a proven pre-effect fault."""
+    """Re-admit an approved external Loop Contract after a proven pre-effect fault."""
     with kb.connect_closing(board=board) as conn:
         with kb.write_txn(conn):
             task = kb.get_task(conn, task_id)
@@ -2788,17 +2788,11 @@ def retry_ready_approved_loop_contract_after_capability_repair(
             if not isinstance(previous_metadata, Mapping):
                 raise ValueError("Approved capability recovery lacks prior run metadata.")
             if (
-                int(previous_metadata.get("external_effect_budget") or 0) != 1
+                int(previous_metadata.get("external_effect_budget") or 0) < 1
                 or not str(previous_metadata.get("approval_grant_id") or "").strip()
-                or str(previous_metadata.get("task_type") or "")
-                != "facebook_page_api_publish"
             ):
                 raise ValueError(
-                    "Approved capability recovery is limited to one Facebook Page publish effect."
-                )
-            if kb.grace_task_facebook_page_post_contract(conn, task_id) is None:
-                raise ValueError(
-                    "Approved capability recovery cannot verify the sealed owner approval."
+                    "Approved capability recovery requires a prior approved external-effect run."
                 )
             if conn.execute(
                 "SELECT 1 FROM task_external_effects WHERE task_id = ? LIMIT 1",
