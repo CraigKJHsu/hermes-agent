@@ -13930,6 +13930,90 @@ def ensure_grace_objective_stage(
             )
         stages = json.loads(objective["required_stage_keys"])
         if clean_stage_key not in stages:
+            retry_base_stage_key = _grace_objective_retry_base_stage_key(clean_stage_key)
+            if (
+                retry_base_stage_key
+                and retry_base_stage_key == objective["terminal_stage_key"]
+                and retry_base_stage_key in stages
+            ):
+                terminal_stage = conn.execute(
+                    """
+                    SELECT * FROM grace_objective_stages
+                     WHERE objective_id = ? AND stage_key = ?
+                    """,
+                    (clean_objective_id, retry_base_stage_key),
+                ).fetchone()
+                if terminal_stage is not None and terminal_stage["status"] != "done":
+                    superseded_evidence = _canonical_json(
+                        {
+                            "summary": (
+                                "Previous terminal stage was superseded by a "
+                                "new retry stage."
+                            ),
+                            "next_stage_key": clean_stage_key,
+                            "delegation_id": terminal_stage["delegation_id"],
+                            "execution_task_id": terminal_stage["execution_task_id"],
+                            "review_task_id": terminal_stage["review_task_id"],
+                        }
+                    )
+                    conn.execute(
+                        """
+                        UPDATE grace_objective_stages
+                           SET status = 'done',
+                               outcome_kind = 'superseded_by_retry',
+                               evidence = ?, completed_at = ?,
+                               updated_at = ?
+                         WHERE objective_id = ? AND stage_key = ?
+                        """,
+                        (
+                            superseded_evidence,
+                            now,
+                            now,
+                            clean_objective_id,
+                            retry_base_stage_key,
+                        ),
+                    )
+                next_position = (
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(position), -1) + 1
+                          FROM grace_objective_stages
+                         WHERE objective_id = ?
+                        """,
+                        (clean_objective_id,),
+                    ).fetchone()[0]
+                )
+                stages.append(clean_stage_key)
+                conn.execute(
+                    """
+                    INSERT INTO grace_objective_stages (
+                        objective_id, stage_key, position, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'planned', ?, ?)
+                    """,
+                    (clean_objective_id, clean_stage_key, next_position, now, now),
+                )
+                conn.execute(
+                    """
+                    UPDATE grace_objectives
+                       SET required_stage_keys = ?, current_stage_key = ?,
+                           terminal_stage_key = ?, next_action = ?,
+                           waiting_for = '', updated_at = ?
+                     WHERE objective_id = ?
+                    """,
+                    (
+                        json.dumps(stages, ensure_ascii=False, separators=(",", ":")),
+                        clean_stage_key,
+                        clean_stage_key,
+                        str(next_action or "").strip(),
+                        now,
+                        clean_objective_id,
+                    ),
+                )
+                refreshed = conn.execute(
+                    "SELECT * FROM grace_objectives WHERE objective_id = ?",
+                    (clean_objective_id,),
+                ).fetchone()
+                return dict(refreshed)
             current_stage_key = str(objective.get("current_stage_key") or "").strip()
             if (
                 clean_stage_key.startswith("prepare_")
@@ -14089,6 +14173,13 @@ def available_grace_objective_stage_key(
     raise ValueError("No available Grace objective retry stage key")
 
 
+def _grace_objective_retry_base_stage_key(stage_key: str) -> str:
+    match = re.fullmatch(r"(.+)_r([2-9]\d*)", str(stage_key or "").strip())
+    if not match:
+        return ""
+    return match.group(1)
+
+
 def _grace_objective_stage_matches_request(actual: Any, requested: str) -> bool:
     actual_stage = str(actual or "").strip()
     requested_stage = str(requested or "").strip()
@@ -14127,7 +14218,21 @@ def grace_objective_stage_mode(
     clean_stage = str(stage_key or "").strip()
     stages = json.loads(row["required_stage_keys"])
     if clean_stage not in stages:
-        raise ValueError("Grace objective stage is not declared in required_stage_keys")
+        retry_base_stage_key = _grace_objective_retry_base_stage_key(clean_stage)
+        if retry_base_stage_key not in stages:
+            raise ValueError("Grace objective stage is not declared in required_stage_keys")
+        ensure_grace_objective_stage(
+            conn,
+            objective_id=objective_id,
+            stage_key=clean_stage,
+            next_action="Retry objective stage after the previous delegation could not finish.",
+        )
+        row = get_grace_objective(conn, objective_id)
+        if row is None:
+            raise ValueError("Unknown Grace objective")
+        stages = json.loads(row["required_stage_keys"])
+        if clean_stage not in stages:
+            raise ValueError("Grace objective stage is not declared in required_stage_keys")
     return "terminal" if clean_stage == row["terminal_stage_key"] else "intermediate"
 
 

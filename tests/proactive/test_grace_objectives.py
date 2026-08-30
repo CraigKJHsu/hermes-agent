@@ -329,6 +329,149 @@ def test_available_stage_key_skips_done_or_bound_retry_stage(tmp_path):
         ]
 
 
+def test_terminal_retry_stage_becomes_new_terminal_and_supersedes_bound_terminal(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-terminal-retry.db") as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_terminal",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            title="Execute external action",
+            objective="Publish to verified destinations.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=("execute_external_action",),
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=("External result verified",),
+            current_stage_key="execute_external_action",
+            next_action="Execute external action.",
+        )
+        first = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="1" * 64,
+            request_instance_id="request-terminal",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_terminal",
+            stage_key="execute_external_action",
+        )
+
+        mode = kb.grace_objective_stage_mode(
+            conn,
+            objective_id="go_terminal",
+            stage_key="execute_external_action_r2",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+        )
+        objective = kb.get_grace_objective(conn, "go_terminal")
+        stages = conn.execute(
+            """
+            SELECT stage_key, delegation_id, status, outcome_kind
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_terminal'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+
+        assert first["stage_key"] == "execute_external_action"
+        assert mode == "terminal"
+        assert objective["terminal_stage_key"] == "execute_external_action_r2"
+        assert objective["current_stage_key"] == "execute_external_action_r2"
+        assert [
+            (row["stage_key"], row["delegation_id"], row["status"], row["outcome_kind"])
+            for row in stages
+        ] == [
+            (
+                "execute_external_action",
+                first["delegation_id"],
+                "done",
+                "superseded_by_retry",
+            ),
+            ("execute_external_action_r2", None, "planned", None),
+        ]
+
+
+def test_delegation_reservation_retries_bound_terminal_stage(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-terminal-reserve-retry.db") as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_terminal",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            title="Execute external action",
+            objective="Publish to verified destinations.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=("execute_external_action",),
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=("External result verified",),
+            current_stage_key="execute_external_action",
+            next_action="Execute external action.",
+        )
+        first = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="1" * 64,
+            request_instance_id="request-terminal",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_terminal",
+            stage_key="execute_external_action",
+        )
+        second = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="2" * 64,
+            request_instance_id="request-terminal-retry",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-2",
+            resolved_route={"backend": "hermes"},
+            approval_required=False,
+            objective_id="go_terminal",
+            stage_key="execute_external_action",
+        )
+
+        objective = kb.get_grace_objective(conn, "go_terminal")
+        old_stage = conn.execute(
+            """
+            SELECT status, outcome_kind
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_terminal'
+               AND stage_key = 'execute_external_action'
+            """
+        ).fetchone()
+        new_stage = conn.execute(
+            """
+            SELECT status, delegation_id
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_terminal'
+               AND stage_key = 'execute_external_action_r2'
+            """
+        ).fetchone()
+
+        assert first["stage_key"] == "execute_external_action"
+        assert second["stage_key"] == "execute_external_action_r2"
+        assert objective["terminal_stage_key"] == "execute_external_action_r2"
+        assert old_stage["status"] == "done"
+        assert old_stage["outcome_kind"] == "superseded_by_retry"
+        assert new_stage["status"] == "queued"
+        assert new_stage["delegation_id"] == second["delegation_id"]
+
+
 def test_terminal_stage_cannot_close_before_required_stages(tmp_path):
     with kb.connect_closing(tmp_path / "objective-close.db") as conn:
         _create_objective(conn)
