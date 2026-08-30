@@ -12,6 +12,7 @@ from hermes_cli import kanban_db as kb
 from proactive.clawops_intake import create_clawops_task, subscribe_clawops_task
 from proactive.loop_contract import contract_fingerprint, validate_loop_contract
 from proactive.policy_registry import policy_snapshot_marker
+from proactive.prompt_policy import evidence_first_answering_prompt
 from proactive.thread_context_registry import assert_contract_matches_context
 
 
@@ -327,6 +328,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "Do not search unrelated chats, topics, projects, or global history for intent.",
             "Use working memory only inside the declared namespace.",
             "Before completion, provide every required verification item and evidence.",
+            evidence_first_answering_prompt(),
             *_render_policy_guidance(worker_contract, review=False),
             *_render_image_generation_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=False),
@@ -375,6 +377,7 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "criterion. Evidence from earlier runs, parent comments, and the external-effect "
             "ledger remains valid until contradicted by a newer readback; never infer absence "
             "from a correction run merely saying it did not touch that platform.",
+            evidence_first_answering_prompt(),
             "For regenerated assets, the newest successful parent run supersedes every older "
             "asset path. Inspect and report the exact newest file path, dimensions, and SHA-256; "
             "never accept or deliver an older image merely because its evidence remains cumulative.",

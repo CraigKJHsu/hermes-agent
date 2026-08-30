@@ -168,6 +168,19 @@ def test_review_body_explains_canonical_verdict_for_fail_closed_parent():
     assert "parent_verdict" in review
 
 
+def test_loop_contract_bodies_include_evidence_first_answering_gate():
+    execution = render_execution_body(_contract())
+    review = render_review_body(_contract(), "t_execution")
+
+    for body in (execution, review):
+        assert "Trusted evidence-first answering gate" in body
+        assert "structured Kanban ledgers/registries" in body
+        assert "task_runs, task_events, task_external_effects" in body
+        assert "Mem0/QMD/session_search as recall or discovery aids" in body
+        assert "historical verified, current live verified" in body
+        assert "verified/not verified" in body
+
+
 def test_ai_bizweek_guidance_uses_operational_readiness_evidence():
     contract = _contract()
     contract["identity"]["project"] = "ai_bizweek"

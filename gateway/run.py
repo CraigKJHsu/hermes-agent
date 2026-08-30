@@ -10517,8 +10517,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from proactive.prompt_policy import (
                 active_objectives_prompt,
                 approval_turn_prompt,
+                evidence_first_answering_prompt,
             )
 
+            evidence_prompt = evidence_first_answering_prompt()
+            if evidence_prompt:
+                context_prompt = f"{context_prompt}\n\n{evidence_prompt}"
             approval_prompt = approval_turn_prompt(str(event.text or ""))
             if approval_prompt:
                 context_prompt = f"{context_prompt}\n\n{approval_prompt}"

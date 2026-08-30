@@ -2,6 +2,7 @@ from proactive.prompt_policy import (
     approval_attempt_candidate,
     approval_token_candidate,
     approval_turn_prompt,
+    evidence_first_answering_prompt,
     ensure_active_policy_prompt,
     stored_prompt_matches_active_policy,
 )
@@ -141,6 +142,22 @@ def test_approval_turn_prompt_routes_malformed_token_to_tool():
 
 def test_approval_turn_prompt_ignores_nonapproval_message():
     assert approval_turn_prompt("請問現在進度如何？") == ""
+
+
+def test_evidence_first_answering_prompt_prioritizes_authoritative_sources():
+    prompt = evidence_first_answering_prompt()
+
+    assert "Trusted evidence-first answering gate" in prompt
+    assert "do not answer from Prompt Memory, Mem0, QMD" in prompt
+    assert "task_runs, task_events, task_external_effects" in prompt
+    assert "user_facing_report" in prompt
+    assert "managed policy snapshots" in prompt
+    assert "Prompt Memory, USER.md, Mem0, QMD, and session_search" in prompt
+    assert "never prove absence by themselves" in prompt
+    assert "historical verified" in prompt
+    assert "current live verified" in prompt
+    assert "verified/not verified" in prompt
+    assert "must not convert a missing current read into 'never existed'" in prompt
 
 
 def test_approval_token_candidate_accepts_harmless_framing():
