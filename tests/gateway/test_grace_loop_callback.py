@@ -381,6 +381,119 @@ def test_legacy_commerce_report_without_contract_is_delivered_and_closed(
     assert receipt["user_report_delivered_at"] is not None
 
 
+def test_contract_single_destination_commerce_status_report_is_delivered(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "single-commerce-status-report.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    now = int(time.time())
+    subject_key = "kolin-kd-291m06:37276725125275496:1333742673375089"
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "subject_keys": [subject_key],
+        },
+    }
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": True,
+        "as_of": "2026-08-30 12:55:28 UTC",
+        "observed_at": now,
+        "rows": [{
+            "subject_key": subject_key,
+            "subject_label": "Kolin KD-291M06 / 37276725125275496 / group 1333742673375089",
+            "destination_id": "1333742673375089",
+            "destination_name": "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
+            "status": "not_posted",
+            "status_label": "未刊登",
+            "observed_at": now,
+            "verified_at": "2026-08-30 12:55:28 UTC",
+            "evidence": "The listing-bound chooser shows the target group as available.",
+            "source_listing_id": "37276725125275496",
+        }],
+        "coverage": [{
+            "subject_key": subject_key,
+            "subject_label": "Kolin KD-291M06 / 37276725125275496 / group 1333742673375089",
+            "complete": True,
+            "named_count": 1,
+            "gap_count": 0,
+            "expected_total": 1,
+            "expected_total_label": "1 個指定 Facebook 社團目的地",
+            "note": "已完成單一指定社團的唯讀狀態分類。",
+        }],
+    }
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 0 "
+            "WHERE singleton_id = 1"
+        )
+        execution_id = kb.create_task(
+            conn,
+            title="Single group status",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps(contract),
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="single status ready",
+            metadata={"user_facing_report": report},
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="single-commerce-status",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="e" * 64,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    delivered_text = "\n".join(text for _, text, _ in adapter.sent)
+    assert "Kolin KD-291M06" in delivered_text
+    assert "未刊登" in delivered_text
+    with kb.connect_closing(db_path) as conn:
+        receipt = kb.get_grace_loop_callback(conn, review_id)
+    assert receipt["state"] == "delivered"
+    assert receipt["outcome_kind"] == "closed"
+    assert receipt["user_report_delivered_at"] is not None
+
+
 def test_page_preflight_evidence_delivers_body_and_verified_hero(
     tmp_path, monkeypatch,
 ):
@@ -1626,25 +1739,38 @@ def test_complete_report_is_not_sent_before_historical_reconciliation(
         "complete": True,
         "as_of": "2026-08-02 20:00 Asia/Taipei",
         "observed_at": now,
-        "rows": [{
-            "subject_key": "kolin-kd291m06",
-            "subject_label": "Kolin KD-291M06",
-            "destination_id": "902016640291333",
-            "destination_name": "【大台北地區】二手家具、二手家電買賣",
-            "status": "public",
-            "status_label": "公開可見",
-            "observed_at": now,
-            "verified_at": "2026-08-02 20:00 Asia/Taipei",
-            "evidence": "社團頁面已讀回商品卡。",
-        }],
+        "rows": [
+            {
+                "subject_key": "kolin-kd291m06",
+                "subject_label": "Kolin KD-291M06",
+                "destination_id": "902016640291333",
+                "destination_name": "【大台北地區】二手家具、二手家電買賣",
+                "status": "public",
+                "status_label": "公開可見",
+                "observed_at": now,
+                "verified_at": "2026-08-02 20:00 Asia/Taipei",
+                "evidence": "社團頁面已讀回商品卡。",
+            },
+            {
+                "subject_key": "kolin-kd291m06",
+                "subject_label": "Kolin KD-291M06",
+                "destination_id": "1333742673375089",
+                "destination_name": "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
+                "status": "not_posted",
+                "status_label": "未刊登",
+                "observed_at": now,
+                "verified_at": "2026-08-02 20:00 Asia/Taipei",
+                "evidence": "社團目的地未顯示此 listing。",
+            },
+        ],
         "coverage": [{
             "subject_key": "kolin-kd291m06",
             "subject_label": "Kolin KD-291M06",
             "complete": True,
-            "named_count": 1,
+            "named_count": 2,
             "gap_count": 0,
-            "expected_total": 1,
-            "expected_total_label": "目前共一個目的地",
+            "expected_total": 2,
+            "expected_total_label": "目前共兩個目的地",
             "note": "清單完整。",
         }],
     }

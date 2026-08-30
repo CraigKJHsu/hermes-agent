@@ -185,6 +185,29 @@ def _commerce_report(*, complete: bool, observed_at: int = 1_785_657_600):
     }
 
 
+def _multi_destination_commerce_report(observed_at: int = 1_785_657_600):
+    report = _commerce_report(complete=True, observed_at=observed_at)
+    report["rows"] = [
+        dict(report["rows"][0]),
+        {
+            **report["rows"][0],
+            "destination_id": "1333742673375089",
+            "destination_name": "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
+            "status": "not_posted",
+            "status_label": "未刊登",
+            "evidence": "社團目的地未顯示此 listing。",
+        },
+    ]
+    report["coverage"] = [{
+        **report["coverage"][0],
+        "named_count": 2,
+        "expected_total": 2,
+        "expected_total_label": "2 個已提交目的地",
+        "note": "多目的地清單完整。",
+    }]
+    return report
+
+
 def _required_user_facing_report_body() -> str:
     return "\n".join([
         "GRACE_LOOP_CONTRACT_STAGE: execution",
@@ -1258,7 +1281,7 @@ def test_complete_user_facing_report_can_close_callback(tmp_path):
             "UPDATE commerce_group_migration_state SET reconciled = 0 "
             "WHERE singleton_id = 1"
         )
-        with pytest.raises(ValueError, match="must be reconciled"):
+        with pytest.raises(ValueError, match="delivery receipt"):
             kb.record_grace_loop_callback_outcome(
                 conn,
                 review_task_id=review_id,
@@ -1438,6 +1461,73 @@ def test_complete_user_facing_report_can_close_callback(tmp_path):
             payload={"summary": "complete"},
         )
     assert stored["outcome_kind"] == "closed"
+
+
+def test_multi_destination_commerce_report_requires_global_reconciliation(
+    tmp_path,
+):
+    db_path = tmp_path / "multi-commerce-report-reconciliation.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body=_required_single_subject_report_body(),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="complete group inventory",
+            metadata={
+                "user_facing_report": _multi_destination_commerce_report(),
+            },
+        )
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="multi-commerce-report",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        conn.execute(
+            "UPDATE commerce_group_migration_state SET reconciled = 0 "
+            "WHERE singleton_id = 1"
+        )
+        with pytest.raises(ValueError, match="must be reconciled"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "premature"},
+            )
 
 
 def test_complete_report_must_match_requested_subjects(tmp_path):

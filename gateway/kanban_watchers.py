@@ -1895,6 +1895,11 @@ class GatewayKanbanWatchersMixin:
             derived_delivery_contract = not isinstance(delivery_contract, dict)
             if not isinstance(delivery_contract, dict):
                 delivery_contract = delivery_contract_from_report(user_facing_report)
+            single_destination_status_report = (
+                kb_module.commerce_report_is_single_destination_status(
+                    user_facing_report,
+                )
+            )
             if not report_matches_user_facing_delivery(
                 user_facing_report,
                 delivery_contract,
@@ -1956,7 +1961,10 @@ class GatewayKanbanWatchersMixin:
                         report=user_facing_report,
                         chunk_index=chunk_index,
                         total_chunks=len(delivery_items),
-                        allow_report_scoped_reconciliation=derived_delivery_contract,
+                        allow_report_scoped_reconciliation=(
+                            derived_delivery_contract
+                            or single_destination_status_report
+                        ),
                     )
                 if reservation["state"] == "pending" and not reservation[
                     "should_send"

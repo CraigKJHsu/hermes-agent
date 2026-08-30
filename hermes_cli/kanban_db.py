@@ -4751,6 +4751,34 @@ def _commerce_report_has_current_subject_coverage(
     return True
 
 
+def commerce_report_is_single_destination_status(
+    report: Mapping[str, Any],
+) -> bool:
+    """Return whether a commerce report covers exactly one requested destination."""
+    if (
+        report.get("kind") != "commerce_group_status"
+        or report.get("complete") is not True
+    ):
+        return False
+    coverage = report.get("coverage") or []
+    rows = report.get("rows") or []
+    if (
+        not isinstance(coverage, list)
+        or len(coverage) != 1
+        or not isinstance(coverage[0], Mapping)
+        or not isinstance(rows, list)
+        or len(rows) != 1
+    ):
+        return False
+    try:
+        expected_total = int(coverage[0].get("expected_total") or 0)
+        named_count = int(coverage[0].get("named_count") or 0)
+        gap_count = int(coverage[0].get("gap_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return expected_total == 1 and named_count == 1 and gap_count == 0
+
+
 def _upsert_commerce_user_facing_report(
     conn: sqlite3.Connection,
     *,
@@ -15610,6 +15638,7 @@ def reserve_grace_user_facing_report_chunk(
                 )
                 report_scoped_reconciled = (
                     allow_report_scoped_reconciliation
+                    and commerce_report_is_single_destination_status(report)
                     and _commerce_report_has_current_subject_coverage(
                         conn,
                         execution_task_id=str(
@@ -16162,7 +16191,16 @@ def record_grace_loop_callback_outcome(
                 "WHERE singleton_id = 1"
             ).fetchone()
             report_scoped_reconciled = (
-                kind == "terminal_blocked"
+                (
+                    kind == "terminal_blocked"
+                    or (
+                        kind == "closed"
+                        and isinstance(user_facing_report, Mapping)
+                        and commerce_report_is_single_destination_status(
+                            user_facing_report
+                        )
+                    )
+                )
                 and isinstance(user_facing_report, Mapping)
                 and _commerce_report_has_current_subject_coverage(
                     conn,
