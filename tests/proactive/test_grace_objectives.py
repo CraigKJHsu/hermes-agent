@@ -134,6 +134,135 @@ def test_delegation_reservation_binds_declared_objective_stage(tmp_path):
         assert stage["delegation_id"] == delegation["delegation_id"]
 
 
+def test_objective_can_append_recovery_stage_before_terminal(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-append-stage.db") as conn:
+        _create_objective(conn)
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_retry_1",
+            next_action="Retry read-only preflight after runtime recovery.",
+        )
+
+        assert objective["current_stage_key"] == "prepare_retry_1"
+        assert objective["next_action"] == (
+            "Retry read-only preflight after runtime recovery."
+        )
+        assert objective["required_stage_keys"] == (
+            '["prepare_asset","publish_page","prepare_retry_1","share_group"]'
+        )
+
+        stages = conn.execute(
+            """
+            SELECT stage_key, position, status FROM grace_objective_stages
+             WHERE objective_id = 'go_test'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+        assert [row["stage_key"] for row in stages] == [
+            "prepare_asset",
+            "publish_page",
+            "prepare_retry_1",
+            "share_group",
+        ]
+        assert stages[2]["status"] == "planned"
+
+
+def test_appending_recovery_stage_supersedes_accepted_prior_prepare(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-supersede-stage.db") as conn:
+        _create_objective(conn)
+        execution_id = kb.create_task(conn, title="prepare execution")
+        assert kb.complete_task(conn, execution_id, summary="fail closed")
+        review_id = kb.create_task(
+            conn,
+            title="prepare review",
+            parents=(execution_id,),
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted fail-closed",
+            metadata={"review_outcome": "accepted"},
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued',
+                   delegation_id = 'gd-old',
+                   execution_task_id = ?,
+                   review_task_id = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """,
+            (execution_id, review_id),
+        )
+
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_retry_2",
+            next_action="Retry preflight.",
+        )
+
+        assert objective["current_stage_key"] == "prepare_retry_2"
+        rows = conn.execute(
+            """
+            SELECT stage_key, status, outcome_kind FROM grace_objective_stages
+             WHERE objective_id = 'go_test'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+        assert [(row["stage_key"], row["status"], row["outcome_kind"]) for row in rows] == [
+            ("prepare_asset", "done", "superseded_by_retry"),
+            ("publish_page", "planned", None),
+            ("prepare_retry_2", "planned", None),
+            ("share_group", "planned", None),
+        ]
+
+
+def test_available_stage_key_skips_done_or_bound_retry_stage(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-next-retry-stage.db") as conn:
+        _create_objective(conn)
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'done',
+                   delegation_id = 'gd-used',
+                   outcome_kind = 'intermediate_blocked'
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        )
+
+        assert (
+            kb.available_grace_objective_stage_key(
+                conn,
+                objective_id="go_test",
+                stage_key="prepare_asset",
+            )
+            == "prepare_asset_r2"
+        )
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            next_action="Retry again.",
+        )
+
+        assert objective["current_stage_key"] == "prepare_asset_r2"
+        stages = conn.execute(
+            """
+            SELECT stage_key FROM grace_objective_stages
+             WHERE objective_id = 'go_test'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+        assert [row["stage_key"] for row in stages] == [
+            "prepare_asset",
+            "publish_page",
+            "prepare_asset_r2",
+            "share_group",
+        ]
+
+
 def test_terminal_stage_cannot_close_before_required_stages(tmp_path):
     with kb.connect_closing(tmp_path / "objective-close.db") as conn:
         _create_objective(conn)

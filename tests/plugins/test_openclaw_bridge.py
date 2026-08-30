@@ -382,6 +382,75 @@ def test_zero_effect_missioncrew_content_loop_allows_content_tools_confirmation(
     ]
 
 
+def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "OpenClaw accepted the read-only Loop Contract execution.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll the OpenClaw run.",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-generic-readonly",
+            "attempt_id": "attempt-generic-readonly",
+            "contract_fingerprint": "fingerprint-generic-readonly",
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "run-generic-readonly",
+            "backend_agent_id": "missioncrew-executor",
+            "backend_session_key": "agent:missioncrew-executor:subagent:test",
+        }
+
+    result = tools.delegate_loop_contract_to_openclaw(
+        {
+            "task_id": "task-generic-readonly",
+            "objective": "Read current task evidence without changing external state.",
+            "risk_level": "medium",
+            "allowed_tools": ["read", "web_search", "browser"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-generic-readonly",
+            "attempt_id": "attempt-generic-readonly",
+            "contract_fingerprint": "fingerprint-generic-readonly",
+            "project": "secondhand_commerce",
+            "topic_id": "2",
+            "task_type": "secondhand_commerce_group_status",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-executor",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-generic-readonly:start",
+            "openclaw_task_id": "openclaw.agent.loop_contract_start",
+            "dry_run": False,
+            "loop_contract": {
+                "trace": {"telegram_message_path": {"trace_id": "tgtrace-generic-readonly"}},
+                "routing": {"task_type": "secondhand_commerce_group_status"},
+                "external_targets": [],
+            },
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert result["backend_agent_id"] == "missioncrew-executor"
+    assert result["protocol_correlated"] is True
+    assert len(seen) == 1
+    assert seen[0]["allowed_tools"] == ["read", "web_search", "browser"]
+
+
 def test_zero_effect_facebook_page_preflight_needs_no_read_confirmation():
     from plugins.openclaw_bridge import tools
 

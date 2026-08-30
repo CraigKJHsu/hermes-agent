@@ -2035,6 +2035,25 @@ class GatewayKanbanWatchersMixin:
                 await _record_quota_blocked_outcome(quota_blocker_message)
             if outcome == "accepted" and not await _has_structured_outcome():
                 if str(callback.get("completion_mode") or "terminal") == "intermediate":
+                    with kb_module.connect_closing(board=board) as conn:
+                        receipt = (
+                            kb_module
+                            .record_grace_intermediate_callback_without_structured_continuation(
+                                conn,
+                                review_task_id=review_id,
+                                event_id=event_id,
+                                platform=platform_name,
+                                chat_id=callback_chat_id,
+                                thread_id=callback_thread_id,
+                                session_id=str(callback.get("session_id") or ""),
+                                lease_owner=lease_owner,
+                                reason=(
+                                    "intermediate callback delivered without "
+                                    "structured continuation"
+                                ),
+                            )
+                        )
+                    callback.update(receipt)
                     await _finish(
                         "intermediate callback delivered without structured "
                         "continuation"

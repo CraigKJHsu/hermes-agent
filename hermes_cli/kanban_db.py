@@ -13844,6 +13844,197 @@ def list_active_grace_objectives(
     return [dict(row) for row in rows]
 
 
+def ensure_grace_objective_stage(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    stage_key: str,
+    next_action: str = "",
+) -> dict:
+    """Ensure an active objective contains a declared stage.
+
+    New stages are inserted immediately before the terminal stage so terminal
+    completion remains last while repeated preparatory/checkpoint contracts can
+    still be tracked under the same originating user outcome.
+    """
+    clean_objective_id = str(objective_id or "").strip()
+    clean_stage_key = str(stage_key or "").strip()
+    if not clean_objective_id or not clean_stage_key:
+        raise ValueError("Grace objective stage requires objective_id and stage_key")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM grace_objectives WHERE objective_id = ?",
+            (clean_objective_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Unknown Grace objective")
+        objective = dict(row)
+        if objective.get("status") not in _ACTIVE_GRACE_OBJECTIVE_STATUSES:
+            raise ValueError(
+                f"Grace objective is not active: {objective.get('status')}"
+            )
+        stages = json.loads(objective["required_stage_keys"])
+        if clean_stage_key not in stages:
+            current_stage_key = str(objective.get("current_stage_key") or "").strip()
+            if (
+                clean_stage_key.startswith("prepare_")
+                and current_stage_key
+                and current_stage_key != clean_stage_key
+                and current_stage_key != objective["terminal_stage_key"]
+                and current_stage_key.startswith("prepare")
+            ):
+                current_stage = conn.execute(
+                    """
+                    SELECT * FROM grace_objective_stages
+                     WHERE objective_id = ? AND stage_key = ?
+                    """,
+                    (clean_objective_id, current_stage_key),
+                ).fetchone()
+                if (
+                    current_stage is not None
+                    and current_stage["status"] != "done"
+                    and current_stage["review_task_id"]
+                ):
+                    review_run = conn.execute(
+                        """
+                        SELECT metadata
+                          FROM task_runs
+                         WHERE task_id = ? AND outcome = 'completed'
+                         ORDER BY id DESC
+                         LIMIT 1
+                        """,
+                        (current_stage["review_task_id"],),
+                    ).fetchone()
+                    try:
+                        review_metadata = (
+                            json.loads(review_run["metadata"])
+                            if review_run is not None and review_run["metadata"]
+                            else {}
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        review_metadata = {}
+                    if grace_review_accepted(review_metadata):
+                        superseded_evidence = _canonical_json(
+                            {
+                                "summary": (
+                                    "Previous preparatory stage was accepted as "
+                                    "incomplete/fail-closed and superseded by a "
+                                    "new retry stage."
+                                ),
+                                "next_stage_key": clean_stage_key,
+                                "review_task_id": current_stage["review_task_id"],
+                            }
+                        )
+                        conn.execute(
+                            """
+                            UPDATE grace_objective_stages
+                               SET status = 'done',
+                                   outcome_kind = 'superseded_by_retry',
+                                   evidence = ?, completed_at = ?,
+                                   updated_at = ?
+                             WHERE objective_id = ? AND stage_key = ?
+                            """,
+                            (
+                                superseded_evidence,
+                                now,
+                                now,
+                                clean_objective_id,
+                                current_stage_key,
+                            ),
+                        )
+            terminal_stage = objective["terminal_stage_key"]
+            if terminal_stage not in stages:
+                raise ValueError("Grace objective terminal stage is not declared")
+            terminal_index = stages.index(terminal_stage)
+            stages.insert(terminal_index, clean_stage_key)
+            conn.execute(
+                """
+                UPDATE grace_objective_stages
+                   SET position = position + 1, updated_at = ?
+                 WHERE objective_id = ? AND position >= ?
+                """,
+                (now, clean_objective_id, terminal_index),
+            )
+            conn.execute(
+                """
+                INSERT INTO grace_objective_stages (
+                    objective_id, stage_key, position, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'planned', ?, ?)
+                """,
+                (clean_objective_id, clean_stage_key, terminal_index, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE grace_objectives
+                   SET required_stage_keys = ?, current_stage_key = ?,
+                       next_action = ?, waiting_for = '', updated_at = ?
+                 WHERE objective_id = ?
+                """,
+                (
+                    json.dumps(stages, ensure_ascii=False, separators=(",", ":")),
+                    clean_stage_key,
+                    str(next_action or "").strip(),
+                    now,
+                    clean_objective_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE grace_objectives
+                   SET current_stage_key = ?, next_action = ?,
+                       waiting_for = '', updated_at = ?
+                 WHERE objective_id = ?
+                """,
+                (
+                    clean_stage_key,
+                    str(next_action or "").strip(),
+                    now,
+                    clean_objective_id,
+                ),
+            )
+        refreshed = conn.execute(
+            "SELECT * FROM grace_objectives WHERE objective_id = ?",
+            (clean_objective_id,),
+        ).fetchone()
+    return dict(refreshed)
+
+
+def available_grace_objective_stage_key(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    stage_key: str,
+) -> str:
+    """Return an unbound stage key for a retryable objective stage family."""
+    clean_objective_id = str(objective_id or "").strip()
+    clean_stage_key = str(stage_key or "").strip()
+    if not clean_objective_id or not clean_stage_key:
+        raise ValueError("Grace objective stage requires objective_id and stage_key")
+
+    def reusable(candidate: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT status, delegation_id
+              FROM grace_objective_stages
+             WHERE objective_id = ? AND stage_key = ?
+            """,
+            (clean_objective_id, candidate),
+        ).fetchone()
+        if row is None:
+            return True
+        return not row["delegation_id"] and row["status"] != "done"
+
+    if reusable(clean_stage_key):
+        return clean_stage_key
+    for index in range(2, 100):
+        candidate = f"{clean_stage_key}_r{index}"
+        if reusable(candidate):
+            return candidate
+    raise ValueError("No available Grace objective retry stage key")
+
+
 def grace_objective_stage_mode(
     conn: sqlite3.Connection,
     *,
@@ -16279,6 +16470,159 @@ def record_grace_loop_callback_outcome(
                     "is already recorded."
                 )
             return dict(existing)
+        row = conn.execute(
+            "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
+            (review_task_id.strip(),),
+        ).fetchone()
+    return dict(row)
+
+
+def record_grace_intermediate_callback_without_structured_continuation(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+    reason: str,
+) -> dict:
+    """Persist a blocked objective state for accepted prose-only continuations."""
+    callback = validate_active_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+    if callback.get("lease_owner") != lease_owner.strip():
+        raise ValueError(
+            "Structured callback outcome is not owned by this callback lease."
+        )
+    if str(callback.get("completion_mode") or "terminal") != "intermediate":
+        raise ValueError("Only intermediate callbacks can use this fallback.")
+    trigger = conn.execute(
+        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    review_run = conn.execute(
+        """
+        SELECT summary, metadata
+          FROM task_runs
+         WHERE task_id = ? AND outcome = 'completed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (review_task_id.strip(),),
+    ).fetchone()
+    try:
+        review_metadata = (
+            json.loads(review_run["metadata"])
+            if review_run is not None and review_run["metadata"]
+            else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        review_metadata = {}
+    if (
+        trigger is None
+        or trigger["task_id"] != review_task_id.strip()
+        or trigger["kind"] != "completed"
+        or not grace_review_accepted(review_metadata)
+    ):
+        raise ValueError(
+            "Intermediate fallback is allowed only for an accepted Grace-review "
+            "completion event."
+        )
+    now = int(time.time())
+    summary = str(
+        review_metadata.get("remaining_blocker")
+        or review_metadata.get("verification_notes")
+        or (review_run["summary"] if review_run is not None else "")
+        or reason
+    ).strip()
+    payload = {
+        "summary": summary,
+        "reason": str(reason or "").strip(),
+        "review_task_id": review_task_id.strip(),
+        "execution_task_id": str(callback.get("execution_task_id") or "").strip(),
+        "phase_outcome": str(review_metadata.get("phase_outcome") or "").strip(),
+        "objective_complete": bool(
+            review_metadata.get("objective_complete")
+            or review_metadata.get("overall_objective_complete")
+        ),
+    }
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    objective_id = str(callback.get("objective_id") or "").strip()
+    stage_key = str(callback.get("stage_key") or "").strip()
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET outcome_event_id = ?, outcome_kind = ?,
+                   outcome_payload = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ?
+               AND lease_owner = ?
+               AND lease_expires > ?
+               AND outcome_event_id IS NULL
+               AND outcome_kind IS NULL
+               AND outcome_payload IS NULL
+            """,
+            (
+                int(event_id),
+                "intermediate_blocked",
+                payload_json,
+                review_task_id.strip(),
+                int(event_id),
+                lease_owner.strip(),
+                now,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(
+                "Grace callback outcome is write-once and another outcome "
+                "is already recorded."
+            )
+        if objective_id:
+            if not stage_key:
+                raise ValueError("Objective-linked callback is missing its stage key")
+            objective = get_grace_objective(conn, objective_id)
+            if (
+                objective is None
+                or objective.get("status") not in _ACTIVE_GRACE_OBJECTIVE_STATUSES
+            ):
+                raise ValueError(
+                    "Objective-linked callback references an inactive objective"
+                )
+            conn.execute(
+                """
+                UPDATE grace_objective_stages
+                   SET status = 'done',
+                       outcome_kind = 'intermediate_blocked',
+                       evidence = ?, completed_at = ?, updated_at = ?
+                 WHERE objective_id = ? AND stage_key = ? AND status <> 'done'
+                """,
+                (payload_json, now, now, objective_id, stage_key),
+            )
+            conn.execute(
+                """
+                UPDATE grace_objectives
+                   SET status = 'blocked', current_stage_key = ?,
+                       next_action = '', waiting_for = ?, updated_at = ?
+                 WHERE objective_id = ?
+                """,
+                (stage_key, summary, now, objective_id),
+            )
         row = conn.execute(
             "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
             (review_task_id.strip(),),

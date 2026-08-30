@@ -38,6 +38,7 @@ _LOOP_CONTRACT_AGENT_IDS = frozenset(
         "missioncrew-executor",
     }
 )
+_ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "browser"})
 
 
 @dataclass(frozen=True)
@@ -1407,7 +1408,7 @@ def delegate_to_openclaw(
             "Create the task through Grace's validated Loop Contract compiler.",
         )
 
-    zero_effect_missioncrew_content_loop = (
+    zero_effect_loop_contract = (
         is_loop_contract_async
         and task.get("openclaw_task_id")
         in {
@@ -1416,17 +1417,13 @@ def delegate_to_openclaw(
             "openclaw.agent.loop_contract_cancel",
         }
         and int(task.get("external_effect_budget") or 0) == 0
+    )
+    zero_effect_missioncrew_content_loop = (
+        zero_effect_loop_contract
         and task.get("backend_agent_id") == "missioncrew-content"
     )
     zero_effect_facebook_page_preflight = (
-        is_loop_contract_async
-        and task.get("openclaw_task_id")
-        in {
-            "openclaw.agent.loop_contract_start",
-            "openclaw.agent.loop_contract_poll",
-            "openclaw.agent.loop_contract_cancel",
-        }
-        and int(task.get("external_effect_budget") or 0) == 0
+        zero_effect_loop_contract
         and task.get("backend_agent_id") == "missioncrew-facebook-page-operator"
         and task.get("allowed_tools") == ["facebook_page_publish_preflight"]
     )
@@ -1439,6 +1436,10 @@ def delegate_to_openclaw(
             decision.level is PolicyLevel.CONFIRM_FIRST
             and risk != "low"
             and not (is_loop_contract_async and scoped_approval)
+            and not (
+                zero_effect_loop_contract
+                and action in _ZERO_EFFECT_LOOP_CONFIRM_ACTIONS
+            )
             and not (
                 zero_effect_missioncrew_content_loop
                 and action in {"read", "write", "web_search", "image_generate"}

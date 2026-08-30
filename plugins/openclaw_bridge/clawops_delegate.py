@@ -928,6 +928,141 @@ def _guard_external_action_objective_downgrade(
     )
 
 
+def _ensure_external_action_objective_ref(
+    args: dict[str, Any],
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_key: str,
+    topic_name: str,
+    goal: dict[str, Any],
+    scope: dict[str, Any],
+    verification: dict[str, Any],
+    internal_only_contract: bool,
+    request_instance_id: str = "",
+    board: str | None = None,
+) -> dict[str, str] | None:
+    """Create/reuse a lane-bound objective for any external-action request."""
+    if isinstance(args.get("objective_ref"), dict):
+        return None
+    original_request = str(args.get("original_request") or "").strip()
+    if _EXTERNAL_ACTION_OBJECTIVE.search(original_request) is None:
+        return None
+    clean_platform = str(platform or "").strip().lower()
+    clean_chat = str(chat_id or "").strip()
+    clean_thread = str(thread_id or "").strip()
+    clean_session_key = str(session_key or "").strip()
+    if not (clean_platform and clean_chat and clean_session_key):
+        return None
+    objective_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "platform": clean_platform,
+                "chat_id": clean_chat,
+                "thread_id": clean_thread,
+                "original_request": original_request,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    stage_text = "\n".join(
+        str(item or "")
+        for item in (
+            goal.get("objective"),
+            goal.get("deliverables"),
+            goal.get("non_goals"),
+            scope.get("allowed"),
+            scope.get("forbidden"),
+            verification.get("checks"),
+            verification.get("acceptance_criteria"),
+        )
+    )
+    preparatory_stage = (
+        internal_only_contract
+        or _has_zero_external_effect_constraint(args, goal, scope)
+        or _ZERO_EXTERNAL_EFFECT_CONSTRAINT.search(stage_text) is not None
+        or _PREPARATORY_OR_TEXT_ONLY_OBJECTIVE.search(stage_text) is not None
+    )
+    objective_id = "go_ext_" + objective_hash[:24]
+    if preparatory_stage:
+        stage_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "request_instance_id": str(request_instance_id or "").strip(),
+                    "goal": goal,
+                    "scope": scope,
+                    "verification": verification,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        stage_key = "prepare_" + stage_hash[:12]
+    else:
+        stage_key = "execute_external_action"
+    objective_text = original_request
+    title_seed = str(goal.get("objective") or objective_text).strip()
+    title = title_seed[:96] or "External action objective"
+    criteria = [
+        str(item).strip()
+        for item in list(verification.get("acceptance_criteria") or [])
+        if str(item).strip()
+    ]
+    if not criteria:
+        criteria = [
+            "The external action result is verified with durable evidence.",
+            "The final user-facing answer distinguishes verified from not verified.",
+        ]
+    with kb.connect_closing(board=board) as conn:
+        existing = kb.get_grace_objective(conn, objective_id)
+        if existing is None:
+            kb.create_grace_objective(
+                conn,
+                objective_id=objective_id,
+                platform=clean_platform,
+                chat_id=clean_chat,
+                thread_id=clean_thread,
+                session_key=clean_session_key,
+                title=title,
+                objective=objective_text,
+                original_request_sha256=objective_hash,
+                required_stage_keys=(stage_key, "execute_external_action"),
+                terminal_stage_key="execute_external_action",
+                acceptance_criteria=criteria,
+                current_stage_key=stage_key,
+                next_action=str(goal.get("objective") or "").strip(),
+            )
+        else:
+            expected_lane = (clean_platform, clean_chat, clean_thread)
+            actual_lane = (
+                existing["platform"],
+                existing["chat_id"],
+                existing["thread_id"],
+            )
+            if actual_lane != expected_lane:
+                raise ValueError("Grace objective belongs to another chat or topic")
+            if existing["original_request_sha256"] != objective_hash:
+                raise ValueError("Existing Grace objective is bound to another request")
+            stage_key = kb.available_grace_objective_stage_key(
+                conn,
+                objective_id=objective_id,
+                stage_key=stage_key,
+            )
+            kb.ensure_grace_objective_stage(
+                conn,
+                objective_id=objective_id,
+                stage_key=stage_key,
+                next_action=str(goal.get("objective") or "").strip(),
+            )
+    objective_ref = {"objective_id": objective_id, "stage_key": stage_key}
+    args["objective_ref"] = objective_ref
+    return objective_ref
+
+
 def _resolve_cancel_board(
     *,
     task_id: str,
@@ -1754,6 +1889,20 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "Delegation requires a stable request_instance_id when no "
                 "originating message or callback event exists."
             )
+        _ensure_external_action_objective_ref(
+            args,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_key=session_key,
+            topic_name=topic_name,
+            goal=goal,
+            scope=scope,
+            verification=verification,
+            internal_only_contract=internal_only_contract,
+            request_instance_id=request_instance_id,
+            board=board,
+        )
         contract = {
             "identity": {
                 "platform": platform,

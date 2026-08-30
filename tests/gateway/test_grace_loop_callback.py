@@ -1183,8 +1183,8 @@ def test_intermediate_accepted_review_without_structured_outcome_delivers_withou
     assert len(adapter.handled) == 1
     assert callback["state"] == "delivered"
     assert callback["last_event_id"] > 0
-    assert callback["outcome_kind"] is None
-    assert callback["outcome_payload"] is None
+    assert callback["outcome_kind"] == "intermediate_blocked"
+    assert "structured continuation" in (callback["outcome_payload"] or "")
     assert "intermediate callback delivered without structured continuation" in (
         callback["last_error"] or ""
     )

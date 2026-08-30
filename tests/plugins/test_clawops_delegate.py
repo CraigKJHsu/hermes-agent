@@ -367,6 +367,140 @@ def test_objective_ref_allows_preparatory_stage_for_external_action_request():
     )
 
 
+def test_external_action_preparatory_stage_auto_creates_objective_ref(tmp_path, monkeypatch):
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _ensure_external_action_objective_ref,
+        _guard_external_action_objective_downgrade,
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    args = _nested_args()
+    args["original_request"] = (
+        "請將任意 Topic 的外部作業重新發布到最多 20 個已知目的地"
+    )
+    args["external_targets"] = ["Facebook Marketplace listing ID 1234567890"]
+    goal = {
+        "objective": "唯讀恢復並對帳原本目的地",
+        "deliverables": ["目的地清單"],
+        "non_goals": ["不發布", "不變更任何外部狀態"],
+    }
+    scope = {
+        "allowed": ["只讀查核歷史目的地"],
+        "forbidden": ["不得發布、提交或改變外部狀態"],
+    }
+    verification = {
+        "checks": ["列出可驗證目的地"],
+        "acceptance_criteria": ["external_effects=[]"],
+    }
+
+    objective_ref = _ensure_external_action_objective_ref(
+        args,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-any",
+        session_key="agent:main:telegram:group:chat-1:topic-any",
+        topic_name="任意 Topic",
+        goal=goal,
+        scope=scope,
+        verification=verification,
+        internal_only_contract=True,
+    )
+
+    assert objective_ref
+    assert objective_ref["stage_key"].startswith("prepare_")
+    assert args["objective_ref"] == objective_ref
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        objective = kb.get_grace_objective(conn, objective_ref["objective_id"])
+        assert objective is not None
+        assert objective["thread_id"] == "topic-any"
+        assert objective["current_stage_key"] == objective_ref["stage_key"]
+        assert objective["terminal_stage_key"] == "execute_external_action"
+
+    contract = {
+        "objective_ref": objective_ref,
+        "goal": goal,
+        "scope": scope,
+        "verification": verification,
+        "routing": {"task_type": "research"},
+    }
+    _guard_external_action_objective_downgrade(
+        args,
+        contract,
+        internal_only_contract=True,
+    )
+
+
+def test_external_action_preparatory_stage_retries_with_fresh_stage_key(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _ensure_external_action_objective_ref,
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    base_args = _nested_args()
+    base_args["original_request"] = (
+        "請將 Kolin KD-291M06 重新刊登至最多 20 個原本已刊登過的 Facebook 社團"
+    )
+    goal = {
+        "objective": "唯讀恢復原本目的地",
+        "deliverables": ["目的地清單"],
+        "non_goals": ["不發布", "不變更任何外部狀態"],
+    }
+    scope = {
+        "allowed": ["只讀查核歷史社團目的地"],
+        "forbidden": ["不得發布、提交或改變 Facebook 狀態"],
+    }
+    verification = {
+        "checks": ["列出可驗證目的地"],
+        "acceptance_criteria": ["external_effects=[]"],
+    }
+    first_ref = _ensure_external_action_objective_ref(
+        base_args,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-any",
+        session_key="agent:main:telegram:group:chat-1:topic-any",
+        topic_name="任意 Topic",
+        goal=goal,
+        scope=scope,
+        verification=verification,
+        internal_only_contract=True,
+        request_instance_id="same-request",
+    )
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'done',
+                   delegation_id = 'gd-used',
+                   outcome_kind = 'intermediate_blocked'
+             WHERE objective_id = ? AND stage_key = ?
+            """,
+            (first_ref["objective_id"], first_ref["stage_key"]),
+        )
+
+    retry_args = dict(base_args)
+    retry_args.pop("objective_ref", None)
+    retry_ref = _ensure_external_action_objective_ref(
+        retry_args,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-any",
+        session_key="agent:main:telegram:group:chat-1:topic-any",
+        topic_name="任意 Topic",
+        goal=goal,
+        scope=scope,
+        verification=verification,
+        internal_only_contract=True,
+        request_instance_id="same-request",
+    )
+
+    assert retry_ref["objective_id"] == first_ref["objective_id"]
+    assert retry_ref["stage_key"] == f"{first_ref['stage_key']}_r2"
+
+
 def test_delegate_creates_execution_and_terra_review_cards(tmp_path, monkeypatch):
     registry = tmp_path / "registry.yaml"
     registry.write_text(
