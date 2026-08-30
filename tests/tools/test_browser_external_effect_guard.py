@@ -265,7 +265,7 @@ def test_browser_mutation_fails_closed_without_page_identity(
     result = json.loads(browser_tool.browser_click("@e1", task_id="browser-1"))
 
     assert result["success"] is False
-    assert "failed closed" in result["error"]
+    assert "browser mutation blocked" in result["error"]
     assert called is False
 
 
@@ -765,6 +765,20 @@ def test_lowercase_group_targets_and_browser_publish_authority_are_accepted():
         '```json\n{"authorization":{"human_approved":true},'
         '"external_targets":["facebook group 1703088130054399"],'
         '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset({
+        "1703088130054399",
+    })
+    assert kb.grace_allows_facebook_group_posting(body) is True
+
+
+def test_marketplace_group_publish_authority_is_accepted():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"facebook_marketplace_group_publish"}}\n```'
     )
 
     assert kb.grace_external_group_ids(body) == frozenset({

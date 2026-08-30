@@ -478,9 +478,14 @@ def _grace_contract_is_browser_publish(
     resolved_task_type = (
         resolved.get("task_type") if isinstance(resolved, Mapping) else None
     )
-    return str(
+    task_type = str(
         routing.get("task_type") or resolved_task_type or ""
-    ).strip().casefold() == "browser_publish"
+    ).strip().casefold()
+    return task_type in {
+        "browser_publish",
+        "facebook_marketplace_group_publish",
+        "facebook_group_relist",
+    }
 
 
 def grace_allows_facebook_group_posting(body: str) -> bool:
@@ -3340,6 +3345,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='task_external_effects'"
     ).fetchone()
+    effects_cols = (
+        {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(task_external_effects)")
+        }
+        if effects_table_exists is not None
+        else set()
+    )
+    effects_have_object_keys = "effect_key" in effects_cols
     if migration_state is None:
         historical_group_effect = (
             conn.execute(
@@ -3348,7 +3362,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                  WHERE platform = 'facebook' AND effect_key LIKE 'group:%'
                 """
             ).fetchone()
-            if effects_table_exists is not None
+            if effects_have_object_keys
             else None
         )
         latest_group_effect_at = int(
@@ -3374,7 +3388,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 int(time.time()),
             ),
         )
-    elif effects_table_exists is not None:
+    elif effects_have_object_keys:
         latest_effect = conn.execute(
             """
             SELECT MAX(updated_at) AS latest_at FROM task_external_effects
@@ -5434,10 +5448,10 @@ def reserve_external_group_post(
             )
         if (
             normalized_group_id not in grace_external_group_ids(task["body"])
-            or not grace_allows_facebook_group_posting(task["body"])
+            or not grace_task_allows_facebook_group_posting(conn, task_id)
         ):
             return (
-                "Facebook group post blocked: target or browser_publish "
+                "Facebook group post blocked: target or browser publish "
                 "authority is absent from the compiled Loop Contract."
             )
         prior = conn.execute(
