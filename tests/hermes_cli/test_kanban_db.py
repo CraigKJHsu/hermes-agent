@@ -1947,6 +1947,64 @@ def test_newer_partial_report_keeps_merged_destination_count(tmp_path):
     assert coverage[0]["complete"] == 0
 
 
+def test_group_external_effect_updates_existing_commerce_ledger_row(tmp_path):
+    db_path = tmp_path / "commerce-ledger-external-effect.db"
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="known destination")
+        report = _commerce_report(complete=False)
+        report["rows"][0]["destination_id"] = "1333742673375089"
+        report["rows"][0]["destination_name"] = (
+            "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣"
+        )
+        report["rows"][0]["status"] = "not_posted"
+        report["rows"][0]["status_label"] = "未刊登"
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="known",
+            metadata={"user_facing_report": report},
+        )
+        effect_id = kb.create_task(
+            conn,
+            title="approved submit",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                '{"external_targets":["group:1333742673375089"]}',
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            effect_id,
+            summary="unknown submit",
+            metadata={
+                "external_effects": [{
+                    "platform": "facebook",
+                    "effect_key": "group:1333742673375089",
+                    "state": "unknown",
+                    "external_id": "1333742673375089",
+                    "details": {
+                        "source_listing_id": "37276725125275496",
+                        "destination_id": "1333742673375089",
+                        "destination_name": (
+                            "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣"
+                        ),
+                        "observed_at_unix": 1_785_658_000,
+                        "readback": "Post submitted once; destination readback unknown.",
+                    },
+                }],
+            },
+        )
+        rows = kb.list_commerce_group_ledger(conn)
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "unknown"
+    assert rows[0]["status_label"] == "已提交但目的地讀回未確認"
+    assert rows[0]["source_task_id"] == effect_id
+    assert rows[0]["source_run_id"] is not None
+
+
 def test_partial_report_cannot_omit_known_destinations(tmp_path):
     db_path = tmp_path / "commerce-ledger-omission.db"
     with kb.connect_closing(db_path) as conn:

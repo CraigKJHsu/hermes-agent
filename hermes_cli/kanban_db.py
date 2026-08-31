@@ -5047,6 +5047,112 @@ def _update_commerce_reconciliation_state(
     )
 
 
+def _upsert_commerce_group_external_effect(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    effect: Mapping[str, Any],
+    now: int,
+) -> None:
+    """Project object-scoped group effects into the commerce ledger when possible."""
+    group_match = re.fullmatch(r"group:([0-9]+)", str(effect.get("effect_key") or ""))
+    if str(effect.get("platform") or "") != "facebook" or group_match is None:
+        return
+    details = effect.get("details")
+    if not isinstance(details, Mapping):
+        return
+    destination_id = str(
+        details.get("destination_id")
+        or details.get("group_id")
+        or effect.get("external_id")
+        or group_match.group(1)
+    ).strip()
+    source_listing_id = str(details.get("source_listing_id") or "").strip()
+    if not destination_id or destination_id != group_match.group(1) or not source_listing_id:
+        return
+    observed_at_value = details.get("observed_at_unix") or details.get("observed_at")
+    try:
+        observed_at = int(observed_at_value)
+    except (TypeError, ValueError):
+        observed_at = now
+    state = str(effect.get("state") or "").strip().lower()
+    status_labels = {
+        "verified": ("posted", "已刊登"),
+        "created": ("posted", "已刊登"),
+        "existing": ("posted", "已刊登"),
+        "pending": ("pending_approval", "已提交，待審或待讀回"),
+        "pending_approval": ("pending_approval", "已提交，待審或待讀回"),
+        "unknown": ("unknown", "已提交但目的地讀回未確認"),
+        "rejected": ("rejected", "已拒絕或不可刊登"),
+    }
+    status, status_label = status_labels.get(state, (state, state))
+    evidence = str(details.get("readback") or details.get("evidence") or "").strip()
+    destination_name = str(
+        details.get("destination_name")
+        or details.get("group_name")
+        or ""
+    ).strip()
+    rows = conn.execute(
+        """
+        SELECT subject_key, subject_label, destination_name
+          FROM commerce_group_ledger
+         WHERE source_listing_id = ? AND destination_id = ?
+        """,
+        (source_listing_id, destination_id),
+    ).fetchall()
+    if not rows:
+        subject_key = str(details.get("subject_key") or "").strip()
+        subject_label = str(details.get("subject_label") or "").strip()
+        if not subject_key or not subject_label or not destination_name:
+            return
+        rows = [{
+            "subject_key": subject_key,
+            "subject_label": subject_label,
+            "destination_name": destination_name,
+        }]
+    for row in rows:
+        row_destination_name = destination_name or str(row["destination_name"] or "")
+        conn.execute(
+            """
+            INSERT INTO commerce_group_ledger (
+                subject_key, subject_label, destination_id, destination_name,
+                source_listing_id, status, status_label, evidence,
+                source_task_id, source_run_id, observed_at, verified_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subject_key, destination_id) DO UPDATE SET
+                destination_name = excluded.destination_name,
+                source_listing_id = excluded.source_listing_id,
+                status = excluded.status,
+                status_label = excluded.status_label,
+                evidence = excluded.evidence,
+                source_task_id = excluded.source_task_id,
+                source_run_id = excluded.source_run_id,
+                observed_at = excluded.observed_at,
+                verified_at = excluded.verified_at,
+                updated_at = excluded.updated_at
+            WHERE excluded.observed_at >= commerce_group_ledger.observed_at
+            """,
+            (
+                str(row["subject_key"]),
+                str(row["subject_label"]),
+                destination_id,
+                row_destination_name,
+                source_listing_id,
+                status,
+                status_label,
+                evidence,
+                task_id,
+                run_id,
+                observed_at,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(observed_at)),
+                now,
+                now,
+            ),
+        )
+
+
 def record_commerce_user_facing_report(
     conn: sqlite3.Connection,
     *,
@@ -7765,6 +7871,13 @@ def complete_task(
                     "source": "kanban_complete",
                 },
                 run_id=run_id,
+            )
+            _upsert_commerce_group_external_effect(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                effect=effect,
+                now=now,
             )
         if user_facing_report is not None:
             if user_facing_report["kind"] == "commerce_group_status":
