@@ -497,6 +497,22 @@ def test_zero_effect_facebook_page_preflight_needs_no_read_confirmation():
             "executor_backend": "openclaw",
             "executor_profile": "loop-contract",
             "backend_agent_id": "missioncrew-facebook-page-operator",
+            "model_route": {
+                "requested_model": "gpt-5.6-luna",
+                "effective_model": "gpt-5.6-luna",
+                "reasoning_effort": "low",
+                "effective_reasoning_effort": "low",
+                "reasoning_mode": "standard",
+                "routing_reason": "mechanical_high_volume_work",
+                "fallback_allowed": True,
+                "fallback_applied": False,
+                "policy_id": "missioncrew-model-routing-v1",
+                "policy_version": "v1",
+                "policy_sha256": "a" * 64,
+                "policy_snapshot_id": "missioncrew-model-routing-v1@v1",
+                "policy_source": "managed_active",
+                "decision_fields": {"task_risk": "low"},
+            },
             "external_effect_budget": 0,
             "workspace_policy": "dedicated",
             "session_policy": "ephemeral",
@@ -539,6 +555,22 @@ def test_facebook_page_preflight_builds_verified_protocol_v2_live_payload():
             "executor_backend": "openclaw",
             "executor_profile": "loop-contract",
             "backend_agent_id": "missioncrew-facebook-page-operator",
+            "model_route": {
+                "requested_model": "gpt-5.6-luna",
+                "effective_model": "gpt-5.6-luna",
+                "reasoning_effort": "low",
+                "effective_reasoning_effort": "low",
+                "reasoning_mode": "standard",
+                "routing_reason": "mechanical_high_volume_work",
+                "fallback_allowed": True,
+                "fallback_applied": False,
+                "policy_id": "missioncrew-model-routing-v1",
+                "policy_version": "v1",
+                "policy_sha256": "a" * 64,
+                "policy_snapshot_id": "missioncrew-model-routing-v1@v1",
+                "policy_source": "managed_active",
+                "decision_fields": {"task_risk": "low"},
+            },
             "external_effect_budget": 0,
             "workspace_policy": "dedicated",
             "session_policy": "ephemeral",
@@ -568,6 +600,10 @@ def test_facebook_page_preflight_builds_verified_protocol_v2_live_payload():
     assert payload["dryRun"] is False
     assert payload["taskId"] == "openclaw.agent.loop_contract_start"
     assert payload["routing"]["backendAgentId"] == "missioncrew-facebook-page-operator"
+    assert payload["routing"]["modelRoute"]["requestedModel"] == "gpt-5.6-luna"
+    assert payload["routing"]["modelRoute"]["policySnapshotId"] == "missioncrew-model-routing-v1@v1"
+    assert payload["routing"]["modelRoute"]["decisionFields"] == {"task_risk": "low"}
+    assert payload["routing"]["modelRoute"]["taskId"] == "task-preflight-payload"
     assert payload["allowedTools"] == ["facebook_page_publish_preflight"]
 
 

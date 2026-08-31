@@ -49,6 +49,7 @@
     "start_idempotency_key": { "type": "string", "minLength": 1 },
     "backend_run_id": { "type": "string", "minLength": 1 },
     "backend_session_key": { "type": "string", "minLength": 1 },
+    "model_route": { "type": "object" },
     "dry_run": { "type": "boolean" },
     "scope": { "type": "object" },
     "context_packet": { "type": "object" },

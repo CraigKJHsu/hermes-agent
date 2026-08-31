@@ -240,6 +240,8 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
             value = str(args.get(field) or "").strip()
             if value:
                 task[field] = value
+        if isinstance(args.get("model_route"), dict):
+            task["model_route"] = dict(args["model_route"])
         if isinstance(args.get("message_path"), dict):
             task["message_path"] = dict(args["message_path"])
         if isinstance(args.get("loop_contract"), dict):
@@ -676,6 +678,10 @@ def _openclaw_payload(
                     "executorBackend": task.get("executor_backend"),
                     "executorProfile": task.get("executor_profile"),
                     "backendAgentId": task.get("backend_agent_id"),
+                    "modelRoute": _model_route_payload(
+                        task.get("model_route") or {},
+                        task_id=str(task["task_id"]),
+                    ),
                 },
                 "policy": {
                     "approvalGrantId": task.get("approval_grant_id"),
@@ -713,6 +719,34 @@ def _with_protocol_failure_correlation(
             }
         )
     return result
+
+
+def _model_route_payload(
+    route: Mapping[str, Any],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    """Expose routing policy receipts in both local and bridge field names."""
+    value = dict(route or {})
+    aliases = {
+        "taskId": str(task_id or ""),
+        "requestedModel": value.get("requested_model"),
+        "effectiveModel": value.get("effective_model"),
+        "reasoningEffort": value.get("reasoning_effort"),
+        "effectiveReasoningEffort": value.get("effective_reasoning_effort"),
+        "reasoningMode": value.get("reasoning_mode"),
+        "routingReason": value.get("routing_reason"),
+        "fallbackAllowed": value.get("fallback_allowed"),
+        "fallbackApplied": value.get("fallback_applied"),
+        "policyId": value.get("policy_id"),
+        "policyVersion": value.get("policy_version"),
+        "policySha256": value.get("policy_sha256"),
+        "policySnapshotId": value.get("policy_snapshot_id"),
+        "policySource": value.get("policy_source"),
+        "decisionFields": value.get("decision_fields"),
+        "runtimeAttested": value.get("runtime_attested", False),
+    }
+    return {**value, **{key: val for key, val in aliases.items() if val is not None}}
 
 
 _USAGE_LIMIT_PATTERNS = (
