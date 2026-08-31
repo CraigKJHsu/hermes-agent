@@ -90,6 +90,41 @@ def _accepted_callback(conn, *, objective_id: str, stage_key: str, requested_mod
     return review_id, callback["event_id"]
 
 
+def _blocked_callback(conn, *, objective_id: str, stage_key: str, requested_mode: str):
+    execution_id = kb.create_task(conn, title=f"execute {stage_key}")
+    review_id = kb.create_task(conn, title=f"review {stage_key}", parents=(execution_id,))
+    kb.add_grace_loop_callback(
+        conn,
+        review_task_id=review_id,
+        execution_task_id=execution_id,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+        session_key="agent:main:telegram:group:chat-1:4641",
+        session_id="session-1",
+        contract_fingerprint="d" * 64,
+        completion_mode=requested_mode,
+        objective_id=objective_id,
+        stage_key=stage_key,
+    )
+    _bind_queued_delegation(conn, execution_id, review_id, suffix=f"blocked-{stage_key}")
+    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (review_id,))
+    assert kb.block_task(
+        conn,
+        review_id,
+        reason="required execution evidence is missing",
+        kind="capability",
+    )
+    callback = kb.list_due_grace_loop_callbacks(conn)[0]
+    assert kb.claim_grace_loop_callback(
+        conn,
+        review_task_id=review_id,
+        event_id=callback["event_id"],
+        lease_owner="owner-a",
+    )
+    return review_id, callback["event_id"]
+
+
 def test_objective_authoritatively_forces_intermediate_stage(tmp_path):
     with kb.connect_closing(tmp_path / "objective.db") as conn:
         _create_objective(conn)
@@ -103,6 +138,45 @@ def test_objective_authoritatively_forces_intermediate_stage(tmp_path):
         assert callback["completion_mode"] == "intermediate"
         assert callback["objective_id"] == "go_test"
         assert callback["stage_key"] == "prepare_asset"
+
+
+def test_terminal_review_blocker_records_objective_terminal_blocked(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-terminal-blocked.db") as conn:
+        _create_objective(conn)
+        review_id, event_id = _blocked_callback(
+            conn,
+            objective_id="go_test",
+            stage_key="share_group",
+            requested_mode="terminal",
+        )
+        kb.record_grace_loop_callback_blocker_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="owner-a",
+            outcome_kind="terminal_blocked",
+            payload={
+                "summary": "Grace review fail-closed.",
+                "reason": "destination readback is missing",
+                "next_action": "Run read-only reconciliation before any retry.",
+            },
+        )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        stage = conn.execute(
+            """
+            SELECT status, outcome_kind, evidence
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'share_group'
+            """
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, review_id)
+
+        assert objective["status"] == "blocked"
+        assert objective["waiting_for"] == "destination readback is missing"
+        assert stage["status"] == "done"
+        assert stage["outcome_kind"] == "terminal_blocked"
+        assert callback["outcome_kind"] == "terminal_blocked"
 
 
 def test_delegation_reservation_binds_declared_objective_stage(tmp_path):

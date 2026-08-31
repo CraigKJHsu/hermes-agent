@@ -17117,9 +17117,9 @@ def record_grace_loop_callback_blocker_outcome(
     outcome_kind: str,
     payload: Mapping[str, Any],
 ) -> dict:
-    """Persist a structured outcome for a machine-classified execution blocker."""
+    """Persist a structured outcome for a non-accepted callback blocker."""
     kind = str(outcome_kind or "").strip()
-    if kind not in {"quota_blocked"}:
+    if kind not in {"quota_blocked", "terminal_blocked"}:
         raise ValueError("Unsupported blocker callback outcome.")
     payload_json = json.dumps(
         dict(payload or {}),
@@ -17153,13 +17153,34 @@ def record_grace_loop_callback_blocker_outcome(
                 "Structured blocker outcome is not owned by this callback lease."
             )
         current = dict(row)
-        if (
-            current.get("event_task_id") != current.get("execution_task_id")
-            or current.get("event_kind") != "blocked"
-        ):
+        event_task_id = str(current.get("event_task_id") or "")
+        event_kind = str(current.get("event_kind") or "")
+        is_execution_blocker = (
+            event_task_id == str(current.get("execution_task_id") or "")
+            and event_kind == "blocked"
+        )
+        is_terminal_review_blocker = (
+            kind == "terminal_blocked"
+            and event_task_id == str(current.get("review_task_id") or "")
+            and event_kind
+            in {"blocked", "block_loop_detected", "gave_up", "crashed", "timed_out"}
+            and str(current.get("completion_mode") or "terminal") == "terminal"
+            and str(current.get("objective_id") or "").strip()
+        )
+        if kind == "quota_blocked" and not is_execution_blocker:
             raise ValueError(
-                "Structured blocker outcomes are allowed only for execution blocked events."
+                "Structured quota blocker outcomes are allowed only for execution blocked events."
             )
+        if kind == "terminal_blocked" and not is_terminal_review_blocker:
+            raise ValueError(
+                "Structured terminal blockers are allowed only for objective-linked terminal review blockers."
+            )
+        if kind == "terminal_blocked":
+            clean_payload = dict(payload or {})
+            if not str(clean_payload.get("summary") or "").strip():
+                raise ValueError("Terminal-blocked callback outcome requires a summary.")
+            if not str(clean_payload.get("reason") or "").strip():
+                raise ValueError("Terminal-blocked callback outcome requires a reason.")
         if current.get("outcome_event_id") is not None:
             if (
                 int(current.get("outcome_event_id") or 0) == int(event_id)
@@ -17197,6 +17218,13 @@ def record_grace_loop_callback_blocker_outcome(
         if cur.rowcount != 1:
             raise ValueError(
                 "Grace callback outcome is write-once and another outcome is already recorded."
+            )
+        if kind == "terminal_blocked":
+            _apply_grace_objective_callback_outcome(
+                conn,
+                callback=current,
+                kind="terminal_blocked",
+                payload=dict(payload or {}),
             )
         updated = conn.execute(
             "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",

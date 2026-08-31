@@ -1203,6 +1203,30 @@ class GatewayKanbanWatchersMixin:
                     conn.close()
             await asyncio.to_thread(_sync_record_quota_blocked_outcome)
 
+        async def _record_review_terminal_blocked_outcome(reason: str) -> None:
+            def _sync_record_review_terminal_blocked_outcome() -> None:
+                conn = kb_module.connect(board=board)
+                try:
+                    kb_module.record_grace_loop_callback_blocker_outcome(
+                        conn,
+                        review_task_id=review_id,
+                        event_id=event_id,
+                        lease_owner=lease_owner,
+                        outcome_kind="terminal_blocked",
+                        payload={
+                            "summary": str(callback.get("review_summary") or "").strip()
+                            or f"Grace review {review_id} blocked the terminal stage.",
+                            "reason": reason,
+                            "next_action": (
+                                "Resolve the review blocker, then create a fresh "
+                                "declared continuation or approval checkpoint."
+                            ),
+                        },
+                    )
+                finally:
+                    conn.close()
+            await asyncio.to_thread(_sync_record_review_terminal_blocked_outcome)
+
         async def _escalate(error: str) -> None:
             def _sync_escalate() -> None:
                 conn = kb_module.connect(board=board)
@@ -2067,6 +2091,20 @@ class GatewayKanbanWatchersMixin:
             await _handle_with_lease_heartbeat(event)
             if quota_blocker_message:
                 await _record_quota_blocked_outcome(quota_blocker_message)
+            if (
+                outcome == "blocked"
+                and str(callback.get("objective_id") or "").strip()
+                and str(callback.get("completion_mode") or "terminal") == "terminal"
+                and not await _has_structured_outcome()
+            ):
+                blocker_reason = ""
+                if isinstance(callback.get("event_payload"), dict):
+                    blocker_reason = str(
+                        (callback.get("event_payload") or {}).get("reason") or ""
+                    ).strip()
+                await _record_review_terminal_blocked_outcome(
+                    blocker_reason or "terminal Grace review blocked"
+                )
             if outcome == "accepted" and not await _has_structured_outcome():
                 if str(callback.get("completion_mode") or "terminal") == "intermediate":
                     with kb_module.connect_closing(board=board) as conn:
