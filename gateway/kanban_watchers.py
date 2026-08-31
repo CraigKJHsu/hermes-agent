@@ -1203,8 +1203,16 @@ class GatewayKanbanWatchersMixin:
                     conn.close()
             await asyncio.to_thread(_sync_record_quota_blocked_outcome)
 
-        async def _record_review_terminal_blocked_outcome(reason: str) -> None:
-            def _sync_record_review_terminal_blocked_outcome() -> None:
+        async def _record_review_blocked_objective_outcome(reason: str) -> None:
+            def _sync_record_review_blocked_objective_outcome() -> None:
+                completion_mode = str(
+                    callback.get("completion_mode") or "terminal"
+                )
+                outcome_kind = (
+                    "intermediate_blocked"
+                    if completion_mode == "intermediate"
+                    else "terminal_blocked"
+                )
                 conn = kb_module.connect(board=board)
                 try:
                     kb_module.record_grace_loop_callback_blocker_outcome(
@@ -1212,10 +1220,10 @@ class GatewayKanbanWatchersMixin:
                         review_task_id=review_id,
                         event_id=event_id,
                         lease_owner=lease_owner,
-                        outcome_kind="terminal_blocked",
+                        outcome_kind=outcome_kind,
                         payload={
                             "summary": str(callback.get("review_summary") or "").strip()
-                            or f"Grace review {review_id} blocked the terminal stage.",
+                            or f"Grace review {review_id} blocked the objective stage.",
                             "reason": reason,
                             "next_action": (
                                 "Resolve the review blocker, then create a fresh "
@@ -1225,7 +1233,7 @@ class GatewayKanbanWatchersMixin:
                     )
                 finally:
                     conn.close()
-            await asyncio.to_thread(_sync_record_review_terminal_blocked_outcome)
+            await asyncio.to_thread(_sync_record_review_blocked_objective_outcome)
 
         async def _escalate(error: str) -> None:
             def _sync_escalate() -> None:
@@ -2094,7 +2102,6 @@ class GatewayKanbanWatchersMixin:
             if (
                 outcome == "blocked"
                 and str(callback.get("objective_id") or "").strip()
-                and str(callback.get("completion_mode") or "terminal") == "terminal"
                 and not await _has_structured_outcome()
             ):
                 blocker_reason = ""
@@ -2102,7 +2109,7 @@ class GatewayKanbanWatchersMixin:
                     blocker_reason = str(
                         (callback.get("event_payload") or {}).get("reason") or ""
                     ).strip()
-                await _record_review_terminal_blocked_outcome(
+                await _record_review_blocked_objective_outcome(
                     blocker_reason or "terminal Grace review blocked"
                 )
             if outcome == "accepted" and not await _has_structured_outcome():

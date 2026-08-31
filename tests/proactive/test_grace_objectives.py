@@ -179,6 +179,46 @@ def test_terminal_review_blocker_records_objective_terminal_blocked(tmp_path):
         assert callback["outcome_kind"] == "terminal_blocked"
 
 
+def test_intermediate_review_blocker_records_objective_intermediate_blocked(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-intermediate-blocked.db") as conn:
+        _create_objective(conn)
+        review_id, event_id = _blocked_callback(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset",
+            requested_mode="terminal",
+        )
+        kb.record_grace_loop_callback_blocker_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="owner-a",
+            outcome_kind="intermediate_blocked",
+            payload={
+                "summary": "Grace review fail-closed.",
+                "reason": "structured recovery evidence is missing",
+                "next_action": "Create a fresh recovery stage.",
+            },
+        )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        stage = conn.execute(
+            """
+            SELECT status, outcome_kind, evidence
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, review_id)
+
+        assert objective["status"] == "blocked"
+        assert objective["waiting_for"] == "structured recovery evidence is missing"
+        assert objective["current_stage_key"] == "prepare_asset"
+        assert stage["status"] == "done"
+        assert stage["outcome_kind"] == "intermediate_blocked"
+        assert callback["outcome_kind"] == "intermediate_blocked"
+
+
 def test_delegation_reservation_binds_declared_objective_stage(tmp_path):
     with kb.connect_closing(tmp_path / "objective-reserve.db") as conn:
         _create_objective(conn)

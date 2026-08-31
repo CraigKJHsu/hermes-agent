@@ -17148,7 +17148,7 @@ def record_grace_loop_callback_blocker_outcome(
 ) -> dict:
     """Persist a structured outcome for a non-accepted callback blocker."""
     kind = str(outcome_kind or "").strip()
-    if kind not in {"quota_blocked", "terminal_blocked"}:
+    if kind not in {"quota_blocked", "terminal_blocked", "intermediate_blocked"}:
         raise ValueError("Unsupported blocker callback outcome.")
     payload_json = json.dumps(
         dict(payload or {}),
@@ -17196,6 +17196,14 @@ def record_grace_loop_callback_blocker_outcome(
             and str(current.get("completion_mode") or "terminal") == "terminal"
             and str(current.get("objective_id") or "").strip()
         )
+        is_intermediate_review_blocker = (
+            kind == "intermediate_blocked"
+            and event_task_id == str(current.get("review_task_id") or "")
+            and event_kind
+            in {"blocked", "block_loop_detected", "gave_up", "crashed", "timed_out"}
+            and str(current.get("completion_mode") or "terminal") == "intermediate"
+            and str(current.get("objective_id") or "").strip()
+        )
         if kind == "quota_blocked" and not is_execution_blocker:
             raise ValueError(
                 "Structured quota blocker outcomes are allowed only for execution blocked events."
@@ -17204,12 +17212,16 @@ def record_grace_loop_callback_blocker_outcome(
             raise ValueError(
                 "Structured terminal blockers are allowed only for objective-linked terminal review blockers."
             )
-        if kind == "terminal_blocked":
+        if kind == "intermediate_blocked" and not is_intermediate_review_blocker:
+            raise ValueError(
+                "Structured intermediate blockers are allowed only for objective-linked intermediate review blockers."
+            )
+        if kind in {"terminal_blocked", "intermediate_blocked"}:
             clean_payload = dict(payload or {})
             if not str(clean_payload.get("summary") or "").strip():
-                raise ValueError("Terminal-blocked callback outcome requires a summary.")
+                raise ValueError(f"{kind} callback outcome requires a summary.")
             if not str(clean_payload.get("reason") or "").strip():
-                raise ValueError("Terminal-blocked callback outcome requires a reason.")
+                raise ValueError(f"{kind} callback outcome requires a reason.")
         if current.get("outcome_event_id") is not None:
             if (
                 int(current.get("outcome_event_id") or 0) == int(event_id)
@@ -17254,6 +17266,42 @@ def record_grace_loop_callback_blocker_outcome(
                 callback=current,
                 kind="terminal_blocked",
                 payload=dict(payload or {}),
+            )
+        if kind == "intermediate_blocked":
+            objective_id = str(current.get("objective_id") or "").strip()
+            stage_key = str(current.get("stage_key") or "").strip()
+            if not stage_key:
+                raise ValueError("Objective-linked callback is missing its stage key")
+            now = int(time.time())
+            conn.execute(
+                """
+                UPDATE grace_objective_stages
+                   SET status = 'done',
+                       outcome_kind = 'intermediate_blocked',
+                       evidence = ?, completed_at = ?, updated_at = ?
+                 WHERE objective_id = ? AND stage_key = ? AND status <> 'done'
+                """,
+                (payload_json, now, now, objective_id, stage_key),
+            )
+            conn.execute(
+                """
+                UPDATE grace_objectives
+                   SET status = 'blocked', current_stage_key = ?,
+                       next_action = ?, waiting_for = ?, updated_at = ?
+                 WHERE objective_id = ?
+                """,
+                (
+                    stage_key,
+                    str(payload.get("next_action") or "").strip(),
+                    str(
+                        payload.get("waiting_for")
+                        or payload.get("reason")
+                        or payload.get("summary")
+                        or ""
+                    ).strip(),
+                    now,
+                    objective_id,
+                ),
             )
         updated = conn.execute(
             "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
