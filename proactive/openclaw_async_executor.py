@@ -376,6 +376,7 @@ def _loop_delegation_args(
         "openclaw_task_id": openclaw_task_id,
         "dry_run": False,
         "loop_contract": contract,
+        "model_route": dict(metadata.get("model_route") or {}),
     }
     message_path = metadata.get("backend_telegram_message_path")
     if isinstance(message_path, Mapping):
@@ -726,9 +727,13 @@ def start_zero_effect_async_acceptance(
                     "review_task_id": existing_review_task_id,
                     "run_id": existing_run.id,
                     "status": (
-                        "succeeded"
-                        if handled.get("accepted") is True
-                        else "blocked"
+                        "review_pending"
+                        if handled.get("review_pending") is True
+                        else (
+                            "succeeded"
+                            if handled.get("accepted") is True
+                            else "blocked"
+                        )
                     ),
                     "backend_run_id": existing_run.backend_run_id,
                     "routing_decision": existing_run.routing_decision,
@@ -1300,9 +1305,13 @@ def start_zero_effect_async_acceptance(
                 "review_task_id": review_task_id,
                 "run_id": run_id,
                 "status": (
-                    "succeeded"
-                    if accepted.get("accepted") is True
-                    else "blocked"
+                    "review_pending"
+                    if accepted.get("review_pending") is True
+                    else (
+                        "succeeded"
+                        if accepted.get("accepted") is True
+                        else "blocked"
+                    )
                 ),
                 "backend_run_id": backend_run_id,
                 "routing_decision": routing_decision,
@@ -1618,42 +1627,17 @@ def make_zero_effect_async_terminal_handler(
                     raise RuntimeError(
                         "Async execution changed before terminal completion."
                     )
-                review = kb.claim_task(
-                    conn,
-                    review_task_id,
-                    claimer="grace-policy-review",
-                )
-                if review is None or review.current_run_id is None:
-                    raise RuntimeError("Grace async review task could not be claimed.")
-                if not kb.complete_task(
-                    conn,
-                    review_task_id,
-                    result="accepted",
-                    summary=(
-                        "Grace accepted exact backend identity, zero tools, zero "
-                        "external effects, terminal evidence, and cleanup."
-                    ),
-                    metadata={
-                        "reviewed_execution_task_id": run.task_id,
-                        "backend_run_id": run.backend_run_id,
-                        "checks": [
-                            "backend_identity",
-                            "zero_tools",
-                            "zero_external_effects",
-                            "terminal_transcript",
-                            "ephemeral_cleanup",
-                        ],
-                    },
-                    expected_run_id=int(review.current_run_id),
-                ):
-                    raise RuntimeError("Grace async review changed before completion.")
                 kb.record_backend_circuit_outcome(
                     conn,
                     "openclaw",
                     succeeded=True,
                     expected_generation=circuit_generation,
                 )
-        return {"accepted": True, "review_task_id": review_task_id}
+        return {
+            "accepted": False,
+            "review_pending": True,
+            "review_task_id": review_task_id,
+        }
 
     return handle
 
@@ -2093,6 +2077,28 @@ def start_loop_contract_execution(
                 raise RuntimeError(
                     json.dumps(routing_decision, ensure_ascii=False, sort_keys=True)
                 )
+            from proactive.model_routing import route_grace, route_worker
+
+            worker_task_type = str(
+                (normalized.get("routing") or {}).get("task_type")
+                or (normalized.get("identity") or {}).get("task_type")
+                or task_type
+                or "general"
+            )
+            worker_model_route = route_worker(
+                worker_task_type,
+                {
+                    "task_risk": risk_level,
+                    "memory_impact": (
+                        "durable"
+                        if normalized.get("memory", {}).get("promote_on_acceptance")
+                        else "none"
+                    ),
+                    "external_action": bool(external_effect_budget),
+                },
+            )
+            routing_decision = dict(routing_decision)
+            routing_decision["model_route"] = worker_model_route
             task_id = kb.create_task(
                 conn,
                 title=f"OpenClaw: {normalized['goal']['objective'][:90]}",
@@ -2111,6 +2117,19 @@ def start_loop_contract_execution(
                 executor_profile="loop-contract",
                 project_namespace=str(identity["project"]),
                 routing_decision=routing_decision,
+                model_override=worker_model_route["requested_model"],
+            )
+            review_model_route = route_grace(
+                "acceptance_review",
+                {
+                    "task_risk": risk_level,
+                    "memory_impact": (
+                        "durable"
+                        if normalized.get("memory", {}).get("promote_on_acceptance")
+                        else "none"
+                    ),
+                    "external_action": bool(external_effect_budget),
+                },
             )
             review_task_id = kb.create_task(
                 conn,
@@ -2132,6 +2151,11 @@ def start_loop_contract_execution(
                 executor_backend="hermes",
                 executor_profile="grace-policy-review",
                 project_namespace=str(identity["project"]),
+                routing_decision={
+                    "selected_backend": "hermes",
+                    "model_route": review_model_route,
+                },
+                model_override=review_model_route["requested_model"],
             )
             if platform and chat_id:
                 for notification_task_id in (task_id, review_task_id):
@@ -2196,6 +2220,7 @@ def start_loop_contract_execution(
                 "external_effect_budget": external_effect_budget,
                 "allowed_tools": allowed_tools,
                 "backend_agent_id": backend_agent_id,
+                "model_route": worker_model_route,
                 "credential_refs": (
                     ["missioncrew-facebook-page"]
                     if task_type in {

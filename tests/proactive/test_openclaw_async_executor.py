@@ -28,6 +28,21 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version=None,
+    )
     return home
 
 
@@ -592,7 +607,10 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
     )
 
     with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
         run = kb.get_run(conn, int(started["run_id"]))
+    assert task is not None
+    assert task.model_override == "gpt-5.6-luna"
     assert run is not None
     assert run.metadata["external_effect_budget"] == 0
     assert run.metadata["credential_refs"] == []
@@ -2541,8 +2559,7 @@ def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):
         review = kb.get_task(conn, started["review_task_id"])
         run = kb.get_run(conn, started["run_id"])
         assert execution is not None and execution.status == "done"
-        assert review is not None and review.status == "done"
-        assert review.result == "accepted"
+        assert review is not None and review.status == "ready"
         assert run is not None and run.backend_status == "succeeded"
         assert run.outcome == "completed"
         assert run.metadata["backend_terminal_observation"][
@@ -2557,12 +2574,12 @@ def test_async_start_accepts_immediate_terminal_success(kanban_home):
         transport=lambda task: _result(task, "succeeded"),
     )
 
-    assert result["status"] == "succeeded"
+    assert result["status"] == "review_pending"
     with kb.connect() as conn:
         execution = kb.get_task(conn, result["execution_task_id"])
         review = kb.get_task(conn, result["review_task_id"])
         assert execution is not None and execution.status == "done"
-        assert review is not None and review.status == "done"
+        assert review is not None and review.status == "ready"
 
 
 def test_async_replay_finalizes_persisted_immediate_terminal_observation(
@@ -2612,7 +2629,7 @@ def test_async_replay_finalizes_persisted_immediate_terminal_observation(
         ),
     )
 
-    assert replayed["status"] == "succeeded"
+    assert replayed["status"] == "review_pending"
     assert replayed["deduplicated"] is True
 
 
