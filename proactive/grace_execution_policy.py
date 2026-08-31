@@ -112,6 +112,43 @@ def _authorized_loop_worker_role(session_id: str = "") -> str:
         return ""
 
 
+def _review_self_report_matches_active_claim() -> bool:
+    """Allow review self-reporting when the raw worker token was not propagated."""
+    task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    run_id = os.getenv("HERMES_KANBAN_RUN_ID", "").strip()
+    claim_lock = os.getenv("HERMES_KANBAN_CLAIM_LOCK", "").strip()
+    if not task_id or not run_id or not claim_lock:
+        return False
+    board = os.getenv("HERMES_KANBAN_BOARD", "").strip() or None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing(board=board) as conn:
+            row = conn.execute(
+                """
+                SELECT t.id, t.status, t.current_run_id, t.claim_lock,
+                       t.assignee, t.executor_profile, t.body, d.state
+                  FROM tasks AS t
+                  JOIN grace_delegations AS d
+                    ON d.review_task_id = t.id
+                 WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            return bool(
+                row is not None
+                and row["status"] == "running"
+                and int(row["current_run_id"] or 0) == int(run_id)
+                and str(row["claim_lock"] or "") == claim_lock
+                and str(row["assignee"] or "") == "default"
+                and str(row["executor_profile"] or "") == "grace-policy-review"
+                and str(row["state"] or "") == "queued"
+                and kb._grace_loop_stage_header(str(row["body"] or "")) == "review"
+            )
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+
+
 def _is_authorized_clawops_worker(session_id: str = "") -> bool:
     return _authorized_loop_worker_role(session_id) == "execution"
 
@@ -203,6 +240,18 @@ def enforce_grace_execution_boundary(
         target_task_id = str((args or {}).get("task_id") or "").strip()
         active_task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
         if not target_task_id or target_task_id == active_task_id:
+            return next_call(args)
+    if (
+        worker_role == ""
+        and has_worker_provenance
+        and normalized_tool in _REVIEW_SELF_MUTATIONS
+    ):
+        target_task_id = str((args or {}).get("task_id") or "").strip()
+        active_task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+        if (
+            (not target_task_id or target_task_id == active_task_id)
+            and _review_self_report_matches_active_claim()
+        ):
             return next_call(args)
     if not (
         is_direct_execution_tool(tool_name, args)

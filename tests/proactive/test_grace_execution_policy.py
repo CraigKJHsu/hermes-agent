@@ -371,6 +371,83 @@ def test_worker_identity_is_bound_to_persisted_execution_delegation(
     assert json.loads(blocked)["status"] == "blocked_by_grace_execution_policy"
 
 
+def test_review_worker_self_report_allowed_when_token_not_propagated(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "review-self-report-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    now = int(time.time())
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+            assignee="clawops-browser",
+            session_id="grace-loop:gd_review_fallback:execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nreview",
+            assignee="default",
+            parents=[execution_id],
+            session_id="grace-loop:gd_review_fallback:review",
+            executor_profile="grace-policy-review",
+        )
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id, session_key, session_id,
+                resolved_route, approval_required, state,
+                execution_task_id, review_task_id, created_at, updated_at
+            ) VALUES (
+                'gd_review_fallback', ?, 'request-review-fallback',
+                'telegram', 'chat-1', '2', 'session-key', 'session-id',
+                '{}', 0, 'queued', ?, ?, ?, ?
+            )
+            """,
+            ("b" * 64, execution_id, review_id, now, now),
+        )
+        execution = kb.claim_task(conn, execution_id, claimer="execution:claim")
+        assert execution is not None
+        kb.block_task(
+            conn,
+            execution_id,
+            reason="terminal blocked",
+            kind="capability",
+            expected_run_id=execution.current_run_id,
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (review_id,))
+        review = kb.claim_task(conn, review_id, claimer="review:claim")
+
+    assert review is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(review.claim_lock))
+    monkeypatch.delenv("HERMES_KANBAN_WORKER_AUTH_TOKEN", raising=False)
+
+    called = []
+    assert enforce_grace_execution_boundary(
+        tool_name="kanban_complete",
+        args={"task_id": review_id},
+        next_call=lambda effective: called.append(effective) or "executed",
+        session_id="runtime",
+    ) == "executed"
+    assert called
+    called.clear()
+    foreign = enforce_grace_execution_boundary(
+        tool_name="kanban_complete",
+        args={"task_id": execution_id},
+        next_call=lambda effective: called.append(effective) or "executed",
+        session_id="runtime",
+    )
+    assert not called
+    assert json.loads(foreign)["status"] == "blocked_by_grace_execution_policy"
+
+
 def test_grace_loop_stage_is_only_read_from_exact_first_line():
     assert (
         kb._grace_loop_stage_header(
