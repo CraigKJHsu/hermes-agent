@@ -121,12 +121,6 @@ def _openclaw_empty_result_blocker_payload(
 ) -> Optional[Mapping[str, Any]]:
     if not isinstance(evidence, Mapping):
         return None
-    if evidence.get("resultContractValid") is True:
-        return None
-    if str(evidence.get("resultContractError") or "").strip() != (
-        "Loop Contract result is not valid JSON."
-    ):
-        return None
     if int(evidence.get("externalEffectBudget") or 0) != 0:
         return None
     if int(metadata.get("external_effect_budget") or 0) != 0:
@@ -136,21 +130,42 @@ def _openclaw_empty_result_blocker_payload(
     result_text = output.get("resultText")
     if isinstance(result_text, str) and result_text.strip():
         return None
-    return {
-        "status": "blocked",
-        "summary": (
+    result_error = str(evidence.get("resultContractError") or "").strip()
+    stop_rule_reason = str(metadata.get("stop_rule_reason") or "").strip()
+    if result_error == "Loop Contract result is not valid JSON.":
+        missing_reason = "empty_result_json"
+        summary = (
             "OpenClaw returned no structured result JSON before terminal "
             "completion."
-        ),
+        )
+        notes = (
+            "Backend returned an empty or missing resultText, so the "
+            "task cannot be accepted as completed."
+        )
+    elif (
+        metadata.get("stop_rule_cleanup_pending") is True
+        or "max_runtime_seconds" in stop_rule_reason
+    ):
+        missing_reason = "runtime_timeout_cleanup"
+        summary = (
+            "OpenClaw reached its runtime limit and cleaned up without a "
+            "structured result JSON."
+        )
+        notes = (
+            stop_rule_reason
+            or "Backend cleanup completed, but no structured task result was returned."
+        )
+    else:
+        return None
+    return {
+        "status": "blocked",
+        "summary": summary,
         "acceptanceEvidence": {
             "checks": [
                 {
                     "name": "result JSON",
                     "result": "blocked",
-                    "notes": (
-                        "Backend returned an empty or missing resultText, so the "
-                        "task cannot be accepted as completed."
-                    ),
+                    "notes": notes,
                 },
                 {
                     "name": "external effects",
@@ -161,6 +176,10 @@ def _openclaw_empty_result_blocker_payload(
         },
         "requiredEvidence": {
             "structuredResultJson": None,
+        },
+        "blocker": {
+            "kind": "runtime_output_contract",
+            "reason": missing_reason,
         },
         "externalEffects": [],
     }

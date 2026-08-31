@@ -2272,6 +2272,75 @@ def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_hom
     assert ended_run.metadata["read_only_zero_external_effects"] is True
 
 
+def test_loop_terminal_synthesizes_readonly_timeout_cleanup_blocker(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-timeout-cleanup-blocker-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="secondhand_commerce_group_status",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-timeout-cleanup-blocker-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        kb.merge_active_run_metadata(
+            conn,
+            run.task_id,
+            expected_run_id=run.id,
+            metadata={
+                "stop_rule_cleanup_pending": True,
+                "stop_rule_reason": (
+                    "Loop Contract max_runtime_seconds reached before backend "
+                    "terminal state: 1200s."
+                ),
+            },
+        )
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output.pop("result")
+    output.pop("resultText", None)
+    output["evidence"].pop("resultContractValid", None)
+    output["evidence"]["sessionCleaned"] = True
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-timeout-cleanup-blocker-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    assert "max_runtime_seconds" in handled["reason"]
+    assert "OpenClaw reached its runtime limit" in handled["reason"]
+    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+    assert ended_run is not None
+    assert ended_run.metadata["loop_contract_blocked_result"]["blocker"] == {
+        "kind": "runtime_output_contract",
+        "reason": "runtime_timeout_cleanup",
+    }
+    assert ended_run.metadata["required_evidence"]["structuredResultJson"] is None
+    assert ended_run.metadata["external_effects"] == []
+
+
 def test_loop_terminal_preserves_readonly_share_link_blocker_details(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-share-link-blocker-1"
