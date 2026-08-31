@@ -113,6 +113,59 @@ def _openclaw_result_payload(output: Mapping[str, Any]) -> Optional[Mapping[str,
     return parsed if isinstance(parsed, Mapping) else None
 
 
+def _openclaw_empty_result_blocker_payload(
+    output: Mapping[str, Any],
+    *,
+    evidence: Any,
+    metadata: Mapping[str, Any],
+) -> Optional[Mapping[str, Any]]:
+    if not isinstance(evidence, Mapping):
+        return None
+    if evidence.get("resultContractValid") is True:
+        return None
+    if str(evidence.get("resultContractError") or "").strip() != (
+        "Loop Contract result is not valid JSON."
+    ):
+        return None
+    if int(evidence.get("externalEffectBudget") or 0) != 0:
+        return None
+    if int(metadata.get("external_effect_budget") or 0) != 0:
+        return None
+    if isinstance(output.get("result"), Mapping):
+        return None
+    result_text = output.get("resultText")
+    if isinstance(result_text, str) and result_text.strip():
+        return None
+    return {
+        "status": "blocked",
+        "summary": (
+            "OpenClaw returned no structured result JSON before terminal "
+            "completion."
+        ),
+        "acceptanceEvidence": {
+            "checks": [
+                {
+                    "name": "result JSON",
+                    "result": "blocked",
+                    "notes": (
+                        "Backend returned an empty or missing resultText, so the "
+                        "task cannot be accepted as completed."
+                    ),
+                },
+                {
+                    "name": "external effects",
+                    "result": "verified",
+                    "notes": "Zero external-effect budget and no reported effects.",
+                },
+            ],
+        },
+        "requiredEvidence": {
+            "structuredResultJson": None,
+        },
+        "externalEffects": [],
+    }
+
+
 def _extract_json_object(text: str) -> Optional[Mapping[str, Any]]:
     decoder = json.JSONDecoder()
     for match in re.finditer(r"\{", text):
@@ -3719,6 +3772,12 @@ def make_loop_contract_terminal_handler(
             else None
         )
         metadata = run.metadata or {}
+        if audited_result is None and isinstance(output, Mapping):
+            audited_result = _openclaw_empty_result_blocker_payload(
+                output,
+                evidence=evidence,
+                metadata=metadata,
+            )
         raw_external_effects = (
             audited_result.get("externalEffects")
             if isinstance(audited_result, Mapping)

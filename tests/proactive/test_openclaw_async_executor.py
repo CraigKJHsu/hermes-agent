@@ -2214,6 +2214,64 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
     assert ended_run.metadata["read_only_zero_external_effects"] is True
 
 
+def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-empty-result-json-blocker-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="secondhand_commerce_group_status",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-empty-result-json-blocker-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output.pop("result")
+    output["resultText"] = ""
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = "Loop Contract result is not valid JSON."
+    terminal["status"] = "failed"
+    terminal["errors"] = ["openclaw_bridge_failed"]
+    observation = {
+        "status": "failed",
+        "delegated_result": terminal,
+        "result_digest": "terminal-empty-result-json-blocker-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    assert "Loop Contract result is not valid JSON" in handled["reason"]
+    assert "OpenClaw returned no structured result JSON" in handled["reason"]
+    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert "No external effect was verified or recorded" not in handled["reason"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+    assert ended_run is not None
+    assert ended_run.metadata["loop_contract_blocked_result"]["status"] == "blocked"
+    assert (
+        ended_run.metadata["required_evidence"]["structuredResultJson"] is None
+    )
+    assert ended_run.metadata["external_effects"] == []
+    assert ended_run.metadata["read_only_zero_external_effects"] is True
+
+
 def test_loop_terminal_preserves_readonly_share_link_blocker_details(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-share-link-blocker-1"
