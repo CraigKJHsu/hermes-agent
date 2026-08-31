@@ -21,6 +21,7 @@ POLICY_ID = "missioncrew-model-routing-v1"
 MODEL_SOL = "gpt-5.6-sol"
 MODEL_TERRA = "gpt-5.6-terra"
 MODEL_LUNA = "gpt-5.6-luna"
+MODEL_MECHANICAL = "gpt-5.5"
 MODEL_SPARK = "gpt-5.3-codex-spark"
 
 _EFFORT_RANK = {
@@ -347,7 +348,7 @@ def route_worker(
         model, effort = _configured_route(
             workers,
             "mechanical",
-            default_model=MODEL_LUNA,
+            default_model=MODEL_MECHANICAL,
             default_effort="low",
         )
         reason = "mechanical_high_volume_work"

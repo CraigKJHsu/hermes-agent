@@ -8,6 +8,7 @@ import pytest
 
 from proactive.model_routing import (
     MODEL_LUNA,
+    MODEL_MECHANICAL,
     MODEL_SOL,
     MODEL_SPARK,
     MODEL_TERRA,
@@ -89,7 +90,7 @@ def test_routing_environment_binds_the_worker_to_the_task() -> None:
 
 def test_worker_routes_spark_luna_and_terra_by_work_class() -> None:
     assert route_worker("focused_code")["requested_model"] == MODEL_SPARK
-    assert route_worker("browser_readonly")["requested_model"] == MODEL_LUNA
+    assert route_worker("browser_readonly")["requested_model"] == MODEL_MECHANICAL
     assert route_worker("general")["requested_model"] == MODEL_TERRA
     assert route_worker("devops")["reasoning_effort"] == "high"
 
@@ -110,7 +111,7 @@ def test_commerce_readonly_tasks_use_mechanical_worker_route(
     task_type: str,
 ) -> None:
     route = route_worker(task_type)
-    assert route["requested_model"] == MODEL_LUNA
+    assert route["requested_model"] == MODEL_MECHANICAL
     assert route["reasoning_effort"] == "low"
     assert route["routing_reason"] == "mechanical_high_volume_work"
 

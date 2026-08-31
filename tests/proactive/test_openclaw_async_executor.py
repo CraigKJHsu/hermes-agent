@@ -610,7 +610,7 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
         task = kb.get_task(conn, started["execution_task_id"])
         run = kb.get_run(conn, int(started["run_id"]))
     assert task is not None
-    assert task.model_override == "gpt-5.6-luna"
+    assert task.model_override == "gpt-5.5"
     assert run is not None
     assert run.metadata["external_effect_budget"] == 0
     assert run.metadata["credential_refs"] == []
