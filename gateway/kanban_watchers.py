@@ -520,6 +520,13 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                # Grace loop callbacks are their own durable handoff stream.
+                # They must be polled even when no user-facing notification
+                # subscription produced a delivery on this tick; otherwise an
+                # accepted review can sit in ``pending`` forever.
+                self._schedule_due_grace_loop_callbacks(
+                    _kb, notifier_profile=notifier_profile,
+                )
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -835,14 +842,6 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
-                # A notify subscription closes the human-visible progress
-                # stream, but a completed/blocked Grace review must also wake
-                # the originating conversational agent.  Keep that durable
-                # callback in its own table so deleting a terminal notify sub
-                # cannot sever the final Grace -> KJ handoff.
-                self._schedule_due_grace_loop_callbacks(
-                    _kb, notifier_profile=notifier_profile,
-                )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
