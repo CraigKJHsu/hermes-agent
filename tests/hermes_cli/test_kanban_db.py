@@ -3222,6 +3222,9 @@ def test_recompute_ready_promotes_grace_review_for_terminal_blocked_parent(kanba
 
         assert promoted == 1
         assert kb.get_task(conn, review).status == "ready"
+        claimed_review = kb.claim_task(conn, review, claimer="grace-policy-review")
+        assert claimed_review is not None
+        assert claimed_review.status == "running"
 
 
 def test_recompute_ready_keeps_regular_child_waiting_on_blocked_parent(kanban_home):

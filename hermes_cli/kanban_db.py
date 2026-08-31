@@ -6419,6 +6419,34 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return payload.get("limit_source") == "forced"
 
 
+def _parent_satisfied_for_ready_child(
+    conn: sqlite3.Connection,
+    *,
+    child_executor_profile: Optional[str],
+    parent_id: str,
+    parent_status: str,
+) -> bool:
+    if parent_status in ("done", "archived"):
+        return True
+    if child_executor_profile != "grace-policy-review" or parent_status != "blocked":
+        return False
+    parent_run = conn.execute(
+        """
+        SELECT status, outcome
+          FROM task_runs
+         WHERE task_id = ?
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (parent_id,),
+    ).fetchone()
+    return (
+        parent_run is not None
+        and parent_run["status"] == "blocked"
+        and parent_run["outcome"] == "blocked"
+    )
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -6473,28 +6501,15 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            grace_review_task = row["executor_profile"] == "grace-policy-review"
-            def parent_allows_promotion(parent: sqlite3.Row) -> bool:
-                if parent["status"] in ("done", "archived"):
-                    return True
-                if not grace_review_task or parent["status"] != "blocked":
-                    return False
-                parent_run = conn.execute(
-                    """
-                    SELECT status, outcome
-                      FROM task_runs
-                     WHERE task_id = ?
-                     ORDER BY id DESC
-                     LIMIT 1
-                    """,
-                    (parent["id"],),
-                ).fetchone()
-                return (
-                    parent_run is not None
-                    and parent_run["status"] == "blocked"
-                    and parent_run["outcome"] == "blocked"
+            if all(
+                _parent_satisfied_for_ready_child(
+                    conn,
+                    child_executor_profile=row["executor_profile"],
+                    parent_id=p["id"],
+                    parent_status=p["status"],
                 )
-            if all(parent_allows_promotion(p) for p in parents):
+                for p in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -6698,12 +6713,27 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        child_row = conn.execute(
+            "SELECT executor_profile FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        parents = conn.execute(
+            "SELECT p.id, p.status FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ?",
+            (task_id,),
+        ).fetchall()
+        undone = any(
+            not _parent_satisfied_for_ready_child(
+                conn,
+                child_executor_profile=(
+                    child_row["executor_profile"] if child_row is not None else None
+                ),
+                parent_id=parent["id"],
+                parent_status=parent["status"],
+            )
+            for parent in parents
+        )
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
