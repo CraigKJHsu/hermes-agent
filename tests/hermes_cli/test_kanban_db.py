@@ -3198,6 +3198,52 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_recompute_ready_promotes_grace_review_for_terminal_blocked_parent(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="execution", assignee="openclaw")
+        review = kb.create_task(
+            conn,
+            title="review",
+            assignee="default",
+            parents=[parent],
+            executor_profile="grace-policy-review",
+        )
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None
+        kb.block_task(
+            conn,
+            parent,
+            reason="OpenClaw Loop Contract was blocked before verified completion.",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        promoted = kb.recompute_ready(conn)
+
+        assert promoted == 1
+        assert kb.get_task(conn, review).status == "ready"
+
+
+def test_recompute_ready_keeps_regular_child_waiting_on_blocked_parent(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="execution", assignee="openclaw")
+        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None
+        kb.block_task(
+            conn,
+            parent,
+            reason="OpenClaw Loop Contract was blocked before verified completion.",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        promoted = kb.recompute_ready(conn)
+
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")

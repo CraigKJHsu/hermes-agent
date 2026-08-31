@@ -6455,7 +6455,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, executor_profile "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -6468,12 +6468,33 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            grace_review_task = row["executor_profile"] == "grace-policy-review"
+            def parent_allows_promotion(parent: sqlite3.Row) -> bool:
+                if parent["status"] in ("done", "archived"):
+                    return True
+                if not grace_review_task or parent["status"] != "blocked":
+                    return False
+                parent_run = conn.execute(
+                    """
+                    SELECT status, outcome
+                      FROM task_runs
+                     WHERE task_id = ?
+                     ORDER BY id DESC
+                     LIMIT 1
+                    """,
+                    (parent["id"],),
+                ).fetchone()
+                return (
+                    parent_run is not None
+                    and parent_run["status"] == "blocked"
+                    and parent_run["outcome"] == "blocked"
+                )
+            if all(parent_allows_promotion(p) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
