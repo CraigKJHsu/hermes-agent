@@ -219,6 +219,40 @@ def test_intermediate_review_blocker_records_objective_intermediate_blocked(tmp_
         assert callback["outcome_kind"] == "intermediate_blocked"
 
 
+def test_retry_stage_supersedes_previous_bound_retry_stage(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-retry-supersedes.db") as conn:
+        _create_objective(conn)
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued',
+                   delegation_id = 'gd-prepare',
+                   execution_task_id = 't-exec',
+                   review_task_id = 't-review'
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        )
+
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            next_action="Retry preparation.",
+        )
+        prior = conn.execute(
+            """
+            SELECT status, outcome_kind, evidence
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        ).fetchone()
+
+        assert objective["current_stage_key"] == "prepare_asset_r2"
+        assert prior["status"] == "done"
+        assert prior["outcome_kind"] == "superseded_by_retry"
+        assert "prepare_asset_r2" in prior["evidence"]
+
+
 def test_delegation_reservation_binds_declared_objective_stage(tmp_path):
     with kb.connect_closing(tmp_path / "objective-reserve.db") as conn:
         _create_objective(conn)

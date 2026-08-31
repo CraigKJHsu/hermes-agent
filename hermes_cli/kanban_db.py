@@ -14254,6 +14254,49 @@ def ensure_grace_objective_stage(
             if terminal_stage not in stages:
                 raise ValueError("Grace objective terminal stage is not declared")
             terminal_index = stages.index(terminal_stage)
+            retry_base_stage_key = _grace_objective_retry_base_stage_key(
+                clean_stage_key
+            )
+            if retry_base_stage_key:
+                base_stage = conn.execute(
+                    """
+                    SELECT delegation_id, execution_task_id, review_task_id
+                      FROM grace_objective_stages
+                     WHERE objective_id = ? AND stage_key = ?
+                       AND status <> 'done'
+                    """,
+                    (clean_objective_id, retry_base_stage_key),
+                ).fetchone()
+                if base_stage is not None and base_stage["delegation_id"]:
+                    superseded_evidence = _canonical_json(
+                        {
+                            "summary": (
+                                "Previous retry stage was superseded by a "
+                                "new retry stage."
+                            ),
+                            "next_stage_key": clean_stage_key,
+                            "delegation_id": base_stage["delegation_id"],
+                            "execution_task_id": base_stage["execution_task_id"],
+                            "review_task_id": base_stage["review_task_id"],
+                        }
+                    )
+                    conn.execute(
+                        """
+                        UPDATE grace_objective_stages
+                           SET status = 'done',
+                               outcome_kind = 'superseded_by_retry',
+                               evidence = ?, completed_at = ?,
+                               updated_at = ?
+                         WHERE objective_id = ? AND stage_key = ?
+                        """,
+                        (
+                            superseded_evidence,
+                            now,
+                            now,
+                            clean_objective_id,
+                            retry_base_stage_key,
+                        ),
+                    )
             stages.insert(terminal_index, clean_stage_key)
             conn.execute(
                 """
