@@ -2032,13 +2032,93 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
 
     assert handled["accepted"] is False
     assert "Required Facebook Graph API tool is unavailable" in handled["reason"]
-    assert "No external effect was verified or recorded" in handled["reason"]
+    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert "No external effect was verified or recorded" not in handled["reason"]
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
         ended_run = kb.latest_run(conn, started["execution_task_id"])
     assert task is not None and task.status == "blocked"
     assert ended_run is not None
     assert "Blocked before any Facebook Graph POST" in ended_run.summary
+    assert ended_run.metadata["loop_contract_blocked_result"]["status"] == "blocked"
+    assert ended_run.metadata["read_only_zero_external_effects"] is True
+
+
+def test_loop_terminal_preserves_readonly_share_link_blocker_details(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-share-link-blocker-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="secondhand_commerce_group_status",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-share-link-blocker-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["result"] = {
+        "status": "blocked",
+        "summary": "blocked",
+        "acceptanceEvidence": {
+            "checks": [
+                {
+                    "name": "redirect inspection",
+                    "result": "blocked",
+                    "notes": "未取得最終導向 URL",
+                },
+                {
+                    "name": "group ID/name binding",
+                    "result": "not_available",
+                    "notes": "無頁面可讀取，無法比對 1333742673375089",
+                },
+            ],
+        },
+        "requiredEvidence": {
+            "resolvedUrl": None,
+            "canonicalUrl": None,
+            "groupId": None,
+            "listingIdentity": None,
+        },
+        "externalEffects": [],
+    }
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-share-link-blocker-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    assert "redirect inspection: blocked" in handled["reason"]
+    assert "Missing required evidence: resolvedUrl, canonicalUrl, groupId" in handled["reason"]
+    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert "No external effect was verified or recorded" not in handled["reason"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+    assert ended_run is not None
+    assert ended_run.metadata["required_evidence"]["resolvedUrl"] is None
+    assert (
+        ended_run.metadata["acceptance_evidence"]["checks"][0]["notes"]
+        == "未取得最終導向 URL"
+    )
+    assert ended_run.metadata["read_only_zero_external_effects"] is True
 
 
 def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):

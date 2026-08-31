@@ -3215,6 +3215,49 @@ def _acceptance_evidence_has_failure(value: Any) -> bool:
     return False
 
 
+def _acceptance_evidence_failure_details(value: Any) -> list[str]:
+    details: list[str] = []
+    if isinstance(value, Mapping):
+        result = str(
+            value.get("result")
+            or value.get("status")
+            or value.get("outcome")
+            or ""
+        ).strip().casefold()
+        if result in {"failed", "fail", "blocked", "rejected", "not_applicable"}:
+            label = str(
+                value.get("name")
+                or value.get("check")
+                or value.get("field")
+                or "acceptance evidence"
+            ).strip()
+            notes = str(
+                value.get("notes")
+                or value.get("reason")
+                or value.get("summary")
+                or ""
+            ).strip()
+            details.append(
+                f"{label}: {result}" + (f" ({notes})" if notes else "")
+            )
+        for item in value.values():
+            details.extend(_acceptance_evidence_failure_details(item))
+    elif isinstance(value, list):
+        for item in value:
+            details.extend(_acceptance_evidence_failure_details(item))
+    return details
+
+
+def _missing_required_evidence_fields(value: Any) -> list[str]:
+    if not isinstance(value, Mapping):
+        return []
+    missing: list[str] = []
+    for key, field_value in value.items():
+        if field_value in (None, ""):
+            missing.append(str(key))
+    return missing
+
+
 def _split_internal_tool_effects(
     effects: Any,
 ) -> tuple[list[Any] | None, list[Any]]:
@@ -3726,12 +3769,79 @@ def make_loop_contract_terminal_handler(
                 "OpenClaw Loop Contract was blocked before verified completion: "
                 + " Worker report: ".join(details)
             )
-        if not external_effects and not internal_tool_receipts:
+        failed_checks = _acceptance_evidence_failure_details(
+            audited_result.get("acceptanceEvidence")
+            if isinstance(audited_result, Mapping)
+            else None
+        )
+        if failed_checks:
+            validation_reason += " Failed checks: " + "; ".join(failed_checks[:5]) + "."
+        missing_evidence = _missing_required_evidence_fields(
+            audited_result.get("requiredEvidence")
+            if isinstance(audited_result, Mapping)
+            else None
+        )
+        if missing_evidence:
+            validation_reason += (
+                " Missing required evidence: "
+                + ", ".join(missing_evidence[:10])
+                + "."
+            )
+        if (
+            external_effect_budget > 0
+            and not external_effects
+            and not internal_tool_receipts
+        ):
             validation_reason += " No external effect was verified or recorded."
+        elif (
+            external_effect_budget == 0
+            and isinstance(external_effects, list)
+            and not external_effects
+            and not internal_tool_receipts
+        ):
+            validation_reason += " Read-only contract reported zero external effects as expected."
         validation_reason = validation_reason[:2000]
         with kb.connect_closing(board=board) as conn:
             with kb.write_txn(conn):
                 if not valid:
+                    kb.merge_active_run_metadata(
+                        conn,
+                        run.task_id,
+                        expected_run_id=run.id,
+                        metadata={
+                            "terminal": True,
+                            "result_digest": observation.get("result_digest"),
+                            "acceptance_evidence": (
+                                audited_result.get("acceptanceEvidence")
+                                if isinstance(audited_result, Mapping)
+                                else None
+                            ),
+                            "required_evidence": (
+                                audited_result.get("requiredEvidence")
+                                if isinstance(audited_result, Mapping)
+                                else None
+                            ),
+                            "loop_contract_evidence": dict(evidence)
+                            if isinstance(evidence, Mapping)
+                            else None,
+                            "loop_contract_blocked_result": dict(audited_result)
+                            if isinstance(audited_result, Mapping)
+                            else None,
+                            "external_effects": normalized_external_effects
+                            if normalized_external_effects is not None
+                            else [],
+                            "raw_external_effects": external_effects
+                            if external_effects is not None
+                            else [],
+                            "internal_tool_receipts": internal_tool_receipts,
+                            "policy_receipts": policy_receipts,
+                            "read_only_zero_external_effects": (
+                                external_effect_budget == 0
+                                and isinstance(external_effects, list)
+                                and not external_effects
+                            ),
+                        },
+                    )
                     kb.block_task(
                         conn,
                         run.task_id,
