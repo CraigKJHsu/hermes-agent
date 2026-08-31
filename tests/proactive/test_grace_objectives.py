@@ -308,6 +308,35 @@ def test_objective_can_append_recovery_stage_before_terminal(tmp_path):
         assert stages[2]["status"] == "planned"
 
 
+def test_adding_recovery_stage_reactivates_blocked_objective(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-reactivate-stage.db") as conn:
+        _create_objective(conn)
+        now = int(time.time())
+        conn.execute(
+            """
+            UPDATE grace_objectives
+               SET status = 'blocked',
+                   waiting_for = 'prior terminal blocker',
+                   completed_at = ?,
+                   updated_at = ?
+             WHERE objective_id = 'go_test'
+            """,
+            (now, now),
+        )
+
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_recovery_1",
+            next_action="Recover durable evidence before retry.",
+        )
+
+        assert objective["status"] == "active"
+        assert objective["current_stage_key"] == "prepare_recovery_1"
+        assert objective["waiting_for"] == ""
+        assert objective["completed_at"] is None
+
+
 def test_appending_recovery_stage_supersedes_accepted_prior_prepare(tmp_path):
     with kb.connect_closing(tmp_path / "objective-supersede-stage.db") as conn:
         _create_objective(conn)

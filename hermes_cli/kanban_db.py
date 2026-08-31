@@ -14162,9 +14162,11 @@ def ensure_grace_objective_stage(
                 conn.execute(
                     """
                     UPDATE grace_objectives
-                       SET required_stage_keys = ?, current_stage_key = ?,
+                       SET status = 'active',
+                           required_stage_keys = ?, current_stage_key = ?,
                            terminal_stage_key = ?, next_action = ?,
-                           waiting_for = '', updated_at = ?
+                           waiting_for = '', completed_at = NULL,
+                           updated_at = ?
                      WHERE objective_id = ?
                     """,
                     (
@@ -14272,8 +14274,10 @@ def ensure_grace_objective_stage(
             conn.execute(
                 """
                 UPDATE grace_objectives
-                   SET required_stage_keys = ?, current_stage_key = ?,
-                       next_action = ?, waiting_for = '', updated_at = ?
+                   SET status = 'active',
+                       required_stage_keys = ?, current_stage_key = ?,
+                       next_action = ?, waiting_for = '',
+                       completed_at = NULL, updated_at = ?
                  WHERE objective_id = ?
                 """,
                 (
@@ -14288,8 +14292,10 @@ def ensure_grace_objective_stage(
             conn.execute(
                 """
                 UPDATE grace_objectives
-                   SET current_stage_key = ?, next_action = ?,
-                       waiting_for = '', updated_at = ?
+                   SET status = 'active',
+                       current_stage_key = ?, next_action = ?,
+                       waiting_for = '', completed_at = NULL,
+                       updated_at = ?
                  WHERE objective_id = ?
                 """,
                 (
