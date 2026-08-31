@@ -628,6 +628,70 @@ def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):
     assert run.metadata["credential_refs"] == []
 
 
+def test_browser_readonly_correction_does_not_inherit_stale_write_tool(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "browser-readonly-correction-tools-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-browser-readonly-correction-tools-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        stale_metadata = dict(run.metadata)
+        stale_metadata["allowed_tools"] = ["read", "write", "web_search"]
+        assert kb.merge_active_run_metadata(
+            conn,
+            started["execution_task_id"],
+            metadata=stale_metadata,
+            expected_run_id=run.id,
+        )
+        assert kb.block_task(
+            conn,
+            started["execution_task_id"],
+            reason="OpenClaw Loop Contract was blocked before verified completion: browser unavailable",
+            kind="capability",
+            expected_run_id=run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 1)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"read-only browser tools were missing"}',
+            ),
+        )
+        conn.commit()
+
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    retried = retry_ready_loop_contract_execution(
+        started["execution_task_id"],
+        transport=transport,
+    )
+
+    assert retried["status"] == "queued"
+    assert seen["allowed_tools"] == ["read", "web_search", "browser"]
+    with kb.connect() as conn:
+        retried_run = kb.get_run(conn, int(retried["run_id"]))
+    assert retried_run is not None
+    assert retried_run.metadata["allowed_tools"] == ["read", "web_search", "browser"]
+
+
 def test_loop_start_replays_ambiguous_timeout_with_same_key(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-timeout-replay-1"
@@ -2149,6 +2213,60 @@ def test_loop_terminal_preserves_readonly_share_link_blocker_details(kanban_home
         == "未取得最終導向 URL"
     )
     assert ended_run.metadata["read_only_zero_external_effects"] is True
+
+
+def test_loop_terminal_rejects_succeeded_payload_with_not_verified_evidence(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-not-verified-evidence-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-not-verified-evidence-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["result"] = {
+        "status": "succeeded",
+        "summary": "未完成驗證。",
+        "acceptanceEvidence": [
+            {
+                "criterion": "可否解析/重導 URL 並讀回最終頁面身份",
+                "outcome": "blocked",
+                "result": "not_verified",
+                "notes": "未取得最終導向 URL",
+            }
+        ],
+        "externalEffects": [],
+    }
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-not-verified-evidence-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    assert "可否解析/重導 URL 並讀回最終頁面身份: not_verified" in handled["reason"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
 
 
 def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):

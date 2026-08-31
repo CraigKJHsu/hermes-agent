@@ -206,6 +206,18 @@ def _loop_allowed_tools(
     return allowed
 
 
+def _loop_correction_contract_tools(
+    normalized: Mapping[str, Any],
+    *,
+    task_type: str,
+    previous_metadata: Mapping[str, Any],
+) -> list[str]:
+    direct_tools = _contract_runtime_tools(normalized)
+    if direct_tools or task_type in _READ_ONLY_EXTERNAL_TARGET_TASK_TYPES:
+        return direct_tools
+    return list(previous_metadata.get("allowed_tools") or [])
+
+
 def _loop_backend_agent_id(
     contract: Mapping[str, Any],
     *,
@@ -2475,9 +2487,10 @@ def retry_ready_loop_contract_execution(
                     "allowed_tools": _loop_allowed_tools(
                         task_type,
                         external_effects=external_effect_budget > 0,
-                        contract_tools=(
-                            _contract_runtime_tools(normalized)
-                            or list(previous_metadata.get("allowed_tools") or [])
+                        contract_tools=_loop_correction_contract_tools(
+                            normalized,
+                            task_type=task_type,
+                            previous_metadata=previous_metadata,
                         ),
                     ),
                     "backend_agent_id": backend_agent_id,
@@ -3203,13 +3216,19 @@ def _result_contract_budget_failure_reclassified(
 
 def _acceptance_evidence_has_failure(value: Any) -> bool:
     if isinstance(value, Mapping):
-        result = str(
-            value.get("result")
-            or value.get("status")
-            or value.get("outcome")
-            or ""
-        ).strip().casefold()
-        if result in {"failed", "fail", "blocked", "rejected", "not_applicable"}:
+        statuses = {
+            str(value.get(key) or "").strip().casefold()
+            for key in ("result", "status", "outcome")
+        }
+        if statuses & {
+            "failed",
+            "fail",
+            "blocked",
+            "rejected",
+            "not_applicable",
+            "not_available",
+            "not_verified",
+        }:
             return True
         return any(_acceptance_evidence_has_failure(item) for item in value.values())
     if isinstance(value, list):
@@ -3220,16 +3239,25 @@ def _acceptance_evidence_has_failure(value: Any) -> bool:
 def _acceptance_evidence_failure_details(value: Any) -> list[str]:
     details: list[str] = []
     if isinstance(value, Mapping):
-        result = str(
-            value.get("result")
-            or value.get("status")
-            or value.get("outcome")
-            or ""
-        ).strip().casefold()
-        if result in {"failed", "fail", "blocked", "rejected", "not_applicable"}:
+        failure_statuses = [
+            str(value.get(key) or "").strip().casefold()
+            for key in ("result", "status", "outcome")
+            if str(value.get(key) or "").strip().casefold()
+            in {
+                "failed",
+                "fail",
+                "blocked",
+                "rejected",
+                "not_applicable",
+                "not_available",
+                "not_verified",
+            }
+        ]
+        if failure_statuses:
             label = str(
                 value.get("name")
                 or value.get("check")
+                or value.get("criterion")
                 or value.get("field")
                 or "acceptance evidence"
             ).strip()
@@ -3240,7 +3268,7 @@ def _acceptance_evidence_failure_details(value: Any) -> list[str]:
                 or ""
             ).strip()
             details.append(
-                f"{label}: {result}" + (f" ({notes})" if notes else "")
+                f"{label}: {failure_statuses[0]}" + (f" ({notes})" if notes else "")
             )
         for item in value.values():
             details.extend(_acceptance_evidence_failure_details(item))
