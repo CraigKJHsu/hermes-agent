@@ -15179,9 +15179,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    def _block(reason: str) -> None:
+    def _block(reason: str, metadata: dict | None = None) -> None:
         c = _kb.connect()
         try:
+            if metadata and task.current_run_id is not None:
+                _kb.merge_active_run_metadata(
+                    c,
+                    task_id,
+                    expected_run_id=int(task.current_run_id),
+                    metadata=metadata,
+                )
             _kb.block_task(c, task_id, reason=reason)
         finally:
             try:

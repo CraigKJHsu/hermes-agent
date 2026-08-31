@@ -29,6 +29,7 @@ Nothing in this module touches the agent's system prompt or toolset.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -1667,6 +1668,29 @@ def run_kanban_goal_loop(
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
 
+    def _block_with_metadata(reason: str, metadata: Dict[str, Any]) -> None:
+        try:
+            signature = inspect.signature(block_fn)
+        except (TypeError, ValueError):
+            block_fn(reason)
+            return
+        accepts_metadata = any(
+            param.kind == inspect.Parameter.VAR_POSITIONAL
+            or (
+                param.kind
+                in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+                and index >= 1
+            )
+            for index, param in enumerate(signature.parameters.values())
+        )
+        if accepts_metadata:
+            block_fn(reason, metadata)
+        else:
+            block_fn(reason)
+
     last_response = first_response or ""
     # The first turn already consumed one unit of budget.
     turns_used = 1
@@ -1705,14 +1729,29 @@ def run_kanban_goal_loop(
                 # Already asked once to call kanban_complete and it still
                 # didn't — block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
+                blocker_metadata = {
+                    "goal_loop_blocker": {
+                        "class": "finalize_protocol_violation",
+                        "judge_verdict": verdict,
+                        "judge_reason": reason,
+                        "turns_used": turns_used,
+                        "last_response_excerpt": _truncate(last_response, 2000),
+                    }
+                }
                 try:
-                    block_fn(
+                    _block_with_metadata(
                         f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
+                        f"called kanban_complete after a finalize nudge ({reason}).",
+                        blocker_metadata,
                     )
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                return {
+                    "outcome": "blocked_budget",
+                    "turns_used": turns_used,
+                    "reason": "judged done, never finalized",
+                    "block_metadata": blocker_metadata,
+                }
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -1721,15 +1760,31 @@ def run_kanban_goal_loop(
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
+            blocker_metadata = {
+                "goal_loop_blocker": {
+                    "class": "turn_budget_exhausted",
+                    "judge_verdict": verdict,
+                    "judge_reason": reason,
+                    "turns_used": turns_used,
+                    "max_turns": max_turns,
+                    "last_response_excerpt": _truncate(last_response, 2000),
+                }
+            }
             try:
-                block_fn(
+                _block_with_metadata(
                     f"Goal-mode worker exhausted its turn budget "
                     f"({turns_used}/{max_turns}) without completing the task. "
-                    f"Last judge verdict: {_truncate(reason, 300)}"
+                    f"Last judge verdict: {_truncate(reason, 300)}",
+                    blocker_metadata,
                 )
             except Exception as exc:
                 _log(f"kanban goal loop: block_fn failed ({exc})")
-            return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
+            return {
+                "outcome": "blocked_budget",
+                "turns_used": turns_used,
+                "reason": "turn budget exhausted",
+                "block_metadata": blocker_metadata,
+            }
 
         # Run another turn in the same session.
         try:

@@ -322,6 +322,31 @@ def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
     assert "finalize" in blocked["reason"].lower()
 
 
+def test_loop_blocks_with_structured_finalize_metadata(monkeypatch):
+    _patch_judge(monkeypatch, ["done", "done"])
+    blocked = {}
+
+    def _block(reason, metadata):
+        blocked["reason"] = reason
+        blocked["metadata"] = metadata
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t5-meta",
+        goal_text="task",
+        run_turn=lambda p: "完整輸出但沒有呼叫工具",
+        task_status_fn=lambda: "running",
+        block_fn=_block,
+        max_turns=10,
+        first_response="looks done",
+    )
+
+    assert res["outcome"] == "blocked_budget"
+    blocker = blocked["metadata"]["goal_loop_blocker"]
+    assert blocker["class"] == "finalize_protocol_violation"
+    assert blocker["judge_verdict"] == "done"
+    assert blocker["last_response_excerpt"] == "完整輸出但沒有呼叫工具"
+
+
 def test_loop_stops_if_task_reclaimed(monkeypatch):
     _patch_judge(monkeypatch, ["continue"])
     res = goals.run_kanban_goal_loop(
