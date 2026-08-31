@@ -589,6 +589,26 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
     contract["external_targets"] = [
         "Facebook Marketplace listing ID 915975414881937"
     ]
+    contract["objective_ref"] = {
+        "objective_id": "go-ext-marketplace-readonly-1",
+        "stage_key": "prepare-readonly",
+    }
+    with kb.connect() as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go-ext-marketplace-readonly-1",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            session_key="agent:main:telegram:chat-1:topic-1",
+            title="Marketplace read-only recovery",
+            objective="Recover exact destination evidence before approval.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=("prepare-readonly", "execute_external_action"),
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=("Recover evidence or return a blocker.",),
+            current_stage_key="prepare-readonly",
+        )
 
     def transport(task):
         assert task["external_effect_budget"] == 0
@@ -614,6 +634,10 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
     assert run is not None
     assert run.metadata["external_effect_budget"] == 0
     assert run.metadata["credential_refs"] == []
+    snapshot = run.metadata["loop_contract"]["durable_evidence_snapshot"]
+    assert snapshot["objective_id"] == "go-ext-marketplace-readonly-1"
+    assert snapshot["stage_key"] == "prepare-readonly"
+    assert snapshot["objective"]["current_stage_key"] == "prepare-readonly"
 
 
 def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):

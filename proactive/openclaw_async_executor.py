@@ -529,6 +529,190 @@ def _worker_safe_loop_contract(
     return safe
 
 
+def _text_excerpt(value: Any, *, limit: int = 900) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _loop_contract_listing_ids(contract: Mapping[str, Any]) -> list[str]:
+    text = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    return sorted(set(re.findall(r"\b[1-9][0-9]{8,}\b", text)))
+
+
+def _loop_contract_subject_keys(contract: Mapping[str, Any]) -> list[str]:
+    delivery = contract.get("user_facing_delivery")
+    if not isinstance(delivery, Mapping):
+        return []
+    keys = delivery.get("subject_keys")
+    if not isinstance(keys, list):
+        return []
+    return [str(item).strip() for item in keys if str(item or "").strip()]
+
+
+def _objective_durable_evidence_snapshot(
+    conn: Any,
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    objective_ref = contract.get("objective_ref")
+    if not isinstance(objective_ref, Mapping):
+        return {}
+    objective_id = str(objective_ref.get("objective_id") or "").strip()
+    if not objective_id:
+        return {}
+    listing_ids = _loop_contract_listing_ids(contract)
+    subject_keys = _loop_contract_subject_keys(contract)
+    snapshot: dict[str, Any] = {
+        "schema_version": "1.0",
+        "source": "hermes_kanban_same_objective_readonly_snapshot",
+        "objective_id": objective_id,
+        "stage_key": str(objective_ref.get("stage_key") or "").strip(),
+        "listing_ids": listing_ids,
+        "subject_keys": subject_keys,
+    }
+    objective = conn.execute(
+        """
+        SELECT status, current_stage_key, terminal_stage_key, next_action, waiting_for,
+               updated_at
+          FROM grace_objectives
+         WHERE objective_id = ?
+        """,
+        (objective_id,),
+    ).fetchone()
+    if objective is not None:
+        snapshot["objective"] = dict(objective)
+
+    stages = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT stage_key, position, status, outcome_kind, delegation_id,
+                   execution_task_id, review_task_id, updated_at
+              FROM grace_objective_stages
+             WHERE objective_id = ?
+             ORDER BY position DESC
+             LIMIT 30
+            """,
+            (objective_id,),
+        ).fetchall()
+    ]
+    snapshot["stages"] = stages
+    task_ids = [
+        str(stage.get(key) or "").strip()
+        for stage in stages
+        for key in ("execution_task_id", "review_task_id")
+        if str(stage.get(key) or "").strip()
+    ]
+    if not task_ids:
+        return snapshot
+
+    placeholders = ",".join("?" for _ in task_ids)
+    snapshot["tasks"] = [
+        {
+            "id": row["id"],
+            "title": _text_excerpt(row["title"], limit=240),
+            "status": row["status"],
+            "assignee": row["assignee"],
+            "block_kind": row["block_kind"],
+            "model_override": row["model_override"],
+            "updated_at": row["completed_at"] or row["started_at"] or row["created_at"],
+            "result_excerpt": _text_excerpt(row["result"], limit=900),
+        }
+        for row in conn.execute(
+            f"""
+            SELECT id, title, status, assignee, block_kind, model_override,
+                   created_at, started_at, completed_at, result
+              FROM tasks
+             WHERE id IN ({placeholders})
+            """,
+            task_ids,
+        ).fetchall()
+    ]
+    snapshot["task_runs"] = [
+        {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "status": row["status"],
+            "outcome": row["outcome"],
+            "summary": _text_excerpt(row["summary"], limit=1200),
+            "error": _text_excerpt(row["error"], limit=900),
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+        }
+        for row in conn.execute(
+            f"""
+            SELECT id, task_id, status, outcome, summary, error, started_at, ended_at
+              FROM task_runs
+             WHERE task_id IN ({placeholders})
+             ORDER BY id DESC
+             LIMIT 80
+            """,
+            task_ids,
+        ).fetchall()
+    ]
+    snapshot["external_effects"] = [
+        {
+            "task_id": row["task_id"],
+            "platform": row["platform"],
+            "effect_key": row["effect_key"],
+            "state": row["state"],
+            "external_id": row["external_id"],
+            "details": _text_excerpt(row["details"], limit=900),
+            "run_id": row["run_id"],
+            "updated_at": row["updated_at"],
+        }
+        for row in conn.execute(
+            f"""
+            SELECT task_id, platform, effect_key, state, external_id, details,
+                   run_id, updated_at
+              FROM task_external_effects
+             WHERE task_id IN ({placeholders})
+             ORDER BY updated_at DESC
+             LIMIT 80
+            """,
+            task_ids,
+        ).fetchall()
+    ]
+    ledger_args = [*subject_keys, *listing_ids]
+    if ledger_args:
+        ledger_clause = " OR ".join(
+            ["subject_key = ?" for _ in subject_keys]
+            + ["source_listing_id = ?" for _ in listing_ids]
+        )
+        snapshot["commerce_group_ledger"] = [
+            {
+                "subject_key": row["subject_key"],
+                "subject_label": row["subject_label"],
+                "destination_id": row["destination_id"],
+                "destination_name": row["destination_name"],
+                "source_listing_id": row["source_listing_id"],
+                "status": row["status"],
+                "status_label": row["status_label"],
+                "evidence": _text_excerpt(row["evidence"], limit=900),
+                "source_task_id": row["source_task_id"],
+                "source_run_id": row["source_run_id"],
+                "observed_at": row["observed_at"],
+                "verified_at": row["verified_at"],
+                "evidence_url": row["evidence_url"],
+            }
+            for row in conn.execute(
+                f"""
+                SELECT subject_key, subject_label, destination_id, destination_name,
+                       source_listing_id, status, status_label, evidence,
+                       source_task_id, source_run_id, observed_at, verified_at,
+                       evidence_url
+                  FROM commerce_group_ledger
+                 WHERE {ledger_clause}
+                 ORDER BY observed_at DESC
+                 LIMIT 80
+                """,
+                ledger_args,
+            ).fetchall()
+        ]
+    return snapshot
+
+
 def _ensure_loop_contract_routing(
     contract: Mapping[str, Any],
     *,
@@ -2270,11 +2454,18 @@ def start_loop_contract_execution(
                     "WHERE delegation_id = ?",
                     (dumps_message_path(canonical_path), int(time.time()), delegation_id),
                 )
-            metadata["loop_contract"] = _worker_safe_loop_contract(
+            worker_contract = _worker_safe_loop_contract(
                 normalized,
                 telegram_message_path=canonical_path,
                 external_effect_budget=external_effect_budget,
             )
+            evidence_snapshot = _objective_durable_evidence_snapshot(
+                conn,
+                worker_contract,
+            )
+            if evidence_snapshot:
+                worker_contract["durable_evidence_snapshot"] = evidence_snapshot
+            metadata["loop_contract"] = worker_contract
             if not kb.merge_active_run_metadata(
                 conn, task_id, expected_run_id=run_id, metadata=metadata
             ):
