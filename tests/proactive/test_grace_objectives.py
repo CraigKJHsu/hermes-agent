@@ -506,6 +506,49 @@ def test_available_stage_key_skips_done_or_bound_retry_stage(tmp_path):
         ]
 
 
+def test_retry_stage_key_uses_root_family_instead_of_nesting(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-root-retry-stage.db") as conn:
+        _create_objective(conn)
+        now = int(time.time())
+        for position, stage_key in enumerate(
+            ("prepare_asset_r2", "prepare_asset_r2_r2"),
+            start=3,
+        ):
+            conn.execute(
+                """
+                INSERT INTO grace_objective_stages (
+                    objective_id, stage_key, position, status, delegation_id,
+                    created_at, updated_at
+                ) VALUES ('go_test', ?, ?, 'done', ?, ?, ?)
+                """,
+                (stage_key, position, f"gd-{stage_key}", now, now),
+            )
+
+        assert (
+            kb.available_grace_objective_stage_key(
+                conn,
+                objective_id="go_test",
+                stage_key="prepare_asset_r2_r2",
+            )
+            == "prepare_asset_r3"
+        )
+
+
+def test_delegation_stage_match_accepts_same_root_retry():
+    assert kb._grace_objective_stage_matches_request(
+        "prepare_asset_r3",
+        "prepare_asset",
+    )
+    assert kb._grace_objective_stage_matches_request(
+        "prepare_asset_r3",
+        "prepare_asset_r2",
+    )
+    assert not kb._grace_objective_stage_matches_request(
+        "prepare_asset",
+        "prepare_asset_r2",
+    )
+
+
 def test_terminal_retry_stage_becomes_new_terminal_and_supersedes_bound_terminal(tmp_path):
     with kb.connect_closing(tmp_path / "objective-terminal-retry.db") as conn:
         kb.create_grace_objective(

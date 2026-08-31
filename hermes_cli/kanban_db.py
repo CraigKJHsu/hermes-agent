@@ -14380,20 +14380,26 @@ def available_grace_objective_stage_key(
             return True
         return not row["delegation_id"] and row["status"] != "done"
 
-    if reusable(clean_stage_key):
+    retry_root_stage_key = _grace_objective_retry_root_stage_key(clean_stage_key)
+    if clean_stage_key == retry_root_stage_key and reusable(clean_stage_key):
         return clean_stage_key
     for index in range(2, 100):
-        candidate = f"{clean_stage_key}_r{index}"
+        candidate = f"{retry_root_stage_key}_r{index}"
         if reusable(candidate):
             return candidate
     raise ValueError("No available Grace objective retry stage key")
 
 
+def _grace_objective_retry_root_stage_key(stage_key: str) -> str:
+    return re.sub(r"(?:_r[2-9]\d*)+$", "", str(stage_key or "").strip())
+
+
 def _grace_objective_retry_base_stage_key(stage_key: str) -> str:
-    match = re.fullmatch(r"(.+)_r([2-9]\d*)", str(stage_key or "").strip())
-    if not match:
+    clean_stage_key = str(stage_key or "").strip()
+    root_stage_key = _grace_objective_retry_root_stage_key(clean_stage_key)
+    if root_stage_key == clean_stage_key:
         return ""
-    return match.group(1)
+    return root_stage_key
 
 
 def _grace_objective_stage_matches_request(actual: Any, requested: str) -> bool:
@@ -14401,11 +14407,13 @@ def _grace_objective_stage_matches_request(actual: Any, requested: str) -> bool:
     requested_stage = str(requested or "").strip()
     if actual_stage == requested_stage:
         return True
-    prefix = f"{requested_stage}_r"
-    if not actual_stage.startswith(prefix):
+    if not actual_stage or not requested_stage:
         return False
-    suffix = actual_stage[len(prefix) :]
-    return suffix.isdigit()
+    actual_root = _grace_objective_retry_root_stage_key(actual_stage)
+    requested_root = _grace_objective_retry_root_stage_key(requested_stage)
+    if actual_root != requested_root:
+        return False
+    return actual_stage != actual_root
 
 
 def grace_objective_stage_mode(
