@@ -15226,6 +15226,29 @@ def add_grace_loop_callback(
     clean_stage_key = str(stage_key or "").strip()
     if bool(clean_objective_id) != bool(clean_stage_key):
         raise ValueError("objective_id and stage_key must be supplied together")
+    if clean_objective_id and contract_fingerprint:
+        delegation_stage = conn.execute(
+            """
+            SELECT stage_key
+              FROM grace_delegations
+             WHERE contract_fingerprint = ?
+               AND objective_id = ?
+               AND stage_key IS NOT NULL
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (contract_fingerprint.strip(), clean_objective_id),
+        ).fetchone()
+        if delegation_stage is not None:
+            authoritative_stage_key = str(delegation_stage["stage_key"] or "").strip()
+            if (
+                authoritative_stage_key
+                and _grace_objective_stage_matches_request(
+                    authoritative_stage_key,
+                    clean_stage_key,
+                )
+            ):
+                clean_stage_key = authoritative_stage_key
     authoritative_mode = completion_mode.strip()
     if clean_objective_id:
         authoritative_mode = grace_objective_stage_mode(

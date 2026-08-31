@@ -487,6 +487,73 @@ def test_callback_lease_renewal_and_outcome_are_owner_fenced(tmp_path):
             )
 
 
+def test_callback_uses_delegation_resolved_retry_stage(tmp_path):
+    db_path = tmp_path / "callback-retry-stage.db"
+    kb.init_db(db_path)
+    common = {
+        "request_instance_id": "req",
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "2",
+        "session_key": "agent:main:telegram:group:chat-1:2",
+        "session_id": "session-1",
+        "resolved_route": {"backend": "openclaw"},
+        "approval_required": False,
+        "objective_id": "go-retry",
+        "stage_key": "prepare_stage",
+    }
+    with kb.connect_closing(db_path) as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go-retry",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            title="retry objective",
+            objective="recover before posting",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["prepare_stage", "execute_external_action"],
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=["prepare then execute"],
+        )
+        first = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="b" * 64,
+            **common,
+        )
+        retry_common = dict(common)
+        retry_common["request_instance_id"] = "req-r2"
+        second = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="c" * 64,
+            **retry_common,
+        )
+        assert first["stage_key"] == "prepare_stage"
+        assert second["stage_key"] == "prepare_stage_r2"
+
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="session-1",
+            contract_fingerprint="c" * 64,
+            completion_mode="intermediate",
+            objective_id="go-retry",
+            stage_key="prepare_stage",
+        )
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback is not None
+        assert callback["stage_key"] == "prepare_stage_r2"
+        assert callback["completion_mode"] == "intermediate"
+
+
 def test_callback_outcome_accepts_approved_review_metadata(tmp_path):
     db_path = tmp_path / "callback-approved-metadata.db"
     with kb.connect_closing(db_path) as conn:
