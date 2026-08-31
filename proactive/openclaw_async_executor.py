@@ -710,6 +710,43 @@ def _objective_durable_evidence_snapshot(
                 ledger_args,
             ).fetchall()
         ]
+        alias_clause = " OR ".join(
+            ["subject_key = ?" for _ in subject_keys]
+            + ["public_listing_id = ? OR management_listing_id = ?" for _ in listing_ids]
+        )
+        alias_args: list[Any] = [*subject_keys]
+        for listing_id in listing_ids:
+            alias_args.extend([listing_id, listing_id])
+        snapshot["commerce_listing_aliases"] = [
+            {
+                "subject_key": row["subject_key"],
+                "subject_label": row["subject_label"],
+                "platform": row["platform"],
+                "public_listing_id": row["public_listing_id"],
+                "management_listing_id": row["management_listing_id"],
+                "seller_name": row["seller_name"],
+                "title": row["title"],
+                "price_label": row["price_label"],
+                "evidence": _text_excerpt(row["evidence"], limit=900),
+                "source_task_id": row["source_task_id"],
+                "source_run_id": row["source_run_id"],
+                "observed_at": row["observed_at"],
+                "verified_at": row["verified_at"],
+            }
+            for row in conn.execute(
+                f"""
+                SELECT subject_key, subject_label, platform,
+                       public_listing_id, management_listing_id,
+                       seller_name, title, price_label, evidence,
+                       source_task_id, source_run_id, observed_at, verified_at
+                  FROM commerce_listing_aliases
+                 WHERE {alias_clause}
+                 ORDER BY observed_at DESC
+                 LIMIT 40
+                """,
+                alias_args,
+            ).fetchall()
+        ]
     return snapshot
 
 

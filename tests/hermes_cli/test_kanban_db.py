@@ -67,6 +67,28 @@ def test_complete_task_accepts_generic_terminal_external_effect(tmp_path):
         assert "redirected to login" in details["readback"]
 
 
+def test_grace_review_profile_requires_runtime_attestation_without_body_marker(
+    tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="formal review without mutable marker",
+            body="review",
+            executor_profile="grace-policy-review",
+        )
+
+        with pytest.raises(ValueError, match="runtime-attested"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="accepted",
+                metadata={"review_outcome": "accepted"},
+            )
+
+
 def test_release_stale_claims_reclaims_dead_pre_spawn_owner_before_ttl(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path)
@@ -1939,7 +1961,43 @@ def test_init_creates_expected_tables(kanban_home):
     assert {
         "tasks", "task_links", "task_comments", "task_events",
         "commerce_group_ledger", "commerce_group_coverage",
+        "commerce_listing_aliases",
     } <= names
+
+
+def test_commerce_listing_alias_persists_public_and_management_ids(tmp_path):
+    db_path = tmp_path / "commerce-listing-alias.db"
+    with kb.connect_closing(db_path) as conn:
+        row = kb.upsert_commerce_listing_alias(
+            conn,
+            subject_key="kolin-kd-291m06",
+            subject_label="Kolin KD-291M06",
+            platform="facebook",
+            public_listing_id="37276725125275496",
+            management_listing_id="915975414881937",
+            seller_name="Craig KJ Hsu",
+            title="Kolin 歌林 KD-291M06",
+            price_label="NT$7,900",
+            evidence="Public item URL readback matched the owner management listing ID.",
+            source_task_id="t_source",
+            source_run_id=123,
+            observed_at=1_788_202_987,
+        )
+        by_public = kb.list_commerce_listing_aliases(
+            conn,
+            listing_id="37276725125275496",
+            platform="facebook",
+        )
+        by_management = kb.list_commerce_listing_aliases(
+            conn,
+            listing_id="915975414881937",
+            platform="facebook",
+        )
+
+    assert row["public_listing_id"] == "37276725125275496"
+    assert row["management_listing_id"] == "915975414881937"
+    assert by_public == by_management
+    assert by_public[0]["source_task_id"] == "t_source"
 
 
 def test_user_facing_report_persists_cross_task_commerce_ledger(tmp_path):

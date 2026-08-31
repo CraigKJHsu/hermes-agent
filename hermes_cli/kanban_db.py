@@ -2103,6 +2103,30 @@ CREATE TABLE IF NOT EXISTS commerce_group_ledger (
     PRIMARY KEY (subject_key, destination_id)
 );
 
+-- Product-centric Marketplace identity aliases.  Facebook can expose one ID
+-- in a public item URL and a different listing/product ID in the owner
+-- management flow.  Persisting the verified mapping prevents future workers
+-- from treating that platform split as either a memory conflict or permission
+-- to use an unrelated listing.
+CREATE TABLE IF NOT EXISTS commerce_listing_aliases (
+    subject_key           TEXT NOT NULL,
+    subject_label         TEXT NOT NULL,
+    platform              TEXT NOT NULL,
+    public_listing_id     TEXT NOT NULL,
+    management_listing_id TEXT NOT NULL,
+    seller_name           TEXT NOT NULL DEFAULT '',
+    title                 TEXT NOT NULL DEFAULT '',
+    price_label           TEXT NOT NULL DEFAULT '',
+    evidence              TEXT NOT NULL,
+    source_task_id        TEXT NOT NULL,
+    source_run_id         INTEGER,
+    observed_at           INTEGER NOT NULL,
+    verified_at           TEXT NOT NULL,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    PRIMARY KEY (platform, public_listing_id, management_listing_id)
+);
+
 -- Coverage is separate from destination rows because Facebook may expose a
 -- total such as "Listed to 21 places" without exposing every destination
 -- name.  That gap must survive future tasks and must prevent false closure.
@@ -3993,6 +4017,7 @@ def create_task(
     executor_profile: Optional[str] = None,
     project_namespace: Optional[str] = None,
     routing_decision: Optional[Mapping[str, Any]] = None,
+    model_override: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4037,6 +4062,7 @@ def create_task(
         )
     executor_profile = str(executor_profile or "").strip() or None
     project_namespace = str(project_namespace or "").strip() or None
+    model_override = str(model_override or "").strip() or None
     routing_decision_json: Optional[str] = None
     if routing_decision is not None:
         if not isinstance(routing_decision, Mapping):
@@ -4246,8 +4272,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         executor_backend, executor_profile, project_namespace,
-                        routing_decision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        routing_decision, model_override
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4274,6 +4300,7 @@ def create_task(
                         executor_profile,
                         project_namespace,
                         routing_decision_json,
+                        model_override,
                     ),
                 )
                 for pid in parents:
@@ -4694,6 +4721,141 @@ def list_commerce_group_ledger(
           FROM commerce_group_ledger
           {where}
          ORDER BY subject_label, destination_name
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_commerce_listing_alias(
+    conn: sqlite3.Connection,
+    *,
+    subject_key: str,
+    subject_label: str,
+    platform: str,
+    public_listing_id: str,
+    management_listing_id: str,
+    evidence: str,
+    source_task_id: str,
+    source_run_id: Optional[int] = None,
+    observed_at: Optional[int] = None,
+    seller_name: str = "",
+    title: str = "",
+    price_label: str = "",
+) -> dict[str, Any]:
+    clean_subject_key = str(subject_key or "").strip()
+    clean_subject_label = str(subject_label or "").strip()
+    clean_platform = str(platform or "").strip().lower()
+    clean_public_id = str(public_listing_id or "").strip()
+    clean_management_id = str(management_listing_id or "").strip()
+    clean_evidence = str(evidence or "").strip()
+    clean_source_task = str(source_task_id or "").strip()
+    missing = [
+        key
+        for key, value in {
+            "subject_key": clean_subject_key,
+            "subject_label": clean_subject_label,
+            "platform": clean_platform,
+            "public_listing_id": clean_public_id,
+            "management_listing_id": clean_management_id,
+            "evidence": clean_evidence,
+            "source_task_id": clean_source_task,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "Commerce listing alias missing required field(s): " + ", ".join(missing)
+        )
+    now = int(time.time())
+    observed = int(observed_at or now)
+    verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(observed))
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO commerce_listing_aliases (
+                subject_key, subject_label, platform,
+                public_listing_id, management_listing_id,
+                seller_name, title, price_label, evidence,
+                source_task_id, source_run_id, observed_at, verified_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, public_listing_id, management_listing_id)
+            DO UPDATE SET
+                subject_key = excluded.subject_key,
+                subject_label = excluded.subject_label,
+                seller_name = excluded.seller_name,
+                title = excluded.title,
+                price_label = excluded.price_label,
+                evidence = excluded.evidence,
+                source_task_id = excluded.source_task_id,
+                source_run_id = excluded.source_run_id,
+                observed_at = excluded.observed_at,
+                verified_at = excluded.verified_at,
+                updated_at = excluded.updated_at
+            WHERE excluded.observed_at >= commerce_listing_aliases.observed_at
+            """,
+            (
+                clean_subject_key,
+                clean_subject_label,
+                clean_platform,
+                clean_public_id,
+                clean_management_id,
+                str(seller_name or "").strip(),
+                str(title or "").strip(),
+                str(price_label or "").strip(),
+                clean_evidence,
+                clean_source_task,
+                source_run_id,
+                observed,
+                verified_at,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT *
+              FROM commerce_listing_aliases
+             WHERE platform = ?
+               AND public_listing_id = ?
+               AND management_listing_id = ?
+            """,
+            (clean_platform, clean_public_id, clean_management_id),
+        ).fetchone()
+    return dict(row)
+
+
+def list_commerce_listing_aliases(
+    conn: sqlite3.Connection,
+    *,
+    subject_key: Optional[str] = None,
+    listing_id: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if subject_key:
+        clauses.append("subject_key = ?")
+        params.append(str(subject_key).strip())
+    if listing_id:
+        clauses.append("(public_listing_id = ? OR management_listing_id = ?)")
+        clean_listing = str(listing_id).strip()
+        params.extend([clean_listing, clean_listing])
+    if platform:
+        clauses.append("platform = ?")
+        params.append(str(platform).strip().lower())
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""
+        SELECT subject_key, subject_label, platform,
+               public_listing_id, management_listing_id,
+               seller_name, title, price_label, evidence,
+               source_task_id, source_run_id, observed_at, verified_at,
+               created_at, updated_at
+          FROM commerce_listing_aliases
+          {where}
+         ORDER BY observed_at DESC, subject_label
         """,
         params,
     ).fetchall()
@@ -7601,11 +7763,45 @@ def complete_task(
         verified_cards = []
 
     task_scope = conn.execute(
-        "SELECT body FROM tasks WHERE id = ?",
+        "SELECT body, routing_decision, executor_profile FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     task_body = str(task_scope["body"] or "") if task_scope is not None else ""
     grace_loop_stage = _grace_loop_stage_header(task_body)
+    if (
+        task_scope is not None
+        and str(task_scope["executor_profile"] or "") == "grace-policy-review"
+    ):
+        grace_loop_stage = "review"
+    task_routing_decision: dict[str, Any] = {}
+    if task_scope is not None and task_scope["routing_decision"]:
+        try:
+            parsed_routing = json.loads(task_scope["routing_decision"])
+            if isinstance(parsed_routing, dict):
+                task_routing_decision = parsed_routing
+        except (TypeError, json.JSONDecodeError):
+            pass
+    formal_grace_review = grace_loop_stage == "review"
+    system_model_receipt: Optional[dict[str, Any]] = None
+    if formal_grace_review:
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Grace review completion requires structured metadata and a "
+                "runtime-attested model receipt."
+            )
+        from proactive.model_routing import (
+            execution_receipt_from_env,
+            validate_grace_acceptance_receipt,
+        )
+
+        system_model_receipt = execution_receipt_from_env(
+            os.environ.get("HERMES_MODEL_ROUTING_RECEIPT")
+        )
+        validate_grace_acceptance_receipt(
+            system_model_receipt,
+            expected_route=task_routing_decision.get("model_route"),
+            expected_task_id=task_id,
+        )
     if "GRACE_POLICY_SNAPSHOT:" in task_body:
         if not isinstance(metadata, dict):
             raise ValueError(
@@ -7626,6 +7822,15 @@ def complete_task(
         # Normalize into a fresh mapping so callers do not observe an in-place
         # rewrite of their metadata object.
         metadata = dict(metadata)
+        if system_model_receipt is None:
+            from proactive.model_routing import execution_receipt_from_env
+
+            system_model_receipt = execution_receipt_from_env(
+                os.environ.get("HERMES_MODEL_ROUTING_RECEIPT")
+            )
+        if system_model_receipt is not None:
+            # System process state outranks any model-authored receipt.
+            metadata["model_execution_receipt"] = system_model_receipt
         if grace_loop_stage == "review":
             canonical_verdict = str(
                 metadata.get("review_outcome") or ""
@@ -12579,8 +12784,21 @@ def probe_profile_callable_tools(
             "probe_error": f"{type(exc).__name__}: {exc}",
         }
     env = dict(os.environ)
+    from proactive.model_routing import clear_routing_env
+
+    clear_routing_env(env)
     env["HERMES_HOME"] = profile_home
     env["HERMES_PROFILE"] = profile_arg
+    env["HERMES_KANBAN_TASK"] = task.id
+    model_route = (
+        task.routing_decision.get("model_route")
+        if isinstance(task.routing_decision, Mapping)
+        else None
+    )
+    if isinstance(model_route, Mapping):
+        from proactive.model_routing import routing_env
+
+        env.update(routing_env(model_route, task_id=task.id))
     result = _probe_worker_capabilities(
         declared_tools=clean_required,
         required_tools=clean_required,
@@ -12717,6 +12935,9 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    from proactive.model_routing import clear_routing_env
+
+    clear_routing_env(env)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -12799,6 +13020,15 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    model_route = (
+        task.routing_decision.get("model_route")
+        if isinstance(task.routing_decision, Mapping)
+        else None
+    )
+    if isinstance(model_route, Mapping):
+        from proactive.model_routing import routing_env
+
+        env.update(routing_env(model_route, task_id=task.id))
 
     cmd = [
         *_resolve_hermes_argv(),
