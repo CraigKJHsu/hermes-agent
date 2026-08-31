@@ -598,6 +598,36 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
     assert run.metadata["credential_refs"] == []
 
 
+def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "browser-readonly-tools-1"
+
+    def transport(task):
+        assert task["backend_agent_id"] == "missioncrew-browser-readonly"
+        assert task["external_effect_budget"] == 0
+        assert not task.get("approval_grant_id")
+        assert task["allowed_tools"] == ["read", "web_search", "browser"]
+        assert task["credential_refs"] == []
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-browser-readonly-tools-1",
+        transport=transport,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["task_type"] == "browser_readonly"
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["allowed_tools"] == ["read", "web_search", "browser"]
+    assert run.metadata["credential_refs"] == []
+
+
 def test_loop_start_replays_ambiguous_timeout_with_same_key(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-timeout-replay-1"

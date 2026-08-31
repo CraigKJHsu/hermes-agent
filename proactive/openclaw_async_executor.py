@@ -91,6 +91,7 @@ LOOP_CONTRACT_AGENT_BY_TASK_TYPE = {
 _READ_ONLY_EXTERNAL_TARGET_TASK_TYPES = frozenset(
     {
         "content_draft",
+        "browser_readonly",
         "facebook_page_publish_preflight",
         "facebook_marketplace_readonly",
         "secondhand_commerce_group_status",
@@ -189,8 +190,9 @@ def _loop_allowed_tools(
         return allowed
     if task_type in {
         "research",
+        "browser_readonly",
         "facebook_marketplace_readonly",
-            "secondhand_commerce_group_status",
+        "secondhand_commerce_group_status",
     }:
         allowed = ["read", "web_search", "browser"]
         for tool in direct_tools:
