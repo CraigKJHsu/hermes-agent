@@ -1631,6 +1631,82 @@ def test_loop_contract_terminal_materializes_openclaw_external_effects(kanban_ho
     ]
 
 
+def test_loop_contract_terminal_downgrades_uncertain_effect_readback(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-openclaw-effect-unknown-1"
+    contract["external_targets"] = [
+        "facebook marketplace listing 37276725125275496 live page",
+        "group:1333742673375089",
+    ]
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="browser_publish",
+        risk_level="high",
+        approved=True,
+        delegation_id="delegation-loop-openclaw-effect-unknown-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["status"] = "failed"
+    terminal["errors"] = ["openclaw_bridge_failed"]
+    terminal["requires_human_review"] = True
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["externalEffectBudget"] = 2
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = (
+        "Loop Contract external effect evidence is incomplete or outside "
+        "the approved targets."
+    )
+    output["result"]["externalEffects"] = [
+        {
+            "target": "group:1333742673375089",
+            "deterministicEffectKey": (
+                "facebook-marketplace-list-more-places-37276725125275496-"
+                "group-1333742673375089-2026-08-31"
+            ),
+            "state": "verified",
+            "externalId": "1333742673375089",
+            "readback": (
+                "Selected exact chooser checkbox and clicked enabled Post once. "
+                "Subsequent destination readback did not expose a matching group "
+                "post, so outcome is recorded as unknown."
+            ),
+        },
+    ]
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "failed",
+        "delegated_result": terminal,
+        "result_digest": "terminal-openclaw-effect-unknown-digest",
+    })
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+        effects = kb.list_external_effects(conn, started["execution_task_id"])
+    assert task is not None and task.status == "done"
+    assert ended_run is not None
+    assert ended_run.metadata["external_effects"][0]["state"] == "unknown"
+    assert [
+        (effect["platform"], effect["effect_key"], effect["state"], effect["external_id"])
+        for effect in effects
+    ] == [("facebook", "group:1333742673375089", "unknown", "1333742673375089")]
+
+
 def test_loop_contract_terminal_rejects_openclaw_external_effect_outside_allowlist(
     kanban_home,
 ):

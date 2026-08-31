@@ -315,6 +315,9 @@ _EXTERNAL_EFFECT_STATES = frozenset({
     "join_started",
     "joined",
     "pending_approval",
+    "pending",
+    "unknown",
+    "rejected",
     "needs_questions",
     "failed",
 })
@@ -7529,7 +7532,7 @@ def complete_task(
                 state = str(raw_effect.get("state") or "").strip().lower()
                 if state not in {
                     "existing", "created", "verified", "joined",
-                    "pending_approval",
+                    "pending_approval", "pending", "unknown", "rejected",
                 }:
                     raise ValueError(
                         "completion external effect state is not terminal"

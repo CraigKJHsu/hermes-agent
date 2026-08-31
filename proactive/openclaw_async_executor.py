@@ -3353,7 +3353,16 @@ def _normalize_openclaw_external_effects(
             or ""
         ).strip()
         state = str(raw_effect.get("state") or "").strip().lower()
-        if state not in {"existing", "created", "verified", "joined", "pending_approval"}:
+        if state not in {
+            "existing",
+            "created",
+            "verified",
+            "joined",
+            "pending_approval",
+            "pending",
+            "unknown",
+            "rejected",
+        }:
             return None
         raw_effect_key = str(
             raw_effect.get("effect_key")
@@ -3410,6 +3419,19 @@ def _normalize_openclaw_external_effects(
             } or None
         if details is not None and not isinstance(details, Mapping):
             details = {"readback": str(details)}
+        readback_text = ""
+        if isinstance(details, Mapping):
+            readback_text = " ".join(str(value) for value in details.values()).casefold()
+        if state == "verified" and (
+            "unknown" in readback_text
+            or "could not be confirmed" in readback_text
+            or "did not expose" in readback_text
+            or "did not surface" in readback_text
+            or "無法確認" in readback_text
+            or "未能確認" in readback_text
+            or "沒有看到" in readback_text
+        ):
+            state = "unknown"
         normalized_effects.append({
             "platform": platform,
             "effect_key": effect_key,
