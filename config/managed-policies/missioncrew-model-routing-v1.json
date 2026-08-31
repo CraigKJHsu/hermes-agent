@@ -1,6 +1,6 @@
 {
   "policy_id": "missioncrew-model-routing-v1",
-  "version": "v2",
+  "version": "v3",
   "pro_mode_enabled": false,
   "grace": {
     "model": "gpt-5.6-sol",
@@ -10,8 +10,8 @@
     "formal_fallback_allowed": false
   },
   "workers": {
-    "default": {"model": "gpt-5.6-terra", "reasoning": "medium"},
-    "complex": {"model": "gpt-5.6-terra", "reasoning": "high"},
+    "default": {"model": "gpt-5.5", "reasoning": "medium"},
+    "complex": {"model": "gpt-5.5", "reasoning": "high"},
     "mechanical": {"model": "gpt-5.5", "reasoning": "low"},
     "focused_coding": {"model": "gpt-5.3-codex-spark", "reasoning": "low"}
   },

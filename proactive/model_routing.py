@@ -308,7 +308,7 @@ def route_worker(
         model, effort = _configured_route(
             workers,
             "complex",
-            default_model=MODEL_TERRA,
+            default_model=MODEL_MECHANICAL,
             default_effort="high",
         )
         reason = "high_risk_worker_requires_independent_grace_gate"
@@ -365,7 +365,7 @@ def route_worker(
         model, effort = _configured_route(
             workers,
             "complex",
-            default_model=MODEL_TERRA,
+            default_model=MODEL_MECHANICAL,
             default_effort="high",
         )
         reason = "complex_worker_or_independent_review"
@@ -373,7 +373,7 @@ def route_worker(
         model, effort = _configured_route(
             workers,
             "default",
-            default_model=MODEL_TERRA,
+            default_model=MODEL_MECHANICAL,
             default_effort="medium",
         )
         reason = "general_worker"

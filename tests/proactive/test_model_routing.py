@@ -11,7 +11,6 @@ from proactive.model_routing import (
     MODEL_MECHANICAL,
     MODEL_SOL,
     MODEL_SPARK,
-    MODEL_TERRA,
     ModelRoutingError,
     attest_runtime_execution,
     classify_grace_message,
@@ -88,11 +87,12 @@ def test_routing_environment_binds_the_worker_to_the_task() -> None:
     assert env["HERMES_KANBAN_TASK"] == "t_review"
 
 
-def test_worker_routes_spark_luna_and_terra_by_work_class() -> None:
+def test_worker_routes_supported_models_by_work_class() -> None:
     assert route_worker("focused_code")["requested_model"] == MODEL_SPARK
     assert route_worker("browser_readonly")["requested_model"] == MODEL_MECHANICAL
-    assert route_worker("general")["requested_model"] == MODEL_TERRA
+    assert route_worker("general")["requested_model"] == MODEL_MECHANICAL
     assert route_worker("devops")["reasoning_effort"] == "high"
+    assert route_worker("browser_publish")["requested_model"] == MODEL_MECHANICAL
 
 
 @pytest.mark.parametrize(
