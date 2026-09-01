@@ -452,6 +452,47 @@ def test_clawops_retry_review_rejects_dependency_todo_without_reconciliation(
         assert _durable_state(conn, execution_id, review_id) == initial
 
 
+def test_clawops_retry_review_reconciles_parent_done_run_with_stale_task_status(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "retry-review-parent-stale-status.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-parent"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                (execution_id,),
+            )
+        initial = _durable_state(conn, execution_id, review_id)
+        assert initial["execution_status"] == "ready"
+
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+
+    assert result["status"] == "queued"
+    assert result["execution_task_id"] == execution_id
+    assert result["grace_review_task_id"] == review_id
+    assert result["review_status"] == "ready"
+    with kb.connect_closing(db_path) as conn:
+        state = _durable_state(conn, execution_id, review_id)
+        assert state["task_count"] == initial["task_count"]
+        assert state["execution_status"] == "done"
+        assert state["review_status"] == "ready"
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='status_reconciled'",
+            (execution_id,),
+        ).fetchone() is not None
+
+
 def test_clawops_retry_review_rejects_when_policy_fault_is_not_repaired(
     tmp_path, monkeypatch
 ):

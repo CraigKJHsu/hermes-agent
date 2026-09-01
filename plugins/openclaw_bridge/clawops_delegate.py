@@ -1460,6 +1460,8 @@ def handle_clawops_retry_review(
                        d.state AS delegation_state,
                        d.session_id AS delegation_session_id,
                        execution.status AS execution_status,
+                       er.status AS execution_run_status,
+                       er.outcome AS execution_run_outcome,
                        review.status AS review_status,
                        review.executor_profile AS review_executor_profile,
                        review.body AS review_body,
@@ -1473,6 +1475,14 @@ def handle_clawops_retry_review(
                   FROM grace_delegations AS d
                   JOIN tasks AS execution ON execution.id = d.execution_task_id
                   JOIN tasks AS review ON review.id = d.review_task_id
+                  LEFT JOIN task_runs AS er
+                    ON er.id = (
+                        SELECT id
+                          FROM task_runs
+                         WHERE task_id = execution.id
+                         ORDER BY started_at DESC, id DESC
+                         LIMIT 1
+                    )
                   JOIN grace_loop_callbacks AS callback
                     ON callback.review_task_id = d.review_task_id
                  WHERE d.review_task_id = ?
@@ -1531,8 +1541,40 @@ def handle_clawops_retry_review(
                     )
             if value.get("delegation_state") != "queued":
                 raise ValueError("Grace delegation is no longer active and cannot be retried.")
-            if value.get("execution_status") != "done":
+            execution_run_completed = (
+                value.get("execution_run_status") in {"done", "completed", "succeeded"}
+                and value.get("execution_run_outcome") == "completed"
+            )
+            if value.get("execution_status") != "done" and not execution_run_completed:
                 raise ValueError("Parent Execution is not done; Review retry is not yet allowed.")
+            if value.get("execution_status") != "done":
+                now = int(time.time())
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'done',
+                           completed_at = COALESCE(completed_at, ?),
+                           current_run_id = NULL,
+                           claim_lock = NULL,
+                           claim_expires = NULL,
+                           worker_pid = NULL
+                     WHERE id = ? AND status != 'done'
+                    """,
+                    (now, value["execution_task_id"]),
+                )
+                kb._append_event(
+                    conn,
+                    value["execution_task_id"],
+                    "status_reconciled",
+                    {
+                        "from_status": value.get("execution_status"),
+                        "to_status": "done",
+                        "reason": (
+                            "latest task_run completed but task status was stale "
+                            "during Grace Review retry"
+                        ),
+                    },
+                )
             if value.get("review_executor_profile") != "grace-policy-review":
                 raise ValueError("Target task is not a controlled Grace Review.")
             if kb._grace_loop_stage_header(str(value.get("review_body") or "")) != "review":
