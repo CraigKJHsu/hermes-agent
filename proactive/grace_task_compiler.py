@@ -219,8 +219,9 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
     if review:
         if not snapshots:
             return [
-                "The Topic policy binding was empty when this contract was compiled. Re-read its "
-                "binding path and reject with policy_stale if its SHA-256 changed.",
+                "The Topic policy binding was empty when this contract was compiled. A still-missing "
+                "binding path with SHA-256 null is the expected unchanged state and is not a blocker. "
+                "Reject with policy_stale only if a binding now exists or its SHA-256 is non-null.",
                 "Accepted kanban_complete metadata must include policy_receipts=[].",
             ]
         return [
@@ -424,6 +425,18 @@ def _render_domain_memory_guidance(
         "coverage_status as authoritative for registry coverage and keep live external "
         "verification separate.",
     ]
+    if mode == "query":
+        guidance.extend([
+            "This is a registry-only inventory query. Do not create or compare Facebook Page "
+            "copy, images, publishing packages, or audit attachments, and do not perform any "
+            "external platform action. The typed registry is the task-scoped source of truth.",
+            "Complete with metadata.acceptance_evidence.domain_inventory_report containing the "
+            "full readable inline answer and metadata.user_facing_report exactly shaped as "
+            "kind=content_package, delivery=inline_only, complete=true, "
+            "body_field=domain_inventory_report, body=<the same full answer>, assets=[]. Include "
+            "title and a plausible Unix-seconds observed_at. Do not invent another report kind "
+            "or require a Markdown attachment.",
+        ])
     if mode == "mutate":
         guidance.append(
             "kanban_complete metadata must include domain_memory_deltas. Each delta "
@@ -642,7 +655,14 @@ def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Remove raw wording unless the contract explicitly makes it source material."""
     safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
     original = str(safe.get("original_request", "") or "")
-    expose_original = _contract_requires_backend_original_request(safe)
+    domain_memory = safe.get("domain_memory")
+    registry_query = (
+        isinstance(domain_memory, Mapping)
+        and domain_memory.get("mode") == "query"
+    )
+    expose_original = (
+        not registry_query and _contract_requires_backend_original_request(safe)
+    )
     if not expose_original:
         safe.pop("original_request", None)
     audit = safe.setdefault("audit", {})

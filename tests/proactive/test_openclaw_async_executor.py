@@ -949,6 +949,101 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     }
 
 
+def test_loop_contract_terminal_promotes_inline_text_content_package(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-inline-content-package-1"
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "final_user_facing_text",
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-inline-content-package-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["result"]["summary"] = "完整最終提案"
+    output["result"]["acceptanceEvidence"] = {
+        "final_user_facing_text": "完整、未截斷的繁體中文提案正文。",
+    }
+
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "inline-content-package-digest",
+        },
+    )
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        completed_run = kb.latest_run(conn, started["execution_task_id"])
+        attachments = kb.list_attachments(conn, started["execution_task_id"])
+    assert completed_run is not None
+    assert completed_run.metadata["user_facing_report"] == {
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "complete": True,
+        "title": "完整最終提案",
+        "body_field": "final_user_facing_text",
+        "body": "完整、未截斷的繁體中文提案正文。",
+        "observed_at": completed_run.metadata["user_facing_report"]["observed_at"],
+        "assets": [],
+    }
+    assert attachments == []
+
+
+@pytest.mark.parametrize(
+    "malformed_body", [{"text": "proposal"}, ["proposal"], True, 1]
+)
+def test_inline_text_content_package_rejects_non_string_body(malformed_body):
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "status": "succeeded",
+            "summary": "完整最終提案",
+            "acceptanceEvidence": {
+                "final_user_facing_text": malformed_body,
+            },
+        },
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "body_field": "final_user_facing_text",
+                },
+            },
+        },
+        task_id="t_inline_package",
+        board=None,
+    )
+
+    assert result == {}
+
+
 def test_loop_contract_terminal_defaults_missing_policy_receipts(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-terminal-no-policy-receipts"

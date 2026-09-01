@@ -516,14 +516,20 @@ def resolve_task_policy_snapshots(task_body: str) -> dict[str, Any]:
         canonical_path = _binding_path(namespace)
         if str(binding.get("path") or "") != str(canonical_path):
             raise PolicyRegistryError("policy snapshot Topic binding path is invalid")
-        if _sha256_file(canonical_path) != binding.get("sha256"):
+        expected_binding_sha256 = binding.get("sha256")
+        if _sha256_file(canonical_path) != expected_binding_sha256:
             raise PolicyRegistryError("policy_stale: Topic policy binding changed")
-        canonical_binding = _load_json(canonical_path, label="Topic policy binding")
-        if canonical_binding.get("namespace") != namespace:
-            raise PolicyRegistryError("policy snapshot Topic binding namespace mismatch")
-        bound_requirements = _normalize_requirements(
-            canonical_binding.get("requirements", [])
-        )
+        if expected_binding_sha256 is None:
+            # A null digest pins the absence of a Topic binding. The missing file is
+            # therefore the verified state, not a read failure.
+            bound_requirements = []
+        else:
+            canonical_binding = _load_json(canonical_path, label="Topic policy binding")
+            if canonical_binding.get("namespace") != namespace:
+                raise PolicyRegistryError("policy snapshot Topic binding namespace mismatch")
+            bound_requirements = _normalize_requirements(
+                canonical_binding.get("requirements", [])
+            )
         refs_by_id = {str(ref.get("policy_id") or ""): ref for ref in refs}
         if len(refs_by_id) != len(refs):
             raise PolicyRegistryError("policy snapshot refs contain invalid policy ids")

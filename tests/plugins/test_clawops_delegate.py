@@ -3108,6 +3108,43 @@ def test_ai_bizweek_delegate_embeds_managed_facebook_page_source(
     )
 
 
+def test_ai_bizweek_domain_query_skips_page_source_augmentation(
+    monkeypatch,
+):
+    import tools.managed_policy_tool as managed_policy_tool
+    from plugins.openclaw_bridge import clawops_delegate as delegate
+
+    def unexpected_policy_read(*, session_id):
+        raise AssertionError(
+            f"registry query must not request Page source for {session_id}"
+        )
+
+    monkeypatch.setattr(
+        managed_policy_tool,
+        "managed_policy_read",
+        unexpected_policy_read,
+    )
+    contract = {
+        "identity": {"project": "ai_bizweek", "topic_name": "AI BizWeek"},
+        "goal": {"objective": "列出 SoloBizAi 七個案例"},
+        "domain_memory": {
+            "schema_id": "solobizai.case.v1",
+            "domain_key": "solobizai",
+            "entity_type": "SoloBizAiCase",
+            "mode": "query",
+        },
+        "original_request": "請列出目前七個案例",
+    }
+
+    augmented = delegate._augment_ai_bizweek_source_evidence(
+        contract,
+        session_id="session-carter",
+    )
+
+    assert augmented is contract
+    assert "TASK-SCOPED SOURCE MATERIAL" not in augmented["original_request"]
+
+
 def test_scheduled_high_risk_browser_delegate_gets_task_scoped_authorization(
     tmp_path,
     monkeypatch,

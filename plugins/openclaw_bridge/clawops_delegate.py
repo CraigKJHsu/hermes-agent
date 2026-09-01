@@ -291,6 +291,7 @@ _USER_FACING_DELIVERY = {
         },
         "subject_keys": _LIST,
         "asset_filenames": _LIST,
+        "body_field": {"type": "string", "minLength": 1},
     },
     "required": ["required", "kind", "delivery"],
     "additionalProperties": False,
@@ -474,6 +475,26 @@ CLAWOPS_CANCEL_SCHEMA = {
         "task. The exact task must belong to the authenticated chat/topic."
     ),
     "parameters": CLAWOPS_CANCEL_PARAMETERS,
+}
+
+CLAWOPS_RETRY_REVIEW_SCHEMA = {
+    "description": (
+        "Retry one existing blocked Grace Review after its runtime or capability "
+        "fault has been repaired. This control-plane action never creates a new "
+        "Execution or Review and is restricted to the authenticated chat/topic "
+        "and original requester."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "review_task_id": {
+                "type": "string",
+                "description": "Exact blocked grace_review_task_id to retry.",
+            },
+        },
+        "required": ["review_task_id"],
+        "additionalProperties": False,
+    },
 }
 
 GRACE_CALLBACK_OUTCOME_PARAMETERS = {
@@ -878,6 +899,26 @@ def _is_explicit_cancel_message(message_text: str) -> bool:
     ):
         return False
     return _CANCEL_INTENT.search(cancel_candidate) is not None
+
+
+_RETRY_REVIEW_INTENT = re.compile(
+    r"(?:重試|重新執行|重新驗收|解除阻擋|繼續處理|retry|re[-\s]?run|unblock)",
+    re.IGNORECASE,
+)
+_RETRY_REVIEW_NEGATION = re.compile(
+    r"(?:不要|不得|不可|禁止|do\s+not|don't)\s*(?:重試|重新執行|重新驗收|unblock|retry|re[-\s]?run)",
+    re.IGNORECASE,
+)
+
+
+def _is_explicit_retry_review_message(message_text: str) -> bool:
+    """Require a fresh authenticated instruction to retry existing review work."""
+    clean = str(message_text or "").strip()
+    return bool(
+        clean
+        and _RETRY_REVIEW_INTENT.search(clean)
+        and _RETRY_REVIEW_NEGATION.search(clean) is None
+    )
 
 
 def _iter_text_values(value: Any) -> list[str]:
@@ -1351,6 +1392,242 @@ def handle_clawops_cancel(
         )
 
 
+def handle_clawops_retry_review(
+    args: dict[str, Any] | None = None,
+    **_kwargs: Any,
+) -> str:
+    """Retry one lane-bound blocked Grace review without creating new cards."""
+    args = dict(args or {})
+    review_task_id = str(args.get("review_task_id") or "").strip()
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    owner_user_id = get_session_env(
+        "HERMES_SESSION_OWNER_USER_ID", "",
+    ).strip()
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
+    internal_turn = (
+        get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower()
+        == "true"
+    )
+    session_source = get_session_env(
+        "HERMES_SESSION_SOURCE", "",
+    ).strip().lower()
+    try:
+        if os.getenv("HERMES_KANBAN_TASK", "").strip():
+            raise ValueError(
+                "A Kanban worker cannot retry another Review; retry must come "
+                "from KJ's authenticated Grace turn."
+            )
+        if internal_turn or session_source == "cron" or platform == "cron":
+            raise ValueError(
+                "Grace Review retry requires a fresh authenticated user turn."
+            )
+        if not review_task_id:
+            raise ValueError("Review retry requires an exact review_task_id.")
+        if not all((platform, chat_id, user_id, message_id)):
+            raise ValueError(
+                "Review retry requires authenticated platform, chat, user, and message identity."
+            )
+        if not _is_explicit_retry_review_message(message_text):
+            raise ValueError(
+                "The current authenticated message does not explicitly request "
+                "retrying the existing Grace Review."
+            )
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(review_task_id)}(?![A-Za-z0-9_])",
+            message_text,
+        ) is None:
+            raise ValueError(
+                "The authenticated retry instruction is not bound to this review_task_id."
+            )
+        board = _resolve_cancel_board(
+            task_id=review_task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if board is None:
+            raise ValueError(
+                "Review was not found in this authenticated chat/topic, or its board is ambiguous."
+            )
+        with kb.connect_closing(board=board) as conn, kb.write_txn(conn):
+            row = conn.execute(
+                """
+                SELECT d.delegation_id, d.execution_task_id, d.review_task_id,
+                       d.state AS delegation_state,
+                       d.session_id AS delegation_session_id,
+                       execution.status AS execution_status,
+                       review.status AS review_status,
+                       review.executor_profile AS review_executor_profile,
+                       review.body AS review_body,
+                       review.block_kind AS review_block_kind,
+                       review.current_run_id AS review_current_run_id,
+                       callback.user_id AS origin_user_id,
+                       callback.platform AS callback_platform,
+                       callback.chat_id AS callback_chat_id,
+                       callback.thread_id AS callback_thread_id,
+                       callback.session_id AS callback_session_id
+                  FROM grace_delegations AS d
+                  JOIN tasks AS execution ON execution.id = d.execution_task_id
+                  JOIN tasks AS review ON review.id = d.review_task_id
+                  JOIN grace_loop_callbacks AS callback
+                    ON callback.review_task_id = d.review_task_id
+                 WHERE d.review_task_id = ?
+                   AND d.platform = ? AND d.chat_id = ? AND d.thread_id = ?
+                 LIMIT 1
+                """,
+                (review_task_id, platform, chat_id, thread_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Review no longer matches this authenticated chat/topic.")
+            value = dict(row)
+            callback_lane = (
+                str(value.get("callback_platform") or "").strip().lower(),
+                str(value.get("callback_chat_id") or "").strip(),
+                str(value.get("callback_thread_id") or "").strip(),
+            )
+            if callback_lane != (platform, chat_id, thread_id) or str(
+                value.get("callback_session_id") or ""
+            ).strip() != str(value.get("delegation_session_id") or "").strip():
+                raise ValueError(
+                    "Grace Review callback no longer matches its durable delegation lane."
+                )
+            authorized_user_id = owner_user_id or str(
+                value.get("origin_user_id") or ""
+            ).strip()
+            if not authorized_user_id or user_id != authorized_user_id:
+                authority = (
+                    "configured owner" if owner_user_id else "original delegation requester"
+                )
+                raise ValueError(
+                    f"Only the authenticated {authority} may retry this Grace Review."
+                )
+            receipt_rows = conn.execute(
+                """
+                SELECT payload
+                  FROM task_events
+                 WHERE task_id = ? AND kind = 'grace_review_retry_authorized'
+                """,
+                (review_task_id,),
+            ).fetchall()
+            for receipt_row in receipt_rows:
+                try:
+                    receipt = json.loads(receipt_row["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    receipt.get("platform") == platform
+                    and receipt.get("chat_id") == chat_id
+                    and receipt.get("thread_id") == thread_id
+                    and receipt.get("user_id") == user_id
+                    and receipt.get("message_id") == message_id
+                    and receipt.get("review_task_id") == review_task_id
+                ):
+                    raise ValueError(
+                        "This authenticated retry instruction was already consumed."
+                    )
+            if value.get("delegation_state") != "queued":
+                raise ValueError("Grace delegation is no longer active and cannot be retried.")
+            if value.get("execution_status") != "done":
+                raise ValueError("Parent Execution is not done; Review retry is not yet allowed.")
+            if value.get("review_executor_profile") != "grace-policy-review":
+                raise ValueError("Target task is not a controlled Grace Review.")
+            if kb._grace_loop_stage_header(str(value.get("review_body") or "")) != "review":
+                raise ValueError("Target task does not carry the Grace Review stage contract.")
+            if value.get("review_status") == "done":
+                return json.dumps(
+                    {
+                        "status": "already_completed",
+                        "task_created": False,
+                        "delegation_id": value["delegation_id"],
+                        "execution_task_id": value["execution_task_id"],
+                        "grace_review_task_id": review_task_id,
+                    },
+                    ensure_ascii=False,
+                )
+            if value.get("review_status") != "blocked":
+                raise ValueError(
+                    f"Grace Review is {value.get('review_status')!r}, not blocked."
+                )
+            if value.get("review_current_run_id") is not None:
+                raise ValueError("Blocked Grace Review still has an active run pointer.")
+            if value.get("review_block_kind") != "capability":
+                raise ValueError(
+                    "Grace Review retry is restricted to a repaired capability blocker."
+                )
+            blocked_event = conn.execute(
+                """
+                SELECT payload
+                  FROM task_events
+                 WHERE task_id = ? AND kind = 'blocked'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (review_task_id,),
+            ).fetchone()
+            try:
+                blocked_payload = (
+                    json.loads(blocked_event["payload"])
+                    if blocked_event is not None and blocked_event["payload"]
+                    else {}
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                blocked_payload = {}
+            blocked_reason = str(blocked_payload.get("reason") or "")
+            if (
+                blocked_payload.get("kind") != "capability"
+                or "managed_policy_read" not in blocked_reason
+                or "Topic policy binding not found" not in blocked_reason
+            ):
+                raise ValueError(
+                    "Grace Review blocker is not the repaired managed-policy binding fault."
+                )
+            from proactive.policy_registry import resolve_task_policy_snapshots
+
+            resolve_task_policy_snapshots(str(value.get("review_body") or ""))
+            if not kb.unblock_task(conn, review_task_id):
+                raise RuntimeError("Grace Review could not be moved back to ready.")
+            kb._append_event(
+                conn,
+                review_task_id,
+                "grace_review_retry_authorized",
+                {
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "user_id": user_id,
+                    "message_id": message_id,
+                    "review_task_id": review_task_id,
+                    "execution_task_id": value["execution_task_id"],
+                    "repaired_fault": "managed_policy_absent_binding",
+                },
+            )
+            retried = kb.get_task(conn, review_task_id)
+        return json.dumps(
+            {
+                "status": "queued",
+                "task_created": False,
+                "delegation_id": value["delegation_id"],
+                "execution_task_id": value["execution_task_id"],
+                "grace_review_task_id": review_task_id,
+                "review_status": retried.status if retried is not None else "ready",
+            },
+            ensure_ascii=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "task_created": False,
+                "reason": str(exc),
+            },
+            ensure_ascii=False,
+        )
+
+
 def _queued_delegation_replay(
     delegation: dict[str, Any] | None,
     *,
@@ -1487,6 +1764,16 @@ def _augment_ai_bizweek_source_evidence(
     session_id: str,
 ) -> dict[str, Any]:
     """Embed managed Page source text before fingerprinting worker contracts."""
+    domain_memory = contract.get("domain_memory")
+    if (
+        isinstance(domain_memory, dict)
+        and domain_memory.get("mode") == "query"
+    ):
+        # A typed inventory/count/status query must stay registry-only.  Page
+        # source fidelity is relevant to content production, but injecting it
+        # here contaminates the query contract with copy/CTA/asset work and can
+        # prevent a valid inventory result from completing.
+        return contract
     if not session_id or not _contract_requests_ai_bizweek_source(contract):
         return contract
     try:

@@ -3959,6 +3959,7 @@ def _commerce_status_report_metadata(
 def _content_package_completion_metadata(
     audited_result: Mapping[str, Any],
     *,
+    metadata: Mapping[str, Any],
     task_id: str,
     board: Optional[str],
 ) -> dict[str, Any]:
@@ -3966,6 +3967,39 @@ def _content_package_completion_metadata(
     acceptance = audited_result.get("acceptanceEvidence")
     if not isinstance(acceptance, Mapping):
         return {}
+    contract = metadata.get("loop_contract")
+    delivery = (
+        contract.get("user_facing_delivery") if isinstance(contract, Mapping) else None
+    )
+    if (
+        isinstance(delivery, Mapping)
+        and delivery.get("required") is True
+        and delivery.get("kind") == "content_package"
+        and delivery.get("delivery") == "inline_only"
+    ):
+        body_field = str(delivery.get("body_field") or "").strip()
+        raw_body = acceptance.get(body_field)
+        if not body_field or not isinstance(raw_body, str):
+            return {}
+        body = raw_body.strip()
+        if not body:
+            return {}
+        report = {
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "complete": True,
+            "title": str(audited_result.get("summary") or "完整內容").strip(),
+            "body_field": body_field,
+            "body": body,
+            "observed_at": int(time.time()),
+            "assets": [],
+        }
+        try:
+            from hermes_cli.user_facing_report import normalize_user_facing_report
+
+            return {"user_facing_report": normalize_user_facing_report(report)}
+        except ValueError:
+            return {}
     package = acceptance.get("telegram_user_facing_content_package")
     if not isinstance(package, Mapping):
         return {}
@@ -4035,14 +4069,18 @@ def _content_package_completion_metadata(
 
 
 def make_loop_contract_terminal_handler(
-    *, board: Optional[str] = None,
+    *,
+    board: Optional[str] = None,
 ) -> Callable[[kb.Run, Mapping[str, Any]], Mapping[str, Any]]:
     def handle(run: kb.Run, observation: Mapping[str, Any]) -> Mapping[str, Any]:
         result = observation.get("delegated_result")
         output = next(
             (
                 artifact.get("value")
-                for artifact in (result.get("artifacts") if isinstance(result, Mapping) else []) or []
+                for artifact in (
+                    result.get("artifacts") if isinstance(result, Mapping) else []
+                )
+                or []
                 if (
                     isinstance(artifact, Mapping)
                     and artifact.get("type") == "openclaw_result"
@@ -4053,9 +4091,7 @@ def make_loop_contract_terminal_handler(
         )
         evidence = output.get("evidence") if isinstance(output, Mapping) else None
         audited_result = (
-            _openclaw_result_payload(output)
-            if isinstance(output, Mapping)
-            else None
+            _openclaw_result_payload(output) if isinstance(output, Mapping) else None
         )
         metadata = run.metadata or {}
         if audited_result is None and isinstance(output, Mapping):
@@ -4152,8 +4188,7 @@ def make_loop_contract_terminal_handler(
             )
             and result.get("protocol_correlated") is True
             and result.get("identity_correlated") is True
-            and str(result.get("backend_run_id") or "")
-            == str(run.backend_run_id or "")
+            and str(result.get("backend_run_id") or "") == str(run.backend_run_id or "")
             and str(result.get("backend_agent_id") or "")
             == str(metadata.get("backend_agent_id") or "")
             and str(result.get("protocol_version") or "") == "2.0"
@@ -4177,7 +4212,8 @@ def make_loop_contract_terminal_handler(
                 normalized_external_effects=normalized_external_effects,
                 external_effect_budget=external_effect_budget,
             )
-            and evidence.get("externalEffectBudget") == metadata.get("external_effect_budget")
+            and evidence.get("externalEffectBudget")
+            == metadata.get("external_effect_budget")
             and isinstance(audited_result, Mapping)
             and audited_result.get("status") == "succeeded"
             and not _acceptance_evidence_has_failure(
@@ -4197,7 +4233,9 @@ def make_loop_contract_terminal_handler(
             if isinstance(audited_result, Mapping)
             else ""
         )
-        validation_reason = "OpenClaw Loop Contract terminal evidence failed validation."
+        validation_reason = (
+            "OpenClaw Loop Contract terminal evidence failed validation."
+        )
         details = [item for item in (validation_error, worker_summary) if item]
         if details:
             validation_reason = (
@@ -4218,9 +4256,7 @@ def make_loop_contract_terminal_handler(
         )
         if missing_evidence:
             validation_reason += (
-                " Missing required evidence: "
-                + ", ".join(missing_evidence[:10])
-                + "."
+                " Missing required evidence: " + ", ".join(missing_evidence[:10]) + "."
             )
         if domain_memory_error:
             validation_reason += " Domain memory: " + domain_memory_error
@@ -4236,7 +4272,9 @@ def make_loop_contract_terminal_handler(
             and not external_effects
             and not internal_tool_receipts
         ):
-            validation_reason += " Read-only contract reported zero external effects as expected."
+            validation_reason += (
+                " Read-only contract reported zero external effects as expected."
+            )
         validation_reason = validation_reason[:2000]
         with kb.connect_closing(board=board) as conn:
             with kb.write_txn(conn):
@@ -4295,13 +4333,16 @@ def make_loop_contract_terminal_handler(
                         "accepted": False,
                         "reason": validation_reason,
                     }
-                summary = str(audited_result.get("summary") or "OpenClaw Loop Contract completed.")
+                summary = str(
+                    audited_result.get("summary") or "OpenClaw Loop Contract completed."
+                )
                 commerce_report_metadata = _commerce_status_report_metadata(
                     audited_result,
                     metadata=metadata,
                 )
                 content_package_metadata = _content_package_completion_metadata(
                     audited_result,
+                    metadata=metadata,
                     task_id=run.task_id,
                     board=board,
                 )
@@ -4332,5 +4373,9 @@ def make_loop_contract_terminal_handler(
                     raise RuntimeError("OpenClaw execution changed before completion.")
                 # The existing parent link releases the normal Grace review card;
                 # Grace remains the independent acceptance authority.
-        return {"accepted": True, "review_task_id": str(metadata.get("review_task_id") or "")}
+        return {
+            "accepted": True,
+            "review_task_id": str(metadata.get("review_task_id") or ""),
+        }
+
     return handle

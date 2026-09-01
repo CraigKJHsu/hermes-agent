@@ -9,9 +9,11 @@ from plugins.openclaw_bridge.tools import (
 from plugins.openclaw_bridge.clawops_delegate import (
     CLAWOPS_CANCEL_SCHEMA,
     CLAWOPS_DELEGATE_SCHEMA,
+    CLAWOPS_RETRY_REVIEW_SCHEMA,
     GRACE_CALLBACK_OUTCOME_SCHEMA,
     handle_clawops_cancel,
     handle_clawops_delegate,
+    handle_clawops_retry_review,
     handle_grace_callback_outcome,
 )
 from proactive.grace_execution_policy import enforce_grace_execution_boundary
@@ -42,6 +44,17 @@ def register(ctx) -> None:
             "task whose objective is to cancel another task."
         ),
         emoji="STOP",
+    )
+    ctx.register_tool(
+        name="clawops_retry_review",
+        toolset="openclaw",
+        schema=CLAWOPS_RETRY_REVIEW_SCHEMA,
+        handler=handle_clawops_retry_review,
+        description=(
+            "After KJ explicitly requests retry and a runtime/capability repair is loaded, "
+            "requeue that exact blocked Grace Review without creating another Execution."
+        ),
+        emoji="RETRY",
     )
     ctx.register_tool(
         name="grace_callback_outcome",

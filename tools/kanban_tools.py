@@ -518,14 +518,76 @@ def _handle_domain_inventory(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            entity_type = str(args.get("entity_type") or "").strip()
+            parameter_source = "tool_arguments"
+
+            # A dispatched Domain Memory worker already has an immutable typed
+            # contract in its own task body.  Bind the read to that contract so
+            # a model omission cannot silently widen the query, and reject a
+            # conflicting value instead of trusting worker prose to notice it.
+            task_id = _default_task_id(None)
+            if task_id:
+                task = kb.get_task(conn, task_id)
+                body = str(task.body or "") if task is not None else ""
+                marker = "```json"
+                start = body.find(marker)
+                end = body.rfind("```")
+                if start >= 0 and end > start + len(marker):
+                    try:
+                        contract = json.loads(
+                            body[start + len(marker):end].strip()
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        contract = None
+                    domain_memory = (
+                        contract.get("domain_memory")
+                        if isinstance(contract, dict)
+                        else None
+                    )
+                    if isinstance(domain_memory, dict):
+                        contract_domain = str(
+                            domain_memory.get("domain_key") or ""
+                        ).strip()
+                        contract_entity_type = str(
+                            domain_memory.get("entity_type") or ""
+                        ).strip()
+                        if contract_domain and domain_key != contract_domain:
+                            return tool_error(
+                                "kanban_domain_inventory: domain_key conflicts "
+                                f"with the sealed task contract ({contract_domain})"
+                            )
+                        if (
+                            entity_type
+                            and contract_entity_type
+                            and entity_type != contract_entity_type
+                        ):
+                            return tool_error(
+                                "kanban_domain_inventory: entity_type conflicts "
+                                "with the sealed task contract "
+                                f"({contract_entity_type})"
+                            )
+                        if not entity_type and contract_entity_type:
+                            entity_type = contract_entity_type
+                            parameter_source = "sealed_task_contract"
+
+            if not entity_type:
+                return tool_error(
+                    "kanban_domain_inventory: entity_type is required when "
+                    "the current task has no typed Domain Memory contract"
+                )
+
             report = kb.domain_inventory_report(
                 conn,
                 domain_key=domain_key,
-                entity_type=(
-                    str(args.get("entity_type") or "").strip() or None
-                ),
+                entity_type=entity_type,
                 expected_total=args.get("expected_total"),
             )
+            report["effective_query"] = {
+                "domain_key": domain_key,
+                "entity_type": entity_type,
+                "expected_total": args.get("expected_total"),
+                "parameter_source": parameter_source,
+            }
             return json.dumps(report, ensure_ascii=False, sort_keys=True)
         finally:
             conn.close()
@@ -1263,7 +1325,11 @@ KANBAN_DOMAIN_INVENTORY_SCHEMA = {
             },
             "entity_type": {
                 "type": "string",
-                "description": "Optional exact entity type such as SoloBizAiCase or ResaleItem.",
+                "description": (
+                    "Required exact entity type such as SoloBizAiCase or "
+                    "ResaleItem. A task-scoped typed Domain Memory contract "
+                    "also binds and verifies this value at execution time."
+                ),
             },
             "expected_total": {
                 "type": "integer",
@@ -1276,7 +1342,7 @@ KANBAN_DOMAIN_INVENTORY_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["domain_key"],
+        "required": ["domain_key", "entity_type"],
         "additionalProperties": False,
     },
 }

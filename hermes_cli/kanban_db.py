@@ -7181,6 +7181,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def _parent_satisfied_for_ready_child(
     conn: sqlite3.Connection,
     *,
+    child_id: str,
     child_executor_profile: Optional[str],
     parent_id: str,
     parent_status: str,
@@ -7189,6 +7190,32 @@ def _parent_satisfied_for_ready_child(
         return True
     if child_executor_profile != "grace-policy-review" or parent_status != "blocked":
         return False
+    latest_wait = conn.execute(
+        """
+        SELECT id
+          FROM task_events
+         WHERE task_id = ? AND kind = 'dependency_wait'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (child_id,),
+    ).fetchone()
+    if latest_wait is not None:
+        latest_parent_terminal = conn.execute(
+            """
+            SELECT id
+              FROM task_events
+             WHERE task_id = ?
+               AND kind IN ('blocked', 'completed', 'unblocked')
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (parent_id,),
+        ).fetchone()
+        if latest_parent_terminal is None or int(latest_parent_terminal["id"]) <= int(
+            latest_wait["id"]
+        ):
+            return False
     parent_run = conn.execute(
         """
         SELECT status, outcome
@@ -7207,7 +7234,8 @@ def _parent_satisfied_for_ready_child(
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -7263,6 +7291,7 @@ def recompute_ready(
             if all(
                 _parent_satisfied_for_ready_child(
                     conn,
+                    child_id=task_id,
                     child_executor_profile=row["executor_profile"],
                     parent_id=p["id"],
                     parent_status=p["status"],
@@ -7281,7 +7310,8 @@ def recompute_ready(
                     failures = int(row["consecutive_failures"] or 0)
                     task_limit = row["max_retries"]
                     effective_limit = (
-                        int(task_limit) if task_limit is not None
+                        int(task_limit)
+                        if task_limit is not None
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
@@ -7485,6 +7515,7 @@ def claim_task(
         undone = any(
             not _parent_satisfied_for_ready_child(
                 conn,
+                child_id=task_id,
                 child_executor_profile=(
                     child_row["executor_profile"] if child_row is not None else None
                 ),
@@ -7495,12 +7526,13 @@ def claim_task(
         )
         if undone:
             conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (task_id,),
             )
             _append_event(
-                conn, task_id, "claim_rejected",
+                conn,
+                task_id,
+                "claim_rejected",
                 {"reason": "parents_not_done"},
             )
             return None
@@ -7575,7 +7607,9 @@ def claim_task(
             (run_id, task_id),
         )
         _append_event(
-            conn, task_id, "claimed",
+            conn,
+            task_id,
+            "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
@@ -16802,6 +16836,39 @@ def grace_inline_content_package_report(
     ):
         return None
     task = get_task(conn, execution_task_id)
+    if delivery.get("delivery") == "inline_only":
+        body_field = str(delivery.get("body_field") or "").strip()
+        run = latest_run(conn, execution_task_id)
+        metadata = getattr(run, "metadata", None) or {}
+        acceptance = metadata.get("acceptance_evidence")
+        raw_body = (
+            acceptance.get(body_field)
+            if isinstance(acceptance, Mapping) and body_field
+            else None
+        )
+        if not isinstance(raw_body, str):
+            return None
+        body = raw_body.strip()
+        if not body:
+            return None
+        from hermes_cli.user_facing_report import normalize_user_facing_report
+
+        observed_at = int(
+            getattr(run, "ended_at", 0) or getattr(run, "started_at", 0) or time.time()
+        )
+        try:
+            return normalize_user_facing_report({
+                "kind": "content_package",
+                "delivery": "inline_only",
+                "complete": True,
+                "title": task.title if task is not None else "Content package",
+                "body": body,
+                "body_field": body_field,
+                "observed_at": observed_at,
+                "assets": [],
+            })
+        except ValueError:
+            return None
     attachments = list_attachments(conn, execution_task_id)
     markdown = [
         attachment
@@ -16821,9 +16888,11 @@ def grace_inline_content_package_report(
         if not expected_assets or image.filename in expected_assets
     }
     images = list(image_by_name.values())
-    if len(markdown) != 1 or not images or {
-        image.filename for image in images
-    } != expected_assets:
+    if (
+        len(markdown) != 1
+        or not images
+        or {image.filename for image in images} != expected_assets
+    ):
         return _grace_facebook_page_preflight_report(
             conn,
             execution_task_id,

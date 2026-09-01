@@ -76,6 +76,70 @@ def test_content_package_user_facing_delivery_requires_assets():
         validate_loop_contract(contract)
 
 
+def test_text_content_package_user_facing_delivery_is_accepted():
+    contract = _contract()
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "finalPasteReadyDraft",
+    }
+
+    accepted = validate_loop_contract(contract)
+
+    assert accepted["user_facing_delivery"] == {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "finalPasteReadyDraft",
+    }
+
+
+def test_text_content_package_user_facing_delivery_requires_body_field():
+    contract = _contract()
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+    }
+
+    with pytest.raises(LoopContractError, match="body_field"):
+        validate_loop_contract(contract)
+
+
+def test_domain_inventory_query_gets_canonical_inline_delivery():
+    contract = _contract()
+    contract["identity"]["project"] = "ai_bizweek"
+    contract["identity"]["topic_name"] = "AI BizWeek"
+
+    accepted = validate_loop_contract(contract)
+
+    assert accepted["domain_memory"]["mode"] == "query"
+    assert accepted["user_facing_delivery"] == {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "domain_inventory_report",
+    }
+
+
+def test_domain_inventory_query_never_exposes_page_source_to_worker():
+    contract = _contract()
+    contract["identity"]["project"] = "ai_bizweek"
+    contract["identity"]["topic_name"] = "AI BizWeek"
+    contract["original_request"] = (
+        "列出七案\nTASK-SCOPED SOURCE MATERIAL: facebook_page_source_text\n"
+        "UNIQUE_PAGE_SOURCE_SHOULD_NOT_REACH_QUERY_WORKER"
+    )
+    contract["verification"]["checks"] = ["呼叫 kanban_domain_inventory"]
+
+    rendered = render_execution_body(validate_loop_contract(contract))
+
+    assert "UNIQUE_PAGE_SOURCE_SHOULD_NOT_REACH_QUERY_WORKER" not in rendered
+    assert "This is a registry-only inventory query" in rendered
+    assert "body_field=domain_inventory_report" in rendered
+
+
 def test_facebook_group_publish_requires_canonical_url_per_group():
     contract = _contract()
     contract["external_targets"] = [

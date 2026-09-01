@@ -119,6 +119,48 @@ def test_managed_policy_read_uses_current_policy_pinned_kanban_task(
     ]
 
 
+def test_managed_policy_read_accepts_task_pinned_absent_topic_binding(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from proactive.policy_registry import policy_snapshot_marker, resolve_contract_policies
+
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    namespace = "telegram:-1003938559457:2120/kj_profile"
+    normalized = resolve_contract_policies(
+        {"memory": {"namespace": namespace}, "policy_requirements": []}
+    )
+    marker = policy_snapshot_marker(normalized)
+    assert marker is not None
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="Grace review with no Topic policy binding",
+            body=f"GRACE_LOOP_CONTRACT_STAGE: grace_review\n{marker}\n",
+            assignee="default",
+        )
+    finally:
+        conn.close()
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.create_session("empty-binding-review-session", "cli")
+    finally:
+        db.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    result = json.loads(
+        managed_policy_read(session_id="empty-binding-review-session")
+    )
+
+    assert result["success"] is True
+    assert result["binding"] == normalized["policy_binding_snapshot"]
+    assert result["policies"] == []
+    assert result["review_policy_receipts"] == []
+
+
 def test_managed_policy_read_returns_ai_bizweek_asset_guidance_for_review_task(
     tmp_path, monkeypatch
 ):

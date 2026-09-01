@@ -219,6 +219,26 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
     assert "preparing initial system prompt" in agent._activities
+    assert agent._activities[-1] == "turn preparation complete"
+
+
+def test_turn_setup_activity_identifies_each_blocking_boundary():
+    agent = _FakeAgent()
+    agent._cached_system_prompt = None
+
+    def _restore(_agent, _system_message, _history):
+        _agent._cached_system_prompt = "REBUILT-SYSTEM"
+
+    _build(agent, restore_or_build_system_prompt=_restore)
+
+    assert agent._activities == [
+        "preparing initial system prompt",
+        "initial system prompt ready",
+        "ensuring session persistence",
+        "persisting inbound turn",
+        "running pre-LLM hooks",
+        "turn preparation complete",
+    ]
 
 
 def test_safe_fallback_is_invalidated_and_rebuilt_on_next_turn():

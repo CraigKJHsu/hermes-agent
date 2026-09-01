@@ -196,6 +196,104 @@ def test_show_explicit_task_id(worker_env):
     assert d["task"]["id"] == other
 
 
+def test_domain_inventory_binds_missing_entity_type_from_task_contract(
+    monkeypatch, worker_env
+):
+    """A typed task contract, not model recall, owns the inventory type."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    contract = {
+        "domain_memory": {
+            "domain_key": "solobizai",
+            "entity_type": "SoloBizAiCase",
+            "mode": "query",
+            "schema_id": "solobizai.case.v1",
+        }
+    }
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="typed inventory",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+                f"```json\n{json.dumps(contract)}\n```"
+            ),
+            assignee="test-worker",
+        )
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    observed = {}
+
+    def _inventory(conn, *, domain_key, entity_type, expected_total):
+        observed.update(
+            domain_key=domain_key,
+            entity_type=entity_type,
+            expected_total=expected_total,
+        )
+        return {"registry_total": 7, "coverage_status": "complete"}
+
+    monkeypatch.setattr(kb, "domain_inventory_report", _inventory)
+    result = json.loads(kt._handle_domain_inventory({"domain_key": "solobizai"}))
+
+    assert observed == {
+        "domain_key": "solobizai",
+        "entity_type": "SoloBizAiCase",
+        "expected_total": None,
+    }
+    assert result["effective_query"] == {
+        "domain_key": "solobizai",
+        "entity_type": "SoloBizAiCase",
+        "expected_total": None,
+        "parameter_source": "sealed_task_contract",
+    }
+
+
+def test_domain_inventory_rejects_entity_type_conflicting_with_contract(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    contract = {
+        "domain_memory": {
+            "domain_key": "solobizai",
+            "entity_type": "SoloBizAiCase",
+            "mode": "query",
+        }
+    }
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="typed inventory mismatch",
+            body=f"```json\n{json.dumps(contract)}\n```",
+            assignee="test-worker",
+        )
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    result = json.loads(
+        kt._handle_domain_inventory(
+            {"domain_key": "solobizai", "entity_type": "ResaleItem"}
+        )
+    )
+    assert "entity_type conflicts with the sealed task contract" in result["error"]
+
+
+def test_domain_inventory_schema_requires_typed_entity():
+    from tools import kanban_tools as kt
+
+    assert kt.KANBAN_DOMAIN_INVENTORY_SCHEMA["parameters"]["required"] == [
+        "domain_key",
+        "entity_type",
+    ]
+
+
 def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt

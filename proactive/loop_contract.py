@@ -376,6 +376,27 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         raise LoopContractError(f"policy resolution failed: {exc}") from exc
     except DomainMemoryError as exc:
         raise LoopContractError(f"domain memory validation failed: {exc}") from exc
+    domain_memory = value.get("domain_memory")
+    if (
+        isinstance(domain_memory, Mapping)
+        and domain_memory.get("mode") == "query"
+        and str(
+            (value.get("routing") or {}).get("task_type")
+            if isinstance(value.get("routing"), Mapping)
+            else ""
+        ).strip() != "secondhand_commerce_group_status"
+        and value.get("user_facing_delivery") is None
+    ):
+        # Enumerable Domain Memory questions are always delivered inline.  A
+        # compiler-generated attachment contract made a read-only registry
+        # lookup depend on unrelated content-package asset validation and can
+        # keep an otherwise complete worker alive until the dispatcher limit.
+        value["user_facing_delivery"] = {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "domain_inventory_report",
+        }
     errors: list[str] = []
 
     def required_text(path: str) -> None:
@@ -486,12 +507,15 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
                     )
                 required_list("user_facing_delivery.subject_keys")
             elif delivery_kind == "content_package":
-                if delivery_mode != "inline_with_attachment":
+                if delivery_mode == "inline_only":
+                    required_text("user_facing_delivery.body_field")
+                elif delivery_mode == "inline_with_attachment":
+                    required_list("user_facing_delivery.asset_filenames")
+                else:
                     errors.append(
                         "content_package user_facing_delivery.delivery must be "
-                        "inline_with_attachment"
+                        "inline_only or inline_with_attachment"
                     )
-                required_list("user_facing_delivery.asset_filenames")
             if delivery_mode not in {"inline_only", "inline_with_attachment"}:
                 errors.append(
                     "user_facing_delivery.delivery must be inline_only or "

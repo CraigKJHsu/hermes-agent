@@ -870,6 +870,7 @@ def test_plugin_registers_tool_command_and_gateway_hook():
         "tools": [
             "clawops_delegate",
             "clawops_cancel",
+            "clawops_retry_review",
             "grace_callback_outcome",
             "openclaw_delegate",
         ],

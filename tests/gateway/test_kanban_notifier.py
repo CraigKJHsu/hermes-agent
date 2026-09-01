@@ -97,6 +97,21 @@ def _inline_commerce_report():
     }
 
 
+def _disable_model_receipt_gate(monkeypatch):
+    from proactive import model_routing
+
+    monkeypatch.setattr(
+        model_routing,
+        "execution_receipt_from_env",
+        lambda _raw: {"test": True},
+    )
+    monkeypatch.setattr(
+        model_routing,
+        "validate_grace_acceptance_receipt",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 def test_loop_task_context_requires_durable_binding_and_exact_header(tmp_path):
     db_path = tmp_path / "loop-context.db"
     kb.init_db(db_path)
@@ -200,6 +215,40 @@ def test_kanban_notifier_reports_claimed_and_spawned_progress(tmp_path, monkeypa
     assert "已啟動" in adapter.sent[0]["text"]
     assert "執行中" in adapter.sent[1]["text"]
     assert "pid=4321" in adapter.sent[1]["text"]
+
+
+def test_kanban_notifier_labels_timeout_give_up_as_timeout(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "gave-up-timeout.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="timeout", assignee="clawops-ops")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="gave_up",
+            payload={
+                "trigger_outcome": "timed_out",
+                "error": "elapsed 1800s > limit 1800s",
+            },
+        )
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "after repeated timeouts" in adapter.sent[0]["text"]
+    assert "spawn failures" not in adapter.sent[0]["text"]
 
 
 def test_kanban_notifier_reports_cancellation_once_and_unsubscribes(
@@ -346,6 +395,7 @@ def test_kanban_notifier_completed_message_preserves_long_summary(tmp_path, monk
 def test_accepted_grace_review_delivers_parent_execution_artifact(
     tmp_path, monkeypatch,
 ):
+    _disable_model_receipt_gate(monkeypatch)
     db_path = tmp_path / "accepted-artifact.db"
     artifact_path = tmp_path / "verified-report.txt"
     artifact_path.write_text("verified", encoding="utf-8")
@@ -423,6 +473,7 @@ def test_accepted_grace_review_delivers_parent_execution_artifact(
 def test_inline_user_facing_report_keeps_markdown_artifact_audit_only(
     tmp_path, monkeypatch,
 ):
+    _disable_model_receipt_gate(monkeypatch)
     db_path = tmp_path / "inline-only-artifact.db"
     artifact_path = tmp_path / "audit-only.md"
     artifact_path.write_text("# audit", encoding="utf-8")
@@ -480,6 +531,7 @@ def test_inline_user_facing_report_keeps_markdown_artifact_audit_only(
 def test_contract_backed_content_package_never_falls_back_to_partial_artifact(
     tmp_path, monkeypatch,
 ):
+    _disable_model_receipt_gate(monkeypatch)
     db_path = tmp_path / "incomplete-content-package.db"
     partial = tmp_path / "partial.txt"
     partial.write_text("partial", encoding="utf-8")

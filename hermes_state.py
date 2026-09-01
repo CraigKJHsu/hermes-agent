@@ -31,6 +31,49 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+
+class _ProcessLockTimeout(TimeoutError):
+    """Raised instead of allowing one state.db operation to convoy a process."""
+
+
+class _BoundedProcessLock:
+    """``Lock`` compatible context manager with a finite default wait.
+
+    ``SessionDB`` shares one SQLite connection across gateway threads.  The
+    process lock is therefore required, but an expensive FTS query must not
+    leave unrelated turns waiting behind it until the gateway's 30-minute
+    inactivity watchdog fires.  Explicit ``acquire(timeout=...)`` calls keep
+    their caller-supplied timeout; ``with lock:`` uses the bounded default.
+    """
+
+    def __init__(self, timeout_seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._timeout_seconds = max(0.0, float(timeout_seconds))
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if not blocking:
+            return self._lock.acquire(False)
+        if timeout is not None and timeout >= 0:
+            return self._lock.acquire(True, timeout)
+        return self._lock.acquire(True, self._timeout_seconds)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> "_BoundedProcessLock":
+        if not self.acquire():
+            raise _ProcessLockTimeout(
+                "state.db process mutex wait exceeded "
+                f"{self._timeout_seconds:.1f}s"
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
@@ -811,6 +854,10 @@ class SessionDB:
     _WRITE_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    # A long FTS/read operation on the shared connection must not convoy an
+    # unrelated gateway turn until agent.gateway_timeout.  Callers already
+    # degrade safely on state-store failures, so fail fast and retry next turn.
+    _PROCESS_LOCK_TIMEOUT_S = 5.0
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
@@ -818,7 +865,7 @@ class SessionDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
 
-        self._lock = threading.Lock()
+        self._lock = _BoundedProcessLock(self._PROCESS_LOCK_TIMEOUT_S)
         self._write_count = 0
         self._fts_enabled = False
         self._trigram_available = False

@@ -3457,6 +3457,123 @@ def test_recompute_ready_promotes_grace_review_for_terminal_blocked_parent(kanba
         assert claimed_review is not None
         assert claimed_review.status == "running"
 
+        kb.block_task(
+            conn,
+            review,
+            reason="parent remains blocked",
+            kind="dependency",
+            expected_run_id=claimed_review.current_run_id,
+        )
+        assert kb.get_task(conn, review).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+
+        assert kb.unblock_task(conn, parent)
+        parent_retry = kb.claim_task(conn, parent)
+        assert parent_retry is not None
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="OpenClaw recovered and completed the deliverable.",
+            expected_run_id=parent_retry.current_run_id,
+        )
+        assert kb.get_task(conn, review).status == "ready"
+
+
+def test_inline_content_package_is_derived_from_acceptance_evidence(kanban_home):
+    with kb.connect() as conn:
+        execution = kb.create_task(
+            conn,
+            title="Tasker proposal",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                '{"user_facing_delivery":{"required":true,'
+                '"kind":"content_package","delivery":"inline_only",'
+                '"body_field":"finalPasteReadyDraft"}}',
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution,
+            summary="proposal ready",
+            metadata={
+                "acceptance_evidence": {
+                    "finalPasteReadyDraft": "完整繁體中文提案正文",
+                },
+            },
+        )
+
+        report = kb.grace_inline_content_package_report(conn, execution)
+
+        assert report is not None
+        assert report["delivery"] == "inline_only"
+        assert report["body_field"] == "finalPasteReadyDraft"
+        assert report["body"] == "完整繁體中文提案正文"
+        assert report["assets"] == []
+
+
+@pytest.mark.parametrize(
+    "malformed_body", [{"text": "proposal"}, ["proposal"], True, 1]
+)
+def test_inline_content_package_fallback_rejects_non_string_body(
+    kanban_home,
+    malformed_body,
+):
+    with kb.connect() as conn:
+        execution = kb.create_task(
+            conn,
+            title="Tasker proposal",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                '{"user_facing_delivery":{"required":true,'
+                '"kind":"content_package","delivery":"inline_only",'
+                '"body_field":"finalPasteReadyDraft"}}',
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution,
+            summary="proposal ready",
+            metadata={
+                "acceptance_evidence": {
+                    "finalPasteReadyDraft": malformed_body,
+                },
+            },
+        )
+
+        assert kb.grace_inline_content_package_report(conn, execution) is None
+
+
+def test_inline_content_package_fallback_handles_oversized_body(kanban_home):
+    with kb.connect() as conn:
+        execution = kb.create_task(
+            conn,
+            title="Tasker proposal",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                '{"user_facing_delivery":{"required":true,'
+                '"kind":"content_package","delivery":"inline_only",'
+                '"body_field":"finalPasteReadyDraft"}}',
+                "```",
+            ]),
+        )
+        assert kb.complete_task(
+            conn,
+            execution,
+            summary="proposal ready",
+            metadata={
+                "acceptance_evidence": {
+                    "finalPasteReadyDraft": "x" * 80_000,
+                },
+            },
+        )
+
+        assert kb.grace_inline_content_package_report(conn, execution) is None
+
 
 def test_recompute_ready_keeps_regular_child_waiting_on_blocked_parent(kanban_home):
     with kb.connect() as conn:

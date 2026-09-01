@@ -292,10 +292,10 @@ def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
     delivery = str(raw.get("delivery") or "inline_with_attachment").strip()
-    if delivery != "inline_with_attachment":
+    if delivery not in {INLINE_ONLY_DELIVERY, "inline_with_attachment"}:
         raise ValueError(
             "metadata.user_facing_report content_package delivery must be "
-            "inline_with_attachment"
+            "inline_only or inline_with_attachment"
         )
     if raw.get("complete") is not True:
         raise ValueError(
@@ -304,11 +304,26 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
     title = _required_text(raw.get("title"), "title")
     body = _required_text(raw.get("body"), "body")
     observed_at = _unix_seconds(raw.get("observed_at"), "observed_at")
-    raw_assets = raw.get("assets")
-    if not isinstance(raw_assets, list) or not raw_assets:
+    body_field = str(raw.get("body_field") or "").strip()
+    raw_assets = raw.get("assets", [])
+    if not isinstance(raw_assets, list):
+        raise ValueError(
+            "metadata.user_facing_report content_package assets must be a list"
+        )
+    if delivery == INLINE_ONLY_DELIVERY and not body_field:
+        raise ValueError(
+            "metadata.user_facing_report content_package body_field must be "
+            "non-empty for inline_only delivery"
+        )
+    if delivery == INLINE_ONLY_DELIVERY and raw_assets:
+        raise ValueError(
+            "metadata.user_facing_report content_package assets must be empty "
+            "for inline_only delivery"
+        )
+    if delivery == "inline_with_attachment" and not raw_assets:
         raise ValueError(
             "metadata.user_facing_report content_package assets must be a "
-            "non-empty list"
+            "non-empty list for inline_with_attachment delivery"
         )
     assets: list[dict[str, str]] = []
     seen_filenames: set[str] = set()
@@ -352,6 +367,8 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
         "observed_at": observed_at,
         "assets": assets,
     }
+    if body_field:
+        normalized["body_field"] = body_field
     if len(json.dumps(normalized, ensure_ascii=False, sort_keys=True)) > (
         MAX_CONTENT_PACKAGE_JSON_CHARS
     ):
@@ -385,14 +402,18 @@ def delivery_contract_from_report(report: Any) -> dict[str, Any]:
     """
     normalized = normalize_user_facing_report(report)
     if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
-        return {
+        contract = {
             "required": True,
             "kind": CONTENT_PACKAGE_REPORT_KIND,
             "delivery": normalized["delivery"],
-            "asset_filenames": [
-                asset["filename"] for asset in normalized["assets"]
-            ],
         }
+        if normalized["delivery"] == INLINE_ONLY_DELIVERY:
+            contract["body_field"] = normalized["body_field"]
+        else:
+            contract["asset_filenames"] = [
+                asset["filename"] for asset in normalized["assets"]
+            ]
+        return contract
     return {
         "required": True,
         "kind": COMMERCE_GROUP_REPORT_KIND,
@@ -415,6 +436,15 @@ def report_satisfies_user_facing_delivery(
     except ValueError:
         return False
     if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
+        if normalized["delivery"] == INLINE_ONLY_DELIVERY:
+            return (
+                delivery_contract.get("required") is True
+                and delivery_contract.get("kind") == CONTENT_PACKAGE_REPORT_KIND
+                and delivery_contract.get("delivery") == INLINE_ONLY_DELIVERY
+                and delivery_contract.get("body_field")
+                == normalized.get("body_field")
+                and bool(normalized["complete"])
+            )
         requested_assets = delivery_contract.get("asset_filenames")
         return (
             delivery_contract.get("required") is True
@@ -460,6 +490,14 @@ def report_matches_user_facing_delivery(
     except ValueError:
         return False
     if normalized["kind"] == CONTENT_PACKAGE_REPORT_KIND:
+        if normalized["delivery"] == INLINE_ONLY_DELIVERY:
+            return (
+                delivery_contract.get("required") is True
+                and delivery_contract.get("kind") == CONTENT_PACKAGE_REPORT_KIND
+                and delivery_contract.get("delivery") == INLINE_ONLY_DELIVERY
+                and delivery_contract.get("body_field")
+                == normalized.get("body_field")
+            )
         requested_assets = delivery_contract.get("asset_filenames")
         return (
             delivery_contract.get("required") is True

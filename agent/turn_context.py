@@ -323,15 +323,28 @@ def build_turn_context(
             pass
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
+    try:
+        agent._touch_activity("initial system prompt ready")
+    except Exception:
+        pass
+
     active_system_prompt = agent._cached_system_prompt
 
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
     # #45499). Idempotent: _ensure_db_session() no-ops once the row exists.
+    try:
+        agent._touch_activity("ensuring session persistence")
+    except Exception:
+        pass
     agent._ensure_db_session()
 
     # Crash-resilience: persist the inbound user turn as soon as the session row exists.
     try:
+        try:
+            agent._touch_activity("persisting inbound turn")
+        except Exception:
+            pass
         agent._persist_session(messages, conversation_history)
     except Exception:
         logger.warning(
@@ -350,6 +363,10 @@ def build_turn_context(
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
     ):
+        try:
+            agent._touch_activity("estimating preflight context")
+        except Exception:
+            pass
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
@@ -424,6 +441,10 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
+        try:
+            agent._touch_activity("running pre-LLM hooks")
+        except Exception:
+            pass
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",
@@ -478,6 +499,10 @@ def build_turn_context(
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
+            try:
+                agent._touch_activity("prefetching external memory")
+            except Exception:
+                pass
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(
                 _query,
@@ -485,6 +510,11 @@ def build_turn_context(
             ) or ""
         except Exception:
             pass
+
+    try:
+        agent._touch_activity("turn preparation complete")
+    except Exception:
+        pass
 
     return TurnContext(
         user_message=user_message,

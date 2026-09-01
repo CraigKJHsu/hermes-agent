@@ -81,6 +81,21 @@ def _install_policy(namespace: str, content: str = "# Brand policy\n\nMust compl
     )
 
 
+def _disable_model_receipt_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    from proactive import model_routing
+
+    monkeypatch.setattr(
+        model_routing,
+        "execution_receipt_from_env",
+        lambda _raw: {"test": True},
+    )
+    monkeypatch.setattr(
+        model_routing,
+        "validate_grace_acceptance_receipt",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 def test_topic_binding_resolves_complete_policy_into_contract(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     namespace = "telegram:chat:5000/project"
@@ -312,6 +327,7 @@ def test_initial_activation_can_cas_against_no_active_version(tmp_path, monkeypa
 def test_latest_active_contract_and_review_fail_closed_after_policy_update(
     tmp_path, monkeypatch
 ):
+    _disable_model_receipt_gate(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     namespace = "topic:stale"
     _install_policy(namespace, "version one")
@@ -488,6 +504,7 @@ def test_policy_text_cannot_change_execution_receipt_role(tmp_path, monkeypatch)
 
 
 def test_current_policy_review_with_exact_receipt_is_accepted(tmp_path, monkeypatch):
+    _disable_model_receipt_gate(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     namespace = "topic:current-review"
     _install_policy(namespace)
@@ -605,6 +622,12 @@ def test_empty_topic_binding_is_pinned_and_rejected_if_policy_is_added(
     assert normalized.get("policy_snapshots") is None
     review_body = render_review_body(normalized, "t_parent")
     assert "GRACE_POLICY_SNAPSHOT:" in review_body
+    assert "expected unchanged state and is not a blocker" in review_body
+    assert "policy_receipts=[]" in review_body
+
+    resolved = resolve_task_policy_snapshots(review_body)
+    assert resolved["binding"] == normalized["policy_binding_snapshot"]
+    assert resolved["policies"] == []
 
     create_policy_version(
         "new-policy",
@@ -619,6 +642,9 @@ def test_empty_topic_binding_is_pinned_and_rejected_if_policy_is_added(
         [{"policy_id": "new-policy", "resolution": "latest_active"}],
         expected_binding_sha256=None,
     )
+
+    with pytest.raises(PolicyRegistryError, match="Topic policy binding changed"):
+        resolve_task_policy_snapshots(review_body)
 
     with pytest.raises(PolicyRegistryError, match="Topic policy binding changed"):
         validate_policy_completion(
