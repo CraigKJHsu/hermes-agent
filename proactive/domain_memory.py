@@ -283,6 +283,25 @@ def normalize_memory_deltas(
         field = f"metadata.domain_memory_deltas[{index}]"
         if not isinstance(raw, Mapping):
             raise DomainMemoryError(f"{field} must be an object")
+        top_level_artifact_fields = {
+            "artifact_id",
+            "artifact_type",
+            "artifact_key",
+            "platform",
+            "external_id",
+            "public_url",
+            "evidence_url",
+            "evidence_ref",
+            "group_id",
+            "group_name",
+        }
+        misplaced = sorted(top_level_artifact_fields.intersection(raw.keys()))
+        if misplaced:
+            raise DomainMemoryError(
+                f"{field} must be an entity delta with artifact state inside "
+                "artifacts[]; top-level artifact fields are not allowed: "
+                + ", ".join(misplaced)
+            )
         operation = str(raw.get("operation") or "upsert").strip().casefold()
         if operation != "upsert":
             raise DomainMemoryError(f"{field}.operation must be upsert")

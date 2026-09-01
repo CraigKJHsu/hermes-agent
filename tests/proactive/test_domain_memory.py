@@ -143,6 +143,25 @@ def test_materialized_artifact_requires_exact_evidence_ref():
         normalize_memory_deltas([raw], spec)
 
 
+def test_mutation_delta_rejects_top_level_artifact_shape():
+    spec = attach_domain_memory_contract(
+        _contract(task_type="facebook_page_api_publish")
+    )["domain_memory"]
+    raw = {
+        "operation": "upsert",
+        "entity_id": "carters-junk-away-ep04",
+        "label": "Carter's Junk Away",
+        "status": "published",
+        "artifact_type": "facebook_page_post",
+        "artifact_id": "facebook:page:123_456",
+        "platform": "facebook",
+        "public_url": "https://www.facebook.com/123/posts/456",
+    }
+
+    with pytest.raises(DomainMemoryError, match="artifact state inside artifacts"):
+        normalize_memory_deltas([raw], spec)
+
+
 def test_builtin_schema_cannot_be_redefined_under_same_id():
     with pytest.raises(DomainMemoryError, match="conflicts with built-in"):
         normalize_domain_memory_contract({

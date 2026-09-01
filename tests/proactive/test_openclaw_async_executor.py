@@ -905,11 +905,23 @@ def test_domain_mutation_loop_contract_sends_terminal_result_contract(kanban_hom
     assert result_contract["format"] == "single_valid_json_object"
     assert "python_expression" in result_contract["forbidden"]
     assert "domainMemoryDeltas" in result_contract["required_top_level_keys"]
+    assert (
+        result_contract["domainMemoryDeltas"]["shape"]
+        == "array of entity deltas; each delta must use artifacts[] for artifact state"
+    )
+    assert (
+        "artifact_type"
+        in result_contract["domainMemoryDeltas"]["forbidden_top_level_artifact_fields"]
+    )
     assert result_contract["domainMemoryDeltas"]["artifact_types"] == [
         "shopee_listing",
         "facebook_marketplace_listing",
         "facebook_group_post",
     ]
+    assert (
+        result_contract["externalEffects"]["zero_effects_allowed_only_when_status"]
+        == "blocked"
+    )
     assert result_contract["facebook_group_publish"]["destination_count"] == 1
     assert (
         result_contract["facebook_group_publish"]["per_destination_external_effect"][

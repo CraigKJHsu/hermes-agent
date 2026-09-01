@@ -531,6 +531,7 @@ def _worker_safe_loop_contract(
             "domainMemoryDeltas": {
                 "required_when_status": "succeeded",
                 "operation": "upsert",
+                "shape": "array of entity deltas; each delta must use artifacts[] for artifact state",
                 "entity_required_fields": list(
                     domain_spec.get("required_entity_fields") or []
                 ),
@@ -539,14 +540,29 @@ def _worker_safe_loop_contract(
                     domain_spec.get("required_artifact_fields") or []
                 ),
                 "evidence_ref_format": "task_external_effect:<platform>:<effect_key>",
+                "forbidden_top_level_artifact_fields": [
+                    "artifact_id",
+                    "artifact_type",
+                    "artifact_key",
+                    "platform",
+                    "external_id",
+                    "public_url",
+                    "evidence_url",
+                    "evidence_ref",
+                    "group_id",
+                    "group_name",
+                ],
                 "notes": [
+                    "Do not return one flat delta per artifact; put artifacts inside the parent entity delta's artifacts array.",
                     "Represent every artifact slot explicitly; use status=unknown or not_published for slots not changed.",
                     "Every materialized artifact must cite an exact externalEffects entry via evidence_ref.",
+                    "If no new external write is performed in a mutation task, return status=blocked with the readback evidence and blocker classification; do not report succeeded.",
                 ],
             },
             "externalEffects": {
                 "required_for_materialized_artifacts": True,
                 "effect_key_examples": ["group:<numeric_id>", "create"],
+                "zero_effects_allowed_only_when_status": "blocked",
             },
         }
         group_publish = safe.get("facebook_group_publish")
