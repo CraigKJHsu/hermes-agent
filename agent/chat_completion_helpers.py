@@ -1264,6 +1264,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        fb_reasoning_effort = str(fb.get("reasoning_effort") or "").strip().lower()
+        if fb_reasoning_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed_fb_reasoning = parse_reasoning_effort(fb_reasoning_effort)
+            if parsed_fb_reasoning is not None:
+                agent.reasoning_config = parsed_fb_reasoning
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -1401,6 +1408,30 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
+        routing_receipt_raw = os.environ.get("HERMES_MODEL_ROUTING_RECEIPT", "")
+        kanban_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        if routing_receipt_raw and kanban_task_id:
+            try:
+                routing_receipt = json.loads(routing_receipt_raw)
+                if (
+                    isinstance(routing_receipt, dict)
+                    and routing_receipt.get("task_id") == kanban_task_id
+                ):
+                    routing_receipt["effective_model"] = fb_model
+                    if fb_reasoning_effort:
+                        routing_receipt["effective_reasoning_effort"] = (
+                            fb_reasoning_effort
+                        )
+                    routing_receipt["fallback_applied"] = True
+                    routing_receipt["fallback_provider"] = fb_provider
+                    os.environ["HERMES_MODEL_ROUTING_RECEIPT"] = json.dumps(
+                        routing_receipt,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+            except (TypeError, ValueError):
+                logger.exception("Could not update Kanban model-routing receipt")
         return True
     except Exception as e:
         logger.error("Failed to activate fallback %s: %s", fb_model, e)

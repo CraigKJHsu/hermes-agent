@@ -77,6 +77,10 @@ _MARKETPLACE_BROAD_MUTATION_BANS = (
     "不得對 facebook 做任何變更",
     "不對 facebook 做任何變更",
 )
+_FACEBOOK_GROUP_CANONICAL_URL_RE = re.compile(
+    r"^https://(?:www\.)?facebook\.com/groups/([1-9][0-9]*)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
 
 
 class LoopContractError(ValueError):
@@ -242,6 +246,104 @@ def canonical_marketplace_readonly_sections(
     }
 
 
+def facebook_group_publish_destination_ids(
+    contract: Mapping[str, Any],
+) -> set[str]:
+    """Return exact numeric group IDs from canonical per-group publish scope.
+
+    This scope is intentionally separate from Marketplace's ``List in more
+    places`` chooser.  The chooser can hide numeric IDs, so writable contracts
+    must bind every destination to a known canonical group URL before a worker
+    is allowed to navigate there or report an external effect.
+    """
+    publish = contract.get("facebook_group_publish")
+    if not isinstance(publish, Mapping):
+        return set()
+    destinations = publish.get("destinations")
+    if not isinstance(destinations, list):
+        return set()
+    ids: set[str] = set()
+    for item in destinations:
+        if not isinstance(item, Mapping):
+            continue
+        group_id = str(item.get("group_id") or "").strip()
+        if re.fullmatch(r"[1-9][0-9]*", group_id):
+            ids.add(group_id)
+    return ids
+
+
+def _validate_facebook_group_publish_scope(
+    value: Mapping[str, Any],
+) -> list[str]:
+    publish = value.get("facebook_group_publish")
+    if publish is None:
+        return []
+    errors: list[str] = []
+    if not isinstance(publish, Mapping):
+        return ["facebook_group_publish must be an object"]
+    mode = str(publish.get("mode") or "").strip()
+    if mode != "canonical_url_per_group":
+        errors.append(
+            "facebook_group_publish.mode must be canonical_url_per_group"
+        )
+    source_listing_id = str(publish.get("source_listing_id") or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", source_listing_id):
+        errors.append(
+            "facebook_group_publish.source_listing_id must be canonical ASCII digits"
+        )
+    management_listing_id = str(publish.get("management_listing_id") or "").strip()
+    if management_listing_id and not re.fullmatch(r"[1-9][0-9]*", management_listing_id):
+        errors.append(
+            "facebook_group_publish.management_listing_id must be canonical ASCII digits"
+        )
+    destinations = publish.get("destinations")
+    if not isinstance(destinations, list) or not destinations:
+        errors.append("facebook_group_publish.destinations must be a non-empty list")
+        return errors
+    seen: set[str] = set()
+    for index, item in enumerate(destinations):
+        prefix = f"facebook_group_publish.destinations[{index}]"
+        if not isinstance(item, Mapping):
+            errors.append(f"{prefix} must be an object")
+            continue
+        group_id = str(item.get("group_id") or "").strip()
+        canonical_name = str(item.get("canonical_name") or "").strip()
+        canonical_url = str(item.get("canonical_url") or "").strip()
+        if not re.fullmatch(r"[1-9][0-9]*", group_id):
+            errors.append(f"{prefix}.group_id must be canonical ASCII digits")
+        elif group_id in seen:
+            errors.append(f"{prefix}.group_id duplicates another destination")
+        else:
+            seen.add(group_id)
+        if not canonical_name:
+            errors.append(f"{prefix}.canonical_name must be non-empty")
+        url_match = _FACEBOOK_GROUP_CANONICAL_URL_RE.fullmatch(canonical_url)
+        if url_match is None:
+            errors.append(
+                f"{prefix}.canonical_url must be https://www.facebook.com/groups/<numeric_id>"
+            )
+        elif group_id and url_match.group(1) != group_id:
+            errors.append(f"{prefix}.canonical_url must match group_id")
+    external_targets = value.get("external_targets")
+    if isinstance(external_targets, list):
+        target_ids = {
+            match.group(1)
+            for target in external_targets
+            for match in [
+                re.search(r"\bgroup:([1-9][0-9]*)\b", str(target), re.IGNORECASE),
+                _FACEBOOK_GROUP_CANONICAL_URL_RE.search(str(target).strip()),
+            ]
+            if match is not None
+        }
+        missing = sorted(seen - target_ids)
+        if missing:
+            errors.append(
+                "facebook_group_publish destinations must also appear in "
+                f"external_targets: {', '.join(missing)}"
+            )
+    return errors
+
+
 def contract_fingerprint(contract: Mapping[str, Any]) -> str:
     """Return the immutable scope fingerprint used by approval and callbacks.
 
@@ -315,11 +417,24 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         "stop_rules.blocked",
         "stop_rules.no_progress",
         "memory.working",
-        "memory.promote_on_acceptance",
     ):
         required_list(path)
+    promote_on_acceptance = (value.get("memory") or {}).get(
+        "promote_on_acceptance"
+    )
+    if (
+        not isinstance(promote_on_acceptance, list)
+        or any(
+            not isinstance(item, str) or not item.strip()
+            for item in promote_on_acceptance
+        )
+    ):
+        errors.append(
+            "memory.promote_on_acceptance must be a list of non-empty strings"
+        )
     if "external_targets" in value:
         required_list("external_targets")
+    errors.extend(_validate_facebook_group_publish_scope(value))
 
     objective_ref = value.get("objective_ref")
     if objective_ref is not None:

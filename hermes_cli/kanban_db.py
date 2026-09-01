@@ -385,6 +385,10 @@ _FACEBOOK_GROUP_TARGET_RE = re.compile(
     r"(?P<url_group_id>[0-9]+)/?)?",
     flags=re.IGNORECASE,
 )
+_FACEBOOK_GROUP_CANONICAL_URL_RE = re.compile(
+    r"https://(?:www\.)?facebook\.com/groups/([1-9][0-9]*)(?:[/?#].*)?",
+    flags=re.IGNORECASE,
+)
 
 
 def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
@@ -438,25 +442,49 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
     contract = _grace_compiled_contract(body)
     if contract is None:
         return frozenset()
-    targets = contract.get("external_targets")
-    if not isinstance(targets, list):
-        return frozenset()
     group_ids: set[str] = set()
-    for target in targets:
-        normalized = str(target or "").strip()
-        scoped_match = re.fullmatch(r"group:([1-9][0-9]*)", normalized, flags=re.IGNORECASE)
-        if scoped_match is not None:
-            group_ids.add(scoped_match.group(1))
-            continue
-        match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
-        if match is not None:
-            group_id = match.group("group_id")
-            url_group_id = match.group("url_group_id")
-            if url_group_id is not None and url_group_id != group_id:
+    targets = contract.get("external_targets")
+    if isinstance(targets, list):
+        for target in targets:
+            normalized = str(target or "").strip()
+            scoped_match = re.fullmatch(
+                r"group:([1-9][0-9]*)",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+            if scoped_match is not None:
+                group_ids.add(scoped_match.group(1))
+                continue
+            url_match = _FACEBOOK_GROUP_CANONICAL_URL_RE.fullmatch(normalized)
+            if url_match is not None:
+                group_ids.add(url_match.group(1))
+                continue
+            match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
+            if match is not None:
+                group_id = match.group("group_id")
+                url_group_id = match.group("url_group_id")
+                if url_group_id is not None and url_group_id != group_id:
+                    return frozenset()
+                group_ids.add(group_id)
+            elif normalized.casefold().startswith("facebook group"):
                 return frozenset()
-            group_ids.add(group_id)
-        elif normalized.casefold().startswith("facebook group"):
-            return frozenset()
+    publish = contract.get("facebook_group_publish")
+    if isinstance(publish, Mapping):
+        destinations = publish.get("destinations")
+        if isinstance(destinations, list):
+            for item in destinations:
+                if not isinstance(item, Mapping):
+                    return frozenset()
+                group_id = str(item.get("group_id") or "").strip()
+                canonical_url = str(item.get("canonical_url") or "").strip()
+                url_match = _FACEBOOK_GROUP_CANONICAL_URL_RE.fullmatch(canonical_url)
+                if (
+                    not re.fullmatch(r"[1-9][0-9]*", group_id)
+                    or url_match is None
+                    or url_match.group(1) != group_id
+                ):
+                    return frozenset()
+                group_ids.add(group_id)
     return frozenset(group_ids)
 
 
@@ -14328,9 +14356,14 @@ def ensure_grace_objective_stage(
         stages = json.loads(objective["required_stage_keys"])
         if clean_stage_key not in stages:
             retry_base_stage_key = _grace_objective_retry_base_stage_key(clean_stage_key)
+            terminal_stage_key = str(objective["terminal_stage_key"] or "").strip()
+            retry_root_stage_key = _grace_objective_retry_root_stage_key(clean_stage_key)
+            terminal_root_stage_key = _grace_objective_retry_root_stage_key(
+                terminal_stage_key
+            )
             if (
                 retry_base_stage_key
-                and retry_base_stage_key == objective["terminal_stage_key"]
+                and retry_root_stage_key == terminal_root_stage_key
                 and retry_base_stage_key in stages
             ):
                 terminal_stage = conn.execute(
@@ -14338,7 +14371,7 @@ def ensure_grace_objective_stage(
                     SELECT * FROM grace_objective_stages
                      WHERE objective_id = ? AND stage_key = ?
                     """,
-                    (clean_objective_id, retry_base_stage_key),
+                    (clean_objective_id, terminal_stage_key),
                 ).fetchone()
                 if terminal_stage is not None and terminal_stage["status"] != "done":
                     superseded_evidence = _canonical_json(
@@ -14367,7 +14400,7 @@ def ensure_grace_objective_stage(
                             now,
                             now,
                             clean_objective_id,
-                            retry_base_stage_key,
+                            terminal_stage_key,
                         ),
                     )
                 next_position = (
@@ -14632,6 +14665,16 @@ def _grace_objective_retry_base_stage_key(stage_key: str) -> str:
     return root_stage_key
 
 
+def _grace_objective_recovery_stage_key(stage_key: str) -> bool:
+    return (
+        re.fullmatch(
+            r"(?:prepare|recover|recovery)_[A-Za-z0-9][A-Za-z0-9_-]*",
+            str(stage_key or "").strip(),
+        )
+        is not None
+    )
+
+
 def _grace_objective_stage_matches_request(actual: Any, requested: str) -> bool:
     actual_stage = str(actual or "").strip()
     requested_stage = str(requested or "").strip()
@@ -14673,7 +14716,9 @@ def grace_objective_stage_mode(
     stages = json.loads(row["required_stage_keys"])
     if clean_stage not in stages:
         retry_base_stage_key = _grace_objective_retry_base_stage_key(clean_stage)
-        if retry_base_stage_key not in stages:
+        if retry_base_stage_key not in stages and not _grace_objective_recovery_stage_key(
+            clean_stage
+        ):
             raise ValueError("Grace objective stage is not declared in required_stage_keys")
         ensure_grace_objective_stage(
             conn,

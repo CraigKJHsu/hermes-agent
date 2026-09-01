@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import (
@@ -12,6 +13,25 @@ from proactive.grace_task_compiler import (
 )
 from proactive.hubops_routing import resolved_route_binding, route_clawops_objective
 from proactive.loop_contract import contract_fingerprint, validate_loop_contract
+from proactive.policy_registry import create_policy_version
+
+
+def _activate_model_routing_policy() -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version=None,
+    )
 
 
 def _image_contract() -> dict:
@@ -137,6 +157,7 @@ def _openclaw_loop_result(task: dict, backend_agent_id: str = "missioncrew-conte
 def test_image_generation_loop_contract_routes_to_openclaw_content(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    _activate_model_routing_policy()
     from proactive import openclaw_async_executor
 
     monkeypatch.setattr(
@@ -251,6 +272,7 @@ def test_internal_only_image_generation_contract_uses_content_runtime_without_to
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    _activate_model_routing_policy()
     from proactive import openclaw_async_executor
 
     monkeypatch.setattr(
@@ -339,6 +361,7 @@ def test_source_bound_content_contract_exposes_original_request_to_openclaw(
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    _activate_model_routing_policy()
     from proactive import openclaw_async_executor
 
     seen: dict[str, dict] = {}
@@ -442,6 +465,7 @@ def test_source_truth_content_contract_exposes_original_request_to_openclaw(
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    _activate_model_routing_policy()
     from proactive import openclaw_async_executor
 
     seen: dict[str, dict] = {}
@@ -587,6 +611,7 @@ def test_image_generation_contract_does_not_use_internal_hermes_runtime():
 def test_internal_ops_contract_uses_hermes_ops_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db()
+    _activate_model_routing_policy()
 
     contract = _image_contract()
     contract["identity"]["request_instance_id"] = "internal-ops-contract-1"

@@ -1,8 +1,17 @@
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive import grace_memory_promotion as promotion
+from proactive.model_routing import (
+    attest_runtime_execution,
+    route_grace,
+    routing_env,
+)
+from proactive.policy_registry import create_policy_version
 
 
 NAMESPACE = "telegram:-1003938559457:2680/dementia_care"
@@ -46,7 +55,44 @@ def _write_memory_config(home: Path, *, limit: int) -> None:
     )
 
 
-def test_accepted_review_completion_queues_exact_memory_outbox(tmp_path):
+def _attest_review_route(conn, review_id: str, home: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version=None,
+    )
+    route = route_grace("acceptance_review")
+    conn.execute(
+        "UPDATE tasks SET model_override = ?, routing_decision = ? WHERE id = ?",
+        (
+            route["requested_model"],
+            json.dumps({"selected_backend": "hermes", "model_route": route}),
+            review_id,
+        ),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
+    for key, value in routing_env(route, task_id=review_id).items():
+        monkeypatch.setenv(key, value)
+    attest_runtime_execution(
+        model=route["requested_model"],
+        reasoning_effort=route["reasoning_effort"],
+        api_mode="codex_responses",
+    )
+    assert os.environ.get("HERMES_MODEL_ROUTING_RECEIPT")
+
+
+def test_accepted_review_completion_queues_exact_memory_outbox(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
@@ -56,6 +102,7 @@ def test_accepted_review_completion_queues_exact_memory_outbox(tmp_path):
             body=_review_body(),
             assignee="default",
         )
+        _attest_review_route(conn, review_id, tmp_path / "hermes", monkeypatch)
         assert kb.complete_task(
             conn,
             review_id,
@@ -79,7 +126,7 @@ def test_accepted_review_completion_queues_exact_memory_outbox(tmp_path):
     assert run.metadata["memory_promotion"]["promotion_id"] == row["id"]
 
 
-def test_memory_outbox_claim_and_finish_updates_run_metadata(tmp_path):
+def test_memory_outbox_claim_and_finish_updates_run_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
@@ -89,6 +136,7 @@ def test_memory_outbox_claim_and_finish_updates_run_metadata(tmp_path):
             body=_review_body(),
             assignee="default",
         )
+        _attest_review_route(conn, review_id, tmp_path / "hermes", monkeypatch)
         assert kb.complete_task(
             conn,
             review_id,

@@ -277,6 +277,34 @@ _OBJECTIVE_REF = {
     "required": ["objective_id", "stage_key"],
     "additionalProperties": False,
 }
+_FACEBOOK_GROUP_PUBLISH_DESTINATION = {
+    "type": "object",
+    "properties": {
+        "group_id": {"type": "string"},
+        "canonical_name": {"type": "string"},
+        "canonical_url": {"type": "string"},
+    },
+    "required": ["group_id", "canonical_name", "canonical_url"],
+    "additionalProperties": False,
+}
+_FACEBOOK_GROUP_PUBLISH = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["canonical_url_per_group"],
+        },
+        "source_listing_id": {"type": "string"},
+        "management_listing_id": {"type": "string"},
+        "destinations": {
+            "type": "array",
+            "items": _FACEBOOK_GROUP_PUBLISH_DESTINATION,
+            "minItems": 1,
+        },
+    },
+    "required": ["mode", "source_listing_id", "destinations"],
+    "additionalProperties": False,
+}
 
 CLAWOPS_DELEGATE_PARAMETERS = {
     "type": "object",
@@ -296,6 +324,14 @@ CLAWOPS_DELEGATE_PARAMETERS = {
                 "Required when the active Topic prompt names a durable Grace "
                 "objective. The database, not the model, decides whether this "
                 "stage is terminal or intermediate."
+            ),
+        },
+        "facebook_group_publish": {
+            **_FACEBOOK_GROUP_PUBLISH,
+            "description": (
+                "Use for Facebook group publishing that must avoid Marketplace "
+                "chooser identity. Each destination is bound to exact numeric "
+                "group_id, canonical_name, and canonical_url."
             ),
         },
         "task_type": {
@@ -1351,6 +1387,7 @@ def _stable_contract_discriminator(
                 "completion_mode": str(args.get("completion_mode") or "").strip(),
                 "user_facing_delivery": args.get("user_facing_delivery"),
                 "objective_ref": args.get("objective_ref"),
+                "facebook_group_publish": args.get("facebook_group_publish"),
                 "external_targets": external_targets,
             },
             ensure_ascii=False,
@@ -1951,6 +1988,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
         if external_targets:
             contract["external_targets"] = external_targets
+        if isinstance(args.get("facebook_group_publish"), dict):
+            contract["facebook_group_publish"] = dict(
+                args["facebook_group_publish"]
+            )
         if task_type == "facebook_page_api_publish":
             contract["facebook_page_post"] = _bind_facebook_page_publish_manifest(
                 scope,

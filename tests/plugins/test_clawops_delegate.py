@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from proactive.policy_registry import create_policy_version
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +40,25 @@ def _isolated_openclaw_loop_backend(monkeypatch):
     monkeypatch.setattr(
         "proactive.openclaw_async_executor.delegate_loop_contract_to_openclaw",
         accepted,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _active_model_routing_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-policy"))
+    policy_source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        policy_source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
     )
 
 
@@ -118,6 +139,21 @@ def _external_listing_args():
 
 
 def _configure_secondhand_context(tmp_path, monkeypatch, values):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-policy"))
+    policy_source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        policy_source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+    )
     registry = tmp_path / "registry.yaml"
     registry.write_text(
         "version: 1\ncontexts:\n"
@@ -1239,6 +1275,69 @@ def test_delegate_records_scope_bound_approval_from_owner_turn(
             "SELECT COUNT(*) FROM grace_approval_challenges"
         ).fetchone()[0]
     assert challenge_count == 1
+
+
+def test_delegate_preserves_canonical_group_publish_scope_in_challenge(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-canonical-group-publish",
+        "HERMES_SESSION_MESSAGE_TEXT": "請準備逐社團 canonical URL 重刊核准",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args["original_request"] = "重新刊登到指定 Facebook 社團"
+    args["goal"]["objective"] = "逐一重新刊登 Kolin KD-291M06 到指定 Facebook 社團"
+    args["goal"]["deliverables"] = ["指定社團刊登結果"]
+    args["scope"]["allowed"] = [
+        "使用 source listing 37276725125275496",
+        "逐一開啟 https://www.facebook.com/groups/897927458651235",
+    ]
+    args["scope"]["forbidden"] = ["不得使用 chooser-only row 當作社團身份"]
+    args["verification"]["checks"] = ["驗證 group_id、canonical_name、canonical_url 一致"]
+    args["verification"]["evidence_required"] = ["每個 group:<id> external_effect"]
+    args["verification"]["acceptance_criteria"] = ["所有 external_effect 均在 allowlist 內"]
+    args["task_type"] = "secondhand_commerce_cross_platform_listing"
+    args["risk_level"] = "medium"
+    args["external_targets"] = [
+        "facebook marketplace listing 37276725125275496",
+        "https://www.facebook.com/groups/897927458651235",
+    ]
+    args["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "management_listing_id": "915975414881937",
+        "destinations": [
+            {
+                "group_id": "897927458651235",
+                "canonical_name": "二手家具 家電 買賣",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }
+        ],
+    }
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    challenge = json.loads(handle_clawops_delegate(args))
+
+    assert challenge["status"] == "approval_required"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        stored = kb.get_grace_approval_challenge(
+            conn,
+            challenge["approval_token"],
+        )
+    durable_args = json.loads(stored["delegation_args"])
+    assert durable_args["facebook_group_publish"] == args["facebook_group_publish"]
+    compiled = durable_args["_approval_compiled_contract"]
+    assert compiled["facebook_group_publish"] == args["facebook_group_publish"]
 
 
 def test_approval_token_cannot_escape_to_nonapproval_contract(
@@ -2509,9 +2608,24 @@ def test_callback_outcome_uses_originating_nondefault_board(
 def test_fresh_approval_continuation_preserves_nondefault_board(
     tmp_path,
     monkeypatch,
-):
+) -> None:
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-policy"))
+    policy_source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        policy_source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+    )
     registry = tmp_path / "registry.yaml"
     registry.write_text(
         "version: 1\ncontexts:\n"

@@ -5,6 +5,7 @@ import pytest
 from proactive.loop_contract import (
     LoopContractError,
     browser_readonly_marketplace_fallback_listing_id,
+    facebook_group_publish_destination_ids,
     is_internal_only_target,
     validate_loop_contract,
 )
@@ -40,6 +41,15 @@ def test_complete_loop_contract_is_accepted():
     assert validate_loop_contract(_contract())["contract_version"] == "1.0"
 
 
+def test_contract_can_explicitly_disable_durable_memory_promotion():
+    contract = _contract()
+    contract["memory"]["promote_on_acceptance"] = []
+
+    accepted = validate_loop_contract(contract)
+
+    assert accepted["memory"]["promote_on_acceptance"] == []
+
+
 def test_content_package_user_facing_delivery_is_accepted():
     contract = _contract()
     contract["user_facing_delivery"] = {
@@ -63,6 +73,57 @@ def test_content_package_user_facing_delivery_requires_assets():
     }
 
     with pytest.raises(LoopContractError, match="asset_filenames"):
+        validate_loop_contract(contract)
+
+
+def test_facebook_group_publish_requires_canonical_url_per_group():
+    contract = _contract()
+    contract["external_targets"] = [
+        "facebook marketplace listing 37276725125275496",
+        "https://www.facebook.com/groups/897927458651235",
+    ]
+    contract["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "management_listing_id": "915975414881937",
+        "destinations": [
+            {
+                "group_id": "897927458651235",
+                "canonical_name": "二手家具 家電 買賣",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }
+        ],
+    }
+
+    accepted = validate_loop_contract(contract)
+
+    assert facebook_group_publish_destination_ids(accepted) == {"897927458651235"}
+
+
+def test_facebook_group_publish_rejects_chooser_only_or_mismatched_identity():
+    contract = _contract()
+    contract["external_targets"] = ["group:897927458651235"]
+    contract["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "destinations": [
+            {
+                "group_id": "897927458651235",
+                "canonical_name": "二手家具 家電 買賣",
+                "canonical_url": "https://www.facebook.com/groups/123",
+            }
+        ],
+    }
+
+    with pytest.raises(LoopContractError, match="canonical_url must match group_id"):
+        validate_loop_contract(contract)
+
+    contract["facebook_group_publish"]["destinations"][0]["canonical_url"] = (
+        "https://www.facebook.com/groups/897927458651235"
+    )
+    contract["external_targets"] = ["Facebook chooser row: 二手家具 家電 買賣"]
+
+    with pytest.raises(LoopContractError, match="must also appear in external_targets"):
         validate_loop_contract(contract)
 
 
@@ -167,6 +228,29 @@ def test_review_body_explains_canonical_verdict_for_fail_closed_parent():
     assert "Do not set approved=false" in review
     assert "review_outcome=blocked" in review
     assert "parent_verdict" in review
+
+
+def test_facebook_group_publish_body_forbids_chooser_identity():
+    contract = _contract()
+    contract["external_targets"] = ["group:897927458651235"]
+    contract["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "destinations": [
+            {
+                "group_id": "897927458651235",
+                "canonical_name": "二手家具 家電 買賣",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }
+        ],
+    }
+
+    execution = render_execution_body(contract)
+    review = render_review_body(contract, "t_execution")
+
+    assert "canonical_url_per_group" in execution
+    assert "Do not use Marketplace 'List in more places' chooser rows" in execution
+    assert "canonical_url_per_group" in review
 
 
 def test_text_only_review_body_does_not_require_page_hero_visual_review():

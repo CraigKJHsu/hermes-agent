@@ -3753,15 +3753,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        source: Optional["SessionSource"] = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        Grace's model and reasoning are selected by the active managed policy;
+        session config still supplies the provider credentials and endpoint.
+        If `/fast` is enabled and the model supports Priority Processing /
+        Anthropic fast mode, attach request overrides for that API call.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_constants import parse_reasoning_effort
+        from proactive.model_routing import (
+            MODEL_TERRA,
+            ModelRoutingError,
+            classify_grace_message,
+            route_grace,
+        )
+
+        profile_name = str(
+            (getattr(source, "profile", None) if source is not None else None)
+            or self._active_profile_name()
+            or ""
+        ).strip().lower()
+        is_grace_turn = source is not None and profile_name in {
+            "default",
+            "grace",
+            "missioncrew-grace",
+        }
+        grace_route = (
+            route_grace("planning", classify_grace_message(user_message))
+            if is_grace_turn
+            else None
+        )
+        managed_provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+        managed_base_url = str(runtime_kwargs.get("base_url") or "").strip().lower()
+        provider_compatible = managed_provider in {"openai-codex", "openai"}
+        if managed_provider == "openai":
+            provider_compatible = (
+                not managed_base_url
+                or managed_base_url.startswith("https://api.openai.com/")
+                or managed_base_url == "https://api.openai.com"
+            )
+        if (
+            not provider_compatible
+            and grace_route is not None
+            and grace_route.get("policy_source") == "managed_active"
+        ):
+            raise ModelRoutingError(
+                "MissionCrew Grace routing requires an OpenAI/OpenAI-Codex "
+                f"provider; configured provider is {managed_provider or 'missing'}"
+            )
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -3773,11 +3821,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        effective_model = (
+            grace_route["requested_model"]
+            if provider_compatible and grace_route is not None
+            else model
+        )
+        effective_reasoning = (
+            parse_reasoning_effort(grace_route["reasoning_effort"])
+            if provider_compatible and grace_route is not None
+            else getattr(self, "_reasoning_config", None)
+        )
+        if provider_compatible and grace_route is not None:
+            effective_fallback = (
+                [
+                    {
+                        "provider": runtime["provider"],
+                        "model": MODEL_TERRA,
+                        "reasoning_effort": "high",
+                    }
+                ]
+                if grace_route["fallback_allowed"]
+                else []
+            )
+        else:
+            effective_fallback = getattr(self, "_fallback_model", None)
         route = {
-            "model": model,
+            "model": effective_model,
             "runtime": runtime,
+            "reasoning_config": effective_reasoning,
+            "model_route": grace_route,
+            "fallback_model": effective_fallback,
             "signature": (
-                model,
+                effective_model,
+                grace_route["reasoning_effort"] if grace_route else None,
+                grace_route["policy_sha256"] if grace_route else None,
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
@@ -13349,7 +13426,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, source=source
+            )
+            reasoning_config = turn_route.get("reasoning_config", reasoning_config)
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -13396,7 +13476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    fallback_model=self._fallback_model,
+                    fallback_model=turn_route.get("fallback_model", self._fallback_model),
                 )
                 try:
                     return agent.run_conversation(
@@ -17932,7 +18012,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message, model, runtime_kwargs, source=source
+            )
+            reasoning_config = turn_route.get("reasoning_config", reasoning_config)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -18073,7 +18156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    fallback_model=self._fallback_model,
+                    fallback_model=turn_route.get("fallback_model", self._fallback_model),
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -18198,7 +18281,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return build_translator_detail_repair_prompt(errors)
 
                 agent.final_response_validator = _translator_detail_validator
+            if getattr(agent, "_fallback_activated", False):
+                # MissionCrew routing is evaluated per turn. A cached agent
+                # must not carry Terra's fallback runtime into the next Sol
+                # turn under the primary route signature.
+                agent._rate_limited_until = 0
+                if not agent._restore_primary_runtime():
+                    raise RuntimeError(
+                        "Could not restore Grace primary runtime after fallback"
+                    )
             agent.reasoning_config = reasoning_config
+            agent._fallback_chain = list(
+                turn_route.get("fallback_model", self._fallback_model) or []
+            )
+            agent._fallback_index = 0
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 

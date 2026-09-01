@@ -335,16 +335,29 @@ def test_delegation_reservation_declares_retry_stage_when_requested_stage_is_bou
         assert replay["stage_key"] == "publish_page_r2"
         rows = conn.execute(
             """
-            SELECT stage_key, delegation_id, status FROM grace_objective_stages
+            SELECT stage_key, delegation_id, status, outcome_kind FROM grace_objective_stages
              WHERE objective_id = 'go_test'
              ORDER BY position ASC
             """
         ).fetchall()
-        assert [(row["stage_key"], row["delegation_id"], row["status"]) for row in rows] == [
-            ("prepare_asset", None, "planned"),
-            ("publish_page", first["delegation_id"], "queued"),
-            ("publish_page_r2", second["delegation_id"], "queued"),
-            ("share_group", None, "planned"),
+        assert [
+            (
+                row["stage_key"],
+                row["delegation_id"],
+                row["status"],
+                row["outcome_kind"],
+            )
+            for row in rows
+        ] == [
+            ("prepare_asset", None, "planned", None),
+            (
+                "publish_page",
+                first["delegation_id"],
+                "done",
+                "superseded_by_retry",
+            ),
+            ("publish_page_r2", second["delegation_id"], "queued", None),
+            ("share_group", None, "planned", None),
         ]
 
 
@@ -409,6 +422,54 @@ def test_adding_recovery_stage_reactivates_blocked_objective(tmp_path):
         assert objective["current_stage_key"] == "prepare_recovery_1"
         assert objective["waiting_for"] == ""
         assert objective["completed_at"] is None
+
+
+def test_stage_mode_declares_new_recovery_stage_family(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-stage-mode-recovery.db") as conn:
+        _create_objective(conn)
+        mode = kb.grace_objective_stage_mode(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_canonical_url_per_group",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+        )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        stages = conn.execute(
+            """
+            SELECT stage_key, status FROM grace_objective_stages
+             WHERE objective_id = 'go_test'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+
+        assert mode == "intermediate"
+        assert objective["current_stage_key"] == "prepare_canonical_url_per_group"
+        assert [row["stage_key"] for row in stages] == [
+            "prepare_asset",
+            "publish_page",
+            "prepare_canonical_url_per_group",
+            "share_group",
+        ]
+
+
+def test_stage_mode_rejects_undeclared_non_recovery_stage_family(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-stage-mode-invalid.db") as conn:
+        _create_objective(conn)
+        with pytest.raises(
+            ValueError,
+            match="stage is not declared in required_stage_keys",
+        ):
+            kb.grace_objective_stage_mode(
+                conn,
+                objective_id="go_test",
+                stage_key="execute_social_action",
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="4641",
+            )
 
 
 def test_appending_recovery_stage_supersedes_accepted_prior_prepare(tmp_path):
@@ -615,6 +676,59 @@ def test_terminal_retry_stage_becomes_new_terminal_and_supersedes_bound_terminal
                 "superseded_by_retry",
             ),
             ("execute_external_action_r2", None, "planned", None),
+        ]
+
+
+def test_terminal_retry_stage_family_can_advance_from_existing_retry(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-terminal-family-retry.db") as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_terminal",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            title="Execute external action",
+            objective="Publish to verified destinations.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=("execute_external_action",),
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=("External result verified",),
+            current_stage_key="execute_external_action",
+            next_action="Execute external action.",
+        )
+        kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_terminal",
+            stage_key="execute_external_action_r2",
+            next_action="Retry terminal action.",
+        )
+
+        mode = kb.grace_objective_stage_mode(
+            conn,
+            objective_id="go_terminal",
+            stage_key="execute_external_action_r3",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+        )
+        objective = kb.get_grace_objective(conn, "go_terminal")
+        stages = conn.execute(
+            """
+            SELECT stage_key, status, outcome_kind
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_terminal'
+             ORDER BY position ASC
+            """
+        ).fetchall()
+
+        assert mode == "terminal"
+        assert objective["terminal_stage_key"] == "execute_external_action_r3"
+        assert objective["current_stage_key"] == "execute_external_action_r3"
+        assert [row["stage_key"] for row in stages] == [
+            "execute_external_action",
+            "execute_external_action_r2",
+            "execute_external_action_r3",
         ]
 
 

@@ -359,6 +359,44 @@ def policy_status(policy_id: str) -> dict[str, Any]:
     return result
 
 
+def resolve_active_policy(
+    policy_id: str,
+    *,
+    sections: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return the verified active policy content and immutable receipt.
+
+    Runtime governance code should depend on a policy id, not on a mutable
+    persona or memory file.  This public wrapper preserves the registry's
+    digest/readback checks while keeping the lower-level requirement resolver
+    private.
+    """
+    return _resolve_requirement(
+        {
+            "policy_id": policy_id,
+            "resolution": "latest_active",
+            "sections": list(sections),
+        }
+    )
+
+
+def resolve_policy_snapshot(
+    policy_id: str,
+    version: str,
+    *,
+    sections: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return one immutable registry version after manifest and digest checks."""
+    return _resolve_requirement(
+        {
+            "policy_id": policy_id,
+            "resolution": "pinned_version",
+            "version": version,
+            "sections": list(sections),
+        }
+    )
+
+
 def bind_topic_policies(
     namespace: str,
     requirements: Sequence[Mapping[str, Any]],

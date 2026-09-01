@@ -10,7 +10,11 @@ from typing import Any, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
 from proactive.clawops_intake import create_clawops_task, subscribe_clawops_task
-from proactive.loop_contract import contract_fingerprint, validate_loop_contract
+from proactive.loop_contract import (
+    contract_fingerprint,
+    facebook_group_publish_destination_ids,
+    validate_loop_contract,
+)
 from proactive.policy_registry import policy_snapshot_marker
 from proactive.prompt_policy import evidence_first_answering_prompt
 from proactive.thread_context_registry import assert_contract_matches_context
@@ -360,6 +364,31 @@ def _render_approved_external_execution_guidance(contract: Mapping[str, Any]) ->
     ]
 
 
+def _render_facebook_group_publish_guidance(contract: Mapping[str, Any]) -> list[str]:
+    publish = contract.get("facebook_group_publish")
+    if not isinstance(publish, Mapping):
+        return []
+    if str(publish.get("mode") or "").strip() != "canonical_url_per_group":
+        return []
+    group_count = len(facebook_group_publish_destination_ids(contract))
+    return [
+        "Facebook group publish routing: this contract uses canonical_url_per_group. "
+        "Do not use Marketplace 'List in more places' chooser rows to establish "
+        "destination identity, because that chooser may hide numeric group IDs.",
+        "Operate one destination at a time from the contract's canonical_url values. "
+        "Before any write, verify the live page/group identity matches both group_id "
+        "and canonical_name from facebook_group_publish.destinations. If either value "
+        "is missing, hidden, ambiguous, or contradicted, block that destination without "
+        "posting there.",
+        "Every reported Facebook group external effect must use effect_key=group:<group_id>, "
+        "external_id=<group_id>, and details containing canonical_url, canonical_name, "
+        "source_listing_id, live identity readback, submit action readback, and post-submit "
+        "or pending-review readback.",
+        f"This contract declares {group_count} canonical per-group destination(s); do not "
+        "broaden to suggested groups, similarly named groups, or chooser-only rows.",
+    ]
+
+
 def render_execution_body(contract: Mapping[str, Any]) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
@@ -376,6 +405,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             evidence_first_answering_prompt(),
             *_render_policy_guidance(worker_contract, review=False),
             *_render_approved_external_execution_guidance(worker_contract),
+            *_render_facebook_group_publish_guidance(worker_contract),
             *_render_image_generation_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=False),
             "For each external draft/object you find or create, call kanban_external_effect "
@@ -451,6 +481,7 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "under parent_verdict or evidence instead.",
             *page_hero_guidance,
             *_render_policy_guidance(worker_contract, review=True),
+            *_render_facebook_group_publish_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=True),
             "For a requested user-facing status, inventory, or destination list, reject the "
             "parent unless metadata.user_facing_report is present, readable names are primary, "
@@ -697,6 +728,22 @@ def compile_and_delegate(
             board=board,
         )
         execution_task_id = execution.task_id
+        from proactive.model_routing import route_grace
+
+        review_route = route_grace(
+            "acceptance_review",
+            {
+                "task_risk": risk_level,
+                "memory_impact": (
+                    "durable"
+                    if normalized.get("memory", {}).get("promote_on_acceptance")
+                    else "none"
+                ),
+                "external_action": bool(
+                    normalized.get("external_effect_budget", {}).get("max_effects", 0)
+                ),
+            },
+        )
         with kb.connect_closing(board=board) as conn:
             review_task_id = kb.create_task(
                 conn,
@@ -718,6 +765,11 @@ def compile_and_delegate(
                 executor_backend="hermes",
                 executor_profile="grace-policy-review",
                 project_namespace=str(identity["project"]),
+                routing_decision={
+                    "selected_backend": "hermes",
+                    "model_route": review_route,
+                },
+                model_override=review_route["requested_model"],
             )
             if platform and chat_id:
                 for notification_task_id in (execution_task_id, review_task_id):

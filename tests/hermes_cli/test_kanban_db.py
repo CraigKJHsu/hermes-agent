@@ -16,6 +16,59 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from proactive.model_routing import (
+    attest_runtime_execution,
+    route_grace,
+    routing_env,
+)
+from proactive.policy_registry import create_policy_version
+
+
+def _install_model_routing_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-policy"))
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+    )
+
+
+def _create_attested_grace_review_task(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    _install_model_routing_policy(tmp_path, monkeypatch)
+    route = route_grace("acceptance_review")
+    review_id = kb.create_task(
+        conn,
+        title="Grace review",
+        body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
+        routing_decision={
+            "version": 1,
+            "mode": "test_model_route",
+            "selected_backend": "hermes",
+            "model_route": route,
+        },
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
+    for key, value in routing_env(route, task_id=review_id).items():
+        monkeypatch.setenv(key, value)
+    attest_runtime_execution(
+        model=route["requested_model"],
+        reasoning_effort=route["reasoning_effort"],
+        api_mode="codex_responses",
+    )
+    return review_id
 
 
 @pytest.fixture
@@ -624,14 +677,13 @@ def test_callback_outcome_accepts_approved_review_metadata(tmp_path):
     assert stored["outcome_kind"] == "closed"
 
 
-def test_grace_review_completion_normalizes_equivalent_accepted_metadata(tmp_path):
+def test_grace_review_completion_normalizes_equivalent_accepted_metadata(
+    tmp_path,
+    monkeypatch,
+):
     db_path = tmp_path / "normalized-review-metadata.db"
     with kb.connect_closing(db_path) as conn:
-        review_id = kb.create_task(
-            conn,
-            title="Grace review",
-            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
-        )
+        review_id = _create_attested_grace_review_task(conn, tmp_path, monkeypatch)
         assert kb.complete_task(
             conn,
             review_id,
@@ -652,14 +704,13 @@ def test_grace_review_completion_normalizes_equivalent_accepted_metadata(tmp_pat
     assert json.loads(row["metadata"])["review_outcome"] == "accepted"
 
 
-def test_grace_review_completion_accepts_structured_approved_metadata(tmp_path):
+def test_grace_review_completion_accepts_structured_approved_metadata(
+    tmp_path,
+    monkeypatch,
+):
     db_path = tmp_path / "structured-approved-review-metadata.db"
     with kb.connect_closing(db_path) as conn:
-        review_id = kb.create_task(
-            conn,
-            title="Grace review",
-            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
-        )
+        review_id = _create_attested_grace_review_task(conn, tmp_path, monkeypatch)
         assert kb.complete_task(
             conn,
             review_id,
@@ -677,14 +728,13 @@ def test_grace_review_completion_accepts_structured_approved_metadata(tmp_path):
     assert json.loads(row["metadata"])["review_outcome"] == "accepted"
 
 
-def test_grace_review_completion_rejects_noncanonical_accepted_alias(tmp_path):
+def test_grace_review_completion_rejects_noncanonical_accepted_alias(
+    tmp_path,
+    monkeypatch,
+):
     db_path = tmp_path / "rejected-review-accepted-alias.db"
     with kb.connect_closing(db_path) as conn:
-        review_id = kb.create_task(
-            conn,
-            title="Grace review",
-            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
-        )
+        review_id = _create_attested_grace_review_task(conn, tmp_path, monkeypatch)
         with pytest.raises(ValueError, match="canonical metadata"):
             kb.complete_task(
                 conn,
@@ -701,14 +751,13 @@ def test_grace_review_completion_rejects_noncanonical_accepted_alias(tmp_path):
     assert task.status != "done"
 
 
-def test_grace_review_completion_rejects_conflicting_canonical_verdict(tmp_path):
+def test_grace_review_completion_rejects_conflicting_canonical_verdict(
+    tmp_path,
+    monkeypatch,
+):
     db_path = tmp_path / "conflicting-review-verdict.db"
     with kb.connect_closing(db_path) as conn:
-        review_id = kb.create_task(
-            conn,
-            title="Grace review",
-            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
-        )
+        review_id = _create_attested_grace_review_task(conn, tmp_path, monkeypatch)
         with pytest.raises(ValueError, match="conflicts"):
             kb.complete_task(
                 conn,
@@ -2128,6 +2177,63 @@ def test_group_external_effect_updates_existing_commerce_ledger_row(tmp_path):
     assert rows[0]["status_label"] == "已提交但目的地讀回未確認"
     assert rows[0]["source_task_id"] == effect_id
     assert rows[0]["source_run_id"] is not None
+
+
+def test_group_completion_effect_allows_canonical_url_per_group_contract(tmp_path):
+    db_path = tmp_path / "canonical-url-group-effect.db"
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="canonical url group submit",
+            body="\n".join([
+                "GRACE_LOOP_CONTRACT_STAGE: execution",
+                "```json",
+                json.dumps({
+                    "external_targets": [
+                        "https://www.facebook.com/groups/897927458651235",
+                    ],
+                    "facebook_group_publish": {
+                        "mode": "canonical_url_per_group",
+                        "source_listing_id": "37276725125275496",
+                        "destinations": [
+                            {
+                                "group_id": "897927458651235",
+                                "canonical_name": "二手家具 家電 買賣",
+                                "canonical_url": (
+                                    "https://www.facebook.com/groups/897927458651235"
+                                ),
+                            }
+                        ],
+                    },
+                }),
+                "```",
+            ]),
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="submitted",
+            metadata={
+                "external_effects": [{
+                    "platform": "facebook",
+                    "effect_key": "group:897927458651235",
+                    "state": "verified",
+                    "external_id": "897927458651235",
+                    "details": {
+                        "canonical_url": "https://www.facebook.com/groups/897927458651235",
+                        "canonical_name": "二手家具 家電 買賣",
+                        "source_listing_id": "37276725125275496",
+                    },
+                }],
+            },
+        )
+        effects = kb.list_external_effects(conn, task_id)
+
+    assert [
+        (effect["effect_key"], effect["external_id"], effect["state"])
+        for effect in effects
+    ] == [("group:897927458651235", "897927458651235", "verified")]
 
 
 def test_partial_report_cannot_omit_known_destinations(tmp_path):

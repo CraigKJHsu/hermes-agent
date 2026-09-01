@@ -30,6 +30,7 @@ from proactive.execution_backends import (
 )
 from proactive.loop_contract import (
     contract_fingerprint,
+    facebook_group_publish_destination_ids,
     is_internal_only_target as _internal_only_external_target,
     validate_loop_contract,
 )
@@ -3629,6 +3630,10 @@ def _split_internal_tool_effects(
 
 
 _FACEBOOK_GROUP_EFFECT_RE = re.compile(r"\bgroup:([1-9][0-9]*)\b", re.IGNORECASE)
+_FACEBOOK_GROUP_URL_EFFECT_RE = re.compile(
+    r"https://(?:www\.)?facebook\.com/groups/([1-9][0-9]*)(?:[/?#].*)?",
+    re.IGNORECASE,
+)
 _MARKETPLACE_LISTING_EFFECT_RE = re.compile(
     r"\b(?:marketplace(?: listing)?|listing)[: ]+([1-9][0-9]*)\b",
     re.IGNORECASE,
@@ -3647,15 +3652,22 @@ def _contract_external_target_ids(
     group_ids: set[str] = set()
     listing_ids: set[str] = set()
     if not isinstance(targets, list):
+        if isinstance(contract, Mapping):
+            group_ids.update(facebook_group_publish_destination_ids(contract))
         return group_ids, listing_ids
     for target in targets:
         normalized = str(target or "").strip()
         group_match = _FACEBOOK_GROUP_EFFECT_RE.search(normalized)
         if group_match is not None:
             group_ids.add(group_match.group(1))
+        group_url_match = _FACEBOOK_GROUP_URL_EFFECT_RE.search(normalized)
+        if group_url_match is not None:
+            group_ids.add(group_url_match.group(1))
         listing_match = _MARKETPLACE_LISTING_EFFECT_RE.search(normalized)
         if listing_match is not None:
             listing_ids.add(listing_match.group(1))
+    if isinstance(contract, Mapping):
+        group_ids.update(facebook_group_publish_destination_ids(contract))
     return group_ids, listing_ids
 
 
@@ -3697,6 +3709,8 @@ def _normalize_openclaw_external_effects(
             or ""
         ).strip()
         group_match = _FACEBOOK_GROUP_EFFECT_RE.search(target)
+        if group_match is None:
+            group_match = _FACEBOOK_GROUP_URL_EFFECT_RE.search(target)
         if group_match is None and external_id.isdigit():
             if external_id in allowed_group_ids:
                 group_match = re.match(r"([1-9][0-9]*)", external_id)

@@ -300,6 +300,32 @@ def create_clawops_task(
     else:
         body = _body_from_objective(clean_objective, source=enriched_source, hubops_envelope=hubops_envelope)
 
+    from proactive.model_routing import route_worker
+
+    task_type = str(enriched_source.get("task_type") or "general").strip()
+    worker_route = route_worker(
+        task_type,
+        {
+            "task_risk": str(enriched_source.get("risk_level") or "low"),
+            "memory_impact": (
+                str(contract.get("memory", {}).get("impact") or "none")
+                if isinstance(contract, Mapping)
+                and isinstance(contract.get("memory"), Mapping)
+                else "none"
+            ),
+            "external_action": bool(
+                hubops_envelope
+                or (isinstance(contract, Mapping) and contract.get("external_effects"))
+            ),
+        },
+    )
+    task_routing_decision = {
+        "selected_backend": clean_executor_backend,
+        "model_route": worker_route,
+    }
+    if bound_route:
+        task_routing_decision["execution_route"] = bound_route
+
     with kb.connect_closing(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -322,6 +348,8 @@ def create_clawops_task(
             executor_profile=executor_profile,
             project_namespace=str(enriched_source.get("project") or "").strip() or None,
             skills=skills,
+            routing_decision=task_routing_decision,
+            model_override=worker_route["requested_model"],
         )
         row = kb.get_task(conn, task_id)
         status = str(row.status if row else "ready")

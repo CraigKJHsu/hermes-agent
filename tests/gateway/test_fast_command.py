@@ -129,6 +129,37 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_turn_route_does_not_apply_grace_policy_to_worker_profiles(monkeypatch):
+    runner = _make_runner()
+    runner._reasoning_config = {"effort": "high"}
+    runner._fallback_model = []
+    monkeypatch.setattr(
+        "proactive.model_routing.route_grace",
+        lambda *args, **kwargs: pytest.fail("worker turn must not invoke Grace routing"),
+    )
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://api.openai.com/v1",
+        "provider": "openai",
+        "api_mode": "responses",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "worker task",
+        "gpt-5.6-terra",
+        runtime_kwargs,
+        source=SimpleNamespace(profile="clawops-dev"),
+    )
+
+    assert route["model"] == "gpt-5.6-terra"
+    assert route["model_route"] is None
+
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()

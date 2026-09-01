@@ -1673,6 +1673,83 @@ def test_loop_contract_terminal_materializes_openclaw_external_effects(kanban_ho
     ]
 
 
+def test_loop_contract_terminal_accepts_canonical_group_url_effect_target(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-openclaw-effect-url-target-1"
+    contract["external_targets"] = [
+        "facebook marketplace listing 37276725125275496",
+        "https://www.facebook.com/groups/897927458651235",
+    ]
+    contract["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "destinations": [
+            {
+                "group_id": "897927458651235",
+                "canonical_name": "二手家具 家電 買賣",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }
+        ],
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="browser_publish",
+        risk_level="high",
+        approved=True,
+        delegation_id="delegation-loop-openclaw-effect-url-target-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["status"] = "failed"
+    terminal["errors"] = ["openclaw_bridge_failed"]
+    terminal["requires_human_review"] = True
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["externalEffectBudget"] = 2
+    output["evidence"]["resultContractValid"] = False
+    output["evidence"]["resultContractError"] = (
+        "Loop Contract external effect evidence is incomplete or outside "
+        "the approved targets."
+    )
+    output["result"]["externalEffects"] = [
+        {
+            "target": "https://www.facebook.com/groups/897927458651235",
+            "state": "verified",
+            "externalId": "897927458651235",
+            "readback": "Canonical group URL matched numeric id and group name before Post.",
+        },
+    ]
+
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "failed",
+            "delegated_result": terminal,
+            "result_digest": "terminal-openclaw-effect-url-target-digest",
+        },
+    )
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        effects = kb.list_external_effects(conn, started["execution_task_id"])
+    assert [
+        (effect["platform"], effect["effect_key"], effect["state"], effect["external_id"])
+        for effect in effects
+    ] == [("facebook", "group:897927458651235", "verified", "897927458651235")]
+
+
 def test_loop_contract_terminal_downgrades_uncertain_effect_readback(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-openclaw-effect-unknown-1"

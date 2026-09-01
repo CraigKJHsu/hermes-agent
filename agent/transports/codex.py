@@ -7,6 +7,7 @@ streaming, or the _run_codex_stream() call path.
 
 import hashlib
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
@@ -170,6 +171,14 @@ class ResponsesApiTransport(ProviderTransport):
             # Spark fallback fail after the primary model reaches its quota.
             _effort_clamp["none"] = "low"
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            from proactive.model_routing import attest_runtime_execution
+
+            attest_runtime_execution(
+                model=model,
+                reasoning_effort=(reasoning_effort if reasoning_enabled else "none"),
+                api_mode="codex_responses",
+            )
 
         response_tools = _responses_tools(tools)
 

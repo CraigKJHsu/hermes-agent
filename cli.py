@@ -3677,7 +3677,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         
         # Reasoning config (OpenRouter reasoning effort level)
         self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
+            os.environ.get("HERMES_REASONING_EFFORT", "").strip()
+            or CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
@@ -3710,6 +3711,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        if os.environ.get("HERMES_DISABLE_MODEL_FALLBACK") == "1":
+            self._fallback_model = []
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
