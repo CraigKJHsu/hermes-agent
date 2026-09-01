@@ -389,6 +389,59 @@ def _render_facebook_group_publish_guidance(contract: Mapping[str, Any]) -> list
     ]
 
 
+def _render_domain_memory_guidance(
+    contract: Mapping[str, Any],
+    *,
+    review: bool,
+) -> list[str]:
+    spec = contract.get("domain_memory")
+    if not isinstance(spec, Mapping):
+        return []
+    schema_id = str(spec.get("schema_id") or "").strip()
+    domain_key = str(spec.get("domain_key") or "").strip()
+    entity_type = str(spec.get("entity_type") or "").strip()
+    mode = str(spec.get("mode") or "").strip()
+    artifact_types = ", ".join(
+        str(item) for item in (spec.get("artifact_types") or [])
+    )
+    if review:
+        return [
+            f"Typed domain-memory contract: {schema_id} ({domain_key}/{entity_type}), mode={mode}.",
+            "For a mutation, reject unless the parent completion contains canonical "
+            "domain_memory_deltas whose entity/artifact state is supported by the "
+            "parent external-effect ledger and readback evidence. Do not author or "
+            "rewrite deltas in the review metadata; accepted review projects only "
+            "the parent payload transactionally into the Domain Registry.",
+            "For an inventory/count/status answer, use the Domain Registry as the "
+            "enumerable source and report registry_total, persisted expected_total "
+            "and its source when known, coverage_status, and every missing required "
+            "artifact. Retrieval results "
+            "alone never establish completeness.",
+        ]
+    guidance = [
+        f"Typed domain-memory contract: {schema_id} ({domain_key}/{entity_type}), mode={mode}.",
+        "Use kanban_domain_inventory for any inventory/count/status read. Treat its "
+        "coverage_status as authoritative for registry coverage and keep live external "
+        "verification separate.",
+    ]
+    if mode == "mutate":
+        guidance.append(
+            "kanban_complete metadata must include domain_memory_deltas. Each delta "
+            "requires operation=upsert, entity_id, readable label, status, attributes, "
+            "evidence_refs, and artifacts. Allowed artifact types: "
+            f"{artifact_types}. Every artifact requires artifact_type, platform, "
+            "status, a stable artifact_key or public/external identity, and verified_at "
+            "when verified. Every allowed artifact type must appear explicitly, using "
+            "a not_published/unknown state where appropriate; silence is not absence. "
+            "Every materialized artifact must carry evidence_ref and the delta-level "
+            "evidence_refs must include that same exact completion effect as "
+            "task_external_effect:<platform>:<effect_key>. When the execution backend returns a structured OpenClaw "
+            "result instead of calling kanban_complete directly, return the identical "
+            "list as domainMemoryDeltas. The database rejects missing or uncontracted deltas."
+        )
+    return guidance
+
+
 def render_execution_body(contract: Mapping[str, Any]) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
@@ -406,6 +459,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             *_render_policy_guidance(worker_contract, review=False),
             *_render_approved_external_execution_guidance(worker_contract),
             *_render_facebook_group_publish_guidance(worker_contract),
+            *_render_domain_memory_guidance(worker_contract, review=False),
             *_render_image_generation_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=False),
             "For each external draft/object you find or create, call kanban_external_effect "
@@ -482,6 +536,7 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             *page_hero_guidance,
             *_render_policy_guidance(worker_contract, review=True),
             *_render_facebook_group_publish_guidance(worker_contract),
+            *_render_domain_memory_guidance(worker_contract, review=True),
             *_render_language_polish_guidance(worker_contract, review=True),
             "For a requested user-facing status, inventory, or destination list, reject the "
             "parent unless metadata.user_facing_report is present, readable names are primary, "

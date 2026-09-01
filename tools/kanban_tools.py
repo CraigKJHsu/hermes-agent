@@ -410,6 +410,7 @@ def _handle_show(args: dict, **kw) -> str:
                         "verification",
                         "external_actions_performed",
                         "external_effects",
+                        "domain_memory_deltas",
                     )
                     review_evidence = (
                         {
@@ -506,6 +507,33 @@ def _handle_show(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_show failed")
         return tool_error(f"kanban_show: {e}")
+
+
+def _handle_domain_inventory(args: dict, **kw) -> str:
+    """Read the typed operational registry with explicit coverage status."""
+    domain_key = str(args.get("domain_key") or "").strip()
+    if not domain_key:
+        return tool_error("domain_key is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            report = kb.domain_inventory_report(
+                conn,
+                domain_key=domain_key,
+                entity_type=(
+                    str(args.get("entity_type") or "").strip() or None
+                ),
+                expected_total=args.get("expected_total"),
+            )
+            return json.dumps(report, ensure_ascii=False, sort_keys=True)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_domain_inventory: {e}")
+    except Exception as e:
+        logger.exception("kanban_domain_inventory failed")
+        return tool_error(f"kanban_domain_inventory: {e}")
 
 
 def _handle_list(args: dict, **kw) -> str:
@@ -1216,6 +1244,43 @@ KANBAN_SHOW_SCHEMA = {
     },
 }
 
+KANBAN_DOMAIN_INVENTORY_SCHEMA = {
+    "name": "kanban_domain_inventory",
+    "description": (
+        "Read the complete typed operational registry for one business domain, "
+        "such as solobizai or secondhand. Use this before answering which items, "
+        "cases, posts, podcasts, or listings exist and what their status is. "
+        "Returns every entity and artifact plus registry_total, expected_total, "
+        "missing required artifact types, and an explicit coverage_status. "
+        "Semantic memory and session search do not replace this inventory."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "domain_key": {
+                "type": "string",
+                "description": "Stable domain key, for example solobizai or secondhand.",
+            },
+            "entity_type": {
+                "type": "string",
+                "description": "Optional exact entity type such as SoloBizAiCase or ResaleItem.",
+            },
+            "expected_total": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Optional independently verified expected count for an ad hoc check. "
+                    "Omit to use the persisted certified baseline; if no baseline exists, "
+                    "the result reports unknown_expected_total."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["domain_key"],
+        "additionalProperties": False,
+    },
+}
+
 KANBAN_LIST_SCHEMA = {
     "name": "kanban_list",
     "description": (
@@ -1737,6 +1802,15 @@ registry.register(
     handler=_handle_show,
     check_fn=_check_kanban_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_domain_inventory",
+    toolset="kanban",
+    schema=KANBAN_DOMAIN_INVENTORY_SCHEMA,
+    handler=_handle_domain_inventory,
+    check_fn=_check_kanban_mode,
+    emoji="🗂️",
 )
 
 registry.register(

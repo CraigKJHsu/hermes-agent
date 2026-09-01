@@ -4087,6 +4087,43 @@ def make_loop_contract_terminal_handler(
             external_effects,
             metadata=metadata,
         )
+        raw_domain_memory_deltas = (
+            audited_result.get("domainMemoryDeltas")
+            if isinstance(audited_result, Mapping)
+            else None
+        )
+        loop_contract = metadata.get("loop_contract")
+        domain_spec = (
+            loop_contract.get("domain_memory")
+            if isinstance(loop_contract, Mapping)
+            else None
+        )
+        normalized_domain_memory_deltas: list[dict[str, Any]] | None = None
+        domain_memory_error = ""
+        if domain_spec is None:
+            if raw_domain_memory_deltas is not None:
+                domain_memory_error = (
+                    "OpenClaw returned domainMemoryDeltas without a compiler-owned "
+                    "domain_memory contract."
+                )
+        else:
+            try:
+                from proactive.domain_memory import (
+                    normalize_memory_deltas,
+                    validate_delta_external_effect_refs,
+                )
+
+                normalized_domain_memory_deltas = normalize_memory_deltas(
+                    raw_domain_memory_deltas,
+                    domain_spec,
+                )
+                if str(domain_spec.get("mode") or "") == "mutate":
+                    validate_delta_external_effect_refs(
+                        normalized_domain_memory_deltas,
+                        normalized_external_effects or [],
+                    )
+            except ValueError as exc:
+                domain_memory_error = str(exc)
         reclassified_external_effect_error = (
             isinstance(evidence, Mapping)
             and evidence.get("resultContractValid") is not True
@@ -4096,6 +4133,7 @@ def make_loop_contract_terminal_handler(
                 "the approved targets."
             )
             and normalized_external_effects is not None
+            and not domain_memory_error
         )
         valid = (
             (
@@ -4184,6 +4222,8 @@ def make_loop_contract_terminal_handler(
                 + ", ".join(missing_evidence[:10])
                 + "."
             )
+        if domain_memory_error:
+            validation_reason += " Domain memory: " + domain_memory_error
         if (
             external_effect_budget > 0
             and not external_effects
@@ -4232,6 +4272,11 @@ def make_loop_contract_terminal_handler(
                             else [],
                             "internal_tool_receipts": internal_tool_receipts,
                             "policy_receipts": policy_receipts,
+                            "domain_memory_deltas": (
+                                normalized_domain_memory_deltas
+                                if normalized_domain_memory_deltas is not None
+                                else raw_domain_memory_deltas
+                            ),
                             "read_only_zero_external_effects": (
                                 external_effect_budget == 0
                                 and isinstance(external_effects, list)
@@ -4274,6 +4319,11 @@ def make_loop_contract_terminal_handler(
                         "raw_external_effects": external_effects,
                         "internal_tool_receipts": internal_tool_receipts,
                         "policy_receipts": policy_receipts,
+                        **(
+                            {"domain_memory_deltas": normalized_domain_memory_deltas}
+                            if normalized_domain_memory_deltas is not None
+                            else {}
+                        ),
                         **commerce_report_metadata,
                         **content_package_metadata,
                     },

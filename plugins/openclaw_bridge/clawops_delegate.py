@@ -250,6 +250,33 @@ _MEMORY = {
     "required": ["working", "promote_on_acceptance"],
     "additionalProperties": False,
 }
+_DOMAIN_MEMORY = {
+    "type": "object",
+    "properties": {
+        "schema_id": {
+            "type": "string",
+            "description": (
+                "Stable versioned schema id. Known values are "
+                "solobizai.case.v1 and secondhand.item.v1."
+            ),
+        },
+        "domain_key": {"type": "string"},
+        "entity_type": {"type": "string"},
+        "mode": {"type": "string", "enum": ["query", "mutate"]},
+        "required_entity_fields": _LIST,
+        "artifact_types": _LIST,
+        "required_artifact_fields": _LIST,
+        "require_delta_on_acceptance": {"type": "boolean"},
+        "expected_total": {
+            "anyOf": [
+                {"type": "integer", "minimum": 0},
+                {"type": "null"},
+            ]
+        },
+    },
+    "required": ["schema_id", "mode"],
+    "additionalProperties": False,
+}
 _USER_FACING_DELIVERY = {
     "type": "object",
     "properties": {
@@ -317,6 +344,15 @@ CLAWOPS_DELEGATE_PARAMETERS = {
         "verification": _VERIFICATION,
         "stop_rules": _STOP_RULES,
         "memory": _MEMORY,
+        "domain_memory": {
+            **_DOMAIN_MEMORY,
+            "description": (
+                "Typed operational-memory contract for enumerable Topic facts. "
+                "Use query for inventory/count/status questions and mutate for "
+                "publishing/listing/status changes. Known SoloBizAi and secondhand "
+                "Topics are also inferred deterministically when omitted."
+            ),
+        },
         "user_facing_delivery": _USER_FACING_DELIVERY,
         "objective_ref": {
             **_OBJECTIVE_REF,
@@ -736,6 +772,22 @@ _ZERO_EXTERNAL_EFFECT_CONSTRAINT = re.compile(
     r")",
     re.IGNORECASE,
 )
+_APPROVAL_CHECKPOINT_ONLY_CONTRACT = re.compile(
+    r"(?:"
+    r"(?:本次|此(?:次|回合)|this\s+(?:call|turn|request)).{0,80}?"
+    r"(?:只|僅|only).{0,40}?"
+    r"(?:建立|create).{0,40}?"
+    r"(?:approval|核准).{0,40}?"
+    r"(?:checkpoint|關卡)|"
+    r"(?:只|僅|only).{0,40}?"
+    r"(?:建立|create).{0,40}?"
+    r"(?:approval|核准).{0,40}?"
+    r"(?:checkpoint|關卡).{0,80}?"
+    r"(?:不|不得|禁止|no|without).{0,40}?"
+    r"(?:Facebook|external|外部|寫入|write|post|publish|submit)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 _FORBIDDEN_EXTERNAL_EFFECT = re.compile(
     r"(?:外部|發布|上架|刊登|傳送|publish|publishing|post|submit|send|external)",
     re.IGNORECASE,
@@ -755,6 +807,22 @@ _PREPARATORY_OR_TEXT_ONLY_OBJECTIVE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _approval_contract_is_checkpoint_only(contract: Mapping[str, Any]) -> bool:
+    text = json.dumps(
+        {
+            "goal": contract.get("goal"),
+            "scope": contract.get("scope"),
+            "verification": contract.get("verification"),
+            "stop_rules": contract.get("stop_rules"),
+            "original_request": contract.get("original_request"),
+            "grace_interpretation": contract.get("grace_interpretation"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return _APPROVAL_CHECKPOINT_ONLY_CONTRACT.search(text) is not None
 
 
 def _without_approval_checkpoint_stop(message_text: str) -> str:
@@ -1978,6 +2046,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             },
             "completion_mode": str(args.get("completion_mode") or "").strip(),
         }
+        if isinstance(args.get("domain_memory"), dict):
+            contract["domain_memory"] = dict(args["domain_memory"])
         if isinstance(args.get("user_facing_delivery"), dict):
             contract["user_facing_delivery"] = dict(
                 args["user_facing_delivery"]
@@ -2078,6 +2148,14 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             contract = json.loads(json.dumps(sealed_contract))
             normalized_contract = sealed_contract
             exact_fingerprint = sealed_fingerprint
+        if (approval_token or approval_refresh_token) and _approval_contract_is_checkpoint_only(
+            normalized_contract
+        ):
+            raise ValueError(
+                "Approval token is bound to an approval-checkpoint-only "
+                "contract; create a fresh challenge whose sealed contract is "
+                "the post-approval external action."
+            )
         approval_needed = (
             route_requires_owner_approval(routing_preview)
             and not internal_only_contract

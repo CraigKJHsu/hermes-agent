@@ -1277,6 +1277,49 @@ def test_delegate_records_scope_bound_approval_from_owner_turn(
     assert challenge_count == 1
 
 
+def test_approval_rejects_checkpoint_only_sealed_contract_without_consuming_token(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-kj-request",
+        "HERMES_SESSION_MESSAGE_TEXT": "請準備上架核准",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _external_listing_args()
+    args["approved"] = False
+    args["goal"]["objective"] = (
+        "本次呼叫只建立核准 checkpoint，不執行 Facebook 寫入。"
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    challenge_result = json.loads(handle_clawops_delegate(args))
+
+    assert challenge_result["status"] == "approval_required"
+    token = challenge_result["approval_token"]
+
+    values["HERMES_SESSION_MESSAGE_ID"] = "msg-kj-approval"
+    values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
+    approval_args = json.loads(json.dumps(args))
+    approval_args["approval_token"] = token
+
+    result = json.loads(handle_clawops_delegate(approval_args))
+
+    assert result["status"] == "rejected"
+    assert "approval-checkpoint-only" in result["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        still_pending = kb.get_grace_approval_challenge(conn, token)
+    assert still_pending["state"] == "pending"
+
+
 def test_delegate_preserves_canonical_group_publish_scope_in_challenge(
     tmp_path,
     monkeypatch,

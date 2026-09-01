@@ -9,6 +9,10 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 from proactive.policy_registry import PolicyRegistryError, resolve_contract_policies
+from proactive.domain_memory import (
+    DomainMemoryError,
+    attach_domain_memory_contract,
+)
 
 
 CONTRACT_VERSION = "1.0"
@@ -365,9 +369,13 @@ def contract_fingerprint(contract: Mapping[str, Any]) -> str:
 def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Return a normalized contract or reject it before a task is created."""
     try:
-        value = resolve_contract_policies(contract)
+        value = attach_domain_memory_contract(
+            resolve_contract_policies(contract)
+        )
     except PolicyRegistryError as exc:
         raise LoopContractError(f"policy resolution failed: {exc}") from exc
+    except DomainMemoryError as exc:
+        raise LoopContractError(f"domain memory validation failed: {exc}") from exc
     errors: list[str] = []
 
     def required_text(path: str) -> None:

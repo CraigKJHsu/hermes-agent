@@ -437,6 +437,463 @@ def grace_memory_promotion_spec(body: str) -> Optional[dict[str, Any]]:
     return {"namespace": namespace, "entries": entries}
 
 
+def grace_domain_memory_spec(body: str) -> Optional[dict[str, Any]]:
+    """Return the compiler-owned typed domain contract, or fail closed."""
+    contract = _grace_compiled_contract(body)
+    if contract is None:
+        return None
+    raw_spec = contract.get("domain_memory")
+    if raw_spec is None:
+        return None
+    if not isinstance(raw_spec, Mapping):
+        return None
+    from proactive.domain_memory import (
+        DomainMemoryError,
+        normalize_domain_memory_contract,
+    )
+
+    try:
+        return normalize_domain_memory_contract(raw_spec)
+    except DomainMemoryError:
+        return None
+
+
+def _accepted_parent_domain_projection(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    review_body: str,
+) -> Optional[dict[str, Any]]:
+    """Resolve the accepted execution's canonical domain deltas.
+
+    The review never authors deltas. It projects only the latest completed
+    parent run after proving that the execution and review cards embed the same
+    compiler-owned domain contract.
+    """
+    review_spec = grace_domain_memory_spec(review_body)
+    if review_spec is None:
+        return None
+    parents = conn.execute(
+        """
+        SELECT t.id, t.body
+          FROM task_links l
+          JOIN tasks t ON t.id = l.parent_id
+         WHERE l.child_id = ?
+           AND t.status = 'done'
+         ORDER BY t.completed_at DESC, t.id
+        """,
+        (review_task_id,),
+    ).fetchall()
+    execution_parents = [
+        row for row in parents
+        if _grace_loop_stage_header(str(row["body"] or "")) == "execution"
+    ]
+    if len(execution_parents) != 1:
+        raise ValueError(
+            "Grace domain-memory review requires exactly one completed execution parent"
+        )
+    parent = execution_parents[0]
+    execution_spec = grace_domain_memory_spec(str(parent["body"] or ""))
+    if execution_spec != review_spec:
+        raise ValueError(
+            "Grace execution/review domain-memory contracts do not match"
+        )
+    run_row = conn.execute(
+        """
+        SELECT id, metadata
+          FROM task_runs
+         WHERE task_id = ? AND outcome = 'completed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (parent["id"],),
+    ).fetchone()
+    if run_row is None:
+        raise ValueError(
+            "Grace domain-memory review parent has no completed run metadata"
+        )
+    try:
+        run_metadata = json.loads(run_row["metadata"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Grace domain-memory review parent metadata is invalid"
+        ) from exc
+    raw_deltas = (
+        run_metadata.get("domain_memory_deltas")
+        if isinstance(run_metadata, Mapping)
+        else None
+    )
+    from proactive.domain_memory import normalize_memory_deltas
+
+    deltas = normalize_memory_deltas(raw_deltas, review_spec)
+    return {
+        "spec": review_spec,
+        "deltas": deltas,
+        "source_task_id": str(parent["id"]),
+        "source_run_id": int(run_row["id"]),
+    }
+
+
+def _apply_domain_projection(
+    conn: sqlite3.Connection,
+    *,
+    projection: Mapping[str, Any],
+    accepted_review_task_id: str,
+    accepted_review_run_id: Optional[int],
+    now: int,
+) -> dict[str, Any]:
+    """Write accepted deltas into current state and immutable event history."""
+    spec = projection["spec"]
+    deltas = projection["deltas"]
+    source_task_id = str(projection["source_task_id"])
+    source_run_id = int(projection["source_run_id"])
+    definition_json = json.dumps(
+        {
+            key: spec[key]
+            for key in (
+                "schema_id",
+                "domain_key",
+                "entity_type",
+                "required_entity_fields",
+                "artifact_types",
+                "required_artifact_fields",
+            )
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    existing_schema = conn.execute(
+        "SELECT definition FROM domain_schemas WHERE schema_id = ?",
+        (spec["schema_id"],),
+    ).fetchone()
+    if existing_schema is not None and existing_schema["definition"] != definition_json:
+        raise ValueError(
+            "domain schema id already exists with a different definition"
+        )
+    conn.execute(
+        """
+        INSERT INTO domain_schemas (
+            schema_id, domain_key, entity_type, definition, source, active,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'grace_loop_contract', 1, ?, ?)
+        ON CONFLICT(schema_id) DO UPDATE SET
+            active = 1,
+            updated_at = excluded.updated_at
+        """,
+        (
+            spec["schema_id"],
+            spec["domain_key"],
+            spec["entity_type"],
+            definition_json,
+            now,
+            now,
+        ),
+    )
+    for delta in deltas:
+        delta_json = json.dumps(
+            delta,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            """
+            INSERT INTO domain_entity_events (
+                domain_key, schema_id, entity_type, entity_id, operation,
+                delta, evidence_refs, source_task_id, source_run_id,
+                accepted_review_task_id, accepted_review_run_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                spec["domain_key"],
+                spec["schema_id"],
+                spec["entity_type"],
+                delta["entity_id"],
+                delta["operation"],
+                delta_json,
+                json.dumps(delta["evidence_refs"], ensure_ascii=False),
+                source_task_id,
+                source_run_id,
+                accepted_review_task_id,
+                accepted_review_run_id,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO domain_entities (
+                domain_key, entity_type, entity_id, label, status, attributes,
+                schema_id, source_task_id, source_run_id,
+                accepted_review_task_id, accepted_review_run_id,
+                observed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(domain_key, entity_type, entity_id) DO UPDATE SET
+                label = excluded.label,
+                status = excluded.status,
+                attributes = excluded.attributes,
+                schema_id = excluded.schema_id,
+                source_task_id = excluded.source_task_id,
+                source_run_id = excluded.source_run_id,
+                accepted_review_task_id = excluded.accepted_review_task_id,
+                accepted_review_run_id = excluded.accepted_review_run_id,
+                observed_at = excluded.observed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                spec["domain_key"],
+                spec["entity_type"],
+                delta["entity_id"],
+                delta["label"],
+                delta["status"],
+                json.dumps(delta["attributes"], ensure_ascii=False, sort_keys=True),
+                spec["schema_id"],
+                source_task_id,
+                source_run_id,
+                accepted_review_task_id,
+                accepted_review_run_id,
+                now,
+                now,
+                now,
+            ),
+        )
+        for artifact in delta["artifacts"]:
+            conn.execute(
+                """
+                INSERT INTO domain_artifacts (
+                    domain_key, entity_type, entity_id, artifact_type,
+                    platform, artifact_key, status, public_url, external_id,
+                    attributes, verified_at, evidence_ref, source_task_id, source_run_id,
+                    accepted_review_task_id, accepted_review_run_id,
+                    observed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    domain_key, entity_type, entity_id,
+                    artifact_type, platform, artifact_key
+                ) DO UPDATE SET
+                    status = excluded.status,
+                    public_url = COALESCE(excluded.public_url, domain_artifacts.public_url),
+                    external_id = COALESCE(excluded.external_id, domain_artifacts.external_id),
+                    attributes = excluded.attributes,
+                    verified_at = COALESCE(excluded.verified_at, domain_artifacts.verified_at),
+                    evidence_ref = excluded.evidence_ref,
+                    source_task_id = excluded.source_task_id,
+                    source_run_id = excluded.source_run_id,
+                    accepted_review_task_id = excluded.accepted_review_task_id,
+                    accepted_review_run_id = excluded.accepted_review_run_id,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    spec["domain_key"],
+                    spec["entity_type"],
+                    delta["entity_id"],
+                    artifact["artifact_type"],
+                    artifact["platform"],
+                    artifact["artifact_key"],
+                    artifact["status"],
+                    artifact["public_url"] or None,
+                    artifact["external_id"] or None,
+                    json.dumps(
+                        artifact["attributes"], ensure_ascii=False, sort_keys=True
+                    ),
+                    artifact["verified_at"],
+                    artifact["evidence_ref"] or "",
+                    source_task_id,
+                    source_run_id,
+                    accepted_review_task_id,
+                    accepted_review_run_id,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+    current_total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM domain_entities "
+            "WHERE domain_key = ? AND entity_type = ?",
+            (spec["domain_key"], spec["entity_type"]),
+        ).fetchone()[0]
+    )
+    coverage = conn.execute(
+        "SELECT expected_total FROM domain_coverage "
+        "WHERE domain_key = ? AND entity_type = ?",
+        (spec["domain_key"], spec["entity_type"]),
+    ).fetchone()
+    declared_total = spec.get("expected_total")
+    if declared_total is not None and current_total != int(declared_total):
+        raise ValueError(
+            "accepted domain-memory baseline does not match expected_total: "
+            f"registry={current_total}, expected={declared_total}"
+        )
+    if declared_total is not None or coverage is not None:
+        conn.execute(
+            """
+            INSERT INTO domain_coverage (
+                domain_key, entity_type, expected_total, certified_at,
+                source_review_task_id, source_review_run_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(domain_key, entity_type) DO UPDATE SET
+                expected_total = excluded.expected_total,
+                source_review_task_id = excluded.source_review_task_id,
+                source_review_run_id = excluded.source_review_run_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                spec["domain_key"],
+                spec["entity_type"],
+                current_total,
+                now,
+                accepted_review_task_id,
+                accepted_review_run_id,
+                now,
+            ),
+        )
+    return {
+        "schema_id": spec["schema_id"],
+        "domain_key": spec["domain_key"],
+        "entity_type": spec["entity_type"],
+        "delta_count": len(deltas),
+        "source_task_id": source_task_id,
+        "source_run_id": source_run_id,
+        "registry_total": current_total,
+        "coverage_certified": declared_total is not None or coverage is not None,
+    }
+
+
+def domain_inventory_report(
+    conn: sqlite3.Connection,
+    *,
+    domain_key: str,
+    entity_type: Optional[str] = None,
+    expected_total: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return an enumerable registry view with explicit coverage truth."""
+    clean_domain = str(domain_key or "").strip().casefold()
+    if not clean_domain:
+        raise ValueError("domain_key is required")
+    if expected_total is not None and (
+        not isinstance(expected_total, int) or expected_total < 0
+    ):
+        raise ValueError("expected_total must be a non-negative integer or null")
+    params: list[Any] = [clean_domain]
+    entity_filter = ""
+    if entity_type:
+        entity_filter = " AND e.entity_type = ?"
+        params.append(str(entity_type).strip())
+    rows = conn.execute(
+        f"""
+        SELECT e.*
+          FROM domain_entities e
+         WHERE e.domain_key = ?{entity_filter}
+         ORDER BY e.updated_at DESC, e.label COLLATE NOCASE, e.entity_id
+        """,
+        tuple(params),
+    ).fetchall()
+    entities: list[dict[str, Any]] = []
+    missing_required: list[dict[str, Any]] = []
+    for row in rows:
+        artifacts = conn.execute(
+            """
+            SELECT artifact_type, platform, artifact_key, status, public_url,
+                   external_id, attributes, verified_at, evidence_ref, observed_at,
+                   source_task_id, source_run_id
+              FROM domain_artifacts
+             WHERE domain_key = ? AND entity_type = ? AND entity_id = ?
+             ORDER BY artifact_type, platform, artifact_key
+            """,
+            (row["domain_key"], row["entity_type"], row["entity_id"]),
+        ).fetchall()
+        schema_row = conn.execute(
+            "SELECT definition FROM domain_schemas WHERE schema_id = ?",
+            (row["schema_id"],),
+        ).fetchone()
+        definition = json.loads(schema_row["definition"]) if schema_row else {}
+        artifact_types = {item["artifact_type"] for item in artifacts}
+        required_artifact_types = set(definition.get("artifact_types") or [])
+        missing_types = sorted(required_artifact_types - artifact_types)
+        if missing_types:
+            missing_required.append(
+                {
+                    "entity_id": row["entity_id"],
+                    "missing_artifact_types": missing_types,
+                }
+            )
+        entities.append(
+            {
+                "entity_id": row["entity_id"],
+                "entity_type": row["entity_type"],
+                "label": row["label"],
+                "status": row["status"],
+                "attributes": json.loads(row["attributes"] or "{}"),
+                "schema_id": row["schema_id"],
+                "source_task_id": row["source_task_id"],
+                "source_run_id": row["source_run_id"],
+                "observed_at": row["observed_at"],
+                "artifacts": [
+                    {
+                        **dict(item),
+                        "attributes": json.loads(item["attributes"] or "{}"),
+                    }
+                    for item in artifacts
+                ],
+            }
+        )
+    if entity_type:
+        persisted_coverage = conn.execute(
+            "SELECT expected_total, certified_at, source_review_task_id, "
+            "source_review_run_id FROM domain_coverage "
+            "WHERE domain_key = ? AND entity_type = ?",
+            (clean_domain, str(entity_type).strip()),
+        ).fetchone()
+    else:
+        coverage_rows = conn.execute(
+            "SELECT expected_total, certified_at, source_review_task_id, "
+            "source_review_run_id FROM domain_coverage WHERE domain_key = ?",
+            (clean_domain,),
+        ).fetchall()
+        persisted_coverage = coverage_rows[0] if len(coverage_rows) == 1 else None
+    expected_total_source = "query"
+    if expected_total is None and persisted_coverage is not None:
+        expected_total = int(persisted_coverage["expected_total"])
+        expected_total_source = "certified_registry_baseline"
+    elif expected_total is None:
+        expected_total_source = "unknown"
+    registry_total = len(entities)
+    count_matches = (
+        registry_total == expected_total if expected_total is not None else None
+    )
+    return {
+        "domain_key": clean_domain,
+        "entity_type": str(entity_type or "").strip() or None,
+        "registry_total": registry_total,
+        "expected_total": expected_total,
+        "expected_total_source": expected_total_source,
+        "coverage_certified_at": (
+            int(persisted_coverage["certified_at"])
+            if persisted_coverage is not None
+            else None
+        ),
+        "count_matches": count_matches,
+        "missing_required": missing_required,
+        "complete": bool(
+            expected_total is not None
+            and count_matches
+            and not missing_required
+        ),
+        "coverage_status": (
+            "verified_complete"
+            if expected_total is not None and count_matches and not missing_required
+            else "count_mismatch"
+            if expected_total is not None and not count_matches
+            else "missing_required_artifacts"
+            if missing_required
+            else "unknown_expected_total"
+        ),
+        "entities": entities,
+    }
+
+
 def grace_external_group_ids(body: str) -> frozenset[str]:
     """Read numeric Facebook group targets from the compiled JSON contract."""
     contract = _grace_compiled_contract(body)
@@ -2109,6 +2566,100 @@ CREATE TABLE IF NOT EXISTS task_external_effects (
     PRIMARY KEY (task_id, platform, effect_key)
 );
 
+-- Versioned Topic/domain schema selected by Grace's Topic Memory Planner.
+-- This is operational metadata, not Prompt Memory or semantic recall.
+CREATE TABLE IF NOT EXISTS domain_schemas (
+    schema_id                 TEXT PRIMARY KEY,
+    domain_key                TEXT NOT NULL,
+    entity_type               TEXT NOT NULL,
+    definition                TEXT NOT NULL,
+    source                    TEXT NOT NULL,
+    active                    INTEGER NOT NULL DEFAULT 1,
+    created_at                INTEGER NOT NULL,
+    updated_at                INTEGER NOT NULL
+);
+
+-- Completeness certification is mutable operational state, not part of an
+-- immutable versioned schema definition. A baseline is established only by an
+-- accepted contract with expected_total; subsequent accepted upserts advance
+-- it automatically.
+CREATE TABLE IF NOT EXISTS domain_coverage (
+    domain_key                TEXT NOT NULL,
+    entity_type               TEXT NOT NULL,
+    expected_total            INTEGER NOT NULL,
+    certified_at              INTEGER NOT NULL,
+    source_review_task_id     TEXT NOT NULL,
+    source_review_run_id      INTEGER,
+    updated_at                INTEGER NOT NULL,
+    PRIMARY KEY (domain_key, entity_type)
+);
+
+-- Current materialized state for enumerable business objects. Historical
+-- changes remain in domain_entity_events; rows are never inferred from Mem0.
+CREATE TABLE IF NOT EXISTS domain_entities (
+    domain_key                TEXT NOT NULL,
+    entity_type               TEXT NOT NULL,
+    entity_id                 TEXT NOT NULL,
+    label                     TEXT NOT NULL,
+    status                    TEXT NOT NULL,
+    attributes                TEXT NOT NULL,
+    schema_id                 TEXT NOT NULL,
+    source_task_id            TEXT NOT NULL,
+    source_run_id             INTEGER,
+    accepted_review_task_id   TEXT NOT NULL,
+    accepted_review_run_id    INTEGER,
+    observed_at               INTEGER NOT NULL,
+    created_at                INTEGER NOT NULL,
+    updated_at                INTEGER NOT NULL,
+    PRIMARY KEY (domain_key, entity_type, entity_id)
+);
+
+-- Channel/publication/listing projection for each domain entity. The stable
+-- artifact key prevents retries from creating duplicate published objects.
+CREATE TABLE IF NOT EXISTS domain_artifacts (
+    domain_key                TEXT NOT NULL,
+    entity_type               TEXT NOT NULL,
+    entity_id                 TEXT NOT NULL,
+    artifact_type             TEXT NOT NULL,
+    platform                  TEXT NOT NULL,
+    artifact_key              TEXT NOT NULL,
+    status                    TEXT NOT NULL,
+    public_url                TEXT,
+    external_id               TEXT,
+    attributes                TEXT NOT NULL,
+    verified_at               TEXT,
+    evidence_ref              TEXT NOT NULL,
+    source_task_id            TEXT NOT NULL,
+    source_run_id             INTEGER,
+    accepted_review_task_id   TEXT NOT NULL,
+    accepted_review_run_id    INTEGER,
+    observed_at               INTEGER NOT NULL,
+    created_at                INTEGER NOT NULL,
+    updated_at                INTEGER NOT NULL,
+    PRIMARY KEY (
+        domain_key, entity_type, entity_id,
+        artifact_type, platform, artifact_key
+    )
+);
+
+-- Immutable accepted MemoryDelta history. The event is written in the same
+-- transaction that accepts the Grace review and updates current projections.
+CREATE TABLE IF NOT EXISTS domain_entity_events (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_key                TEXT NOT NULL,
+    schema_id                 TEXT NOT NULL,
+    entity_type               TEXT NOT NULL,
+    entity_id                 TEXT NOT NULL,
+    operation                 TEXT NOT NULL,
+    delta                     TEXT NOT NULL,
+    evidence_refs             TEXT NOT NULL,
+    source_task_id            TEXT NOT NULL,
+    source_run_id             INTEGER,
+    accepted_review_task_id   TEXT NOT NULL,
+    accepted_review_run_id    INTEGER,
+    created_at                INTEGER NOT NULL
+);
+
 -- Product-centric projection of Facebook group evidence across Kanban tasks.
 -- ``task_external_effects`` remains the task-scoped idempotency/audit ledger;
 -- this table supplies the long-lived human-facing inventory so a later status
@@ -2373,6 +2924,14 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_external_effects_state
     ON task_external_effects(task_id, state);
+CREATE INDEX IF NOT EXISTS idx_domain_schemas_lookup
+    ON domain_schemas(domain_key, entity_type, active);
+CREATE INDEX IF NOT EXISTS idx_domain_entities_lookup
+    ON domain_entities(domain_key, entity_type, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_domain_artifacts_lookup
+    ON domain_artifacts(domain_key, entity_type, artifact_type, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_domain_events_entity
+    ON domain_entity_events(domain_key, entity_type, entity_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_commerce_group_status
     ON commerce_group_ledger(subject_key, status, observed_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
@@ -3034,6 +3593,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    domain_artifact_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(domain_artifacts)")
+    }
+    if domain_artifact_columns and "evidence_ref" not in domain_artifact_columns:
+        _add_column_if_missing(
+            conn,
+            "domain_artifacts",
+            "evidence_ref",
+            "evidence_ref TEXT NOT NULL DEFAULT ''",
+        )
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -7846,6 +8415,9 @@ def complete_task(
     external_effect_records: list[dict[str, Any]] = []
     user_facing_report: Optional[dict[str, Any]] = None
     grace_memory_promotion: Optional[dict[str, Any]] = None
+    domain_memory_spec = grace_domain_memory_spec(task_body)
+    domain_memory_deltas: list[dict[str, Any]] = []
+    accepted_domain_projection: Optional[dict[str, Any]] = None
     if isinstance(metadata, dict):
         # Normalize into a fresh mapping so callers do not observe an in-place
         # rewrite of their metadata object.
@@ -7981,11 +8553,47 @@ def complete_task(
                     "external_id": effect_external_id,
                     "details": details,
                 })
+        raw_domain_deltas = metadata.get("domain_memory_deltas")
+        if grace_loop_stage == "review" and raw_domain_deltas is not None:
+            raise ValueError(
+                "Grace review cannot author domain_memory_deltas; it projects "
+                "the accepted execution parent"
+            )
+        if domain_memory_spec is None:
+            if raw_domain_deltas is not None:
+                raise ValueError(
+                    "metadata.domain_memory_deltas requires a compiler-owned "
+                    "Loop Contract domain_memory section"
+                )
+        elif grace_loop_stage == "execution":
+            from proactive.domain_memory import (
+                normalize_memory_deltas,
+                validate_delta_external_effect_refs,
+            )
+
+            domain_memory_deltas = normalize_memory_deltas(
+                raw_domain_deltas,
+                domain_memory_spec,
+            )
+            if domain_memory_spec["mode"] == "mutate":
+                validate_delta_external_effect_refs(
+                    domain_memory_deltas,
+                    external_effect_records,
+                )
+            metadata["domain_memory_deltas"] = domain_memory_deltas
         if cleaned_artifacts:
             preserved_artifacts, artifact_records = _persist_completion_artifacts(
                 task_id,
                 cleaned_artifacts,
             )
+    elif (
+        grace_loop_stage == "execution"
+        and domain_memory_spec is not None
+        and domain_memory_spec["require_delta_on_acceptance"]
+    ):
+        raise ValueError(
+            "this domain mutation requires structured metadata.domain_memory_deltas"
+        )
 
     with write_txn(conn):
         if isinstance(metadata, dict) and grace_review_accepted(metadata):
@@ -8021,6 +8629,21 @@ def complete_task(
                     "state": "pending",
                     "namespace": promotion_spec["namespace"],
                     "targets": ["topic_archive", "mem0", "prompt_memory"],
+                }
+            accepted_domain_projection = _accepted_parent_domain_projection(
+                conn,
+                review_task_id=task_id,
+                review_body=review_row["body"] if review_row is not None else "",
+            )
+            if accepted_domain_projection is not None:
+                metadata["domain_registry_projection"] = {
+                    "state": "applied",
+                    "schema_id": accepted_domain_projection["spec"]["schema_id"],
+                    "domain_key": accepted_domain_projection["spec"]["domain_key"],
+                    "entity_type": accepted_domain_projection["spec"]["entity_type"],
+                    "delta_count": len(accepted_domain_projection["deltas"]),
+                    "source_task_id": accepted_domain_projection["source_task_id"],
+                    "source_run_id": accepted_domain_projection["source_run_id"],
                 }
         if external_effect_records:
             fresh_scope = conn.execute(
@@ -8129,6 +8752,21 @@ def complete_task(
                     "namespace": grace_memory_promotion["namespace"],
                     "entry_count": len(grace_memory_promotion["entries"]),
                 },
+                run_id=run_id,
+            )
+        if accepted_domain_projection is not None:
+            projection_result = _apply_domain_projection(
+                conn,
+                projection=accepted_domain_projection,
+                accepted_review_task_id=task_id,
+                accepted_review_run_id=run_id,
+                now=now,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "domain_registry_projected",
+                projection_result,
                 run_id=run_id,
             )
         for effect in external_effect_records:
