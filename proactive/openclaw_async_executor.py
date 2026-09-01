@@ -507,6 +507,69 @@ def _worker_safe_loop_contract(
             safe["external_targets"] = external_targets
         else:
             safe.pop("external_targets", None)
+    domain_spec = safe.get("domain_memory")
+    if isinstance(domain_spec, Mapping) and domain_spec.get("mode") == "mutate":
+        terminal_contract: dict[str, Any] = {
+            "format": "single_valid_json_object",
+            "forbidden": [
+                "markdown_fence",
+                "python_expression",
+                "javascript_expression",
+                "comments",
+                "string_concatenation",
+                "placeholder_values",
+            ],
+            "required_top_level_keys": [
+                "status",
+                "summary",
+                "acceptanceEvidence",
+                "externalEffects",
+                "domainMemoryDeltas",
+                "userFacingReport",
+            ],
+            "status_values": ["succeeded", "blocked"],
+            "domainMemoryDeltas": {
+                "required_when_status": "succeeded",
+                "operation": "upsert",
+                "entity_required_fields": list(
+                    domain_spec.get("required_entity_fields") or []
+                ),
+                "artifact_types": list(domain_spec.get("artifact_types") or []),
+                "artifact_required_fields": list(
+                    domain_spec.get("required_artifact_fields") or []
+                ),
+                "evidence_ref_format": "task_external_effect:<platform>:<effect_key>",
+                "notes": [
+                    "Represent every artifact slot explicitly; use status=unknown or not_published for slots not changed.",
+                    "Every materialized artifact must cite an exact externalEffects entry via evidence_ref.",
+                ],
+            },
+            "externalEffects": {
+                "required_for_materialized_artifacts": True,
+                "effect_key_examples": ["group:<numeric_id>", "create"],
+            },
+        }
+        group_publish = safe.get("facebook_group_publish")
+        if isinstance(group_publish, Mapping):
+            terminal_contract["facebook_group_publish"] = {
+                "mode": group_publish.get("mode"),
+                "source_listing_id": group_publish.get("source_listing_id"),
+                "destination_count": len(group_publish.get("destinations") or []),
+                "per_destination_external_effect": {
+                    "platform": "facebook",
+                    "effect_key": "group:<group_id>",
+                    "external_id": "<group_id>",
+                    "details_required": [
+                        "canonical_url",
+                        "canonical_name",
+                        "source_listing_id",
+                        "live_identity_readback",
+                        "submit_action_readback",
+                        "post_submit_or_pending_readback",
+                    ],
+                },
+            }
+        safe["terminal_result_contract"] = terminal_contract
     original = str(safe.get("original_request", "") or "")
     expose_original = _contract_requires_backend_original_request(safe)
     if not expose_original:

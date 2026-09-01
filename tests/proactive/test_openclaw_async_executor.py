@@ -861,6 +861,64 @@ def test_loop_contract_terminal_result_releases_grace_review(kanban_home):
     assert review is not None and review.status in {"ready", "todo"}
 
 
+def test_domain_mutation_loop_contract_sends_terminal_result_contract(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-domain-mutation-schema-1"
+    contract["domain_memory"] = {
+        "schema_id": "secondhand.item.v1",
+        "mode": "mutate",
+        "require_delta_on_acceptance": True,
+    }
+    contract["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "management_listing_id": "915975414881937",
+        "destinations": [
+            {
+                "group_id": "207110076321670",
+                "canonical_name": "二手家電冷氣買賣",
+                "canonical_url": "https://www.facebook.com/groups/207110076321670",
+            }
+        ],
+    }
+    contract["external_targets"] = [
+        "facebook marketplace listing 37276725125275496",
+        "https://www.facebook.com/groups/207110076321670",
+    ]
+    seen: dict[str, object] = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_marketplace_group_publish",
+        risk_level="high",
+        approved=True,
+        delegation_id="delegation-loop-domain-mutation-schema-1",
+        transport=transport,
+    )
+
+    assert started["status"] == "queued"
+    result_contract = seen["loop_contract"]["terminal_result_contract"]
+    assert result_contract["format"] == "single_valid_json_object"
+    assert "python_expression" in result_contract["forbidden"]
+    assert "domainMemoryDeltas" in result_contract["required_top_level_keys"]
+    assert result_contract["domainMemoryDeltas"]["artifact_types"] == [
+        "shopee_listing",
+        "facebook_marketplace_listing",
+        "facebook_group_post",
+    ]
+    assert result_contract["facebook_group_publish"]["destination_count"] == 1
+    assert (
+        result_contract["facebook_group_publish"]["per_destination_external_effect"][
+            "effect_key"
+        ]
+        == "group:<group_id>"
+    )
+
+
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
 ):
