@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from hermes_cli import kanban_db as kb
-from proactive.policy_registry import policy_snapshot_marker, resolve_contract_policies
+from proactive.policy_registry import (
+    bind_topic_policies,
+    create_policy_version,
+    policy_snapshot_marker,
+    resolve_contract_policies,
+)
 
 
-def _seed_blocked_review(conn):
+def _seed_blocked_review(
+    conn,
+    *,
+    block_kind="capability",
+    block_reason=(
+        "managed_policy_read 回報 Topic policy binding not found；"
+        "runtime capability fault"
+    ),
+):
+    # The runtime repair teaches the resolver that a task-pinned null digest
+    # means verified binding absence; creating a binding would make it stale.
     execution_id = kb.create_task(
         conn,
         title="execution",
@@ -63,11 +80,8 @@ def _seed_blocked_review(conn):
     assert kb.block_task(
         conn,
         review_id,
-        reason=(
-            "managed_policy_read 回報 Topic policy binding not found；"
-            "runtime capability fault"
-        ),
-        kind="capability",
+        reason=block_reason,
+        kind=block_kind,
     )
     return execution_id, review_id
 
@@ -86,6 +100,34 @@ def _session_values(message_text="請重試 Grace Review t_review"):
     }
 
 
+def _durable_state(conn, execution_id, review_id):
+    delegation = conn.execute(
+        """
+        SELECT delegation_id, state, execution_task_id, review_task_id,
+               platform, chat_id, thread_id, session_id
+          FROM grace_delegations
+         WHERE review_task_id = ?
+        """,
+        (review_id,),
+    ).fetchone()
+    callback = kb.get_grace_loop_callback(conn, review_id)
+    return {
+        "task_count": len(kb.list_tasks(conn, include_archived=True)),
+        "execution_status": kb.get_task(conn, execution_id).status,
+        "review_status": kb.get_task(conn, review_id).status,
+        "delegation": dict(delegation) if delegation is not None else None,
+        "callback": callback,
+        "retry_receipts": conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM task_events
+             WHERE task_id = ? AND kind = 'grace_review_retry_authorized'
+            """,
+            (review_id,),
+        ).fetchone()[0],
+    }
+
+
 def test_clawops_retry_review_requeues_only_existing_lane_bound_review(
     tmp_path, monkeypatch
 ):
@@ -95,6 +137,7 @@ def test_clawops_retry_review_requeues_only_existing_lane_bound_review(
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
         execution_id, review_id = _seed_blocked_review(conn)
+        initial = _durable_state(conn, execution_id, review_id)
 
     values = _session_values(f"請重試 Grace Review {review_id}，不要建立新 Execution")
     monkeypatch.setattr(
@@ -114,9 +157,13 @@ def test_clawops_retry_review_requeues_only_existing_lane_bound_review(
         "review_status": "ready",
     }
     with kb.connect_closing(db_path) as conn:
-        assert len(kb.list_tasks(conn, include_archived=True)) == 2
-        assert kb.get_task(conn, execution_id).status == "done"
-        assert kb.get_task(conn, review_id).status == "ready"
+        success = _durable_state(conn, execution_id, review_id)
+        assert success["task_count"] == initial["task_count"] == 2
+        assert success["execution_status"] == initial["execution_status"] == "done"
+        assert success["review_status"] == "ready"
+        assert success["delegation"] == initial["delegation"]
+        assert success["callback"] == initial["callback"]
+        assert success["retry_receipts"] == 1
         assert kb.block_task(
             conn,
             review_id,
@@ -126,12 +173,58 @@ def test_clawops_retry_review_requeues_only_existing_lane_bound_review(
             ),
             kind="capability",
         )
+        before_replay = _durable_state(conn, execution_id, review_id)
 
     replay = json.loads(
         handle_clawops_retry_review({"review_task_id": review_id})
     )
     assert replay["status"] == "rejected"
     assert "already consumed" in replay["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == before_replay
+
+
+def test_clawops_retry_review_consumes_one_message_atomically(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "retry-review-concurrent.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(conn)
+        initial = _durable_state(conn, execution_id, review_id)
+
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+
+    barrier = Barrier(2)
+
+    def invoke():
+        barrier.wait()
+        return json.loads(
+            handle_clawops_retry_review({"review_task_id": review_id})
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: invoke(), range(2)))
+
+    assert [item["status"] for item in results].count("queued") == 1
+    rejected = [item for item in results if item["status"] == "rejected"]
+    assert len(rejected) == 1
+    assert "already consumed" in rejected[0]["reason"]
+    with kb.connect_closing(db_path) as conn:
+        concurrent = _durable_state(conn, execution_id, review_id)
+        assert concurrent["task_count"] == initial["task_count"] == 2
+        assert concurrent["execution_status"] == "done"
+        assert concurrent["review_status"] == "ready"
+        assert concurrent["delegation"] == initial["delegation"]
+        assert concurrent["callback"] == initial["callback"]
+        assert concurrent["retry_receipts"] == 1
 
 
 def test_clawops_retry_review_rejects_wrong_topic_and_missing_retry_intent(
@@ -142,7 +235,8 @@ def test_clawops_retry_review_rejects_wrong_topic_and_missing_retry_intent(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
-        _execution_id, review_id = _seed_blocked_review(conn)
+        execution_id, review_id = _seed_blocked_review(conn)
+        initial = _durable_state(conn, execution_id, review_id)
 
     values = _session_values(f"請重試 Grace Review {review_id}")
     monkeypatch.setattr(
@@ -157,6 +251,8 @@ def test_clawops_retry_review_rejects_wrong_topic_and_missing_retry_intent(
     )
     assert wrong_topic["status"] == "rejected"
     assert "authenticated chat/topic" in wrong_topic["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
 
     values["HERMES_SESSION_THREAD_ID"] = "2120"
     values["HERMES_SESSION_MESSAGE_TEXT"] = (
@@ -167,6 +263,8 @@ def test_clawops_retry_review_rejects_wrong_topic_and_missing_retry_intent(
     )
     assert missing_intent["status"] == "rejected"
     assert "does not explicitly request" in missing_intent["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
 
     values["HERMES_SESSION_MESSAGE_TEXT"] = "請重試另一張 Review t_deadbeef"
     wrong_id = json.loads(
@@ -174,6 +272,69 @@ def test_clawops_retry_review_rejects_wrong_topic_and_missing_retry_intent(
     )
     assert wrong_id["status"] == "rejected"
     assert "not bound to this review_task_id" in wrong_id["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
+
+
+def test_clawops_retry_review_enforces_authenticated_lane_and_owner_fields(
+    tmp_path, monkeypatch
+):
+    for field, mismatched in (
+        ("HERMES_SESSION_PLATFORM", "discord"),
+        ("HERMES_SESSION_CHAT_ID", "other-chat"),
+        ("HERMES_SESSION_USER_ID", "someone-else"),
+        ("HERMES_SESSION_OWNER_USER_ID", "configured-owner"),
+    ):
+        db_path = tmp_path / f"retry-review-auth-{field}.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / f".hermes-{field}"))
+        kb.init_db(db_path)
+        with kb.connect_closing(db_path) as conn:
+            execution_id, review_id = _seed_blocked_review(conn)
+            initial = _durable_state(conn, execution_id, review_id)
+        values = _session_values(f"請重試 Grace Review {review_id}")
+        values[field] = mismatched
+        monkeypatch.setattr(
+            "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+            lambda key, default="", values=values: values.get(key, default),
+        )
+        from plugins.openclaw_bridge.clawops_delegate import (
+            handle_clawops_retry_review,
+        )
+
+        result = json.loads(
+            handle_clawops_retry_review({"review_task_id": review_id})
+        )
+        assert result["status"] == "rejected"
+        with kb.connect_closing(db_path) as conn:
+            assert _durable_state(conn, execution_id, review_id) == initial
+
+
+def test_clawops_retry_review_accepts_matching_configured_owner(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "retry-review-configured-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-owner"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(conn)
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    values["HERMES_SESSION_USER_ID"] = "configured-owner"
+    values["HERMES_SESSION_OWNER_USER_ID"] = "configured-owner"
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+
+    assert result["status"] == "queued"
+    assert result["task_created"] is False
+    with kb.connect_closing(db_path) as conn:
+        assert kb.get_task(conn, execution_id).status == "done"
+        assert kb.get_task(conn, review_id).status == "ready"
 
 
 def test_clawops_retry_review_requires_callback_and_repaired_block_class(
@@ -184,7 +345,7 @@ def test_clawops_retry_review_requires_callback_and_repaired_block_class(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
-        _execution_id, review_id = _seed_blocked_review(conn)
+        execution_id, review_id = _seed_blocked_review(conn)
 
     values = _session_values(f"請重試 Grace Review {review_id}")
     monkeypatch.setattr(
@@ -198,8 +359,135 @@ def test_clawops_retry_review_requires_callback_and_repaired_block_class(
             "DELETE FROM grace_loop_callbacks WHERE review_task_id = ?",
             (review_id,),
         )
+        initial = _durable_state(conn, execution_id, review_id)
     missing_callback = json.loads(
         handle_clawops_retry_review({"review_task_id": review_id})
     )
     assert missing_callback["status"] == "rejected"
     assert "authenticated chat/topic" in missing_callback["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
+
+
+def test_clawops_retry_review_rejects_unrelated_block_classes(
+    tmp_path, monkeypatch
+):
+    for suffix, block_kind, block_reason, expected_reason in (
+        (
+            "needs-input",
+            "needs_input",
+            "A human decision is required.",
+            "repaired capability blocker",
+        ),
+        (
+            "other-capability",
+            "capability",
+            "browser credential is missing",
+            "not the repaired managed-policy binding fault",
+        ),
+    ):
+        db_path = tmp_path / f"retry-review-{suffix}.db"
+        home = tmp_path / f".hermes-{suffix}"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        kb.init_db(db_path)
+        with kb.connect_closing(db_path) as conn:
+            execution_id, review_id = _seed_blocked_review(
+                conn,
+                block_kind=block_kind,
+                block_reason=block_reason,
+            )
+            initial = _durable_state(conn, execution_id, review_id)
+        values = _session_values(f"請重試 Grace Review {review_id}")
+        monkeypatch.setattr(
+            "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+            lambda key, default="", values=values: values.get(key, default),
+        )
+        from plugins.openclaw_bridge.clawops_delegate import (
+            handle_clawops_retry_review,
+        )
+
+        result = json.loads(
+            handle_clawops_retry_review({"review_task_id": review_id})
+        )
+        assert result["status"] == "rejected"
+        assert expected_reason in result["reason"]
+        with kb.connect_closing(db_path) as conn:
+            assert _durable_state(conn, execution_id, review_id) == initial
+
+
+def test_clawops_retry_review_rejects_dependency_todo_without_reconciliation(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "retry-review-dependency-todo.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-dependency"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(
+            conn,
+            block_kind="dependency",
+            block_reason="approval_required checkpoint needs a new revision stage",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), execution_id),
+            )
+        initial = _durable_state(conn, execution_id, review_id)
+        assert initial["execution_status"] == "done"
+        assert initial["review_status"] == "todo"
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+
+    assert result["status"] == "rejected"
+    assert "not blocked" in result["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
+
+
+def test_clawops_retry_review_rejects_when_policy_fault_is_not_repaired(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "retry-review-policy-stale.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(conn)
+
+    create_policy_version(
+        "new-policy",
+        "v1",
+        "# Newly added policy\n",
+        owner_scope="topic",
+        owner_id="telegram:chat-1:2120/kj_profile",
+        activate=True,
+    )
+    bind_topic_policies(
+        "telegram:chat-1:2120/kj_profile",
+        [{"policy_id": "new-policy", "resolution": "latest_active"}],
+        expected_binding_sha256=None,
+    )
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+
+    with kb.connect_closing(db_path) as conn:
+        initial = _durable_state(conn, execution_id, review_id)
+
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+
+    assert result["status"] == "rejected"
+    assert "policy_stale" in result["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
