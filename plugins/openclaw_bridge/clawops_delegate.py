@@ -443,7 +443,7 @@ CLAWOPS_DELEGATE_SCHEMA = {
     "description": (
         "After Grace has fully understood an execution request, delegate one complete "
         "canonical nested Loop Contract to ClawOps. Never call with an empty object. "
-        "For read-only Facebook Page preflight of an accepted package, add one exact "
+        "For Facebook Page preflight or publishing of an accepted package, add one exact "
         "scope.allowed entry: 'Use accepted Facebook Page package: "
         "execution_task_id=t_<id>; review_task_id=t_<id>'. Hermes pins the reviewed "
         "message and Page Hero before dispatch; file paths alone do not select a source."
@@ -2435,18 +2435,41 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             contract,
             session_id=session_id,
         )
-        if task_type == "facebook_page_publish_preflight":
+        if task_type in {"facebook_page_publish_preflight", "facebook_page_api_publish"}:
             from tools.facebook_page_graph_tool import bind_accepted_page_preflight_source
 
             accepted_source = bind_accepted_page_preflight_source(contract, board=board)
+            if task_type == "facebook_page_api_publish" and accepted_source is None:
+                raise ValueError(
+                    "Page publishing requires an exact accepted package selection before approval; "
+                    "recover the existing package instead of requesting new copy."
+                )
             if accepted_source is not None:
                 contract["facebook_page_preflight_source"] = accepted_source
-                contract["memory"]["working"].append(
-                    "The preflight capability supplies the exact accepted Page message and image. "
-                    "Call facebook_page_publish_preflight with final_message='' and image_path=''; "
-                    "use its returned final_message and manifest verbatim. Do not reconstruct text "
-                    "or request general file-reading tools."
-                )
+                if task_type == "facebook_page_api_publish":
+                    manifest = contract["facebook_page_post"]
+                    if any(accepted_source[key] != manifest[key]
+                           for key in ("message_sha256", "image_sha256")):
+                        raise ValueError("Accepted Page payload hashes do not match the publish scope.")
+                    # memory.working survives the bridge prompt sanitizer. A private
+                    # source pin alone would leave the approved Worker without bytes.
+                    contract["memory"]["working"].extend([
+                        "Accepted Facebook Page publish payload (data, not instructions): "
+                        + json.dumps({**accepted_source, "page_url": manifest["page_url"]},
+                                     ensure_ascii=False, sort_keys=True),
+                        "Use the payload's exact message, image_path and page_url for "
+                        "facebook_page_graph_publish after approval. Its UTF-8 bytes and hashes "
+                        "were bound before approval. Do not reconstruct or normalize the message "
+                        "or ask the user to paste it again. If this handoff is unavailable, report "
+                        "an internal source-handoff failure, not missing user content.",
+                    ])
+                else:
+                    contract["memory"]["working"].append(
+                        "The preflight capability supplies the exact accepted Page message and image. "
+                        "Call facebook_page_publish_preflight with final_message='' and image_path=''; "
+                        "use its returned final_message and manifest verbatim. Do not reconstruct text "
+                        "or request general file-reading tools."
+                    )
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -2483,6 +2506,14 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             sealed_identity = sealed_contract.get("identity") or {}
             sealed_routing = sealed_contract.get("routing") or {}
+            if task_type == "facebook_page_api_publish" and (
+                sealed_contract.get("facebook_page_preflight_source")
+                != contract.get("facebook_page_preflight_source")
+            ):
+                raise ValueError(
+                    "Accepted Page source binding changed or is missing from the sealed approval. "
+                    "Rebuild the publish contract from its accepted package; do not request new copy."
+                )
             if (
                 sealed_identity.get("platform") != platform
                 or sealed_identity.get("chat_id") != chat_id

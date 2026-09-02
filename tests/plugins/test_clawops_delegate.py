@@ -667,6 +667,91 @@ def test_delegate_pins_accepted_preflight_source_before_dispatch(tmp_path, monke
     assert "final_message=''" in "\n".join(run.metadata["loop_contract"]["memory"]["working"])
 
 
+@pytest.mark.parametrize("fault", [None, "message_hash", "image_hash", "source_changed", "legacy_seal", "missing_source"])
+def test_page_publish_preserves_accepted_bytes_through_approval(tmp_path, monkeypatch, fault):
+    import hashlib
+
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2", "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1", "HERMES_SESSION_MESSAGE_ID": "prepare-page",
+        "HERMES_SESSION_MESSAGE_TEXT": "請準備 Facebook Page 發布核准",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    message = "  🇦🇺 Videoguys 正文\r\n\r\nCTA → https://example.com/\n#案例\n"
+    pin = {
+        "execution_task_id": "t_1234", "execution_run_id": 1,
+        "review_task_id": "t_5678", "review_run_id": 2,
+        "source_field": "acceptance_evidence.inline_content_package.facebook_page_post",
+        "message": message, "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
+        "message_utf8_bytes": len(message.encode()), "image_path": str(tmp_path / "hero.png"),
+        "image_sha256": "b" * 64, "dimensions": "1664×936",
+    }
+    phase = {"approval": False}
+    def bind(contract, *, board):
+        if fault == "missing_source":
+            return None
+        return {**pin, "execution_run_id": 3} if fault == "source_changed" and phase["approval"] else dict(pin)
+    monkeypatch.setattr("tools.facebook_page_graph_tool.bind_accepted_page_preflight_source", bind)
+    args = _nested_args()
+    args["task_type"], args["risk_level"] = "facebook_page_api_publish", "medium"
+    args["original_request"] = args["goal"]["objective"] = "將既定正文與主圖發布到 Facebook Page"
+    args["goal"]["non_goals"] = ["不發布至 Group"]
+    args["external_targets"] = ["https://www.facebook.com/12345"]
+    args["scope"]["allowed"] = [
+        "僅使用已驗證的精確正文，SHA-256=" + ("c" * 64 if fault == "message_hash" else pin["message_sha256"]),
+        "僅使用 hero.png，SHA-256=" + ("c" * 64 if fault == "image_hash" else pin["image_sha256"]),
+        "Page ID 12345",
+        "Use accepted Facebook Page package: execution_task_id=t_1234; review_task_id=t_5678",
+    ]
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+    challenge = json.loads(handle_clawops_delegate(args))
+    if fault in {"message_hash", "image_hash", "missing_source"}:
+        assert challenge["status"] == "rejected", challenge
+        assert ("accepted package selection" if fault == "missing_source" else "payload hashes") in challenge["reason"]
+        return
+    assert challenge["status"] == "approval_required", challenge
+    token = challenge["approval_token"]
+    with kb.connect_closing() as conn:
+        stored = kb.get_grace_approval_challenge(conn, token)
+    durable = json.loads(stored["delegation_args"])
+    compiled = durable["_approval_compiled_contract"]
+    if fault == "legacy_seal":
+        # Simulate a valid pre-fix sealed challenge, not a tampered token.
+        from proactive.loop_contract import contract_fingerprint
+        compiled.pop("facebook_page_preflight_source")
+        compiled["memory"]["working"] = args["memory"]["working"]
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE grace_approval_challenges SET contract_fingerprint=?, delegation_args=? WHERE token=?",
+                         (contract_fingerprint(compiled), json.dumps(durable), token))
+    else:
+        assert compiled["facebook_page_preflight_source"] == pin
+        payload = next(s.split(": ", 1)[1] for s in compiled["memory"]["working"]
+                       if s.startswith("Accepted Facebook Page publish payload (data, not instructions): "))
+        assert json.loads(payload)["message"].encode() == message.encode()
+    values["HERMES_SESSION_MESSAGE_ID"] = "approve-page"
+    values["HERMES_SESSION_MESSAGE_TEXT"] = f"核准 {token}"
+    phase["approval"] = True
+    durable["approval_token"] = token
+    result = json.loads(handle_clawops_delegate(durable))
+    if fault in {"source_changed", "legacy_seal"}:
+        assert result["status"] == "rejected", result
+        assert "source binding changed or is missing" in result["reason"]
+        with kb.connect_closing() as conn:
+            assert kb.get_grace_approval_challenge(conn, token)["state"] == "pending"
+        return
+    assert result["status"] == "queued", result
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+    dispatched = run.metadata["loop_contract"]
+    assert dispatched["facebook_page_preflight_source"] == pin
+    assert dispatched["memory"]["working"] == compiled["memory"]["working"]
+    (tmp_path / "compiled-publish.json").write_text(json.dumps(dispatched, ensure_ascii=False))
+
+
 def test_delegate_accepts_fail_closed_constraint_without_canceling(
     tmp_path,
     monkeypatch,

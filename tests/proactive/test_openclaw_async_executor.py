@@ -2593,7 +2593,8 @@ def test_loop_terminal_rejects_failed_acceptance_evidence(kanban_home):
     assert task is not None and task.status == "blocked"
 
 
-def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
+@pytest.mark.parametrize("ledger_state", [None, "created", "verified"])
+def test_loop_terminal_preserves_specific_backend_blocker(kanban_home, ledger_state):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-specific-blocker-1"
     started = start_loop_contract_execution(
@@ -2607,6 +2608,11 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
     with kb.connect() as conn:
         run = kb.get_run(conn, int(started["run_id"]))
         assert run is not None
+    run.metadata["loop_contract"]["domain_memory"] = {
+        "schema_id": "solobizai.case.v1", "domain_key": "solobizai",
+        "entity_type": "SoloBizAiCase", "mode": "mutate",
+        "require_delta_on_acceptance": True,
+    }
     terminal = _loop_result(
         {
             "task_id": run.task_id,
@@ -2628,7 +2634,13 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
         "summary": "Blocked before any Facebook Graph POST.",
         "acceptanceEvidence": {},
         "externalEffects": [],
+        "unvalidatedWorkerResult": {"externalEffects": [{"target": {"page_url": "bad-shape"}}],
+                                    "domainMemoryDeltas": [{"op": "upsert_entity"}]},
     }
+    if ledger_state:
+        with kb.connect() as conn:
+            kb.record_external_effect(conn, run.task_id, platform="facebook", state=ledger_state,
+                                      external_id="existing-post", expected_run_id=run.id)
     observation = {
         "status": "succeeded",
         "delegated_result": terminal,
@@ -2638,17 +2650,23 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home):
     handled = make_loop_contract_terminal_handler()(run, observation)
 
     assert handled["accepted"] is False
+    assert "Domain memory:" not in handled["reason"]
     assert "Required Facebook Graph API tool is unavailable" in handled["reason"]
-    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert ("Read-only contract reported zero external effects as expected" in handled["reason"]) is (ledger_state is None)
     assert "No external effect was verified or recorded" not in handled["reason"]
+    if ledger_state:
+        assert "do not repeat the external action" in handled["reason"]
+        assert f"state={ledger_state}" in handled["reason"]
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
         ended_run = kb.latest_run(conn, started["execution_task_id"])
     assert task is not None and task.status == "blocked"
     assert ended_run is not None
+    assert ended_run.metadata["unvalidated_worker_result"] == output["result"]["unvalidatedWorkerResult"]
+    assert len(ended_run.metadata["durable_external_effects"]) == (1 if ledger_state else 0)
     assert "Blocked before any Facebook Graph POST" in ended_run.summary
     assert ended_run.metadata["loop_contract_blocked_result"]["status"] == "blocked"
-    assert ended_run.metadata["read_only_zero_external_effects"] is True
+    assert ended_run.metadata["read_only_zero_external_effects"] is (ledger_state is None)
 
 
 def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_home):

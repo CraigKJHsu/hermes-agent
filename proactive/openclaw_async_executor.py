@@ -561,6 +561,10 @@ def _worker_safe_loop_contract(
             },
             "externalEffects": {
                 "required_for_materialized_artifacts": True,
+                "target": "exact string from loopContract.external_targets; never an object",
+                "required_fields": ["target", "effectKey", "state", "externalId", "readback"],
+                "state": "verified",
+                "effectKey": "complete deterministic key, never abbreviated; use create for one Page post",
                 "effect_key_examples": ["group:<numeric_id>", "create"],
                 "zero_effects_allowed_only_when_status": "blocked",
             },
@@ -4278,7 +4282,11 @@ def make_loop_contract_terminal_handler(
                     "OpenClaw returned domainMemoryDeltas without a compiler-owned "
                     "domain_memory contract."
                 )
-        else:
+        elif not (
+            isinstance(audited_result, Mapping)
+            and audited_result.get("status") == "blocked"
+            and raw_domain_memory_deltas is None
+        ):
             try:
                 from proactive.domain_memory import (
                     normalize_memory_deltas,
@@ -4397,21 +4405,6 @@ def make_loop_contract_terminal_handler(
             )
         if domain_memory_error:
             validation_reason += " Domain memory: " + domain_memory_error
-        if (
-            external_effect_budget > 0
-            and not external_effects
-            and not internal_tool_receipts
-        ):
-            validation_reason += " No external effect was verified or recorded."
-        elif (
-            external_effect_budget == 0
-            and isinstance(external_effects, list)
-            and not external_effects
-            and not internal_tool_receipts
-        ):
-            validation_reason += (
-                " Read-only contract reported zero external effects as expected."
-            )
         content_package_metadata = {}
         if valid:
             content_package_metadata = _content_package_completion_metadata(
@@ -4437,6 +4430,22 @@ def make_loop_contract_terminal_handler(
         with kb.connect_closing(board=board) as conn:
             with kb.write_txn(conn):
                 if not valid:
+                    durable_effects = kb.list_external_effects(conn, run.task_id)
+                    if durable_effects:
+                        effect_summary = "; ".join(
+                            f"{e['platform']}:{e['effect_key']} state={e['state']} id={e.get('external_id') or 'unknown'}"
+                            for e in durable_effects
+                        )
+                        validation_reason = (
+                            "Durable external-effect records exist; do not repeat the external action. "
+                            + effect_summary + ". " + validation_reason
+                        )[:2000]
+                    elif not external_effects and not internal_tool_receipts:
+                        validation_reason += (
+                            " Worker result contains no accepted external-effect evidence."
+                            if external_effect_budget > 0 else
+                            " Read-only contract reported zero external effects as expected."
+                        )
                     kb.merge_active_run_metadata(
                         conn,
                         run.task_id,
@@ -4460,6 +4469,9 @@ def make_loop_contract_terminal_handler(
                             "loop_contract_blocked_result": dict(audited_result)
                             if isinstance(audited_result, Mapping)
                             else None,
+                            "unvalidated_worker_result": audited_result.get("unvalidatedWorkerResult")
+                            if isinstance(audited_result, Mapping) else None,
+                            "durable_external_effects": durable_effects,
                             "external_effects": normalized_external_effects
                             if normalized_external_effects is not None
                             else [],
@@ -4476,6 +4488,7 @@ def make_loop_contract_terminal_handler(
                             ),
                             "read_only_zero_external_effects": (
                                 external_effect_budget == 0
+                                and not durable_effects
                                 and isinstance(external_effects, list)
                                 and not external_effects
                             ),
