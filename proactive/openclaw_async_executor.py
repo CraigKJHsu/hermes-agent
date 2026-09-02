@@ -4035,6 +4035,57 @@ def _commerce_status_report_metadata(
         return {}
 
 
+def _materialize_content_package_report(
+    report: Mapping[str, Any],
+    *,
+    delivery: Any,
+    task_id: str,
+    board: Optional[str],
+) -> dict[str, Any]:
+    from hermes_cli.user_facing_report import (
+        normalize_user_facing_report,
+        report_satisfies_user_facing_delivery,
+    )
+
+    if report.get("kind") != "content_package" or not isinstance(report.get("body"), str):
+        return {}
+    # Internal delivery-field references must be expanded before user delivery.
+    # Section completeness/source fidelity remain independent review checks.
+    if re.search(
+        r"(?i)(?:acceptanceEvidence\.|metadata\.user_facing_report)",
+        report["body"],
+    ):
+        return {}
+    try:
+        normalized = normalize_user_facing_report(report)
+    except ValueError:
+        return {}
+    if not report_satisfies_user_facing_delivery(normalized, delivery):
+        return {}
+    paths = []
+    for asset in normalized["assets"]:
+        path = Path(asset["path"]).expanduser().resolve()
+        if (
+            not path.is_file()
+            or path.name != asset["filename"]
+            or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}
+            or hashlib.sha256(path.read_bytes()).hexdigest() != asset["sha256"]
+        ):
+            return {}
+        asset["path"] = str(path.resolve())
+        paths.append(str(path.resolve()))
+    if normalized["delivery"] == "inline_only":
+        return {"user_facing_report": normalized}
+    staging_dir = kb.attachments_root(board=board).parent / "artifacts"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    body_path = staging_dir / f"{task_id}-content-package.md"
+    body_path.write_text(normalized["body"] + "\n", encoding="utf-8")
+    return {
+        "artifacts": [str(body_path), *paths],
+        "user_facing_report": normalized,
+    }
+
+
 def _content_package_completion_metadata(
     audited_result: Mapping[str, Any],
     *,
@@ -4050,6 +4101,18 @@ def _content_package_completion_metadata(
     delivery = (
         contract.get("user_facing_delivery") if isinstance(contract, Mapping) else None
     )
+    worker_metadata = audited_result.get("metadata")
+    if isinstance(worker_metadata, Mapping) and "user_facing_report" in worker_metadata:
+        report = worker_metadata["user_facing_report"]
+        if not isinstance(report, Mapping):
+            return {}
+        if isinstance(delivery, Mapping) and delivery.get("delivery") == "inline_only":
+            # Gateway rebuilds inline-only reports from this pinned evidence field.
+            if acceptance.get(str(delivery.get("body_field") or "")) != report.get("body"):
+                return {}
+        return _materialize_content_package_report(
+            report, delivery=delivery, task_id=task_id, board=board,
+        )
     if (
         isinstance(delivery, Mapping)
         and delivery.get("required") is True
@@ -4091,15 +4154,14 @@ def _content_package_completion_metadata(
     )
     sections = []
     for label, key in section_fields:
-        value = str(package.get(key) or "").strip()
-        if not value:
+        value = package.get(key)
+        if not isinstance(value, str) or not value.strip():
             return {}
-        sections.append(f"## {label}\n\n{value}")
+        sections.append(f"## {label}\n\n{value.strip()}")
     raw_assets = package.get("image_attachments")
     if not isinstance(raw_assets, list) or not raw_assets:
         return {}
     assets: list[dict[str, str]] = []
-    artifact_paths: list[str] = []
     for raw_asset in raw_assets:
         if not isinstance(raw_asset, Mapping):
             return {}
@@ -4127,15 +4189,9 @@ def _content_package_completion_metadata(
             "path": str(path.resolve()),
             "sha256": actual_sha,
         })
-        artifact_paths.append(str(path.resolve()))
     body = "\n\n".join(sections)
-    staging_dir = kb.attachments_root(board=board).parent / "artifacts"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    body_path = staging_dir / f"{task_id}-content-package.md"
-    body_path.write_text(body + "\n", encoding="utf-8")
-    return {
-        "artifacts": [str(body_path), *artifact_paths],
-        "user_facing_report": {
+    return _materialize_content_package_report(
+        {
             "kind": "content_package",
             "delivery": "inline_with_attachment",
             "complete": True,
@@ -4144,7 +4200,8 @@ def _content_package_completion_metadata(
             "observed_at": int(time.time()),
             "assets": assets,
         },
-    }
+        delivery=delivery, task_id=task_id, board=board,
+    )
 
 
 def make_loop_contract_terminal_handler(
@@ -4355,6 +4412,27 @@ def make_loop_contract_terminal_handler(
             validation_reason += (
                 " Read-only contract reported zero external effects as expected."
             )
+        content_package_metadata = {}
+        if valid:
+            content_package_metadata = _content_package_completion_metadata(
+                audited_result, metadata=metadata, task_id=run.task_id, board=board,
+            )
+            contract = metadata.get("loop_contract") or {}
+            delivery = contract.get("user_facing_delivery") or {}
+            # Page preflight has its own manifest-bound report builder in Kanban.
+            if (
+                delivery.get("required") is True
+                and delivery.get("kind") == "content_package"
+                and metadata.get("task_type") != "facebook_page_publish_preflight"
+                and not content_package_metadata.get("user_facing_report")
+            ):
+                valid = False
+                validation_reason = (
+                    "Required content package is missing or invalid. Return canonical "
+                    "metadata.user_facing_report with complete text and every contracted "
+                    "image filename, local path and matching SHA-256; references alone "
+                    "are not a deliverable."
+                )
         validation_reason = validation_reason[:2000]
         with kb.connect_closing(board=board) as conn:
             with kb.write_txn(conn):
@@ -4420,12 +4498,6 @@ def make_loop_contract_terminal_handler(
                 commerce_report_metadata = _commerce_status_report_metadata(
                     audited_result,
                     metadata=metadata,
-                )
-                content_package_metadata = _content_package_completion_metadata(
-                    audited_result,
-                    metadata=metadata,
-                    task_id=run.task_id,
-                    board=board,
                 )
                 if not kb.complete_task(
                     conn,

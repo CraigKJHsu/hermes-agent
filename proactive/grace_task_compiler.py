@@ -295,6 +295,14 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         "from the worker. Put the copyable text body and both image assets in "
         "metadata.user_facing_report kind=content_package so Gateway delivers them only "
         "after Grace Review accepts the package.",
+        "The final OpenClaw JSON must contain metadata.user_facing_report with "
+        "kind='content_package', delivery='inline_with_attachment', complete=true, "
+        "title, observed_at (current Unix seconds), body (the entire copyable package "
+        "as one string), and assets=[{filename,label,path,sha256},...]. Use exactly "
+        "the contract's asset_filenames. Include every Page/Group/Gemini/Podcast text "
+        "in body, not field references or an object. Put policy and visual evidence "
+        "in acceptanceEvidence. Hermes validates bytes and registers the body and "
+        "images as attachments before releasing the independent review.",
         "For AI BizWeek asset evidence, literal requested ratios are not enough: record "
         "machine-read actual dimensions. Page Hero must be exact 16:9, Audio Brief must "
         "be exact 1:1. If dimensions are unavailable or mismatched, regenerate before "

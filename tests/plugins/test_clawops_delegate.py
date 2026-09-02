@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from pathlib import Path
 
@@ -634,6 +635,36 @@ def test_delegate_accepts_canonical_nested_loop_contract(tmp_path, monkeypatch):
     assert result["project"] == "secondhand_commerce"
     assert result["execution_task_id"]
     assert result["grace_review_task_id"]
+
+
+def test_delegate_pins_accepted_preflight_source_before_dispatch(tmp_path, monkeypatch):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2", "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1", "HERMES_SESSION_MESSAGE_ID": "preflight-source",
+        "HERMES_SESSION_MESSAGE_TEXT": "只做發布前檢查，不發布",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args["goal"]["objective"] = "Facebook Page Hero 發布前 preflight，呼叫 facebook_page_graph_status，不發布"
+    args["scope"]["allowed"] = ["Use accepted Facebook Page package: execution_task_id=t_1234; review_task_id=t_5678"]
+    pin = {"message": "精確正文\n", "message_sha256": "a" * 64, "message_utf8_bytes": 13}
+    seen = []
+    def bind(contract, *, board):
+        seen.append(contract["identity"])
+        return pin
+    monkeypatch.setattr("tools.facebook_page_graph_tool.bind_accepted_page_preflight_source", bind)
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+    result = json.loads(handle_clawops_delegate(args))
+    assert result["status"] == "queued", result
+    assert len(seen) == 1
+    assert seen[0]["thread_id"] == "2"
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, result["execution_task_id"])
+    assert run.metadata["loop_contract"]["facebook_page_preflight_source"] == pin
+    assert "final_message=''" in "\n".join(run.metadata["loop_contract"]["memory"]["working"])
 
 
 def test_delegate_accepts_fail_closed_constraint_without_canceling(
@@ -3042,6 +3073,7 @@ def test_ai_bizweek_delegate_embeds_managed_facebook_page_source(
                 "success": True,
                 "content_source_evidence": {
                     "message_id": "m-source",
+                    "session_id": "historical-source-session",
                     "facebook_page_source_text": page_source,
                 },
             },
@@ -3082,6 +3114,10 @@ def test_ai_bizweek_delegate_embeds_managed_facebook_page_source(
 
     args = _nested_args()
     args["original_request"] = "請產製 Carter's Junk Away AI BizWeek 完整發布包"
+    args["scope"]["allowed"].append(
+        "Use stored Facebook Page source: session_id=historical-source-session; "
+        f"message_id=m-source; sha256={hashlib.sha256(page_source.encode()).hexdigest()}"
+    )
     args["grace_interpretation"] = "Use source material for Facebook Page source fidelity."
     args["goal"]["objective"] = "產製 Carter's Junk Away EP04 AI BizWeek 完整發布包"
     args["scope"]["allowed"].append("OpenClaw loop-contract missioncrew-content")
@@ -3106,6 +3142,55 @@ def test_ai_bizweek_delegate_embeds_managed_facebook_page_source(
         loop_contract["verification"],
         ensure_ascii=False,
     )
+
+
+@pytest.mark.parametrize("quote_historical_copy", [False, True])
+def test_ai_bizweek_other_case_source_does_not_contaminate_worker(
+    monkeypatch, quote_historical_copy
+):
+    import tools.managed_policy_tool as managed_policy_tool
+    from plugins.openclaw_bridge import clawops_delegate as delegate
+    from proactive.domain_memory import attach_domain_memory_contract
+    from proactive.grace_task_compiler import _worker_safe_contract
+
+    carter = "Carter’s Junk Away：到府清運正文"
+    monkeypatch.setattr(
+        managed_policy_tool,
+        "managed_policy_read",
+        lambda **kwargs: json.dumps({
+            "success": True,
+            "content_source_evidence": {
+                "available": True,
+                "task_bound": False,
+                "session_id": "historical-source-session",
+                "message_id": "m-source",
+                "facebook_page_source_text": carter,
+            },
+        }),
+    )
+    original = "🇦🇺 Videoguys：AI 購買顧問\n32.41%，AOV +113%。"
+    if quote_historical_copy:
+        original += f"\n以下舊文僅供辨識，不得使用：\n{carter}"
+    contract = {
+        "identity": {"project": "AI BizWeek"},
+        "original_request": original,
+        "goal": {"objective": "製作 Videoguys／EP05 完整發布包"},
+        "grace_interpretation": "完整保留 KJ 提供的原文",
+        "scope": {"forbidden": ["不得混用 Carter’s Junk Away"]},
+        "routing": {"task_type": "product_marketing"},
+        "user_facing_delivery": {"body_field": "inline_content_package"},
+    }
+    augmented = delegate._augment_ai_bizweek_source_evidence(
+        contract, session_id="videoguys-session"
+    )
+    assert augmented == contract
+    normalized = attach_domain_memory_contract(augmented)
+    assert "domain_memory" not in normalized
+    worker = _worker_safe_contract(normalized)
+    assert worker["original_request"] == original
+    assert "TASK-SCOPED SOURCE MATERIAL" not in json.dumps(worker)
+    if not quote_historical_copy:
+        assert carter not in json.dumps(worker, ensure_ascii=False)
 
 
 def test_ai_bizweek_domain_query_skips_page_source_augmentation(

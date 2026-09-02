@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -13,6 +16,27 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
 from hermes_cli.grace_review_metadata import grace_review_acceptance_error
+from proactive.model_routing import attest_runtime_execution, route_grace, routing_env
+from proactive.policy_registry import create_policy_version
+
+
+def _complete_review(conn, review_id, **kwargs):
+    """Give formal-review fixtures the same model receipt as the real worker."""
+    task = kb.get_task(conn, review_id)
+    if "GRACE_LOOP_CONTRACT_STAGE: grace_review" not in (task.body or ""):
+        return kb.complete_task(conn, review_id, **kwargs)
+    source = (Path(__file__).resolve().parents[2] / "config" / "managed-policies"
+              / "missioncrew-model-routing-v1.json").read_text(encoding="utf-8")
+    create_policy_version("missioncrew-model-routing-v1", "v1", source,
+                          owner_scope="global", owner_id="missioncrew", activate=True)
+    route = route_grace("acceptance_review")
+    conn.execute("UPDATE tasks SET routing_decision = ? WHERE id = ?",
+                 (json.dumps({"model_route": route}), review_id))
+    with patch.dict(os.environ, routing_env(route, task_id=review_id)):
+        attest_runtime_execution(model=route["requested_model"],
+                                 reasoning_effort=route["reasoning_effort"],
+                                 api_mode="codex_responses")
+        return kb.complete_task(conn, review_id, **kwargs)
 
 
 class CallbackAdapter:
@@ -158,7 +182,7 @@ def test_legacy_telegram_content_package_is_delivered_before_callback_closes(
             message_id="42",
             contract_fingerprint="b" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="accepted",
@@ -254,7 +278,7 @@ def test_complete_content_package_auto_closes_after_verified_inline_delivery(
             message_id="42",
             contract_fingerprint="c" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="accepted",
@@ -355,7 +379,7 @@ def test_legacy_commerce_report_without_contract_is_delivered_and_closed(
             message_id="42",
             contract_fingerprint="d" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="accepted",
@@ -471,7 +495,7 @@ def test_contract_single_destination_commerce_status_report_is_delivered(
         )
         review_report = json.loads(json.dumps(report))
         review_report["rows"][0]["source_task_id"] = review_id
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="accepted",
@@ -1022,7 +1046,7 @@ def test_orphan_callback_cannot_be_listed_or_claimed(tmp_path, monkeypatch):
             session_id="grace-session-1",
             contract_fingerprint="f" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="orphan must not wake Grace",
@@ -1483,7 +1507,7 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     with kb.connect_closing(db_path) as conn:
         assert kb.unblock_task(conn, execution_id)
         assert kb.complete_task(conn, execution_id, summary="execution complete")
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="review accepted",
@@ -1693,7 +1717,7 @@ def test_large_snapshot_preserves_bounded_user_facing_report(
             message_id="42",
             contract_fingerprint="a" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="accepted",
@@ -1810,7 +1834,7 @@ def test_complete_report_is_not_sent_before_historical_reconciliation(
             message_id="42",
             contract_fingerprint="a" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="accepted",
@@ -1884,7 +1908,7 @@ def test_rejected_review_metadata_wakes_grace_as_blocked(tmp_path, monkeypatch):
             message_id="42",
             contract_fingerprint="a" * 64,
         )
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="review rejected incomplete",
@@ -2132,7 +2156,7 @@ def test_superseded_execution_blocker_coalesces_to_accepted_review(
         )
         assert kb.unblock_task(conn, execution_id)
         assert kb.complete_task(conn, execution_id, summary="execution complete")
-        assert kb.complete_task(
+        assert _complete_review(
             conn,
             review_id,
             summary="review accepted",

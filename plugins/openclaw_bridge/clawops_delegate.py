@@ -442,7 +442,11 @@ CLAWOPS_DELEGATE_PARAMETERS = {
 CLAWOPS_DELEGATE_SCHEMA = {
     "description": (
         "After Grace has fully understood an execution request, delegate one complete "
-        "canonical nested Loop Contract to ClawOps. Never call with an empty object."
+        "canonical nested Loop Contract to ClawOps. Never call with an empty object. "
+        "For read-only Facebook Page preflight of an accepted package, add one exact "
+        "scope.allowed entry: 'Use accepted Facebook Page package: "
+        "execution_task_id=t_<id>; review_task_id=t_<id>'. Hermes pins the reviewed "
+        "message and Page Hero before dispatch; file paths alone do not select a source."
     ),
     "parameters": CLAWOPS_DELEGATE_PARAMETERS,
 }
@@ -1830,14 +1834,22 @@ def _augment_ai_bizweek_source_evidence(
     if not isinstance(source, dict):
         return contract
     page_text = str(source.get("facebook_page_source_text") or "").strip()
-    if not page_text:
+    original = str(contract.get("original_request") or "").strip()
+    if not page_text or not source.get("session_id") or not source.get("message_id"):
         return contract
     digest = hashlib.sha256(page_text.encode("utf-8")).hexdigest()
+    selection = (
+        f"Use stored Facebook Page source: session_id={source['session_id']}; "
+        f"message_id={source['message_id']}; sha256={digest}"
+    )
+    # Only this affirmative scope entry binds historical copy. Quoting it in
+    # original_request, or sharing its Topic policy, does not select it.
+    if selection not in (contract.get("scope") or {}).get("allowed", []):
+        return contract
     augmented = json.loads(json.dumps(contract, ensure_ascii=False))
-    original = str(augmented.get("original_request") or "").strip()
     source_block = (
         "\n\nTASK-SCOPED SOURCE MATERIAL: facebook_page_source_text\n"
-        f"source=session:{session_id}\n"
+        f"source=session:{source.get('session_id') or session_id}\n"
         f"message_id={source.get('message_id') or ''}\n"
         f"length={len(page_text)}\n"
         f"sha256={digest}\n"
@@ -1845,7 +1857,7 @@ def _augment_ai_bizweek_source_evidence(
         f"{page_text}\n"
         "END_FACEBOOK_PAGE_SOURCE_TEXT"
     )
-    if page_text not in original:
+    if source_block.strip() not in original:
         augmented["original_request"] = f"{original}{source_block}".strip()
     augmented["grace_interpretation"] = " ".join(
         entry
@@ -2423,6 +2435,18 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             contract,
             session_id=session_id,
         )
+        if task_type == "facebook_page_publish_preflight":
+            from tools.facebook_page_graph_tool import bind_accepted_page_preflight_source
+
+            accepted_source = bind_accepted_page_preflight_source(contract, board=board)
+            if accepted_source is not None:
+                contract["facebook_page_preflight_source"] = accepted_source
+                contract["memory"]["working"].append(
+                    "The preflight capability supplies the exact accepted Page message and image. "
+                    "Call facebook_page_publish_preflight with final_message='' and image_path=''; "
+                    "use its returned final_message and manifest verbatim. Do not reconstruct text "
+                    "or request general file-reading tools."
+                )
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(

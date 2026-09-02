@@ -1024,8 +1024,15 @@ def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
     assert ended_run.metadata["external_effects"] == []
 
 
+@pytest.mark.parametrize("wire_format", [
+    "existing_package", "canonical_report", "missing_report", "wrong_hash",
+    "wrong_filename", "missing_image", "object_body", "reference_body", "see_reference_body",
+    "prose_reference_body", "metadata_reference_body", "symlink_asset",
+    "cjk_reference_body", "cjk_metadata_reference_body",
+])
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
+    wire_format,
 ):
     page = kanban_home / "page.png"
     cover = kanban_home / "cover.png"
@@ -1089,6 +1096,48 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
             ],
         }
     }
+    if wire_format != "existing_package":
+        payload = terminal["artifacts"][0]["value"]["result"]
+        package = payload["acceptanceEvidence"].pop("telegram_user_facing_content_package")
+        payload["acceptanceEvidence"]["source_fidelity"] = "verified"
+        payload["metadata"] = {"user_facing_report": {
+            "kind": "content_package", "delivery": "inline_with_attachment",
+            "complete": True, "title": "Verified package",
+            "observed_at": int(openclaw_async_executor.time.time()),
+            "body": "\n\n".join(package[key] for key in [
+                "facebook_page_body", "group_discussion_copy", "gemini_notebook_audio_prompt",
+                "podcast_title", "podcast_description",
+            ]),
+            "assets": [{**a, "label": a["asset_family"]} for a in package["image_attachments"]],
+        }}
+        report = payload["metadata"]["user_facing_report"]
+        if wire_format == "missing_report":
+            payload["metadata"] = {"user_facing_report": {"kind": "content_package",
+                "inline_content_package_field": "acceptanceEvidence.inline_content_package"}}
+        elif wire_format == "wrong_hash":
+            report["assets"][0]["sha256"] = "0" * 64
+        elif wire_format == "wrong_filename":
+            report["assets"][0]["filename"] = "another-case.png"
+        elif wire_format == "missing_image":
+            report["assets"].pop()
+        elif wire_format == "object_body":
+            report["body"] = {"reference": "acceptanceEvidence.inline_content_package"}
+        elif wire_format == "reference_body":
+            report["body"] = "acceptanceEvidence.inline_content_package"
+        elif wire_format == "see_reference_body":
+            report["body"] = "請參閱 `acceptanceEvidence.inline_content_package`。"
+        elif wire_format == "prose_reference_body":
+            report["body"] = "See acceptanceEvidence.inline_content_package for the complete package."
+        elif wire_format == "metadata_reference_body":
+            report["body"] = "The package is at metadata.user_facing_report.body"
+        elif wire_format == "cjk_reference_body":
+            report["body"] = "請參閱acceptanceEvidence.inline_content_package"
+        elif wire_format == "cjk_metadata_reference_body":
+            report["body"] = "請參閱metadata.user_facing_report內容"
+        elif wire_format == "symlink_asset":
+            target = kanban_home / "unrelated.txt"
+            page.rename(target)
+            page.symlink_to(target)
     observation = {
         "status": "succeeded",
         "delegated_result": terminal,
@@ -1097,6 +1146,13 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
 
     handled = make_loop_contract_terminal_handler()(run, observation)
 
+    if wire_format not in {"existing_package", "canonical_report"}:
+        assert handled["accepted"] is False
+        assert "Required content package" in handled["reason"]
+        with kb.connect() as conn:
+            assert kb.get_task(conn, run.task_id).status == "blocked"
+            assert kb.list_attachments(conn, run.task_id) == []
+        return
     assert handled["accepted"] is True
     with kb.connect() as conn:
         completed_run = kb.latest_run(conn, started["execution_task_id"])
@@ -1110,6 +1166,10 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         page.name,
         cover.name,
     }
+    with kb.connect() as conn:
+        rebuilt = kb.grace_inline_content_package_report(conn, started["execution_task_id"])
+    assert rebuilt["body"] == report["body"]
+    assert {a["sha256"] for a in rebuilt["assets"]} == {a["sha256"] for a in report["assets"]}
 
 
 def test_loop_contract_terminal_promotes_inline_text_content_package(

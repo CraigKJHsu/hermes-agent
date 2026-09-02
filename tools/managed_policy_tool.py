@@ -273,6 +273,11 @@ def _ai_bizweek_carter_source_materials(
     return {
         "kind": "ai_bizweek_carter_ep04_source_material",
         "available": True,
+        "task_bound": False,
+        "selection_scope_entry": (
+            f"Use stored Facebook Page source: session_id={row['session_id']}; "
+            f"message_id={row['id']}; sha256={hashlib.sha256(facebook_page_text.encode('utf-8')).hexdigest()}"
+        ),
         "source": "hermes_state_db.messages",
         "session_id": str(row["session_id"]),
         "message_id": int(row["id"]),
@@ -286,11 +291,13 @@ def _ai_bizweek_carter_source_materials(
         "raw_message_text": raw_text,
         "canonical_note": (
             "This is the KJ-provided Carter's Junk Away Facebook Page source text "
-            "from Topic 4641 session history. Use it as task-scoped source "
-            "material for source-vs-output diff; do not ask KJ to repost it."
+            "from Topic 4641 session history, not the current task's source binding. "
+            "Use it only when the current request explicitly selects this exact copy; "
+            "do not ask KJ to repost it. Never replace another case's supplied text."
         ),
         "guidance": [
-            "Embed facebook_page_source_text into the production Loop Contract source_materials.",
+            "Shared Topic policies do not select a case. Prefer the current request's original text; embed this historical copy only after an exact task-source selection.",
+            "Only when KJ selected this historical source, copy selection_scope_entry verbatim into the Loop Contract scope.allowed to bind it without reposting the full text.",
             "Use raw_message_text only as audit context; the final instruction line is not Page body.",
             "If a newer explicit KJ/Grace discussion overrides this source, record that authorization and diff.",
         ],

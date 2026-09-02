@@ -84,6 +84,20 @@ def test_known_publish_task_requires_memory_delta():
         normalize_memory_deltas([], normalized["domain_memory"])
 
 
+def test_content_package_delivery_does_not_disable_publish_memory_delta():
+    contract = _contract(task_type="facebook_page_api_publish")
+    contract["user_facing_delivery"] = {"body_field": "inline_content_package"}
+    spec = attach_domain_memory_contract(contract)["domain_memory"]
+    assert spec["mode"] == "mutate"
+    assert spec["require_delta_on_acceptance"] is True
+
+
+def test_inventory_with_inline_package_delivery_keeps_query_contract():
+    contract = _contract()
+    contract["user_facing_delivery"] = {"body_field": "inline_content_package"}
+    assert attach_domain_memory_contract(contract)["domain_memory"]["mode"] == "query"
+
+
 def test_query_contract_cannot_smuggle_registry_write():
     spec = attach_domain_memory_contract(_contract())["domain_memory"]
 

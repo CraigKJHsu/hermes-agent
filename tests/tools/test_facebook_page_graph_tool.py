@@ -4,9 +4,123 @@ from contextlib import contextmanager
 import hashlib
 import json
 import struct
+import pytest
 
 from tools import facebook_page_graph_tool as tool
 from hermes_cli import kanban_db as kb
+
+
+@pytest.fixture
+def accepted_page_package(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    image = tmp_path / "hero.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+                      + struct.pack(">II", 1664, 936) + b"\x08\x06\x00\x00\x00")
+    message = "  已驗收正文\r\n\r\n保留 Page → Group CTA。\n\n#案例\n"
+    contract = {"identity": {"platform": "telegram", "chat_id": "chat-1",
+                             "thread_id": "2", "project": "case-project"}}
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(conn, title="accepted package")
+        assert kb.claim_task(conn, source_id)
+        assert kb.complete_task(conn, source_id, metadata={
+            "loop_contract": contract,
+            "acceptance_evidence": {"inline_content_package": {"facebook_page_post": message}},
+        })
+        review_id = kb.create_task(conn, title="accepted review", parents=(source_id,))
+        assert kb.claim_task(conn, review_id)
+        assert kb.complete_task(conn, review_id, metadata={
+            "review_outcome": "accepted", "accepted": True,
+            "asset_review": [{"asset_family": "page_hero", "accepted": True,
+                              "path": str(image), "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+                              "width": 1664, "height": 936}],
+        })
+        conn.execute(
+            "INSERT INTO grace_delegations (delegation_id, contract_fingerprint, request_instance_id, "
+            "platform, chat_id, thread_id, session_key, session_id, resolved_route, approval_required, "
+            "state, execution_task_id, review_task_id, created_at, updated_at) "
+            "VALUES ('gd-source', ?, 'request-source', 'telegram', 'chat-1', '2', 'session-key', "
+            "'session', '{}', 0, 'queued', ?, ?, 1, 1)",
+            ("a" * 64, source_id, review_id),
+        )
+    contract["scope"] = {"allowed": [f"Use accepted Facebook Page package: execution_task_id={source_id}; review_task_id={review_id}"]}
+    contract["facebook_page_preflight_source"] = tool.bind_accepted_page_preflight_source(contract)
+    return contract, message, source_id, review_id
+
+
+@pytest.mark.parametrize("fault", [None, "wrong_topic", "wrong_project", "rejected", "new_execution",
+                                       "wrong_review", "ambiguous", "unselected"])
+def test_accepted_page_source_requires_exact_review_and_topic(accepted_page_package, fault):
+    contract, message, source_id, review_id = accepted_page_package
+    if fault == "wrong_topic":
+        contract["identity"]["thread_id"] = "3"
+    elif fault == "wrong_project":
+        contract["identity"]["project"] = "other-case"
+    elif fault == "rejected":
+        with kb.connect_closing() as conn:
+            row = kb.latest_run(conn, review_id)
+            conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", ('{"review_outcome":"rejected"}', row.id))
+    elif fault == "new_execution":
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE task_runs SET ended_at=ended_at+100 WHERE task_id=?", (source_id,))
+    elif fault == "wrong_review":
+        contract["scope"]["allowed"][0] = contract["scope"]["allowed"][0].replace(review_id, "t_ffffffff")
+    elif fault == "ambiguous":
+        contract["scope"]["allowed"] *= 2
+    elif fault == "unselected":
+        contract["scope"]["allowed"] = []
+        assert tool.bind_accepted_page_preflight_source(contract) is None
+        return
+    if fault:
+        with pytest.raises(ValueError):
+            tool.bind_accepted_page_preflight_source(contract)
+    else:
+        resolved = tool.bind_accepted_page_preflight_source(contract)
+        assert resolved["message"] == message
+        assert resolved["message_utf8_bytes"] == len(message.encode("utf-8"))
+        assert resolved["message_sha256"] == hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("fault", [None, "changed_pin", "changed_message", "wrong_image", "inactive"])
+def test_preflight_reads_accepted_bytes_through_active_capability(
+    accepted_page_package, monkeypatch, fault,
+):
+    contract, message, _, _ = accepted_page_package
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="preflight")
+        task = kb.claim_task(conn, task_id)
+        run_id = task.current_run_id
+        scope = tool.OpenClawCapabilityScope(task_id=task_id, run_id=run_id,
+            delegation_id="gd-preflight", contract_fingerprint="b" * 64, approval_grant_id="",
+            backend_agent_id="missioncrew-facebook-page-operator", task_type="facebook_page_publish_preflight")
+        if fault == "changed_pin":
+            contract["facebook_page_preflight_source"]["message"] = "different case"
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps({
+            "delegation_id": scope.delegation_id, "contract_fingerprint": scope.contract_fingerprint,
+            "approval_grant_id": "", "backend_agent_id": scope.backend_agent_id,
+            "allowed_tools": ["facebook_page_publish_preflight"], "external_effect_budget": 0,
+            "task_type": scope.task_type, "credential_refs": ["missioncrew-facebook-page"],
+            "loop_contract": contract,
+        }), run_id))
+        if fault == "inactive":
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+    calls = []
+    def status(_args):
+        calls.append("GET")
+        return json.dumps({"identity_verified": True, "configured": True, "page_id": "123",
+                           "page_name": "Test", "page_url": "https://www.facebook.com/test", "api_version": "v26.0"})
+    monkeypatch.setattr(tool, "_handle_status", status)
+    result = json.loads(tool._handle_publish_preflight({
+        "final_message": "changed" if fault == "changed_message" else "",
+        "image_path": "/unbound/private.txt" if fault == "wrong_image" else "",
+    }, capability_scope=scope))
+    assert result["success"] is (fault is None)
+    assert result["published"] is False
+    assert calls == ([] if fault else ["GET"])
+    if not fault:
+        assert result["final_message"] == message
+        assert result["manifest"]["message_utf8_bytes"] == len(message.encode("utf-8"))
+        assert result["external_effects"] == []
 
 
 def _config() -> tool.FacebookPageConfig:

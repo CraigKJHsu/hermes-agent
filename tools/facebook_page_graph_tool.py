@@ -330,6 +330,85 @@ def _embedded_page_source(contract: Mapping[str, Any]) -> tuple[str, str]:
     return match.group(2), match.group(1)
 
 
+def bind_accepted_page_preflight_source(
+    contract: Mapping[str, Any], *, board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve an explicitly selected, same-Topic accepted package; never read a path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.grace_review_metadata import grace_review_accepted
+
+    prefix = "Use accepted Facebook Page package: "
+    entries = [s for s in (contract.get("scope") or {}).get("allowed", [])
+               if isinstance(s, str) and s.startswith(prefix)]
+    if not entries:
+        return None
+    match = re.fullmatch(
+        re.escape(prefix) + r"execution_task_id=(t_[0-9a-f]+); review_task_id=(t_[0-9a-f]+)",
+        entries[0],
+    )
+    if len(entries) != 1 or match is None:
+        raise ValueError("Preflight requires one exact accepted package selection.")
+    execution_id, review_id = match.groups()
+    identity = contract.get("identity") or {}
+    with kb.connect_closing(board=board) as conn:
+        link = conn.execute(
+            "SELECT d.platform, d.chat_id, d.thread_id FROM grace_delegations d "
+            "JOIN task_links l ON l.parent_id=d.execution_task_id AND l.child_id=d.review_task_id "
+            "WHERE d.execution_task_id=? AND d.review_task_id=?",
+            (execution_id, review_id),
+        ).fetchone()
+        if link is None or any(
+            not identity.get(key) or str(link[key]) != str(identity[key])
+            for key in ("platform", "chat_id", "thread_id")
+        ):
+            raise ValueError("Accepted package must belong to this exact Topic and review link.")
+        execution = kb.get_task(conn, execution_id)
+        review = kb.get_task(conn, review_id)
+        source_run = kb.latest_run(conn, execution_id)
+        review_run = kb.latest_run(conn, review_id)
+        if (
+            execution is None or review is None
+            or execution.status != "done" or review.status != "done"
+            or source_run is None or review_run is None
+            or source_run.status != "done" or review_run.status != "done"
+            or not source_run.ended_at or not review_run.started_at
+            or review_run.started_at < source_run.ended_at
+            or not grace_review_accepted(review_run.metadata)
+        ):
+            raise ValueError("Selected package has no completed review of its latest execution.")
+    source_metadata = source_run.metadata or {}
+    source_identity = (source_metadata.get("loop_contract") or {}).get("identity") or {}
+    if not identity.get("project") or source_identity.get("project") != identity["project"]:
+        raise ValueError("Accepted package belongs to another project.")
+    evidence = source_metadata.get("acceptance_evidence") or {}
+    package = evidence.get("inline_content_package") or {}
+    message = package.get("facebook_page_post") if isinstance(package, Mapping) else None
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("Accepted package lacks structured facebook_page_post text.")
+    images = [a for a in (review_run.metadata or {}).get("asset_review", [])
+              if isinstance(a, Mapping) and a.get("asset_family") == "page_hero"
+              and a.get("accepted") is True]
+    if len(images) != 1:
+        raise ValueError("Accepted package must have one reviewed Page Hero.")
+    asset = images[0]
+    if (not isinstance(asset.get("path"), str) or not asset["path"]
+        or not re.fullmatch(r"[0-9a-f]{64}", str(asset.get("sha256") or ""))
+        or not isinstance(asset.get("width"), int) or not isinstance(asset.get("height"), int)
+        or asset["width"] <= 0 or asset["height"] <= 0
+        or asset["width"] * 9 != asset["height"] * 16):
+        raise ValueError("Accepted Page Hero lacks exact path/hash/dimensions.")
+    return {
+        "execution_task_id": execution_id, "execution_run_id": source_run.id,
+        "review_task_id": review_id, "review_run_id": review_run.id,
+        "source_field": "acceptance_evidence.inline_content_package.facebook_page_post",
+        "message": message,
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "message_utf8_bytes": len(message.encode("utf-8")),
+        "image_path": asset["path"], "image_sha256": asset["sha256"],
+        "dimensions": f"{asset['width']}×{asset['height']}",
+    }
+
+
 def _authorized_page_body(source: str, final_message: str) -> dict[str, Any]:
     headings = ("💬 Group 討論題：", "Page → Group 導流：")
     positions = []
@@ -375,11 +454,26 @@ def _handle_publish_preflight(
     final_message = str(args.get("final_message") or "")
     image_path_raw = str(args.get("image_path") or "").strip()
     try:
-        source, expected_source_hash = _embedded_page_source(contract)
-        source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        if source_hash != expected_source_hash:
-            raise ValueError("Embedded source SHA-256 does not match its evidence header.")
-        diff = _authorized_page_body(source, final_message)
+        accepted = bind_accepted_page_preflight_source(contract, board=capability_scope.board or None)
+        if accepted is not None:
+            if contract.get("facebook_page_preflight_source") != accepted:
+                raise ValueError("Accepted package changed or was not pinned before delegation.")
+            if final_message and final_message != accepted["message"]:
+                raise ValueError("Worker message differs from the exact accepted Page message.")
+            if image_path_raw and image_path_raw != accepted["image_path"]:
+                raise ValueError("Worker image path differs from the accepted Page Hero.")
+            final_message, image_path_raw = accepted["message"], accepted["image_path"]
+            source_hash = accepted["message_sha256"]
+            diff = {key: value for key, value in accepted.items() if key != "message"}
+            diff["accepted_message_unchanged"] = True
+        else:
+            if contract.get("facebook_page_preflight_source") is not None:
+                raise ValueError("Pinned accepted package has no explicit source selection.")
+            source, expected_source_hash = _embedded_page_source(contract)
+            source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            if source_hash != expected_source_hash:
+                raise ValueError("Embedded source SHA-256 does not match its evidence header.")
+            diff = _authorized_page_body(source, final_message)
         strings = _contract_strings(contract)
         if not image_path_raw or not any(image_path_raw in item for item in strings):
             raise ValueError("Image path is not bound in the Loop Contract.")
@@ -411,6 +505,7 @@ def _handle_publish_preflight(
             "manifest": {
                 "source_sha256": source_hash,
                 "message_sha256": hashlib.sha256(final_message.encode("utf-8")).hexdigest(),
+                "message_utf8_bytes": len(final_message.encode("utf-8")),
                 "image_path": str(image_path),
                 "image_sha256": image_hash,
                 "image_format": "PNG",
@@ -420,6 +515,9 @@ def _handle_publish_preflight(
                 "page_id": page_status.get("page_id"),
                 "page_name": page_status.get("page_name"),
                 "page_url": page_status.get("page_url"),
+                "api_version": page_status.get("api_version"),
+                "configured": page_status.get("configured"),
+                "identity_verified": page_status.get("identity_verified"),
             },
             "evidence": diff,
             "external_effects": [],

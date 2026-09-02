@@ -210,6 +210,15 @@ def infer_builtin_domain_memory(
         "facebook_marketplace_group_publish",
         "facebook_marketplace_price_update",
     }
+    delivery = contract.get("user_facing_delivery")
+    if (
+        task_type == "product_marketing"
+        and isinstance(delivery, Mapping)
+        and delivery.get("body_field") == "inline_content_package"
+    ):
+        # Draft production is not a registry inventory. Inferring query mode
+        # here makes the worker compiler discard the user-provided source.
+        return None
     return normalize_domain_memory_contract({
         "schema_id": schema_id,
         "mode": "mutate" if task_type in mutation_task_types else "query",

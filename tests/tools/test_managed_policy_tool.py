@@ -378,6 +378,7 @@ def test_managed_policy_read_returns_carter_page_source_material(
 
     source = result["content_source_evidence"]
     assert source["available"] is True
+    assert source["task_bound"] is False
     assert source["message_id"] == managed_policy_tool._CARTER_SOURCE_MESSAGE_ID
     assert source["facebook_page_source_text"] == (
         "Carter Page body paragraph.\n\nPage → Group 導流。"
@@ -386,3 +387,20 @@ def test_managed_policy_read_returns_carter_page_source_material(
         source["facebook_page_source_text"].encode()
     ).hexdigest()
     assert "do not ask KJ to repost it" in source["canonical_note"]
+
+    from plugins.openclaw_bridge.clawops_delegate import _augment_ai_bizweek_source_evidence
+
+    contract = {
+        "original_request": (
+            "Use the stored Carter EP04 Page copy for AI BizWeek. "
+            "Ignore this obsolete source block:\n"
+            "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT\nold unrelated source\n"
+            "END_FACEBOOK_PAGE_SOURCE_TEXT"
+        ),
+        "scope": {"allowed": [source["selection_scope_entry"]]},
+    }
+    bound = _augment_ai_bizweek_source_evidence(contract, session_id="session-carter")
+    assert source["facebook_page_source_text"] in bound["original_request"]
+    assert f"source=session:{source['session_id']}" in bound["original_request"]
+    contract["scope"]["allowed"] = [source["selection_scope_entry"] + "-wrong-hash"]
+    assert _augment_ai_bizweek_source_evidence(contract, session_id="session-carter") == contract
