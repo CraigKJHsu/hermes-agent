@@ -931,6 +931,99 @@ def test_domain_mutation_loop_contract_sends_terminal_result_contract(kanban_hom
     )
 
 
+def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-domain-mutation-invalid-delta-1"
+    contract["domain_memory"] = {
+        "schema_id": "secondhand.item.v1",
+        "mode": "mutate",
+        "require_delta_on_acceptance": True,
+    }
+    contract["facebook_group_publish"] = {
+        "mode": "canonical_url_per_group",
+        "source_listing_id": "37276725125275496",
+        "management_listing_id": "915975414881937",
+        "destinations": [
+            {
+                "group_id": "207110076321670",
+                "canonical_name": "二手家電冷氣買賣",
+                "canonical_url": "https://www.facebook.com/groups/207110076321670",
+            }
+        ],
+    }
+    contract["external_targets"] = [
+        "facebook marketplace listing 37276725125275496",
+        "https://www.facebook.com/groups/207110076321670",
+    ]
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_marketplace_group_publish",
+        risk_level="high",
+        approved=True,
+        delegation_id="delegation-loop-domain-mutation-invalid-delta-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["externalEffectBudget"] = run.metadata["external_effect_budget"]
+    output["result"] = {
+        "status": "succeeded",
+        "summary": "Returned flat artifact-style domain deltas.",
+        "acceptanceEvidence": ["worker claims completion"],
+        "externalEffects": [],
+        "domainMemoryDeltas": [
+            {
+                "operation": "upsert_artifact",
+                "entity_id": "kolin-kd-291m06",
+                "label": "Kolin KD-291M06",
+                "status": "published",
+                "artifact_type": "facebook_group_post",
+                "platform": "facebook",
+                "public_url": (
+                    "https://www.facebook.com/groups/207110076321670/posts/1"
+                ),
+            }
+        ],
+    }
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-invalid-domain-delta-digest",
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, observation)
+
+    assert handled["accepted"] is False
+    assert "Domain memory:" in handled["reason"]
+    assert "artifact state inside artifacts[]" in handled["reason"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert task is not None and task.status == "blocked"
+    assert ended_run is not None and ended_run.status == "blocked"
+    assert ended_run.metadata["loop_contract_blocked_result"]["status"] == "succeeded"
+    assert ended_run.metadata["domain_memory_delta_error"].startswith(
+        "metadata.domain_memory_deltas[0] must be an entity delta"
+    )
+    assert ended_run.metadata["external_effects"] == []
+
+
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
 ):

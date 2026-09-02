@@ -4298,6 +4298,7 @@ def make_loop_contract_terminal_handler(
             and not _acceptance_evidence_has_failure(
                 audited_result.get("acceptanceEvidence")
             )
+            and not domain_memory_error
             and isinstance(external_effects, list)
             and len(external_effects) <= external_effect_budget
             and normalized_external_effects is not None
@@ -4389,6 +4390,7 @@ def make_loop_contract_terminal_handler(
                             else [],
                             "internal_tool_receipts": internal_tool_receipts,
                             "policy_receipts": policy_receipts,
+                            "domain_memory_delta_error": domain_memory_error or None,
                             "domain_memory_deltas": (
                                 normalized_domain_memory_deltas
                                 if normalized_domain_memory_deltas is not None
