@@ -1030,6 +1030,7 @@ def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
     "prose_reference_body", "metadata_reference_body", "symlink_asset",
     "cjk_reference_body", "cjk_metadata_reference_body",
     "generated_uuid", "generated_uuid_wrong_hash", "generated_other_case",
+    "existing_package_generated_uuid", "existing_package_other_case",
 ])
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
@@ -1097,7 +1098,13 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
             ],
         }
     }
-    if wire_format != "existing_package":
+    if wire_format.startswith("existing_package_"):
+        package = terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"]["telegram_user_facing_content_package"]
+        stem = "different-case" if wire_format.endswith("other_case") else page.stem
+        generated = page.with_name(stem + "---392d24d4-b1ab-4965-9080-9913b2856da3.png")
+        page.rename(generated)
+        package["image_attachments"][0]["path"] = str(generated)
+    elif wire_format != "existing_package":
         payload = terminal["artifacts"][0]["value"]["result"]
         package = payload["acceptanceEvidence"].pop("telegram_user_facing_content_package")
         payload["acceptanceEvidence"]["source_fidelity"] = "verified"
@@ -1154,7 +1161,7 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
 
     handled = make_loop_contract_terminal_handler()(run, observation)
 
-    if wire_format not in {"existing_package", "canonical_report", "generated_uuid"}:
+    if wire_format not in {"existing_package", "canonical_report", "generated_uuid", "existing_package_generated_uuid"}:
         assert handled["accepted"] is False
         assert "Required content package" in handled["reason"]
         with kb.connect() as conn:
@@ -1169,7 +1176,7 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     report = completed_run.metadata["user_facing_report"]
     assert report["kind"] == "content_package"
     assert "完整 Page 內文" in report["body"]
-    if wire_format == "generated_uuid":
+    if wire_format in {"generated_uuid", "existing_package_generated_uuid"}:
         assert generated.read_bytes() == b"page-image"
         assert Path(report["assets"][0]["path"]).name == page.name
         assert Path(report["assets"][0]["path"]).read_bytes() == generated.read_bytes()

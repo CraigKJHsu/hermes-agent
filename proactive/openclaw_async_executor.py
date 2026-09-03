@@ -4210,7 +4210,6 @@ def _content_package_completion_metadata(
         if (
             not filename
             or not path.is_file()
-            or path.name != filename
             or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None
         ):
             return {}
