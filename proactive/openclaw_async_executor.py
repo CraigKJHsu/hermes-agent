@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import time
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -2916,6 +2917,13 @@ def retry_ready_loop_contract_execution(
                     "parent_contract_fingerprint": parent_fingerprint,
                     "start_idempotency_key": start_key,
                     "review_task_id": str(previous_metadata.get("review_task_id") or ""),
+                    # Corrections retain the admitted model policy; older failed
+                    # retries may have dropped it while the task still pins it.
+                    "model_route": dict(
+                        previous_metadata.get("model_route")
+                        or (task.routing_decision or {}).get("model_route")
+                        or {}
+                    ),
                     "correction_reason": correction_reason,
                     "correction_admission": True,
                     "max_poll_iterations": 0,
@@ -4067,17 +4075,44 @@ def _materialize_content_package_report(
     if not report_satisfies_user_facing_delivery(normalized, delivery):
         return {}
     paths = []
+    verified_assets = []
     for asset in normalized["assets"]:
         path = Path(asset["path"]).expanduser().resolve()
+        filename = asset["filename"]
+        if Path(filename).name != filename or "\\" in filename:
+            return {}
+        requested = Path(filename)
+        generated_name = re.fullmatch(
+            re.escape(requested.stem)
+            + r"---[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            + re.escape(requested.suffix),
+            path.name,
+            flags=re.IGNORECASE,
+        )
         if (
             not path.is_file()
-            or path.name != asset["filename"]
+            or (path.name != filename and not generated_name)
             or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}
-            or hashlib.sha256(path.read_bytes()).hexdigest() != asset["sha256"]
         ):
             return {}
-        asset["path"] = str(path.resolve())
-        paths.append(str(path.resolve()))
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != asset["sha256"]:
+            return {}
+        verified_assets.append((asset, path, data))
+    generated_dir = None
+    for asset, path, data in verified_assets:
+        if path.name != asset["filename"]:
+            # image_generate adds a UUID to physical filenames. Canonicalize
+            # only that known suffix after hash validation; never edit pixels.
+            if generated_dir is None:
+                staging_root = kb.attachments_root(board=board).parent / "artifacts"
+                staging_root.mkdir(parents=True, exist_ok=True)
+                generated_dir = Path(tempfile.mkdtemp(prefix=f"{task_id}-", dir=staging_root))
+            path = generated_dir / asset["filename"]
+            with path.open("xb") as output:
+                output.write(data)
+        asset["path"] = str(path)
+        paths.append(str(path))
     if normalized["delivery"] == "inline_only":
         return {"user_facing_report": normalized}
     staging_dir = kb.attachments_root(board=board).parent / "artifacts"

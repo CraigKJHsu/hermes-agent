@@ -668,8 +668,17 @@ def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         isinstance(domain_memory, Mapping)
         and domain_memory.get("mode") == "query"
     )
+    delivery = safe.get("user_facing_delivery")
+    source_package = (
+        isinstance(delivery, Mapping)
+        and delivery.get("kind") == "content_package"
+        and bool(delivery.get("asset_filenames"))
+    )
+    # Registry query means no registry mutation; an explicitly source-bound
+    # production package still needs its original text in the execution card.
     expose_original = (
-        not registry_query and _contract_requires_backend_original_request(safe)
+        (not registry_query or source_package)
+        and _contract_requires_backend_original_request(safe)
     )
     if not expose_original:
         safe.pop("original_request", None)

@@ -1029,6 +1029,7 @@ def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
     "wrong_filename", "missing_image", "object_body", "reference_body", "see_reference_body",
     "prose_reference_body", "metadata_reference_body", "symlink_asset",
     "cjk_reference_body", "cjk_metadata_reference_body",
+    "generated_uuid", "generated_uuid_wrong_hash", "generated_other_case",
 ])
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
@@ -1114,6 +1115,13 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         if wire_format == "missing_report":
             payload["metadata"] = {"user_facing_report": {"kind": "content_package",
                 "inline_content_package_field": "acceptanceEvidence.inline_content_package"}}
+        elif wire_format in {"generated_uuid", "generated_uuid_wrong_hash", "generated_other_case"}:
+            stem = "different-case" if wire_format == "generated_other_case" else page.stem
+            generated = page.with_name(stem + "---392d24d4-b1ab-4965-9080-9913b2856da3.png")
+            page.rename(generated)
+            report["assets"][0]["path"] = str(generated)
+            if wire_format == "generated_uuid_wrong_hash":
+                report["assets"][0]["sha256"] = "0" * 64
         elif wire_format == "wrong_hash":
             report["assets"][0]["sha256"] = "0" * 64
         elif wire_format == "wrong_filename":
@@ -1146,7 +1154,7 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
 
     handled = make_loop_contract_terminal_handler()(run, observation)
 
-    if wire_format not in {"existing_package", "canonical_report"}:
+    if wire_format not in {"existing_package", "canonical_report", "generated_uuid"}:
         assert handled["accepted"] is False
         assert "Required content package" in handled["reason"]
         with kb.connect() as conn:
@@ -1161,6 +1169,10 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     report = completed_run.metadata["user_facing_report"]
     assert report["kind"] == "content_package"
     assert "完整 Page 內文" in report["body"]
+    if wire_format == "generated_uuid":
+        assert generated.read_bytes() == b"page-image"
+        assert Path(report["assets"][0]["path"]).name == page.name
+        assert Path(report["assets"][0]["path"]).read_bytes() == generated.read_bytes()
     assert {item.filename for item in attachments} == {
         f"{started['execution_task_id']}-content-package.md",
         page.name,
@@ -1539,7 +1551,8 @@ def test_loop_contract_poll_rejects_cross_run_backend_identity(
         adapter(run)
 
 
-def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
+@pytest.mark.parametrize("missing_run_route", [False, True])
+def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, missing_run_route):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-correction-1"
     from hermes_cli.telegram_message_path import build_telegram_message_path
@@ -1564,6 +1577,12 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
     with kb.connect() as conn:
         run = kb.get_run(conn, int(started["run_id"]))
         assert run is not None
+        admitted_route = dict(run.metadata["model_route"])
+        if missing_run_route:
+            prior_metadata = dict(run.metadata)
+            prior_metadata.pop("model_route")
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                         (json.dumps(prior_metadata), run.id))
         assert kb.complete_task(
             conn,
             started["execution_task_id"],
@@ -1601,6 +1620,7 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home):
     assert retried["execution_task_id"] == started["execution_task_id"]
     assert retried["run_id"] != started["run_id"]
     assert seen["objective"] == contract["goal"]["objective"]
+    assert seen["model_route"] == admitted_route
     assert seen["external_effect_budget"] == 0
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])

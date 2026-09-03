@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import (
     compile_and_delegate,
@@ -719,3 +721,27 @@ def test_internal_ops_contract_uses_hermes_ops_runtime(tmp_path, monkeypatch):
     assert execution.executor_profile == "clawops-ops"
     assert review is not None
     assert review.executor_profile == "grace-policy-review"
+
+
+@pytest.mark.parametrize("source_kind", ["package", "inventory", "callback"])
+def test_registry_readonly_package_preserves_exact_source_in_card(source_kind):
+    from proactive.grace_task_compiler import _worker_safe_contract
+    from proactive.openclaw_async_executor import _worker_safe_loop_contract
+
+    contract = _image_contract()
+    original = "  🇺🇸 NewCase 原文\r\n\r\nExact punctuation！\n"
+    if source_kind == "callback":
+        original = "[SYSTEM: Grace Loop callback] source of truth: internal envelope"
+    contract["original_request"] = original
+    contract["grace_interpretation"] = "Preserve the original_request SOURCE MATERIAL verbatim."
+    contract["domain_memory"] = {"mode": "query"}
+    if source_kind != "inventory":
+        contract["user_facing_delivery"] = {
+            "kind": "content_package", "asset_filenames": ["newcase_page.png"],
+        }
+    safe = _worker_safe_contract(contract)
+    if source_kind == "package":
+        assert safe["original_request"].encode("utf-8") == original.encode("utf-8")
+        assert _worker_safe_loop_contract(safe)["original_request"] == original
+    else:
+        assert "original_request" not in safe
