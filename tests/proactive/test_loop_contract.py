@@ -418,6 +418,26 @@ def test_completion_mode_is_required_and_explicit():
         validate_loop_contract(contract)
 
 
+def test_intermediate_completion_requires_objective_stage_binding():
+    contract = _contract()
+    contract["completion_mode"] = "intermediate"
+
+    with pytest.raises(
+        LoopContractError,
+        match="completion_mode=intermediate requires objective_ref",
+    ):
+        validate_loop_contract(contract)
+
+    contract["objective_ref"] = {
+        "objective_id": "obj-secondhand-relist",
+        "stage_key": "candidate_research",
+    }
+
+    normalized = validate_loop_contract(contract)
+    assert normalized["completion_mode"] == "intermediate"
+    assert normalized["objective_ref"] == contract["objective_ref"]
+
+
 def test_user_facing_delivery_is_explicit_and_fail_closed():
     contract = _contract()
     contract["user_facing_delivery"] = {

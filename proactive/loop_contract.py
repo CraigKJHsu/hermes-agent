@@ -472,6 +472,12 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         else:
             required_text("objective_ref.objective_id")
             required_text("objective_ref.stage_key")
+    elif value.get("completion_mode") == "intermediate":
+        errors.append(
+            "completion_mode=intermediate requires objective_ref with an "
+            "objective_id and stage_key; use completion_mode=terminal for a "
+            "standalone execution card"
+        )
 
     user_facing_delivery = value.get("user_facing_delivery")
     routing_task_type = str(
