@@ -358,6 +358,28 @@ def begin_backend_attempt(
     )
 
 
+def begin_delegation(value: Any) -> dict[str, Any]:
+    """Start a successor delegation while preserving the prior trace history."""
+    path = normalize_message_path(value)
+    if not path:
+        return {}
+    for key, history_key in (
+        ("delegation_id", "delegation_ids"),
+        ("execution_task_id", "execution_task_ids"),
+        ("review_task_id", "review_task_ids"),
+        ("run_id", "run_ids"),
+        ("openclaw_backend_agent_id", "openclaw_backend_agent_ids"),
+        ("openclaw_backend_run_id", "openclaw_backend_run_ids"),
+        ("openclaw_backend_session_key", "openclaw_backend_session_keys"),
+    ):
+        old = _clean(path.get(key))
+        if old:
+            history = [_clean(item) for item in path.get(history_key, [])]
+            path[history_key] = list(dict.fromkeys([*history, old]))
+        path[key] = ""
+    return path
+
+
 def append_hop(
     value: Any,
     *,

@@ -16,6 +16,7 @@ from hermes_cli.telegram_message_path import (
     append_hop,
     backend_projection,
     begin_backend_attempt,
+    begin_delegation,
     bind_message_path,
     build_telegram_message_path,
     merge_message_paths,
@@ -110,6 +111,39 @@ def test_session_id_can_advance_with_history_for_same_trace():
     merged = merge_message_paths(first, second)
     assert merged["session_id"] == "session-2"
     assert merged["session_ids"] == ["session-1", "session-2"]
+
+
+def test_begin_delegation_preserves_prior_task_correlation_as_history():
+    first = bind_message_path(
+        _path(),
+        delegation_id="delegation-1",
+        execution_task_id="execution-1",
+        review_task_id="review-1",
+        run_id="run-1",
+        openclaw_backend_agent_id="backend-1",
+        openclaw_backend_run_id="backend-run-1",
+        openclaw_backend_session_key="backend-session-1",
+    )
+
+    successor = begin_delegation(first)
+
+    for key in (
+        "delegation_id",
+        "execution_task_id",
+        "review_task_id",
+        "run_id",
+        "openclaw_backend_agent_id",
+        "openclaw_backend_run_id",
+        "openclaw_backend_session_key",
+    ):
+        assert successor[key] == ""
+    assert successor["delegation_ids"] == ["delegation-1"]
+    assert successor["execution_task_ids"] == ["execution-1"]
+    assert successor["review_task_ids"] == ["review-1"]
+    assert successor["run_ids"] == ["run-1"]
+    assert successor["openclaw_backend_agent_ids"] == ["backend-1"]
+    assert successor["openclaw_backend_run_ids"] == ["backend-run-1"]
+    assert successor["openclaw_backend_session_keys"] == ["backend-session-1"]
 
 
 def test_hops_are_immutable_and_backend_agent_failover_is_historicized():

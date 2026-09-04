@@ -15580,12 +15580,27 @@ def reserve_grace_delegation(
         )
     delegation_id = "gd_" + fingerprint[:32]
     from hermes_cli.telegram_message_path import (
+        begin_delegation,
         bind_message_path,
         dumps_message_path,
         normalize_message_path,
     )
 
     incoming_message_path = normalize_message_path(telegram_message_path)
+    incoming_delegation_id = str(
+        incoming_message_path.get("delegation_id") or ""
+    ).strip()
+    if incoming_delegation_id and incoming_delegation_id != delegation_id:
+        incoming_review_task_id = str(
+            incoming_message_path.get("review_task_id") or ""
+        ).strip()
+        if (
+            not origin_review_task_id
+            or origin_event_id is None
+            or incoming_review_task_id != origin_review_task_id.strip()
+        ):
+            raise ValueError("Telegram message path is bound to another delegation")
+        incoming_message_path = begin_delegation(incoming_message_path)
     message_path_bindings = {
         "session_key": clean_session_key,
         "delegation_id": delegation_id,

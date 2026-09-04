@@ -2440,6 +2440,38 @@ def test_internal_continuation_requires_accepted_owner_fenced_callback(
             event_id=callback["event_id"],
             lease_owner="owner-a",
         )
+        from hermes_cli.telegram_message_path import (
+            bind_message_path,
+            build_telegram_message_path,
+            dumps_message_path,
+        )
+
+        callback_path = bind_message_path(
+            build_telegram_message_path(
+                chat_id="chat-1",
+                thread_id="2",
+                user_id="kj",
+                inbound_message_id="callback-anchor",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id="grace-session-1",
+            ),
+            delegation_id="gd-owner-fenced-callback",
+            execution_task_id=execution_id,
+            review_task_id=review_id,
+            run_id="prior-run",
+            openclaw_backend_agent_id="prior-backend",
+            openclaw_backend_run_id="prior-backend-run",
+            openclaw_backend_session_key="prior-backend-session",
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET telegram_message_path = ? "
+            "WHERE delegation_id = ?",
+            (
+                dumps_message_path(callback_path),
+                "gd-owner-fenced-callback",
+            ),
+        )
+        values["HERMES_TELEGRAM_MESSAGE_PATH"] = dumps_message_path(callback_path)
     from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
     args = _nested_args()
     args.update({
@@ -2449,6 +2481,17 @@ def test_internal_continuation_requires_accepted_owner_fenced_callback(
 
     queued = json.loads(handle_clawops_delegate(args))
     assert queued["status"] == "queued"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        successor = kb.get_grace_delegation(
+            conn, delegation_id=queued["delegation_id"],
+        )
+    successor_path = json.loads(successor["telegram_message_path"])
+    assert successor_path["delegation_id"] == queued["delegation_id"]
+    assert successor_path["delegation_ids"] == ["gd-owner-fenced-callback"]
+    assert successor_path["execution_task_ids"] == [execution_id]
+    assert successor_path["review_task_ids"] == [review_id]
+    assert successor_path["run_ids"] == ["prior-run"]
+    assert successor_path["openclaw_backend_run_ids"] == ["prior-backend-run"]
 
     changed = json.loads(json.dumps(args))
     changed["goal"]["objective"] = "建立另一個不同的後續工作"
