@@ -101,6 +101,14 @@ _READ_ONLY_EXTERNAL_TARGET_TASK_TYPES = frozenset(
     }
 )
 
+_INTERACTIVE_READONLY_TASK_TYPES = frozenset(
+    {
+        "browser_readonly",
+        "facebook_marketplace_readonly",
+        "secondhand_commerce_group_status",
+    }
+)
+
 
 def _openclaw_result_payload(output: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     result = output.get("result")
@@ -2373,12 +2381,18 @@ def start_loop_contract_execution(
         task_type=task_type,
         risk_level=risk_level,
     )
-    fingerprint = contract_fingerprint(normalized)
-    identity = normalized["identity"]
     external_effect_budget = _loop_external_effect_budget(
         normalized,
         task_type=task_type,
     )
+    if (
+        external_effect_budget == 0
+        and task_type in _INTERACTIVE_READONLY_TASK_TYPES
+    ):
+        normalized = json.loads(json.dumps(normalized, ensure_ascii=False))
+        normalized["interaction_mode"] = "interactive_readonly"
+    fingerprint = contract_fingerprint(normalized)
+    identity = normalized["identity"]
     if external_effect_budget and not approved:
         raise ValueError("External-effect OpenClaw execution requires scoped approval.")
     contract_tools = _contract_runtime_tools(normalized)
@@ -2863,6 +2877,7 @@ def retry_ready_loop_contract_execution(
     board: Optional[str] = None,
     transport: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     policy_path: Optional[str] = None,
+    _triage_parent_fingerprint: Optional[str] = None,
 ) -> dict[str, Any]:
     """Re-admit one Grace-rejected OpenClaw card without creating a new card."""
     with kb.connect_closing(board=board) as conn:
@@ -2898,9 +2913,10 @@ def retry_ready_loop_contract_execution(
                         previous_metadata = historical_metadata
             blocked_reason_row = conn.execute(
                 """
-                SELECT payload
+                SELECT kind, payload
                   FROM task_events
-                 WHERE task_id = ? AND kind = 'blocked'
+                 WHERE task_id = ?
+                   AND kind IN ('blocked', 'block_loop_detected')
                  ORDER BY id DESC
                  LIMIT 1
                 """,
@@ -2914,6 +2930,20 @@ def retry_ready_loop_contract_execution(
                     blocked_payload = {}
                 if isinstance(blocked_payload, Mapping):
                     blocked_reason = str(blocked_payload.get("reason") or "").strip()
+            correction_admission_fault = (
+                blocked_reason.startswith(
+                    "OpenClaw Loop Contract admission returned incomplete or uncorrelated evidence"
+                )
+                or blocked_reason.startswith(
+                    "OpenClaw Loop Contract correction admission returned incomplete or uncorrelated evidence"
+                )
+                or blocked_reason.startswith(
+                    "OpenClaw Loop Contract correction admission raised"
+                )
+                or blocked_reason.startswith(
+                    "OpenClaw Loop Contract was blocked before verified completion"
+                )
+            )
             recovering_quarantined_correction = (
                 task.status == "blocked"
                 and blocked_reason.startswith(
@@ -2922,21 +2952,24 @@ def retry_ready_loop_contract_execution(
             )
             recovering_correction_admission_fault = (
                 task.status == "blocked"
-                and (
-                    blocked_reason.startswith(
-                        "OpenClaw Loop Contract admission returned incomplete or uncorrelated evidence:"
-                    )
-                    or blocked_reason.startswith(
-                        "OpenClaw Loop Contract correction admission returned incomplete or uncorrelated evidence:"
-                    )
-                    or blocked_reason.startswith(
-                        "OpenClaw Loop Contract correction admission raised:"
-                    )
-                    or blocked_reason.startswith(
-                        "OpenClaw Loop Contract was blocked before verified completion:"
-                    )
-                )
+                and correction_admission_fault
             )
+            recovering_triaged_zero_effect_correction = (
+                task.status == "triage"
+                and blocked_reason_row is not None
+                and str(blocked_reason_row["kind"] or "") == "block_loop_detected"
+                and correction_admission_fault
+                and previous_metadata.get("correction_admission") is True
+                and bool(str(_triage_parent_fingerprint or "").strip())
+            )
+            if (
+                _triage_parent_fingerprint is not None
+                and not recovering_triaged_zero_effect_correction
+            ):
+                raise ValueError(
+                    "Zero-effect correction triage recovery requires the exact "
+                    "triaged correction-admission state."
+                )
             if task.status == "running":
                 replaying_admission = bool(
                     previous_run
@@ -2956,6 +2989,7 @@ def retry_ready_loop_contract_execution(
                 task.status not in {"ready", "running"}
                 and not recovering_quarantined_correction
                 and not recovering_correction_admission_fault
+                and not recovering_triaged_zero_effect_correction
             ):
                 run = kb.latest_run(conn, task_id)
                 return {
@@ -3069,6 +3103,34 @@ def retry_ready_loop_contract_execution(
                 raise ValueError("OpenClaw correction card scope changed after admission.")
             if not parent_fingerprint:
                 raise ValueError("OpenClaw correction lacks its contract fingerprint.")
+            if recovering_triaged_zero_effect_correction:
+                expected_parent_fingerprint = str(
+                    _triage_parent_fingerprint or ""
+                ).strip()
+                if expected_parent_fingerprint != parent_fingerprint:
+                    raise ValueError(
+                        "Zero-effect correction triage recovery parent fingerprint mismatch."
+                    )
+                if task.block_kind != "capability":
+                    raise ValueError(
+                        "Zero-effect correction triage recovery requires a capability block."
+                    )
+                if previous_metadata.get("external_effect_budget") != 0:
+                    raise ValueError(
+                        "Zero-effect correction triage recovery requires persisted external_effect_budget=0."
+                    )
+                if str(previous_metadata.get("approval_grant_id") or "").strip():
+                    raise ValueError(
+                        "Zero-effect correction triage recovery refuses an external-effect approval grant."
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM task_external_effects WHERE task_id = ? LIMIT 1",
+                    (task_id,),
+                ).fetchone() is not None:
+                    raise ValueError(
+                        "Zero-effect correction triage recovery refuses a task with any durable external effect."
+                    )
+            task_type = str(previous_metadata.get("task_type") or "analysis").strip()
             normalized = json.loads(
                 json.dumps(dict(latest_contract), ensure_ascii=False)
             )
@@ -3082,6 +3144,26 @@ def retry_ready_loop_contract_execution(
                 if correction_reason not in feedback:
                     feedback.append(correction_reason)
                 verification["review_feedback"] = feedback
+            # A legacy blocked/replayed correction must keep its admitted child
+            # contract unchanged.  Only a first correction or the dedicated,
+            # parent-fingerprint-bound triage recovery may admit the enriched
+            # child contract; the immutable parent fingerprint stays pinned.
+            enrich_zero_effect_correction = (
+                previous_metadata.get("correction_admission") is not True
+                or recovering_triaged_zero_effect_correction
+            )
+            if external_effect_budget == 0 and enrich_zero_effect_correction:
+                normalized["control_plane_receipt"] = {
+                    "status": "queued",
+                    "delegation_id": str(previous_metadata["delegation_id"]),
+                    "execution_task_id": task_id,
+                    "grace_review_task_id": str(
+                        previous_metadata.get("review_task_id") or ""
+                    ),
+                    "source": "hermes_persisted_admission",
+                }
+                if task_type in _INTERACTIVE_READONLY_TASK_TYPES:
+                    normalized["interaction_mode"] = "interactive_readonly"
             fingerprint_scope = json.loads(
                 json.dumps(normalized, ensure_ascii=False)
             )
@@ -3097,7 +3179,6 @@ def retry_ready_loop_contract_execution(
                     raise ValueError(
                         "OpenClaw correction replay lacks its admitted fingerprint."
                     )
-            task_type = str(previous_metadata.get("task_type") or "analysis").strip()
             backend_agent_id = _loop_backend_agent_id(
                 normalized,
                 task_type=task_type,
@@ -3110,8 +3191,12 @@ def retry_ready_loop_contract_execution(
                 metadata = dict(previous_metadata)
                 metadata["backend_agent_id"] = backend_agent_id
             else:
-                if recovering_quarantined_correction or recovering_correction_admission_fault:
-                    conn.execute(
+                if (
+                    recovering_quarantined_correction
+                    or recovering_correction_admission_fault
+                    or recovering_triaged_zero_effect_correction
+                ):
+                    promoted = conn.execute(
                         """
                         UPDATE tasks
                            SET status = 'ready',
@@ -3119,10 +3204,26 @@ def retry_ready_loop_contract_execution(
                                claim_expires = NULL,
                                current_run_id = NULL,
                                completed_at = NULL
-                         WHERE id = ?
+                         WHERE id = ? AND status = ?
                         """,
-                        (task_id,),
+                        (task_id, task.status),
                     )
+                    if promoted.rowcount != 1:
+                        raise RuntimeError(
+                            "OpenClaw correction recovery could not release its existing card."
+                        )
+                    if recovering_triaged_zero_effect_correction:
+                        kb._append_event(
+                            conn,
+                            task_id,
+                            "zero_effect_correction_triage_recovery",
+                            {
+                                "previous_status": "triage",
+                                "parent_contract_fingerprint": parent_fingerprint,
+                                "delegation_id": str(previous_metadata["delegation_id"]),
+                                "external_effect_budget": 0,
+                            },
+                        )
                 claimed = kb.claim_task(
                     conn,
                     task_id,
@@ -3446,6 +3547,35 @@ def retry_ready_loop_contract_execution(
         "delegated_result": result,
         **({"terminal_review": dict(terminal_review)} if terminal_review else {}),
     }
+
+
+def retry_triaged_zero_effect_loop_contract_correction(
+    task_id: str,
+    *,
+    expected_parent_fingerprint: str,
+    board: Optional[str] = None,
+    transport: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    policy_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resume one human-approved, zero-effect correction from triage.
+
+    The existing task and delegation remain stable. The supplied fingerprint
+    binds the recovery to the immutable parent contract; the correction run
+    keeps its distinct child fingerprint because Grace feedback is part of the
+    corrected verification contract.
+    """
+    parent_fingerprint = str(expected_parent_fingerprint or "").strip()
+    if not parent_fingerprint:
+        raise ValueError(
+            "Zero-effect correction triage recovery requires the expected parent fingerprint."
+        )
+    return retry_ready_loop_contract_execution(
+        task_id,
+        board=board,
+        transport=transport,
+        policy_path=policy_path,
+        _triage_parent_fingerprint=parent_fingerprint,
+    )
 
 
 def retry_ready_approved_loop_contract_after_capability_repair(

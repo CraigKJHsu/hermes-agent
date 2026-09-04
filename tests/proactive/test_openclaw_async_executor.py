@@ -15,6 +15,7 @@ from proactive.openclaw_async_executor import (
     make_zero_effect_async_terminal_handler,
     retry_ready_approved_loop_contract_after_capability_repair,
     retry_ready_loop_contract_execution,
+    retry_triaged_zero_effect_loop_contract_correction,
     start_loop_contract_execution,
     start_zero_effect_async_acceptance,
 )
@@ -757,6 +758,8 @@ def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):
         assert not task.get("approval_grant_id")
         assert task["allowed_tools"] == ["read", "web_search", "browser"]
         assert task["credential_refs"] == []
+        assert task["loop_contract"]["interaction_mode"] == "interactive_readonly"
+        assert "control_plane_receipt" not in task["loop_contract"]
         return _loop_result(task, "queued")
 
     started = start_loop_contract_execution(
@@ -1881,6 +1884,265 @@ def test_correction_admission_replay_reuses_identical_request(kanban_home):
     assert delegated["identity_correlated"] is True
     assert delegated["protocol_correlated"] is True
     assert replayed["status"] == "queued"
+
+
+def test_human_approved_zero_effect_correction_recovers_same_card_from_triage(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "triaged-correction-recovery-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-triaged-correction-recovery-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        original_run = kb.get_run(conn, int(started["run_id"]))
+        assert original_run is not None
+        parent_fingerprint = original_run.metadata["contract_fingerprint"]
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="candidate evidence incomplete",
+            metadata={"policy_receipts": []},
+            expected_run_id=original_run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 1)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"candidate URLs are missing"}',
+            ),
+        )
+        conn.commit()
+
+    for _ in range(2):
+        rejected = retry_ready_loop_contract_execution(
+            started["execution_task_id"],
+            transport=lambda _task: {},
+        )
+        assert rejected["status"] == "blocked"
+
+    with kb.connect() as conn:
+        triaged_task = kb.get_task(conn, started["execution_task_id"])
+        triaged_run = kb.latest_run(conn, started["execution_task_id"])
+    assert triaged_task is not None and triaged_task.status == "triage"
+    assert triaged_run is not None
+    correction_fingerprint = triaged_run.metadata["contract_fingerprint"]
+    assert correction_fingerprint != parent_fingerprint
+
+    # Recreate a correction admitted by the pre-receipt runtime.  The explicit
+    # triage recovery is a new child admission bound to the same immutable
+    # parent, rather than an unannounced replay mutation.
+    legacy_metadata = dict(triaged_run.metadata)
+    legacy_contract = dict(legacy_metadata["loop_contract"])
+    legacy_contract.pop("control_plane_receipt", None)
+    legacy_metadata["loop_contract"] = legacy_contract
+    legacy_fingerprint = openclaw_async_executor.contract_fingerprint(legacy_contract)
+    legacy_metadata["contract_fingerprint"] = legacy_fingerprint
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(legacy_metadata), triaged_run.id),
+        )
+        conn.commit()
+
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    recovered = retry_triaged_zero_effect_loop_contract_correction(
+        started["execution_task_id"],
+        expected_parent_fingerprint=parent_fingerprint,
+        transport=transport,
+    )
+
+    assert recovered["execution_task_id"] == started["execution_task_id"]
+    assert recovered["status"] == "queued"
+    assert seen["delegation_id"] == "delegation-triaged-correction-recovery-1"
+    assert seen["contract_fingerprint"] == correction_fingerprint
+    assert seen["contract_fingerprint"] != legacy_fingerprint
+    assert seen["external_effect_budget"] == 0
+    assert seen["loop_contract"]["control_plane_receipt"]["status"] == "queued"
+    assert seen["loop_contract"]["control_plane_receipt"]["execution_task_id"] == (
+        started["execution_task_id"]
+    )
+    assert seen["loop_contract"]["control_plane_receipt"][
+        "grace_review_task_id"
+    ].startswith("t_")
+    assert seen["loop_contract"]["control_plane_receipt"]["source"] == (
+        "hermes_persisted_admission"
+    )
+    assert (
+        openclaw_async_executor.contract_fingerprint(seen["loop_contract"])
+        == correction_fingerprint
+    )
+    with kb.connect() as conn:
+        recovered_task = kb.get_task(conn, started["execution_task_id"])
+        recovered_run = kb.get_run(conn, int(recovered["run_id"]))
+        recovery_event = conn.execute(
+            """
+            SELECT payload
+              FROM task_events
+             WHERE task_id = ?
+               AND kind = 'zero_effect_correction_triage_recovery'
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (started["execution_task_id"],),
+        ).fetchone()
+    assert recovered_task is not None and recovered_task.status == "running"
+    assert recovered_run is not None
+    assert recovered_run.metadata["parent_contract_fingerprint"] == parent_fingerprint
+    assert recovered_run.metadata["contract_fingerprint"] == correction_fingerprint
+    assert recovery_event is not None
+    assert json.loads(recovery_event["payload"])["external_effect_budget"] == 0
+
+
+def test_zero_effect_triage_recovery_rejects_wrong_parent_fingerprint(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "triaged-correction-wrong-parent-1"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-triaged-correction-wrong-parent-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        original_run = kb.get_run(conn, int(started["run_id"]))
+        assert original_run is not None
+        metadata = dict(original_run.metadata)
+        metadata["correction_admission"] = True
+        metadata["parent_contract_fingerprint"] = metadata["contract_fingerprint"]
+        assert kb.merge_active_run_metadata(
+            conn,
+            started["execution_task_id"],
+            metadata=metadata,
+            expected_run_id=original_run.id,
+        )
+        assert kb.block_task(
+            conn,
+            started["execution_task_id"],
+            reason=(
+                "OpenClaw Loop Contract correction admission returned incomplete "
+                "or uncorrelated evidence."
+            ),
+            kind="capability",
+            expected_run_id=original_run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        assert kb.block_task(
+            conn,
+            started["execution_task_id"],
+            reason=(
+                "OpenClaw Loop Contract correction admission returned incomplete "
+                "or uncorrelated evidence."
+            ),
+            kind="capability",
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 3)
+            """,
+            (started["execution_task_id"], '{"reason":"missing evidence"}'),
+        )
+        conn.commit()
+
+    with pytest.raises(ValueError, match="parent fingerprint mismatch"):
+        retry_triaged_zero_effect_loop_contract_correction(
+            started["execution_task_id"],
+            expected_parent_fingerprint="f" * 64,
+            transport=lambda _task: pytest.fail("must not delegate"),
+        )
+
+    with kb.connect() as conn:
+        missing_budget_metadata = dict(metadata)
+        missing_budget_metadata.pop("external_effect_budget")
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(missing_budget_metadata), original_run.id),
+        )
+        conn.commit()
+    with pytest.raises(ValueError, match="persisted external_effect_budget=0"):
+        retry_triaged_zero_effect_loop_contract_correction(
+            started["execution_task_id"],
+            expected_parent_fingerprint=metadata["contract_fingerprint"],
+            transport=lambda _task: pytest.fail("must not delegate"),
+        )
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), original_run.id),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_external_effects (
+                task_id, platform, effect_key, state, created_at, updated_at
+            ) VALUES (?, 'facebook', 'group:123', 'unknown', 4, 4)
+            """,
+            (started["execution_task_id"],),
+        )
+        conn.commit()
+    with pytest.raises(ValueError, match="any durable external effect"):
+        retry_triaged_zero_effect_loop_contract_correction(
+            started["execution_task_id"],
+            expected_parent_fingerprint=metadata["contract_fingerprint"],
+            transport=lambda _task: pytest.fail("must not delegate"),
+        )
+
+
+@pytest.mark.parametrize("task_status", ["ready", "running", "blocked"])
+def test_zero_effect_triage_recovery_rejects_non_triaged_tasks(
+    kanban_home,
+    task_status,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = (
+        f"zero-effect-recovery-non-triage-{task_status}"
+    )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id=f"delegation-zero-effect-non-triage-{task_status}",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        parent_fingerprint = run.metadata["contract_fingerprint"]
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (task_status, started["execution_task_id"]),
+        )
+        conn.commit()
+
+    with pytest.raises(ValueError, match="exact triaged correction-admission state"):
+        retry_triaged_zero_effect_loop_contract_correction(
+            started["execution_task_id"],
+            expected_parent_fingerprint=parent_fingerprint,
+            transport=lambda _task: pytest.fail("must not delegate"),
+        )
 
 
 @pytest.mark.parametrize(
