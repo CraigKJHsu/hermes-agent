@@ -156,6 +156,35 @@ async def test_debounce_buffers_rapid_text_then_flushes_to_pending():
 
 
 @pytest.mark.asyncio
+async def test_authenticated_text_never_merges_into_internal_pending_event():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 0.01
+    user_event = _make_event("new authenticated instruction")
+    session_key = build_session_key(user_event.source)
+    internal_event = _make_event("[SYSTEM: Grace Loop callback]")
+    internal_event.internal = True
+    internal_event.internal_context = {
+        "internal_kind": "grace_callback",
+        "grace_callback_review_id": "review-1",
+    }
+    adapter._pending_messages[session_key] = internal_event
+
+    await adapter._queue_text_debounce(session_key, user_event)
+    await asyncio.sleep(0.05)
+
+    assert adapter._pending_messages[session_key] is internal_event
+    assert adapter._pending_messages[session_key].text == "[SYSTEM: Grace Loop callback]"
+    assert _debounced_event(adapter, session_key) is user_event
+
+    adapter._pending_messages.pop(session_key)
+    assert await adapter._flush_text_debounce_now(session_key) is True
+    fresh_turn = adapter._pending_messages[session_key]
+    assert fresh_turn is user_event
+    assert fresh_turn.internal is False
+    assert fresh_turn.internal_context is None
+
+
+@pytest.mark.asyncio
 async def test_debounce_resets_timer_on_new_arrival():
     adapter = _make_adapter()
     adapter._busy_text_debounce_seconds = 0.1

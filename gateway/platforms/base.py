@@ -3959,6 +3959,13 @@ class BasePlatformAdapter(ABC):
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
 
+        # Synthetic orchestration events and authenticated platform messages
+        # must remain separate turns even when they share the same user-shaped
+        # SessionSource. Merging here would make real user text inherit the
+        # callback's ``internal`` flag and trusted internal_context.
+        if getattr(existing, "internal", False) or getattr(event, "internal", False):
+            return False
+
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
             if source is None:

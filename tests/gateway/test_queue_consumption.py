@@ -452,3 +452,37 @@ class TestBusyInputModeQueueFifo:
         head = adapter._pending_messages[session_key]
         assert head.message_type == MessageType.PHOTO
         assert len(head.media_urls) == 3
+
+    def test_authenticated_media_does_not_merge_into_internal_pending_event(self):
+        """Media cannot inherit trusted callback provenance from the pending head."""
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:media-boundary"
+        source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM)
+        internal_event = MessageEvent(
+            text="[SYSTEM: Grace Loop callback]",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="internal-1",
+        )
+        internal_event.internal = True
+        internal_event.internal_context = {
+            "internal_kind": "grace_callback",
+            "grace_callback_review_id": "review-1",
+        }
+        user_photo = MessageEvent(
+            text="new authenticated photo",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="photo-1",
+            media_urls=["http://example.com/new.jpg"],
+            media_types=["image/jpeg"],
+        )
+
+        runner._queue_or_replace_pending_event(session_key, internal_event)
+        runner._queue_or_replace_pending_event(session_key, user_photo)
+
+        assert adapter._pending_messages[session_key] is internal_event
+        assert internal_event.media_urls == []
+        assert runner._queued_events[session_key] == [user_photo]
+        assert user_photo.internal is False
+        assert user_photo.internal_context is None

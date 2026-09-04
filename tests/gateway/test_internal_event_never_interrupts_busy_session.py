@@ -10,9 +10,9 @@ default ``busy_input_mode='interrupt'`` path — calling
 completions (terminal ``notify_on_complete``), which also re-enter as internal
 events.
 
-The fix: ``_handle_active_session_busy_message`` returns ``False`` early for any
-event with ``internal=True``, so the base adapter queues it silently (no
-interrupt, no ack) and it cascades as a new turn after the current one finishes.
+The fix: ``_handle_active_session_busy_message`` queues any event with
+``internal=True`` in the runner FIFO (no interrupt, no ack), so it cascades as a
+new turn after the current one finishes without merging with authenticated text.
 This preserves strict message-role alternation and the design invariant that a
 completion surfaces as a NEW turn only when idle, never spliced into a running
 turn.
@@ -118,9 +118,10 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # The runner owns the queue operation so the base adapter cannot merge a
+    # later authenticated message into this internal callback envelope.
+    assert handled is True
+    assert adapter._pending_messages[sk] is event
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.

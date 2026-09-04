@@ -4911,7 +4911,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
+        same_security_context = (
+            existing is not None
+            and bool(getattr(existing, "internal", False))
+            == bool(getattr(event, "internal", False))
+            and getattr(existing, "internal_context", None)
+            == getattr(event, "internal_context", None)
+        )
+        if same_security_context and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -4994,11 +5001,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (the default busy_text_mode) aborts the active turn AND sends a "⚡
         # Interrupting current task" ack — exactly the opposite of the design
         # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # never splices into a running turn. Queue through the runner FIFO so a
+        # later authenticated user message cannot be merged into this event and
+        # inherit its ``internal`` flag or callback context.
         if getattr(event, "internal", False):
-            return False
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
