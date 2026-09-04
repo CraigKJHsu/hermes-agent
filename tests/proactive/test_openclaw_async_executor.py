@@ -1797,6 +1797,174 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, mi
     ] == ["candidate URLs are missing", "source timestamps are missing"]
 
 
+@pytest.mark.parametrize(
+    ("legacy_metadata", "tampered_target"),
+    [
+        (True, None),
+        (True, "https://www.facebook.com/marketplace/item/99999999999999999/"),
+        (True, "https://www.facebook.com/marketplace/item/"),
+        (False, "https://www.facebook.com/marketplace/item/99999999999999999/"),
+    ],
+)
+def test_readonly_correction_scope_projection_and_target_binding(
+    kanban_home,
+    legacy_metadata,
+    tampered_target,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "readonly-correction-enrichment-1"
+    contract["external_targets"] = [
+        "https://www.facebook.com/marketplace/item/27700220586305145/"
+    ]
+    contract["scope"]["allowed"].append(
+        "Read only https://www.facebook.com/marketplace/item/27700220586305145/"
+    )
+    contract["domain_memory"] = {
+        "mode": "query",
+        "domain_key": "secondhand",
+        "entity_type": "ResaleItem",
+        "schema_id": "secondhand.item.v1",
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_marketplace_readonly",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-readonly-correction-enrichment-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        first_run = kb.get_run(conn, int(started["run_id"]))
+        assert first_run is not None
+        admitted_contract = first_run.metadata["loop_contract"]
+        assert "external_targets" not in admitted_contract
+        assert "durable_evidence_snapshot" in admitted_contract
+        assert first_run.metadata["execution_card_fingerprint"]
+        if legacy_metadata:
+            legacy_run_metadata = dict(first_run.metadata)
+            legacy_run_metadata.pop("execution_card_fingerprint")
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(legacy_run_metadata), first_run.id),
+            )
+        if tampered_target:
+            task = kb.get_task(conn, started["execution_task_id"])
+            assert task is not None
+            tampered_body = task.body.replace(
+                "https://www.facebook.com/marketplace/item/27700220586305145/",
+                tampered_target,
+                1,
+            )
+            assert tampered_body != task.body
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (tampered_body, started["execution_task_id"]),
+            )
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="candidate evidence incomplete",
+            metadata={"policy_receipts": []},
+            expected_run_id=first_run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 1)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"candidate URLs are missing"}',
+            ),
+        )
+        conn.commit()
+
+    if tampered_target:
+        with pytest.raises(ValueError, match="scope changed after admission"):
+            retry_ready_loop_contract_execution(
+                started["execution_task_id"],
+                transport=lambda task: _loop_result(task, "queued"),
+            )
+    else:
+        retried = retry_ready_loop_contract_execution(
+            started["execution_task_id"],
+            transport=lambda task: _loop_result(task, "queued"),
+        )
+        assert retried["status"] == "queued"
+        assert retried["run_id"] != started["run_id"]
+
+
+def test_legacy_target_binding_normalizes_only_url_scheme_and_host():
+    admitted = {
+        "scope": {
+            "allowed": [
+                "Read only HTTPS://EXAMPLE.COM/items/a,b;c?mode=Exact。",
+            ],
+        },
+        "goal": {
+            "objective": "Mention https://example.com/not-authorized for context only",
+        },
+    }
+
+    def is_bound(target):
+        return openclaw_async_executor._legacy_correction_targets_are_bound(
+            {"external_targets": [target]},
+            admitted,
+        )
+
+    assert is_bound("https://example.com/items/a,b;c?mode=Exact")
+    assert not is_bound("https://example.com/items/a,b;c?mode=exact")
+    assert not is_bound("https://example.com/Items/a,b;c?mode=Exact")
+    assert not is_bound("https://example.com/items/")
+    assert not is_bound("https://example.com/not-authorized")
+
+    assert openclaw_async_executor._legacy_correction_targets_are_bound(
+        {"external_targets": ["group:123"]},
+        {"scope": {"allowed": ["Read only group:123。"]}},
+    )
+    for malformed in ("group:123", {"target": "group:123"}, [123]):
+        assert not openclaw_async_executor._legacy_correction_targets_are_bound(
+            {"external_targets": malformed},
+            {"scope": {"allowed": ["Read only group:123。"]}},
+        )
+
+    ambiguous = {
+        "scope": {
+            "allowed": [
+                "Read only https://example.com/items/臺灣",
+                "Read only https://example.com/?next=group:123",
+                "Read only https://example.com/?next=(group:123)",
+                "Read only https://faß.de/item",
+            ],
+        },
+    }
+    for target in (
+        "https://example.com/items/",
+        "group:123",
+        "https://fass.de/item",
+    ):
+        assert not openclaw_async_executor._legacy_correction_targets_are_bound(
+            {"external_targets": [target]},
+            ambiguous,
+        )
+
+    punctuation_admitted = {
+        "scope": {"allowed": ["https://example.com/item/foo)"]},
+    }
+    assert openclaw_async_executor._legacy_correction_targets_are_bound(
+        {"external_targets": ["https://example.com/item/foo)"]},
+        punctuation_admitted,
+    )
+    assert not openclaw_async_executor._legacy_correction_targets_are_bound(
+        {"external_targets": ["https://example.com/item/foo"]},
+        punctuation_admitted,
+    )
+
+
 def test_loop_contract_from_execution_body_keeps_embedded_policy_fences():
     from proactive.grace_task_compiler import render_execution_body
     from proactive.openclaw_async_executor import _loop_contract_from_execution_body

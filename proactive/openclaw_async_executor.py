@@ -9,6 +9,7 @@ import time
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.telegram_message_path import (
@@ -2515,10 +2516,14 @@ def start_loop_contract_execution(
             )
             routing_decision = dict(routing_decision)
             routing_decision["model_route"] = worker_model_route
+            execution_body = render_execution_body(normalized)
+            execution_card_fingerprint = contract_fingerprint(
+                _loop_contract_from_execution_body(execution_body)
+            )
             task_id = kb.create_task(
                 conn,
                 title=f"OpenClaw: {normalized['goal']['objective'][:90]}",
-                body=render_execution_body(normalized),
+                body=execution_body,
                 assignee="openclaw",
                 created_by="grace-loop-compiler",
                 workspace_kind="dir",
@@ -2627,6 +2632,7 @@ def start_loop_contract_execution(
                 "delegation_id": delegation_id,
                 "attempt_id": attempt_id,
                 "contract_fingerprint": fingerprint,
+                "execution_card_fingerprint": execution_card_fingerprint,
                 "project": str(identity["project"]),
                 "topic_id": str(identity.get("thread_id") or identity["topic_name"]),
                 "task_type": task_type,
@@ -2733,6 +2739,122 @@ def _loop_contract_from_execution_body(body: str) -> dict[str, Any]:
     if not isinstance(parsed, Mapping):
         raise ValueError("OpenClaw correction Loop Contract must be an object.")
     return dict(parsed)
+
+
+def _correction_scope_for_comparison(
+    contract: Mapping[str, Any],
+    *,
+    external_effect_budget: int,
+) -> dict[str, Any]:
+    """Project a correction contract onto its immutable admitted scope."""
+    scope = _worker_safe_loop_contract(
+        contract,
+        external_effect_budget=external_effect_budget,
+    )
+    # These fields are derived only after the execution card is rendered.
+    # They provide correlation and read-only context, not execution authority.
+    for key in ("audit", "trace", "durable_evidence_snapshot"):
+        scope.pop(key, None)
+    return scope
+
+
+def _legacy_correction_targets_are_bound(
+    embedded_contract: Mapping[str, Any],
+    admitted_contract: Mapping[str, Any],
+) -> bool:
+    """Fail closed unless legacy card targets are repeated in admitted authority."""
+    def normalize_target(value: object) -> tuple[str, str] | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        group_match = re.fullmatch(r"group:([1-9][0-9]*)", text, re.IGNORECASE)
+        if group_match:
+            return ("group", group_match.group(1))
+        parsed = urlsplit(text)
+        if parsed.scheme.casefold() in {"http", "https"} and parsed.hostname:
+            if parsed.username or parsed.password:
+                return None
+            try:
+                port = parsed.port
+            except ValueError:
+                return None
+            if not parsed.hostname.isascii():
+                return None
+            host = parsed.hostname.lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            netloc = f"{host}:{port}" if port is not None else host
+            return (
+                "url",
+                urlunsplit(
+                    (
+                        parsed.scheme.casefold(),
+                        netloc,
+                        parsed.path,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                ),
+            )
+        return ("literal", text)
+
+    targets = embedded_contract.get("external_targets")
+    if targets is None:
+        return True
+    if not isinstance(targets, list) or not all(
+        isinstance(target, str) and target.strip() for target in targets
+    ):
+        return False
+    if not targets:
+        return True
+    scope = admitted_contract.get("scope")
+    allowed = scope.get("allowed") if isinstance(scope, Mapping) else None
+    if not isinstance(allowed, list):
+        return False
+    authorized_targets: set[tuple[str, str]] = set()
+    leading_delimiters = " \t\r\n([{<\"'，。、；：！？（【《「『"
+    trailing_delimiters = " \t\r\n)]}>\"'，。、；：！？）【】《》「」『』"
+    for item in allowed:
+        if not isinstance(item, str):
+            continue
+        candidates = [item.strip()]
+        url_spans: list[tuple[int, int]] = []
+        for match in re.finditer(
+            r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+",
+            item,
+            re.IGNORECASE,
+        ):
+            before = item[match.start() - 1] if match.start() else ""
+            after = item[match.end()] if match.end() < len(item) else ""
+            if before and before not in leading_delimiters:
+                continue
+            if after and after not in trailing_delimiters:
+                continue
+            candidates.append(match.group(0))
+            url_spans.append(match.span())
+        for match in re.finditer(r"group:[1-9][0-9]*", item, re.IGNORECASE):
+            if any(
+                match.start() < url_end and match.end() > url_start
+                for url_start, url_end in url_spans
+            ):
+                continue
+            before = item[match.start() - 1] if match.start() else ""
+            after = item[match.end()] if match.end() < len(item) else ""
+            if before and before not in leading_delimiters:
+                continue
+            if after and after not in trailing_delimiters:
+                continue
+            candidates.append(match.group(0))
+        authorized_targets.update(
+            normalized
+            for candidate in candidates
+            if (normalized := normalize_target(candidate)) is not None
+        )
+    return all(
+        (normalized := normalize_target(target)) is not None
+        and normalized in authorized_targets
+        for target in targets
+    )
 
 
 def retry_ready_loop_contract_execution(
@@ -2922,16 +3044,28 @@ def retry_ready_loop_contract_execution(
                             or ""
                         )
                         break
-            embedded_scope = _worker_safe_loop_contract(embedded_contract)
-            admitted_scope = dict(parent_contract)
-            embedded_scope.pop("audit", None)
-            admitted_scope.pop("audit", None)
-            # Correlation metadata is bound only after the card body is
-            # rendered. It is not execution authority and must not make the
-            # immutable scope comparison fail during a Grace correction.
-            embedded_scope.pop("trace", None)
-            admitted_scope.pop("trace", None)
-            if embedded_scope != admitted_scope:
+            execution_card_fingerprint = str(
+                previous_metadata.get("execution_card_fingerprint") or ""
+            )
+            card_scope_changed = (
+                contract_fingerprint(embedded_contract) != execution_card_fingerprint
+                if execution_card_fingerprint
+                else (
+                    _correction_scope_for_comparison(
+                        embedded_contract,
+                        external_effect_budget=external_effect_budget,
+                    )
+                    != _correction_scope_for_comparison(
+                        parent_contract,
+                        external_effect_budget=external_effect_budget,
+                    )
+                    or not _legacy_correction_targets_are_bound(
+                        embedded_contract,
+                        parent_contract,
+                    )
+                )
+            )
+            if card_scope_changed:
                 raise ValueError("OpenClaw correction card scope changed after admission.")
             if not parent_fingerprint:
                 raise ValueError("OpenClaw correction lacks its contract fingerprint.")
@@ -3025,6 +3159,7 @@ def retry_ready_loop_contract_execution(
                     ),
                     "parent_loop_contract": dict(parent_contract),
                     "parent_contract_fingerprint": parent_fingerprint,
+                    "execution_card_fingerprint": execution_card_fingerprint,
                     "start_idempotency_key": start_key,
                     "review_task_id": str(previous_metadata.get("review_task_id") or ""),
                     # Corrections retain the admitted model policy; older failed
