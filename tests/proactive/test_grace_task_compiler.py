@@ -133,6 +133,26 @@ def test_approved_execution_body_hides_grace_callback_envelope() -> None:
     assert "Grace session history only; not disclosed to ClawOps" in body
 
 
+def test_domain_query_keeps_contracted_live_readonly_collection() -> None:
+    contract = _image_contract()
+    contract["domain_memory"] = {
+        "schema_id": "secondhand.item.v1",
+        "mode": "query",
+        "require_delta_on_acceptance": False,
+        "expected_total": None,
+    }
+    contract["routing"] = {
+        "task_type": "facebook_marketplace_readonly",
+        "risk_level": "low",
+    }
+
+    body = render_execution_body(contract)
+
+    assert "does not forbid other read-only evidence collection" in body
+    assert "contracted live readback, search, navigation" in body
+    assert "This is a registry-only inventory query" not in body
+
+
 def _openclaw_loop_result(task: dict, backend_agent_id: str = "missioncrew-content") -> dict:
     return {
         "task_id": task["task_id"],

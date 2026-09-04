@@ -84,6 +84,24 @@ def test_hubops_routing_selects_secondhand_agent_and_browser_worker():
     assert envelope["approval_checklist"] == "External Browser Publish"
 
 
+def test_marketplace_readonly_route_admits_interactive_readonly_search():
+    envelope = route_clawops_objective(
+        "唯讀搜尋並檢查 Facebook Marketplace 候選群組規則",
+        project="secondhand_commerce",
+        task_type="facebook_marketplace_readonly",
+        risk_level="low",
+        approved=False,
+    )
+
+    assert envelope["status"] == "routed"
+    assignment = envelope["assignment"]
+    assert assignment["interaction_mode"] == "interactive_readonly"
+    assert {"browser_navigate", "browser_click", "browser_type"}.issubset(
+        assignment["allowed_tools"]
+    )
+    assert "browser_type" not in assignment["approval_required_actions"]
+
+
 def test_hubops_routing_blocks_worker_with_missing_required_callable_tools():
     envelope = route_clawops_objective(
         "發布已核准的 Facebook Page 貼文",

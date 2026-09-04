@@ -1522,6 +1522,59 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     assert "validated_outcome=accepted" in review_event.text
 
 
+def test_capability_blocker_is_not_mislabeled_as_needs_input(tmp_path, monkeypatch):
+    db_path = tmp_path / "execution-capability-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="interactive read-only execution",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn, execution_id, review_id, suffix="execution-capability",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="a" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="worker policy forbids a required read-only click",
+            kind="capability",
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    event = adapter.handled[0]
+    assert "validated_outcome=capability" in event.text
+    assert "validated_outcome=needs_input" not in event.text
+    assert "do not ask KJ to re-authorize" in event.text
+
+
 def test_quota_blocked_execution_records_structured_callback_outcome(
     tmp_path,
     monkeypatch,

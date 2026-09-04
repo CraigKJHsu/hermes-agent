@@ -1369,7 +1369,17 @@ class GatewayKanbanWatchersMixin:
         if execution_id not in parents:
             outcome = "invalid_parent_link"
         elif event_stage == "execution" and event_kind == "blocked":
-            outcome = "needs_input"
+            event_payload = callback.get("event_payload") or {}
+            blocker_kind = str(
+                event_payload.get("kind")
+                if isinstance(event_payload, dict)
+                else ""
+            ).strip().lower()
+            outcome = (
+                blocker_kind
+                if blocker_kind in {"capability", "dependency", "transient"}
+                else "needs_input"
+            )
         elif event_stage == "execution":
             outcome = f"execution_{event_kind or 'fault'}"
         elif event_kind == "blocked":
@@ -1660,11 +1670,24 @@ class GatewayKanbanWatchersMixin:
         }
         is_blocker_callback = event_stage == "execution" or outcome in blocker_outcomes
         if is_blocker_callback:
+            loop_contract = (
+                execution_metadata.get("loop_contract")
+                if isinstance(execution_metadata, dict)
+                else None
+            )
+            contract_boundary = None
+            if isinstance(loop_contract, dict):
+                contract_boundary = {
+                    key: loop_contract.get(key)
+                    for key in ("scope", "routing", "stop_rules")
+                    if loop_contract.get(key) is not None
+                }
             full_snapshot = {
                 "execution": {
                     "task_id": execution_evidence.get("task_id"),
                     "status": execution_evidence.get("status"),
                     "summary": _clip_text(execution_evidence.get("summary"), 1200),
+                    "contract_boundary": contract_boundary,
                     "attachment_count": len(
                         execution_evidence.get("attachments") or []
                     ),
@@ -1803,7 +1826,11 @@ class GatewayKanbanWatchersMixin:
                 "any new external action during this callback turn. If the blocker is "
                 "caused by missing human input, ask one scoped question with the "
                 "minimum facts needed for KJ to answer. A normal prose reply is enough "
-                "for this blocker callback; do not call grace_callback_outcome unless "
+                "for this blocker callback. "
+                "When validated_outcome=capability, dependency, or transient, do not ask "
+                "KJ to re-authorize an interaction already allowed by contract_boundary; "
+                "report the internal routing, policy, tool, or runtime mismatch instead. "
+                "Do not call grace_callback_outcome unless "
                 "the callback evidence itself shows a terminal Grace-review event."
             )
         elif outcome == "accepted" and user_facing_report is not None:

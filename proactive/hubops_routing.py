@@ -45,6 +45,14 @@ TASK_REQUIRED_CALLABLE_TOOLS = {
         }
     ),
 }
+TASK_REQUIRED_INTERACTION_MODES = {
+    "facebook_marketplace_readonly": "interactive_readonly",
+}
+TASK_REQUIRED_WORKER_TOOLS = {
+    "facebook_marketplace_readonly": frozenset(
+        {"browser_navigate", "browser_click", "browser_type"}
+    ),
+}
 OPENCLAW_FACEBOOK_PAGE_PROFILE = "missioncrew-facebook-page-operator"
 
 
@@ -209,6 +217,57 @@ def route_clawops_objective(
             project=project,
             task_type=canonical_task_type,
             risk_level=risk_level,
+        )
+
+    required_interaction_mode = TASK_REQUIRED_INTERACTION_MODES.get(
+        canonical_task_type, ""
+    )
+    interaction_mode = str(worker.get("interaction_mode") or "").strip()
+    if required_interaction_mode and interaction_mode != required_interaction_mode:
+        return _blocked(
+            "Runtime capability admission failed for "
+            f"worker={worker_id}: task_type={canonical_task_type} requires "
+            f"interaction_mode={required_interaction_mode}, got "
+            f"{interaction_mode or '<missing>'}.",
+            objective=clean_objective,
+            project=project,
+            task_type=canonical_task_type,
+            risk_level=risk_level,
+            worker_id=worker_id,
+            worker=worker,
+            approval_required=False,
+        )
+
+    required_worker_tools = TASK_REQUIRED_WORKER_TOOLS.get(
+        canonical_task_type, frozenset()
+    )
+    worker_tools = {
+        str(tool or "").strip()
+        for tool in worker.get("allowed_tools") or []
+        if str(tool or "").strip()
+    }
+    approval_gated_tools = {
+        str(tool or "").strip()
+        for tool in worker.get("approval_required_actions") or []
+        if str(tool or "").strip()
+    }
+    unavailable_readonly_tools = sorted(
+        (required_worker_tools - worker_tools)
+        | (required_worker_tools & approval_gated_tools)
+    )
+    if unavailable_readonly_tools:
+        return _blocked(
+            "Runtime capability admission failed for "
+            f"worker={worker_id}: interactive read-only tools are missing or "
+            "incorrectly approval-gated: "
+            f"{', '.join(unavailable_readonly_tools)}.",
+            objective=clean_objective,
+            project=project,
+            task_type=canonical_task_type,
+            risk_level=risk_level,
+            worker_id=worker_id,
+            worker=worker,
+            approval_required=False,
         )
 
     runtime_profile = str(
@@ -452,6 +511,7 @@ def _assignment(
         "runtime_profile": str(worker.get("runtime_profile") or worker_id.replace(".", "-")),
         "display_name": str(worker.get("display_name") or worker_id),
         "allowed_tools": list(worker.get("allowed_tools") or []),
+        "interaction_mode": str(worker.get("interaction_mode") or ""),
         "required_callable_tools": list(
             worker.get("required_callable_tools") or []
         ),
@@ -508,6 +568,7 @@ def _backend_role_card(
         "approval_required_actions": list(
             assignment.get("approval_required_actions") or []
         ),
+        "interaction_mode": str(assignment.get("interaction_mode") or ""),
         "approval_checklist": approval_checklist,
         "output_format": str(output.get("format") or ""),
         "required_sections": list(output.get("required_sections") or []),

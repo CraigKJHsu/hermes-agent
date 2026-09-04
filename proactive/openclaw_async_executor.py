@@ -8,7 +8,7 @@ import re
 import time
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.telegram_message_path import (
@@ -636,26 +636,197 @@ def _loop_contract_subject_keys(contract: Mapping[str, Any]) -> list[str]:
     return [str(item).strip() for item in keys if str(item or "").strip()]
 
 
+def _attach_commerce_evidence(
+    conn: Any,
+    snapshot: dict[str, Any],
+    *,
+    subject_keys: list[str],
+    listing_ids: list[str],
+) -> None:
+    subject_keys = list(dict.fromkeys(subject_keys))
+    listing_ids = list(dict.fromkeys(listing_ids))
+    if not subject_keys and not listing_ids:
+        return
+
+    def batches(values: list[str], size: int = 200) -> Iterable[list[str]]:
+        for offset in range(0, len(values), size):
+            yield values[offset : offset + size]
+
+    ledger_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(commerce_group_ledger)").fetchall()
+    }
+    evidence_url_select = (
+        "evidence_url" if "evidence_url" in ledger_columns else "'' AS evidence_url"
+    )
+    ledger_select = f"""
+        SELECT subject_key, subject_label, destination_id, destination_name,
+               source_listing_id, status, status_label, evidence,
+               source_task_id, source_run_id, observed_at, verified_at,
+               {evidence_url_select}
+          FROM commerce_group_ledger
+         WHERE {{predicate}}
+         ORDER BY observed_at DESC
+         LIMIT 80
+    """
+    ledger_rows: dict[tuple[str, str], Any] = {}
+    for column, values in (
+        ("subject_key", subject_keys),
+        ("source_listing_id", listing_ids),
+    ):
+        for batch in batches(values):
+            placeholders = ",".join("?" for _ in batch)
+            for row in conn.execute(
+                ledger_select.format(predicate=f"{column} IN ({placeholders})"),
+                batch,
+            ).fetchall():
+                ledger_rows.setdefault(
+                    (row["subject_key"], row["destination_id"]), row
+                )
+    snapshot["commerce_group_ledger"] = [
+        {
+            "subject_key": row["subject_key"],
+            "subject_label": row["subject_label"],
+            "destination_id": row["destination_id"],
+            "destination_name": row["destination_name"],
+            "source_listing_id": row["source_listing_id"],
+            "status": row["status"],
+            "status_label": row["status_label"],
+            "evidence": _text_excerpt(row["evidence"], limit=900),
+            "source_task_id": row["source_task_id"],
+            "source_run_id": row["source_run_id"],
+            "observed_at": row["observed_at"],
+            "verified_at": row["verified_at"],
+            "evidence_url": row["evidence_url"],
+        }
+        for row in sorted(
+            ledger_rows.values(), key=lambda item: item["observed_at"], reverse=True
+        )[:80]
+    ]
+    alias_select = """
+        SELECT subject_key, subject_label, platform,
+               public_listing_id, management_listing_id,
+               seller_name, title, price_label, evidence,
+               source_task_id, source_run_id, observed_at, verified_at
+          FROM commerce_listing_aliases
+         WHERE {predicate}
+         ORDER BY observed_at DESC
+         LIMIT 40
+    """
+    alias_rows: dict[tuple[str, str, str], Any] = {}
+    for batch in batches(subject_keys):
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            alias_select.format(predicate=f"subject_key IN ({placeholders})"),
+            batch,
+        ).fetchall():
+            key = (
+                row["platform"],
+                row["public_listing_id"],
+                row["management_listing_id"],
+            )
+            alias_rows.setdefault(key, row)
+    for batch in batches(listing_ids):
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            alias_select.format(
+                predicate=(
+                    f"public_listing_id IN ({placeholders}) OR "
+                    f"management_listing_id IN ({placeholders})"
+                )
+            ),
+            [*batch, *batch],
+        ).fetchall():
+            key = (
+                row["platform"],
+                row["public_listing_id"],
+                row["management_listing_id"],
+            )
+            alias_rows.setdefault(key, row)
+    snapshot["commerce_listing_aliases"] = [
+        {
+            "subject_key": row["subject_key"],
+            "subject_label": row["subject_label"],
+            "platform": row["platform"],
+            "public_listing_id": row["public_listing_id"],
+            "management_listing_id": row["management_listing_id"],
+            "seller_name": row["seller_name"],
+            "title": row["title"],
+            "price_label": row["price_label"],
+            "evidence": _text_excerpt(row["evidence"], limit=900),
+            "source_task_id": row["source_task_id"],
+            "source_run_id": row["source_run_id"],
+            "observed_at": row["observed_at"],
+            "verified_at": row["verified_at"],
+        }
+        for row in sorted(
+            alias_rows.values(), key=lambda item: item["observed_at"], reverse=True
+        )[:40]
+    ]
+
+
 def _objective_durable_evidence_snapshot(
     conn: Any,
     contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     objective_ref = contract.get("objective_ref")
-    if not isinstance(objective_ref, Mapping):
-        return {}
+    objective_ref = objective_ref if isinstance(objective_ref, Mapping) else {}
     objective_id = str(objective_ref.get("objective_id") or "").strip()
-    if not objective_id:
+    domain_spec = contract.get("domain_memory")
+    has_domain_query = bool(
+        isinstance(domain_spec, Mapping)
+        and domain_spec.get("mode") == "query"
+        and str(domain_spec.get("domain_key") or "").strip()
+        and str(domain_spec.get("entity_type") or "").strip()
+    )
+    if not objective_id and not has_domain_query:
         return {}
     listing_ids = _loop_contract_listing_ids(contract)
     subject_keys = _loop_contract_subject_keys(contract)
     snapshot: dict[str, Any] = {
         "schema_version": "1.0",
-        "source": "hermes_kanban_same_objective_readonly_snapshot",
+        "source": "hermes_kanban_predelegation_readonly_snapshot",
         "objective_id": objective_id,
         "stage_key": str(objective_ref.get("stage_key") or "").strip(),
         "listing_ids": listing_ids,
         "subject_keys": subject_keys,
     }
+    if has_domain_query:
+        domain_inventory = kb.domain_inventory_report(
+            conn,
+            domain_key=str(domain_spec.get("domain_key") or ""),
+            entity_type=str(domain_spec.get("entity_type") or ""),
+            expected_total=domain_spec.get("expected_total"),
+        )
+        snapshot["domain_inventory"] = domain_inventory
+        for entity in domain_inventory.get("entities") or []:
+            entity_id = str(entity.get("entity_id") or "").strip()
+            attributes = entity.get("attributes")
+            if entity_id and entity_id not in subject_keys:
+                subject_keys.append(entity_id)
+            if isinstance(attributes, Mapping):
+                subject_key = str(attributes.get("subject_key") or "").strip()
+                if subject_key and subject_key not in subject_keys:
+                    subject_keys.append(subject_key)
+            for artifact in entity.get("artifacts") or []:
+                external_id = str(artifact.get("external_id") or "").strip()
+                if (
+                    re.fullmatch(r"[1-9][0-9]{8,}", external_id)
+                    and external_id not in listing_ids
+                ):
+                    listing_ids.append(external_id)
+        snapshot["listing_ids"] = sorted(listing_ids)
+        snapshot["subject_keys"] = sorted(subject_keys)
+
+    if not objective_id:
+        _attach_commerce_evidence(
+            conn,
+            snapshot,
+            subject_keys=subject_keys,
+            listing_ids=listing_ids,
+        )
+        return snapshot
+
     objective = conn.execute(
         """
         SELECT status, current_stage_key, terminal_stage_key, next_action, waiting_for,
@@ -690,6 +861,12 @@ def _objective_durable_evidence_snapshot(
         if str(stage.get(key) or "").strip()
     ]
     if not task_ids:
+        _attach_commerce_evidence(
+            conn,
+            snapshot,
+            subject_keys=subject_keys,
+            listing_ids=listing_ids,
+        )
         return snapshot
 
     placeholders = ",".join("?" for _ in task_ids)
@@ -759,79 +936,12 @@ def _objective_durable_evidence_snapshot(
             task_ids,
         ).fetchall()
     ]
-    ledger_args = [*subject_keys, *listing_ids]
-    if ledger_args:
-        ledger_clause = " OR ".join(
-            ["subject_key = ?" for _ in subject_keys]
-            + ["source_listing_id = ?" for _ in listing_ids]
-        )
-        snapshot["commerce_group_ledger"] = [
-            {
-                "subject_key": row["subject_key"],
-                "subject_label": row["subject_label"],
-                "destination_id": row["destination_id"],
-                "destination_name": row["destination_name"],
-                "source_listing_id": row["source_listing_id"],
-                "status": row["status"],
-                "status_label": row["status_label"],
-                "evidence": _text_excerpt(row["evidence"], limit=900),
-                "source_task_id": row["source_task_id"],
-                "source_run_id": row["source_run_id"],
-                "observed_at": row["observed_at"],
-                "verified_at": row["verified_at"],
-                "evidence_url": row["evidence_url"],
-            }
-            for row in conn.execute(
-                f"""
-                SELECT subject_key, subject_label, destination_id, destination_name,
-                       source_listing_id, status, status_label, evidence,
-                       source_task_id, source_run_id, observed_at, verified_at,
-                       evidence_url
-                  FROM commerce_group_ledger
-                 WHERE {ledger_clause}
-                 ORDER BY observed_at DESC
-                 LIMIT 80
-                """,
-                ledger_args,
-            ).fetchall()
-        ]
-        alias_clause = " OR ".join(
-            ["subject_key = ?" for _ in subject_keys]
-            + ["public_listing_id = ? OR management_listing_id = ?" for _ in listing_ids]
-        )
-        alias_args: list[Any] = [*subject_keys]
-        for listing_id in listing_ids:
-            alias_args.extend([listing_id, listing_id])
-        snapshot["commerce_listing_aliases"] = [
-            {
-                "subject_key": row["subject_key"],
-                "subject_label": row["subject_label"],
-                "platform": row["platform"],
-                "public_listing_id": row["public_listing_id"],
-                "management_listing_id": row["management_listing_id"],
-                "seller_name": row["seller_name"],
-                "title": row["title"],
-                "price_label": row["price_label"],
-                "evidence": _text_excerpt(row["evidence"], limit=900),
-                "source_task_id": row["source_task_id"],
-                "source_run_id": row["source_run_id"],
-                "observed_at": row["observed_at"],
-                "verified_at": row["verified_at"],
-            }
-            for row in conn.execute(
-                f"""
-                SELECT subject_key, subject_label, platform,
-                       public_listing_id, management_listing_id,
-                       seller_name, title, price_label, evidence,
-                       source_task_id, source_run_id, observed_at, verified_at
-                  FROM commerce_listing_aliases
-                 WHERE {alias_clause}
-                 ORDER BY observed_at DESC
-                 LIMIT 40
-                """,
-                alias_args,
-            ).fetchall()
-        ]
+    _attach_commerce_evidence(
+        conn,
+        snapshot,
+        subject_keys=subject_keys,
+        listing_ids=listing_ids,
+    )
     return snapshot
 
 

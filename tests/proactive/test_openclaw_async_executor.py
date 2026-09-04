@@ -593,6 +593,12 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
         "objective_id": "go-ext-marketplace-readonly-1",
         "stage_key": "prepare-readonly",
     }
+    contract["domain_memory"] = {
+        "schema_id": "secondhand.item.v1",
+        "mode": "query",
+        "require_delta_on_acceptance": False,
+        "expected_total": None,
+    }
     with kb.connect() as conn:
         kb.create_grace_objective(
             conn,
@@ -608,6 +614,44 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
             terminal_stage_key="execute_external_action",
             acceptance_criteria=("Recover evidence or return a blocker.",),
             current_stage_key="prepare-readonly",
+        )
+        now = 1_788_503_127
+        conn.execute(
+            """
+            INSERT INTO domain_entities (
+                domain_key, entity_type, entity_id, label, status, attributes,
+                schema_id, source_task_id, source_run_id,
+                accepted_review_task_id, accepted_review_run_id,
+                observed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "secondhand", "ResaleItem", "celestron-130eq",
+                "Celestron 130EQ", "listed",
+                json.dumps({"subject_key": "celestron-130eq"}),
+                "secondhand.item.v1", "source-task", 7,
+                "review-task", 8, now, now, now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO domain_artifacts (
+                domain_key, entity_type, entity_id, artifact_type, platform,
+                artifact_key, status, public_url, external_id, attributes,
+                verified_at, evidence_ref, source_task_id, source_run_id,
+                accepted_review_task_id, accepted_review_run_id,
+                observed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "secondhand", "ResaleItem", "celestron-130eq",
+                "facebook_marketplace_listing", "facebook",
+                "facebook_marketplace_listing:27700220586305145", "listed",
+                "https://www.facebook.com/marketplace/item/27700220586305145/",
+                "27700220586305145", "{}", "2026-09-04T06:25:00Z",
+                "task_event:t_source:completed", "source-task", 7,
+                "review-task", 8, now, now, now,
+            ),
         )
 
     def transport(task):
@@ -638,6 +682,69 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
     assert snapshot["objective_id"] == "go-ext-marketplace-readonly-1"
     assert snapshot["stage_key"] == "prepare-readonly"
     assert snapshot["objective"]["current_stage_key"] == "prepare-readonly"
+    assert snapshot["domain_inventory"]["registry_total"] == 1
+    assert snapshot["domain_inventory"]["entities"][0]["entity_id"] == (
+        "celestron-130eq"
+    )
+    assert "27700220586305145" in snapshot["listing_ids"]
+
+
+def test_commerce_evidence_lookup_batches_large_registry_inventory(kanban_home):
+    count = 600
+    with kb.connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO commerce_group_ledger (
+                subject_key, subject_label, destination_id, destination_name,
+                source_listing_id, status, status_label, evidence,
+                source_task_id, source_run_id, observed_at, verified_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    f"item-{index}", f"Item {index}", f"group-{index}",
+                    f"Group {index}", str(10_000_000_000 + index), "unknown",
+                    "unknown", "test evidence", "source-task", 7, index,
+                    "2026-09-04T00:00:00Z", index, index,
+                )
+                for index in range(count)
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO commerce_listing_aliases (
+                subject_key, subject_label, platform, public_listing_id,
+                management_listing_id, seller_name, title, price_label,
+                evidence, source_task_id, source_run_id, observed_at,
+                verified_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    f"item-{index}", f"Item {index}", "facebook",
+                    str(10_000_000_000 + index), str(20_000_000_000 + index),
+                    "seller", f"Item {index}", "NT$1", "test evidence",
+                    "source-task", 7, index, "2026-09-04T00:00:00Z",
+                    index, index,
+                )
+                for index in range(count)
+            ],
+        )
+        snapshot = {}
+        openclaw_async_executor._attach_commerce_evidence(
+            conn,
+            snapshot,
+            subject_keys=[f"item-{index}" for index in range(count)],
+            listing_ids=[str(10_000_000_000 + index) for index in range(count)],
+        )
+
+    assert len(snapshot["commerce_group_ledger"]) == 80
+    assert len(snapshot["commerce_listing_aliases"]) == 40
+    assert snapshot["commerce_group_ledger"][0]["destination_id"] == "group-599"
+    assert snapshot["commerce_listing_aliases"][0]["public_listing_id"] == (
+        str(10_000_000_000 + 599)
+    )
 
 
 def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):

@@ -435,9 +435,10 @@ def _render_domain_memory_guidance(
     ]
     if mode == "query":
         guidance.extend([
-            "This is a registry-only inventory query. Do not create or compare Facebook Page "
-            "copy, images, publishing packages, or audit attachments, and do not perform any "
-            "external platform action. The typed registry is the task-scoped source of truth.",
+            "Query mode forbids Domain Registry writes; it does not forbid other read-only "
+            "evidence collection explicitly allowed by the Loop Contract. Use the typed "
+            "registry as the enumerable baseline, then perform any contracted live readback, "
+            "search, navigation, or comparison without changing external state.",
             "Complete with metadata.acceptance_evidence.domain_inventory_report containing the "
             "full readable inline answer and metadata.user_facing_report exactly shaped as "
             "kind=content_package, delivery=inline_only, complete=true, "
