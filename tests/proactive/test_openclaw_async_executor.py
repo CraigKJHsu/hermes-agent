@@ -1797,6 +1797,92 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, mi
     ] == ["candidate URLs are missing", "source timestamps are missing"]
 
 
+def test_correction_admission_replay_reuses_identical_request(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "correction-replay-identical-1"
+    from hermes_cli.telegram_message_path import build_telegram_message_path
+
+    message_path = build_telegram_message_path(
+        chat_id="chat-1",
+        thread_id="2",
+        user_id="kj",
+        inbound_message_id="message-correction-replay-1",
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-correction-replay-identical-1",
+        telegram_message_path=message_path,
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        assert kb.complete_task(
+            conn,
+            started["execution_task_id"],
+            result="candidate evidence incomplete",
+            metadata={"policy_receipts": []},
+            expected_run_id=run.id,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (started["execution_task_id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'grace_correction_requested', ?, 1)
+            """,
+            (
+                started["execution_task_id"],
+                '{"reason":"candidate URLs are missing"}',
+            ),
+        )
+        conn.commit()
+
+    requests = []
+
+    def timeout_transport(task):
+        requests.append(json.loads(json.dumps(task)))
+        raise TimeoutError("response lost after correction admission")
+
+    first = retry_ready_loop_contract_execution(
+        started["execution_task_id"],
+        transport=timeout_transport,
+    )
+    assert first["status"] == "retrying"
+
+    def replay_transport(task):
+        requests.append(json.loads(json.dumps(task)))
+        return _loop_result(task, "queued")
+
+    replayed = retry_ready_loop_contract_execution(
+        started["execution_task_id"],
+        transport=replay_transport,
+    )
+
+    assert requests[0] == requests[1]
+    delegated = replayed["delegated_result"]
+    for field in (
+        "delegation_id",
+        "attempt_id",
+        "contract_fingerprint",
+        "backend_agent_id",
+    ):
+        assert delegated[field] == requests[1][field]
+    assert delegated["backend_run_id"]
+    assert delegated["backend_session_key"]
+    assert delegated["protocol_version"] == "2.0"
+    assert delegated["identity_correlated"] is True
+    assert delegated["protocol_correlated"] is True
+    assert replayed["status"] == "queued"
+
+
 @pytest.mark.parametrize(
     ("legacy_metadata", "tampered_target"),
     [

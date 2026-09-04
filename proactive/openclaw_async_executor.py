@@ -3089,6 +3089,14 @@ def retry_ready_loop_contract_execution(
             fingerprint = contract_fingerprint(fingerprint_scope)
             if fingerprint == parent_fingerprint:
                 raise ValueError("OpenClaw correction must produce a fresh fingerprint.")
+            if replaying_admission:
+                fingerprint = str(
+                    previous_metadata.get("contract_fingerprint") or ""
+                )
+                if not fingerprint:
+                    raise ValueError(
+                        "OpenClaw correction replay lacks its admitted fingerprint."
+                    )
             task_type = str(previous_metadata.get("task_type") or "analysis").strip()
             backend_agent_id = _loop_backend_agent_id(
                 normalized,
@@ -3173,51 +3181,52 @@ def retry_ready_loop_contract_execution(
                     "correction_admission": True,
                     "max_poll_iterations": 0,
                 }
-                correction_path = begin_backend_attempt(
-                    merge_message_paths(
-                        kb.telegram_message_path_for_task(conn, task_id),
-                        previous_metadata.get("telegram_message_path"),
-                    ),
-                    run_id=run_id,
-                    backend_agent_id=backend_agent_id,
-                )
-                if correction_path:
-                    correction_path = append_hop(
-                        correction_path,
-                        stage="openclaw_correction_attempt",
-                        from_actor=actor("grace-review", "grace_review"),
-                        to_actor=actor(
-                            str(metadata["backend_agent_id"]),
-                            "openclaw_backend",
+                if not replaying_admission:
+                    correction_path = begin_backend_attempt(
+                        merge_message_paths(
+                            kb.telegram_message_path_for_task(conn, task_id),
+                            previous_metadata.get("telegram_message_path"),
                         ),
-                        status="attempted",
-                        identifiers={"run_id": run_id},
+                        run_id=run_id,
+                        backend_agent_id=backend_agent_id,
                     )
-                    metadata["telegram_message_path"] = correction_path
-                    metadata["backend_telegram_message_path"] = backend_projection(
-                        correction_path
-                    )
-                    correction_contract = _worker_safe_loop_contract(
-                        normalized,
-                        external_effect_budget=external_effect_budget,
-                    )
-                    correction_contract["trace"] = {
-                        "telegram_message_path": backend_projection(
+                    if correction_path:
+                        correction_path = append_hop(
+                            correction_path,
+                            stage="openclaw_correction_attempt",
+                            from_actor=actor("grace-review", "grace_review"),
+                            to_actor=actor(
+                                str(metadata["backend_agent_id"]),
+                                "openclaw_backend",
+                            ),
+                            status="attempted",
+                            identifiers={"run_id": run_id},
+                        )
+                        metadata["telegram_message_path"] = correction_path
+                        metadata["backend_telegram_message_path"] = backend_projection(
                             correction_path
-                        ),
-                        "visibility": "backend-visible-audit-metadata",
-                        "raw_user_message": "not_disclosed",
-                    }
-                    metadata["loop_contract"] = correction_contract
-                    conn.execute(
-                        "UPDATE grace_delegations SET telegram_message_path = ?, updated_at = ? "
-                        "WHERE delegation_id = ?",
-                        (
-                            dumps_message_path(correction_path),
-                            int(time.time()),
-                            str(metadata["delegation_id"]),
-                        ),
-                    )
+                        )
+                        correction_contract = _worker_safe_loop_contract(
+                            normalized,
+                            external_effect_budget=external_effect_budget,
+                        )
+                        correction_contract["trace"] = {
+                            "telegram_message_path": backend_projection(
+                                correction_path
+                            ),
+                            "visibility": "backend-visible-audit-metadata",
+                            "raw_user_message": "not_disclosed",
+                        }
+                        metadata["loop_contract"] = correction_contract
+                        conn.execute(
+                            "UPDATE grace_delegations SET telegram_message_path = ?, updated_at = ? "
+                            "WHERE delegation_id = ?",
+                            (
+                                dumps_message_path(correction_path),
+                                int(time.time()),
+                                str(metadata["delegation_id"]),
+                            ),
+                        )
             if not kb.merge_active_run_metadata(
                 conn,
                 task_id,
