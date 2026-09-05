@@ -7,6 +7,7 @@ import json
 import re
 import time
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -635,6 +636,33 @@ def _loop_contract_listing_ids(contract: Mapping[str, Any]) -> list[str]:
     return sorted(set(re.findall(r"\b[1-9][0-9]{8,}\b", text)))
 
 
+def _loop_contract_marketplace_listing_ids(contract: Mapping[str, Any]) -> set[str]:
+    scope = contract.get("scope")
+    scope = scope if isinstance(scope, Mapping) else {}
+    current_binding = {
+        "goal": contract.get("goal"),
+        "grace_interpretation": contract.get("grace_interpretation"),
+        "trigger": contract.get("trigger"),
+        "verification": contract.get("verification"),
+        "allowed_scope": scope.get("allowed"),
+        "facebook_crosspost": contract.get("facebook_crosspost"),
+        "marketplace_listing_id": contract.get("marketplace_listing_id"),
+        "source_listing_id": contract.get("source_listing_id"),
+    }
+    text = json.dumps(current_binding, ensure_ascii=False, sort_keys=True)
+    patterns = (
+        r"facebook\.com/marketplace/item/([1-9][0-9]*)",
+        r"Marketplace\s+listing(?:\s+ID)?\s+([1-9][0-9]*)",
+        r'"(?:marketplace_listing_id|source_listing_id)"\s*:\s*"([1-9][0-9]*)"',
+    )
+    listing_ids = {
+        match
+        for pattern in patterns
+        for match in re.findall(pattern, text, flags=re.IGNORECASE)
+    }
+    return listing_ids if len(listing_ids) == 1 else set()
+
+
 def _loop_contract_subject_keys(contract: Mapping[str, Any]) -> list[str]:
     delivery = contract.get("user_facing_delivery")
     if not isinstance(delivery, Mapping):
@@ -643,6 +671,175 @@ def _loop_contract_subject_keys(contract: Mapping[str, Any]) -> list[str]:
     if not isinstance(keys, list):
         return []
     return [str(item).strip() for item in keys if str(item or "").strip()]
+
+
+def _loop_contract_task_ids(contract: Mapping[str, Any]) -> list[str]:
+    goal = contract.get("goal")
+    verification = contract.get("verification")
+    memory = contract.get("memory")
+    scope = contract.get("scope")
+    positive_scope = {
+        "goal": goal,
+        "verification": verification,
+        "memory_working": memory.get("working") if isinstance(memory, Mapping) else None,
+        "scope_allowed": scope.get("allowed") if isinstance(scope, Mapping) else None,
+        "grace_interpretation": contract.get("grace_interpretation"),
+    }
+    strings: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(positive_scope)
+    task_ids: set[str] = set()
+    for text in strings:
+        for match in re.finditer(r"\bt_[0-9a-f]{8}\b", text):
+            prefix = text[max(0, match.start() - 64):match.start()].casefold()
+            if re.search(r"(?:ignore|do not use|exclude|forbid|忽略|不要|禁止)[^.;。；]*$", prefix):
+                continue
+            task_ids.add(match.group(0))
+    explicit_ids = contract.get("referenced_task_ids")
+    if isinstance(explicit_ids, list):
+        task_ids.update(
+            item.strip()
+            for item in explicit_ids
+            if isinstance(item, str) and re.fullmatch(r"t_[0-9a-f]{8}", item.strip())
+        )
+    receipt = contract.get("control_plane_receipt")
+    if isinstance(receipt, Mapping):
+        task_ids.difference_update(
+            str(receipt.get(key) or "").strip()
+            for key in ("execution_task_id", "grace_review_task_id")
+        )
+    return sorted(task_ids)
+
+
+def _attach_referenced_task_evidence(
+    conn: Any,
+    snapshot: dict[str, Any],
+    *,
+    task_ids: list[str],
+    project_namespace: str,
+    thread_id: str,
+) -> None:
+    if not task_ids:
+        return
+
+    def run_thread_id(metadata: Mapping[str, Any]) -> str:
+        loop_contract = metadata.get("loop_contract")
+        identity = (
+            loop_contract.get("identity")
+            if isinstance(loop_contract, Mapping)
+            else None
+        )
+        return (
+            str(identity.get("thread_id") or "").strip()
+            if isinstance(identity, Mapping)
+            else ""
+        )
+
+    rows = []
+    for task_id in task_ids:
+        task = conn.execute(
+            """
+            SELECT id, title, status, result, project_namespace
+              FROM tasks
+             WHERE id = ? AND project_namespace = ?
+            """,
+            (task_id, project_namespace),
+        ).fetchone()
+        if task is None or not project_namespace or not thread_id:
+            rows.append({"task_id": task_id, "status": "unauthorized_or_missing"})
+            continue
+        run = conn.execute(
+            """
+            SELECT id, status, outcome, summary, metadata, ended_at
+              FROM task_runs
+             WHERE task_id = ? AND outcome = 'completed'
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        try:
+            metadata = json.loads(run["metadata"] or "{}") if run is not None else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        child_thread_id = run_thread_id(metadata)
+        same_thread = child_thread_id == thread_id
+        if not same_thread and not child_thread_id:
+            parent_count = conn.execute(
+                "SELECT COUNT(*) FROM task_links WHERE child_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            parent_runs = conn.execute(
+                """
+                SELECT run.metadata
+                  FROM task_links AS link
+                  JOIN tasks AS parent ON parent.id = link.parent_id
+                  JOIN task_runs AS run ON run.id = (
+                      SELECT MAX(candidate.id)
+                        FROM task_runs AS candidate
+                       WHERE candidate.task_id = parent.id
+                         AND candidate.outcome = 'completed'
+                  )
+                 WHERE link.child_id = ?
+                   AND parent.project_namespace = ?
+                """,
+                (task_id, project_namespace),
+            ).fetchall() if parent_count == 1 else []
+            for parent_run in parent_runs:
+                try:
+                    parent_metadata = json.loads(parent_run["metadata"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if run_thread_id(parent_metadata) == thread_id:
+                    same_thread = True
+                    break
+        if not same_thread:
+            rows.append({"task_id": task_id, "status": "unauthorized_or_missing"})
+            continue
+        item: dict[str, Any] = {
+            "task_id": task_id,
+            "title": task["title"],
+            "status": task["status"],
+        }
+        if run is not None:
+            item["latest_completed_run"] = {
+                "run_id": run["id"],
+                "status": run["status"],
+                "outcome": run["outcome"],
+                "summary": run["summary"],
+                "ended_at": run["ended_at"],
+                **{
+                    key: metadata[key]
+                    for key in (
+                        "acceptance_evidence",
+                        "accepted",
+                        "review_outcome",
+                        "verification",
+                        "decisions",
+                        "policy_receipts",
+                    )
+                    if key in metadata
+                },
+            }
+        if run is None or "acceptance_evidence" not in item["latest_completed_run"]:
+            result = str(task["result"] or "").strip()
+            if result:
+                try:
+                    item["result"] = json.loads(result)
+                except json.JSONDecodeError:
+                    item["result"] = result
+        rows.append(item)
+    snapshot["referenced_task_evidence"] = rows
 
 
 def _attach_commerce_evidence(
@@ -788,10 +985,15 @@ def _objective_durable_evidence_snapshot(
         and str(domain_spec.get("domain_key") or "").strip()
         and str(domain_spec.get("entity_type") or "").strip()
     )
-    if not objective_id and not has_domain_query:
+    referenced_task_ids = _loop_contract_task_ids(contract)
+    if not objective_id and not has_domain_query and not referenced_task_ids:
         return {}
     listing_ids = _loop_contract_listing_ids(contract)
     subject_keys = _loop_contract_subject_keys(contract)
+    identity = contract.get("identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    project_namespace = str(identity.get("project") or "").strip()
+    thread_id = str(identity.get("thread_id") or "").strip()
     snapshot: dict[str, Any] = {
         "schema_version": "1.0",
         "source": "hermes_kanban_predelegation_readonly_snapshot",
@@ -799,6 +1001,7 @@ def _objective_durable_evidence_snapshot(
         "stage_key": str(objective_ref.get("stage_key") or "").strip(),
         "listing_ids": listing_ids,
         "subject_keys": subject_keys,
+        "referenced_task_ids": referenced_task_ids,
     }
     if has_domain_query:
         domain_inventory = kb.domain_inventory_report(
@@ -828,6 +1031,13 @@ def _objective_durable_evidence_snapshot(
         snapshot["subject_keys"] = sorted(subject_keys)
 
     if not objective_id:
+        _attach_referenced_task_evidence(
+            conn,
+            snapshot,
+            task_ids=referenced_task_ids,
+            project_namespace=project_namespace,
+            thread_id=thread_id,
+        )
         _attach_commerce_evidence(
             conn,
             snapshot,
@@ -951,6 +1161,13 @@ def _objective_durable_evidence_snapshot(
         subject_keys=subject_keys,
         listing_ids=listing_ids,
     )
+    _attach_referenced_task_evidence(
+        conn,
+        snapshot,
+        task_ids=referenced_task_ids,
+        project_namespace=project_namespace,
+        thread_id=thread_id,
+    )
     return snapshot
 
 
@@ -969,7 +1186,14 @@ def _ensure_loop_contract_routing(
         else None
     )
     if isinstance(role_card, Mapping):
-        return normalized
+        if task_type != "facebook_marketplace_readonly":
+            return normalized
+        enriched = json.loads(json.dumps(normalized, ensure_ascii=False))
+        resolved = enriched["routing"]["resolved"]
+        resolved["output_schema"] = {"format": "json", "required_sections": []}
+        resolved["backend_role_card"]["output_format"] = "json"
+        resolved["backend_role_card"]["required_sections"] = []
+        return validate_loop_contract(enriched)
 
     from proactive.hubops_routing import (
         resolved_route_binding,
@@ -992,6 +1216,13 @@ def _ensure_loop_contract_routing(
         enriched_routing = {}
         enriched["routing"] = enriched_routing
     enriched_routing["resolved"] = resolved_route_binding(preview)
+    if task_type == "facebook_marketplace_readonly":
+        enriched_routing["resolved"]["output_schema"] = {
+            "format": "json",
+            "required_sections": [],
+        }
+        enriched_routing["resolved"]["backend_role_card"]["output_format"] = "json"
+        enriched_routing["resolved"]["backend_role_card"]["required_sections"] = []
     return validate_loop_contract(enriched)
 
 
@@ -2943,6 +3174,9 @@ def retry_ready_loop_contract_execution(
                 or blocked_reason.startswith(
                     "OpenClaw Loop Contract was blocked before verified completion"
                 )
+                or blocked_reason.startswith(
+                    "Required content package is missing or invalid."
+                )
             )
             recovering_quarantined_correction = (
                 task.status == "blocked"
@@ -3327,6 +3561,17 @@ def retry_ready_loop_contract_execution(
                                 int(time.time()),
                                 str(metadata["delegation_id"]),
                             ),
+                        )
+                correction_contract = metadata.get("loop_contract")
+                if isinstance(correction_contract, dict):
+                    correction_contract.pop("durable_evidence_snapshot", None)
+                    evidence_snapshot = _objective_durable_evidence_snapshot(
+                        conn,
+                        correction_contract,
+                    )
+                    if evidence_snapshot:
+                        correction_contract["durable_evidence_snapshot"] = (
+                            evidence_snapshot
                         )
             if not kb.merge_active_run_metadata(
                 conn,
@@ -4331,14 +4576,272 @@ def _commerce_status_report_metadata(
     ):
         return {}
     subject_keys = delivery.get("subject_keys")
-    if not isinstance(subject_keys, list) or len(subject_keys) != 1:
+    if not isinstance(subject_keys, list) or not subject_keys:
         return {}
-    subject_key = str(subject_keys[0] or "").strip()
-    if not subject_key:
+    clean_subject_keys = [str(item or "").strip() for item in subject_keys]
+    if not all(clean_subject_keys) or len(set(clean_subject_keys)) != len(clean_subject_keys):
         return {}
     acceptance = audited_result.get("acceptanceEvidence")
     if not isinstance(acceptance, Mapping):
         return {}
+    groups = acceptance.get("groups")
+    if delivery.get("body_field") == "membership_action_report":
+        if not isinstance(groups, list):
+            return {}
+        if len(groups) != len(clean_subject_keys) or not all(
+            isinstance(item, Mapping) for item in groups
+        ):
+            return {}
+        group_ids = [str(item.get("group_id") or "").strip() for item in groups]
+        if len(set(group_ids)) != len(group_ids) or set(group_ids) != set(
+            clean_subject_keys
+        ):
+            return {}
+        by_id = dict(zip(group_ids, groups, strict=True))
+        audit = acceptance.get("forbiddenActionsAudit")
+        if (
+            not isinstance(audit, Mapping)
+            or audit.get("post_publish_submit_share_performed") is not False
+        ):
+            return {}
+        listing_id = str(
+            audit.get("listing_id") or ""
+        ).strip()
+        if listing_id not in _loop_contract_marketplace_listing_ids(contract):
+            return {}
+        status_labels = {
+            "joined": "已加入",
+            "joined_with_unsubmitted_participant_gate": "已加入，但有未提交的參與條件",
+            "unchanged_not_joined": "仍顯示 Join group，尚未確認加入",
+        }
+        rows = []
+        coverage = []
+        observed_values = []
+        for subject_key in clean_subject_keys:
+            item = by_id[subject_key]
+            status = str(item.get("membership_status") or "").strip().lower()
+            name = str(item.get("live_name") or "").strip()
+            observed_text = str(item.get("observed_at") or "").strip()
+            evidence = str(item.get("ui_result") or "").strip()
+            try:
+                observed_datetime = datetime.fromisoformat(observed_text)
+                if (
+                    observed_datetime.tzinfo is None
+                    or observed_datetime.utcoffset() is None
+                ):
+                    return {}
+                observed_at = int(observed_datetime.timestamp())
+            except (TypeError, ValueError, OverflowError):
+                return {}
+            if observed_at <= 0 or observed_at > int(time.time()) + 300:
+                return {}
+            if status not in status_labels or not name or not evidence or not listing_id:
+                return {}
+            resolved = status == "joined"
+            report_status = "not_posted" if resolved else "unknown"
+            try:
+                verified_at = time.strftime(
+                    "%Y-%m-%d %H:%M:%S UTC", time.gmtime(observed_at)
+                )
+            except (OverflowError, OSError, ValueError):
+                return {}
+            rows.append({
+                "subject_key": subject_key,
+                "subject_label": name,
+                "destination_id": subject_key,
+                "destination_name": name,
+                "status": report_status,
+                "status_label": status_labels[status],
+                "observed_at": observed_at,
+                "verified_at": verified_at,
+                "evidence": evidence,
+                "source_listing_id": listing_id,
+            })
+            coverage.append({
+                "subject_key": subject_key,
+                "subject_label": name,
+                "complete": resolved,
+                "named_count": 1,
+                "gap_count": 0,
+                "expected_total": 1,
+                "expected_total_label": "1 個指定 Facebook 社團目的地",
+                "note": (
+                    "已驗證目前顯示 Joined。"
+                    if resolved
+                    else "已保留即時結果，但會員資格仍有未解條件。"
+                ),
+            })
+            observed_values.append(observed_at)
+        report_observed_at = max(observed_values)
+        report = {
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "complete": all(item["complete"] for item in coverage),
+            "as_of": time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(report_observed_at)
+            ),
+            "observed_at": report_observed_at,
+            "rows": rows,
+            "coverage": coverage,
+        }
+        try:
+            from hermes_cli.user_facing_report import normalize_user_facing_report
+
+            return {"user_facing_report": normalize_user_facing_report(report)}
+        except ValueError:
+            return {}
+
+    source_listing = acceptance.get("sourceListing")
+    preflight_rows = acceptance.get("rows")
+    preflight_observed_at = acceptance.get("observed_at")
+    if (
+        not isinstance(preflight_rows, list)
+        and metadata.get("task_type") == "facebook_marketplace_readonly"
+        and isinstance(groups, list)
+        and isinstance(source_listing, Mapping)
+    ):
+        preflight_rows = [{
+            "group_id": item.get("group_id"),
+            "name": item.get("readable_name"),
+            "membership_state": str(
+                item.get("live_membership_state") or ""
+            ).lower(),
+            "chooser_presence": (
+                "present_visible"
+                if item.get("chooser_presence") == "present"
+                else item.get("chooser_presence")
+            ),
+            "chooser_selectability": item.get("chooser_selectability"),
+            "evidence": " ".join(
+                str(item.get(key) or "").strip()
+                for key in ("membership_evidence", "chooser_evidence")
+                if str(item.get(key) or "").strip()
+            ),
+        } for item in groups if isinstance(item, Mapping)]
+        preflight_observed_at = source_listing.get("observed_at")
+    if (
+        isinstance(preflight_rows, list)
+        and isinstance(source_listing, Mapping)
+        and isinstance(acceptance.get("coverageReconciliation"), Mapping)
+    ):
+        reconciliation = acceptance["coverageReconciliation"]
+        expected_count = reconciliation.get("expected_named_destinations")
+        returned_count = reconciliation.get("returned_rows")
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or isinstance(returned_count, bool)
+            or not isinstance(returned_count, int)
+            or expected_count != len(clean_subject_keys)
+            or returned_count != len(preflight_rows)
+        ):
+            return {}
+        reported_gap = reconciliation.get(
+            "identity_gap_count", reconciliation.get("gap_count")
+        )
+        if reported_gap is not None and (
+            isinstance(reported_gap, bool)
+            or not isinstance(reported_gap, int)
+            or reported_gap != expected_count - returned_count
+        ):
+            return {}
+        if len(preflight_rows) != len(clean_subject_keys) or not all(
+            isinstance(item, Mapping) for item in preflight_rows
+        ):
+            return {}
+        group_ids = [
+            str(item.get("group_id") or "").strip() for item in preflight_rows
+        ]
+        if len(set(group_ids)) != len(group_ids) or set(group_ids) != set(
+            clean_subject_keys
+        ):
+            return {}
+        listing_id = str(
+            source_listing.get("source_listing_id")
+            or source_listing.get("listing_id")
+            or ""
+        ).strip()
+        if listing_id not in _loop_contract_marketplace_listing_ids(contract):
+            return {}
+        observed_at = preflight_observed_at
+        if (
+            not listing_id
+            or isinstance(observed_at, bool)
+            or not isinstance(observed_at, int)
+            or observed_at <= 0
+            or observed_at > int(time.time()) + 300
+        ):
+            return {}
+        by_id = dict(zip(group_ids, preflight_rows, strict=True))
+        try:
+            verified_at = time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(observed_at)
+            )
+        except (OverflowError, OSError, ValueError):
+            return {}
+        rows = []
+        coverage = []
+        for subject_key in clean_subject_keys:
+            item = by_id[subject_key]
+            name = str(item.get("name") or "").strip()
+            evidence = str(item.get("evidence") or "").strip()
+            ready = (
+                item.get("membership_state") == "joined"
+                and item.get("chooser_presence") == "present_visible"
+                and item.get("chooser_selectability") == "selectable_unchecked"
+            )
+            if not name or not evidence:
+                return {}
+            status = "not_posted" if ready else "unknown"
+            rows.append({
+                "subject_key": subject_key,
+                "subject_label": name,
+                "destination_id": subject_key,
+                "destination_name": name,
+                "status": status,
+                "status_label": (
+                    "已加入且 chooser 可選，尚未刊登"
+                    if ready
+                    else "chooser 狀態尚未確認"
+                ),
+                "observed_at": observed_at,
+                "verified_at": verified_at,
+                "evidence": evidence,
+                "source_listing_id": listing_id,
+            })
+            coverage.append({
+                "subject_key": subject_key,
+                "subject_label": name,
+                "complete": False,
+                "named_count": 1,
+                "gap_count": 0,
+                "expected_total": 1,
+                "expected_total_label": "1 個指定 Facebook 社團目的地",
+                "note": (
+                    "已驗證為後續精確刊登核准的候選，但尚未刊登。"
+                    if ready
+                    else "已具名，但 chooser 可用性仍未確認。"
+                ),
+            })
+        report = {
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "complete": all(item["complete"] for item in coverage),
+            "as_of": verified_at,
+            "observed_at": observed_at,
+            "rows": rows,
+            "coverage": coverage,
+        }
+        try:
+            from hermes_cli.user_facing_report import normalize_user_facing_report
+
+            return {"user_facing_report": normalize_user_facing_report(report)}
+        except ValueError:
+            return {}
+
+    if len(clean_subject_keys) != 1:
+        return {}
+    subject_key = clean_subject_keys[0]
     inline_report = acceptance.get("inlineReport") or acceptance.get("inline_report")
     if not isinstance(inline_report, Mapping):
         return {}
@@ -4531,11 +5034,24 @@ def _content_package_completion_metadata(
             return {}
         if isinstance(delivery, Mapping) and delivery.get("delivery") == "inline_only":
             # Gateway rebuilds inline-only reports from this pinned evidence field.
-            if acceptance.get(str(delivery.get("body_field") or "")) != report.get("body"):
-                return {}
-        return _materialize_content_package_report(
-            report, delivery=delivery, task_id=task_id, board=board,
-        )
+            if acceptance.get(str(delivery.get("body_field") or "")) == report.get(
+                "body"
+            ):
+                return _materialize_content_package_report(
+                    report,
+                    delivery=delivery,
+                    task_id=task_id,
+                    board=board,
+                )
+            # A worker preview must not override or invalidate the complete,
+            # contract-pinned inline body. Rebuild it below from acceptance evidence.
+        else:
+            return _materialize_content_package_report(
+                report,
+                delivery=delivery,
+                task_id=task_id,
+                board=board,
+            )
     if (
         isinstance(delivery, Mapping)
         and delivery.get("required") is True

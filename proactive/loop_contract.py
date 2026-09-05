@@ -377,14 +377,19 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     except DomainMemoryError as exc:
         raise LoopContractError(f"domain memory validation failed: {exc}") from exc
     domain_memory = value.get("domain_memory")
+    routing = value.get("routing")
+    routing = routing if isinstance(routing, Mapping) else {}
+    resolved_routing = routing.get("resolved")
+    resolved_routing = (
+        resolved_routing if isinstance(resolved_routing, Mapping) else {}
+    )
+    routing_task_type = str(
+        resolved_routing.get("task_type") or routing.get("task_type") or ""
+    ).strip()
     if (
         isinstance(domain_memory, Mapping)
         and domain_memory.get("mode") == "query"
-        and str(
-            (value.get("routing") or {}).get("task_type")
-            if isinstance(value.get("routing"), Mapping)
-            else ""
-        ).strip() != "secondhand_commerce_group_status"
+        and routing_task_type != "secondhand_commerce_group_status"
         and value.get("user_facing_delivery") is None
     ):
         # Enumerable Domain Memory questions are always delivered inline.  A
@@ -480,11 +485,6 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     user_facing_delivery = value.get("user_facing_delivery")
-    routing_task_type = str(
-        (value.get("routing") or {}).get("task_type")
-        if isinstance(value.get("routing"), Mapping)
-        else ""
-    ).strip()
     if (
         routing_task_type == "secondhand_commerce_group_status"
         and user_facing_delivery is None

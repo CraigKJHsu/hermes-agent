@@ -216,6 +216,11 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         for item in snapshots
         if isinstance(item, Mapping)
     )
+    identity = contract.get("identity")
+    is_ai_bizweek = (
+        isinstance(identity, Mapping)
+        and str(identity.get("project") or "").strip().casefold() == "ai_bizweek"
+    )
     if review:
         if not snapshots:
             return [
@@ -224,11 +229,20 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
                 "Reject with policy_stale only if a binding now exists or its SHA-256 is non-null.",
                 "Accepted kanban_complete metadata must include policy_receipts=[].",
             ]
-        return [
+        common = [
             f"Mandatory policy snapshots: {refs}.",
             "Independently read every policy version_path, verify its SHA-256 and compare the "
             "parent deliverable against the complete policy content. Then read each manifest_path; "
             "for latest_active requirements reject with policy_stale if the active version changed.",
+        ]
+        if not is_ai_bizweek:
+            return common + [
+                "Accepted kanban_complete metadata must include policy_receipts: one object per policy "
+                "with role=review, policy_id, version, sha256, loaded=true, and "
+                "latest_active_verified=true for latest_active policies. The database validates these "
+                "receipts and current manifests before accepting completion.",
+            ]
+        return common + [
             "For AI BizWeek image deliverables, use managed_policy_read output when available; "
             "otherwise use the embedded Loop Contract policy_snapshots, policy_requirements, "
             "policy_binding_snapshot, and task-scoped source evidence as the trusted policy "
@@ -278,10 +292,19 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
             "The Topic policy binding was empty when this contract was compiled. Preserve this "
             "snapshot boundary and complete with metadata policy_receipts=[].",
         ]
-    return [
+    common = [
         f"Mandatory policy snapshots: {refs}.",
         "Read and obey the complete content of every policy snapshot before work. Topic memory is "
         "only a binding hint and never substitutes for these policies.",
+    ]
+    if not is_ai_bizweek:
+        return common + [
+            "kanban_complete metadata must include policy_receipts: one object per policy with "
+            "role=execution, policy_id, version, sha256, and loaded=true. The database rejects missing "
+            "or mismatched receipts. When the execution backend returns a structured OpenClaw result "
+            "instead of calling kanban_complete directly, return the identical list as policyReceipts.",
+        ]
+    return common + [
         "For AI BizWeek image deliverables, use embedded Loop Contract policy_snapshots, "
         "policy_requirements, policy_binding_snapshot, and task-scoped source evidence as the "
         "trusted policy readback. If managed_policy_read is available, call it too; if it is "
@@ -410,6 +433,15 @@ def _render_domain_memory_guidance(
     domain_key = str(spec.get("domain_key") or "").strip()
     entity_type = str(spec.get("entity_type") or "").strip()
     mode = str(spec.get("mode") or "").strip()
+    routing = contract.get("routing")
+    routing = routing if isinstance(routing, Mapping) else {}
+    resolved_routing = routing.get("resolved")
+    resolved_routing = (
+        resolved_routing if isinstance(resolved_routing, Mapping) else {}
+    )
+    routing_task_type = str(
+        resolved_routing.get("task_type") or routing.get("task_type") or ""
+    ).strip()
     artifact_types = ", ".join(
         str(item) for item in (spec.get("artifact_types") or [])
     )
@@ -439,13 +471,30 @@ def _render_domain_memory_guidance(
             "evidence collection explicitly allowed by the Loop Contract. Use the typed "
             "registry as the enumerable baseline, then perform any contracted live readback, "
             "search, navigation, or comparison without changing external state.",
-            "Complete with metadata.acceptance_evidence.domain_inventory_report containing the "
-            "full readable inline answer and metadata.user_facing_report exactly shaped as "
-            "kind=content_package, delivery=inline_only, complete=true, "
-            "body_field=domain_inventory_report, body=<the same full answer>, assets=[]. Include "
-            "title and a plausible Unix-seconds observed_at. Do not invent another report kind "
-            "or require a Markdown attachment.",
         ])
+        delivery = contract.get("user_facing_delivery")
+        if (
+            isinstance(delivery, Mapping)
+            and delivery.get("required") is True
+            and delivery.get("kind") == "content_package"
+            and delivery.get("delivery") == "inline_only"
+        ):
+            if routing_task_type not in {
+                "browser_readonly",
+                "facebook_marketplace_readonly",
+            }:
+                guidance.append(
+                    "This is a registry-only inventory query; do not perform unrelated live "
+                    "external navigation or mutation."
+                )
+            guidance.extend([
+                "Complete with metadata.acceptance_evidence.domain_inventory_report containing the "
+                "full readable inline answer and metadata.user_facing_report exactly shaped as "
+                "kind=content_package, delivery=inline_only, complete=true, "
+                "body_field=domain_inventory_report, body=<the same full answer>, assets=[]. Include "
+                "title and a plausible Unix-seconds observed_at. Do not invent another report kind "
+                "or require a Markdown attachment.",
+            ])
     if mode == "mutate":
         guidance.append(
             "kanban_complete metadata must include domain_memory_deltas. Each delta "
@@ -462,6 +511,53 @@ def _render_domain_memory_guidance(
             "list as domainMemoryDeltas. The database rejects missing or uncontracted deltas."
         )
     return guidance
+
+
+def _render_user_facing_delivery_guidance(
+    contract: Mapping[str, Any], *, review: bool
+) -> list[str]:
+    delivery = contract.get("user_facing_delivery")
+    if not isinstance(delivery, Mapping) or delivery.get("required") is not True:
+        if review:
+            return [
+                "This contract does not require user_facing_delivery. Do not require or "
+                "validate metadata.user_facing_report, and do not treat its absence as a "
+                "review blocker even if a generic policy checklist mentions reports."
+            ]
+        return []
+    if delivery.get("kind") == "commerce_group_status":
+        detail = (
+            "one row per product/group with readable names, status, observation time, "
+            "and evidence, plus report.observed_at and per-product coverage. Coverage "
+            "must include numeric expected_total when known and reconcile named_count + "
+            "gap_count; use null for both when the total is unknown. A subject with no "
+            "named destinations remains in coverage with named_count=0 and needs no "
+            "invented row. report.complete describes the complete originating user "
+            "outcome; any unnamed or unverified destination gap requires complete=false. "
+            "A complete=false report may be accepted only as a truthful fail-closed or "
+            "intermediate phase outcome; never treat it as completion or close the "
+            "originating objective."
+        )
+        if review:
+            return [
+                "For the required commerce_group_status delivery, reject the parent unless "
+                "metadata.user_facing_report contains " + detail
+            ]
+        return [
+            "Return metadata.user_facing_report with kind=commerce_group_status, "
+            "delivery=inline_only, and " + detail
+        ]
+    if review:
+        return [
+            "For the requested user-facing delivery, reject the parent unless "
+            "metadata.user_facing_report matches user_facing_delivery and truthfully exposes "
+            "every known gap. Never accept a Markdown attachment path as a substitute for an "
+            "inline payload."
+        ]
+    return [
+        "The contract requires user_facing_delivery. Return a validated "
+        "metadata.user_facing_report matching its declared kind and delivery mode."
+    ]
 
 
 def render_execution_body(contract: Mapping[str, Any]) -> str:
@@ -482,6 +578,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             *_render_approved_external_execution_guidance(worker_contract),
             *_render_facebook_group_publish_guidance(worker_contract),
             *_render_domain_memory_guidance(worker_contract, review=False),
+            *_render_user_facing_delivery_guidance(worker_contract, review=False),
             *_render_image_generation_guidance(worker_contract),
             *_render_language_polish_guidance(worker_contract, review=False),
             "For each external draft/object you find or create, call kanban_external_effect "
@@ -489,16 +586,6 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "kanban_complete metadata.external_effects using platform, effect_key, "
             "state, external_id "
             "(when available), and details. This durable ledger is the create-idempotency gate.",
-            "When a deliverable is a user-facing status, inventory, or destination list, "
-            "kanban_complete metadata must include a validated user_facing_report. For "
-            "Facebook commerce reports use kind=commerce_group_status, delivery=inline_only, "
-            "one row per product/group with readable names, status, observation time, and "
-            "evidence, plus report.observed_at and per-product coverage. Coverage must include "
-            "numeric expected_total when known and reconcile named_count + gap_count; use null "
-            "for both when the total is unknown. A subject with no named destinations remains "
-            "in coverage with named_count=0 and needs no invented row. report.complete describes the complete "
-            "originating user outcome, not merely this execution stage; any unnamed or "
-            "unverified destination gap requires complete=false.",
             "When every deliverable and verification item is complete, call kanban_complete "
             "even if Grace or KJ must still review or approve a later public/external action. "
             "Record those downstream gates in metadata.approval_needed; they are not execution blockers.",
@@ -559,13 +646,8 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             *_render_policy_guidance(worker_contract, review=True),
             *_render_facebook_group_publish_guidance(worker_contract),
             *_render_domain_memory_guidance(worker_contract, review=True),
+            *_render_user_facing_delivery_guidance(worker_contract, review=True),
             *_render_language_polish_guidance(worker_contract, review=True),
-            "For a requested user-facing status, inventory, or destination list, reject the "
-            "parent unless metadata.user_facing_report is present, readable names are primary, "
-            "all rows include status/evidence/time, and coverage truthfully exposes every known "
-            "gap. Never accept a Markdown attachment path as a substitute for the inline payload. "
-            "An incomplete report may be evidence-correct, but it does not satisfy the complete "
-            "originating user outcome and must not later be closed as one.",
             "If rejected but safely correctable, do not call kanban_complete. Call kanban_block with "
             "kind=dependency and a precise correction contract that preserves the same project, scope, "
             "verification, stop rules, and memory namespace. This returns the parent execution card for "

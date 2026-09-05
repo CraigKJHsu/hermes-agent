@@ -123,6 +123,36 @@ def test_domain_inventory_query_gets_canonical_inline_delivery():
     }
 
 
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"task_type": "facebook_marketplace_readonly", "risk_level": "low"},
+        {
+            "resolved": {
+                "task_type": "facebook_marketplace_readonly",
+                "risk_level": "low",
+            }
+        },
+        {"resolved": {"task_type": "browser_readonly", "risk_level": "low"}},
+    ],
+)
+def test_live_marketplace_query_gets_canonical_inline_delivery(routing):
+    contract = _contract()
+    contract["identity"]["project"] = "secondhand_commerce"
+    contract["identity"]["topic_name"] = "二手拍賣"
+    contract["routing"] = routing
+
+    accepted = validate_loop_contract(contract)
+
+    assert accepted["domain_memory"]["mode"] == "query"
+    assert accepted["user_facing_delivery"] == {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "domain_inventory_report",
+    }
+
+
 def test_domain_inventory_query_never_exposes_page_source_to_worker():
     contract = _contract()
     contract["identity"]["project"] = "ai_bizweek"
@@ -454,11 +484,20 @@ def test_user_facing_delivery_is_explicit_and_fail_closed():
         validate_loop_contract(contract)
 
 
-def test_commerce_group_status_route_requires_delivery_contract():
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"task_type": "secondhand_commerce_group_status"},
+        {"resolved": {"task_type": "secondhand_commerce_group_status"}},
+        {
+            "task_type": "browser_readonly",
+            "resolved": {"task_type": "secondhand_commerce_group_status"},
+        },
+    ],
+)
+def test_commerce_group_status_route_requires_delivery_contract(routing):
     contract = _contract()
-    contract["routing"] = {
-        "task_type": "secondhand_commerce_group_status",
-    }
+    contract["routing"] = routing
     with pytest.raises(LoopContractError, match="requires user_facing_delivery"):
         validate_loop_contract(contract)
 

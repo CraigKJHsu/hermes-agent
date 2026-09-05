@@ -47,6 +47,14 @@ BUILTIN_DOMAIN_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_BUILTIN_ARTIFACT_PLATFORMS = {
+    "facebook_page_post": "facebook",
+    "facebook_marketplace_listing": "facebook",
+    "facebook_group_post": "facebook",
+    "shopee_listing": "shopee",
+    "podcast_episode": "podcast",
+    "audio_brief": "internal",
+}
 _ENTITY_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _ISOISH_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -361,12 +369,40 @@ def normalize_memory_deltas(
                     f"{artifact_field}.artifact_type is not allowed by {spec['schema_id']}"
                 )
             platform = _clean_slug(
-                artifact_raw.get("platform"), field=f"{artifact_field}.platform"
+                artifact_raw.get("platform")
+                or _BUILTIN_ARTIFACT_PLATFORMS.get(artifact_type),
+                field=f"{artifact_field}.platform",
             )
             artifact_status = _clean_slug(
                 artifact_raw.get("status"), field=f"{artifact_field}.status"
             )
-            external_id = str(artifact_raw.get("external_id") or "").strip()
+            group_id_alias = None
+            if artifact_type == "facebook_group_post" and "group_id" in artifact_raw:
+                raw_group_id = artifact_raw["group_id"]
+                if (
+                    not isinstance(raw_group_id, str)
+                    or re.fullmatch(r"[1-9][0-9]*", raw_group_id.strip()) is None
+                ):
+                    raise DomainMemoryError(
+                        f"{artifact_field}.group_id must be ASCII digits without leading zeros"
+                    )
+                group_id_alias = raw_group_id.strip()
+            explicit_external_id = str(
+                artifact_raw.get("external_id") or ""
+            ).strip()
+            if (
+                group_id_alias
+                and explicit_external_id
+                and group_id_alias != explicit_external_id
+            ):
+                raise DomainMemoryError(
+                    f"{artifact_field}.group_id must match external_id"
+                )
+            external_id = str(
+                explicit_external_id
+                or group_id_alias
+                or ""
+            ).strip()
             public_url = str(artifact_raw.get("public_url") or "").strip()
             artifact_key = str(artifact_raw.get("artifact_key") or "").strip()
             if not artifact_key:
@@ -384,6 +420,23 @@ def normalize_memory_deltas(
                 artifact_raw.get("attributes"),
                 field=f"{artifact_field}.attributes",
             )
+            if "group_name" in artifact_raw and "group_name" not in artifact_attributes:
+                if not isinstance(artifact_raw["group_name"], str):
+                    raise DomainMemoryError(
+                        f"{artifact_field}.group_name must be a string"
+                    )
+                artifact_attributes["group_name"] = _clean_text(
+                    artifact_raw["group_name"],
+                    field=f"{artifact_field}.group_name",
+                )
+            if (
+                "membership_status" in artifact_raw
+                and "membership_status" not in artifact_attributes
+            ):
+                artifact_attributes["membership_status"] = _clean_slug(
+                    artifact_raw["membership_status"],
+                    field=f"{artifact_field}.membership_status",
+                )
             artifact_top = {
                 "artifact_type": artifact_type,
                 "platform": platform,
@@ -473,8 +526,17 @@ def normalize_memory_deltas(
                     "artifact slot; missing: " + ", ".join(missing_slots)
                 )
 
+        raw_evidence_refs = raw.get("evidence_refs")
+        if raw_evidence_refs is None:
+            raw_evidence_refs = list(
+                dict.fromkeys(
+                    item["evidence_ref"]
+                    for item in artifacts
+                    if item.get("evidence_ref")
+                )
+            )
         evidence_refs = _clean_string_list(
-            raw.get("evidence_refs"), field=f"{field}.evidence_refs"
+            raw_evidence_refs, field=f"{field}.evidence_refs"
         )
         normalized.append({
             "operation": operation,

@@ -748,6 +748,173 @@ def test_commerce_evidence_lookup_batches_large_registry_inventory(kanban_home):
     )
 
 
+def test_standalone_snapshot_includes_full_explicit_task_evidence(kanban_home):
+    rows = {
+        "ready": [
+            {
+                "name": "Astronomy Taiwan",
+                "group_id": "454415024674480",
+                "canonical_url": (
+                    "https://www.facebook.com/groups/454415024674480/"
+                ),
+                "evidence": "e" * 2_000,
+            }
+        ],
+        "conditional": [],
+        "excluded": [],
+    }
+    with kb.connect() as conn:
+        execution_task_id = kb.create_task(
+            conn,
+            title="Accepted candidate source",
+            assignee="test",
+            created_by="test",
+            project_namespace="hub_ops",
+        )
+        assert kb.complete_task(
+            conn,
+            execution_task_id,
+            result=json.dumps(rows),
+            metadata={
+                "acceptance_evidence": rows,
+                "loop_contract": _contract(),
+            },
+        )
+        review_task_id = kb.create_task(
+            conn,
+            title="Accepted candidate review",
+            assignee="test",
+            created_by="test",
+            project_namespace="hub_ops",
+            parents=(execution_task_id,),
+        )
+        assert kb.complete_task(
+            conn,
+            review_task_id,
+            result="accepted",
+            metadata={
+                "accepted": True,
+                "review_outcome": "accepted",
+            },
+        )
+        conflicting_child_id = kb.create_task(
+            conn,
+            title="Explicitly different thread",
+            assignee="test",
+            created_by="test",
+            project_namespace="hub_ops",
+            parents=(execution_task_id,),
+        )
+        conflicting_contract = _contract()
+        conflicting_contract["identity"]["thread_id"] = "different-thread"
+        assert kb.complete_task(
+            conn,
+            conflicting_child_id,
+            result="must not cross the explicit thread boundary",
+            metadata={
+                "acceptance_evidence": {"private": True},
+                "loop_contract": conflicting_contract,
+            },
+        )
+        other_parent_id = kb.create_task(
+            conn,
+            title="Parent from different thread",
+            assignee="test",
+            created_by="test",
+            project_namespace="hub_ops",
+        )
+        assert kb.complete_task(
+            conn,
+            other_parent_id,
+            result="different parent evidence",
+            metadata={"loop_contract": conflicting_contract},
+        )
+        ambiguous_child_id = kb.create_task(
+            conn,
+            title="Multi-parent child without thread identity",
+            assignee="test",
+            created_by="test",
+            project_namespace="hub_ops",
+            parents=(execution_task_id, other_parent_id),
+        )
+        assert kb.complete_task(
+            conn,
+            ambiguous_child_id,
+            result="must not inherit one of multiple thread identities",
+            metadata={"acceptance_evidence": {"private": True}},
+        )
+        unrelated_task_id = kb.create_task(
+            conn,
+            title="Unrelated private task",
+            assignee="test",
+            created_by="test",
+            project_namespace="other_project",
+        )
+        assert kb.complete_task(
+            conn,
+            unrelated_task_id,
+            result="must not cross the project boundary",
+            metadata={
+                "acceptance_evidence": {"private": True},
+                "loop_contract": _contract(),
+            },
+        )
+
+        contract = _contract()
+        contract["goal"]["deliverables"] = [
+            "Preserve all rows from "
+            f"{execution_task_id} and {review_task_id}.",
+            f"Inspect evidence from {conflicting_child_id} and {ambiguous_child_id}.",
+            f"Ignore {unrelated_task_id}.",
+        ]
+        contract["domain_memory"] = {
+            "mode": "query",
+            "domain_key": "secondhand",
+            "entity_type": "ResaleItem",
+        }
+        contract["verification"]["review_feedback"] = [
+            "Retry current task t_deadbeef after restoring source evidence."
+        ]
+        contract["control_plane_receipt"] = {
+            "execution_task_id": "t_deadbeef",
+            "grace_review_task_id": "t_cafebabe",
+        }
+        snapshot = openclaw_async_executor._objective_durable_evidence_snapshot(
+            conn,
+            contract,
+        )
+
+    assert snapshot["objective_id"] == ""
+    assert snapshot["referenced_task_ids"] == sorted(
+        [
+            execution_task_id,
+            review_task_id,
+            conflicting_child_id,
+            ambiguous_child_id,
+        ]
+    )
+    referenced = {
+        item["task_id"]: item for item in snapshot["referenced_task_evidence"]
+    }
+    evidence = referenced[execution_task_id]["latest_completed_run"][
+        "acceptance_evidence"
+    ]
+    assert evidence == rows
+    assert evidence["ready"][0]["evidence"] == "e" * 2_000
+    review_run = referenced[review_task_id]["latest_completed_run"]
+    assert review_run["accepted"] is True
+    assert review_run["review_outcome"] == "accepted"
+    assert unrelated_task_id not in referenced
+    assert referenced[conflicting_child_id] == {
+        "task_id": conflicting_child_id,
+        "status": "unauthorized_or_missing",
+    }
+    assert referenced[ambiguous_child_id] == {
+        "task_id": ambiguous_child_id,
+        "status": "unauthorized_or_missing",
+    }
+
+
 def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "browser-readonly-tools-1"
@@ -780,7 +947,21 @@ def test_browser_readonly_task_gets_browser_readback_tools(kanban_home):
     assert run.metadata["credential_refs"] == []
 
 
-def test_browser_readonly_correction_does_not_inherit_stale_write_tool(kanban_home):
+def test_browser_readonly_correction_refreshes_snapshot_and_tools(
+    kanban_home,
+    monkeypatch,
+):
+    snapshot_calls = []
+
+    def snapshot(_conn, _contract):
+        snapshot_calls.append(True)
+        return {"revision": len(snapshot_calls)}
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_objective_durable_evidence_snapshot",
+        snapshot,
+    )
     contract = _contract()
     contract["identity"]["request_instance_id"] = "browser-readonly-correction-tools-1"
     started = start_loop_contract_execution(
@@ -838,6 +1019,7 @@ def test_browser_readonly_correction_does_not_inherit_stale_write_tool(kanban_ho
 
     assert retried["status"] == "queued"
     assert seen["allowed_tools"] == ["read", "web_search", "browser"]
+    assert seen["loop_contract"]["durable_evidence_snapshot"] == {"revision": 2}
     with kb.connect() as conn:
         retried_run = kb.get_run(conn, int(retried["run_id"]))
     assert retried_run is not None
@@ -1338,6 +1520,18 @@ def test_loop_contract_terminal_promotes_inline_text_content_package(
     output["result"]["summary"] = "完整最終提案"
     output["result"]["acceptanceEvidence"] = {
         "final_user_facing_text": "完整、未截斷的繁體中文提案正文。",
+    }
+    output["result"]["metadata"] = {
+        "user_facing_report": {
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "complete": True,
+            "title": "Worker preview",
+            "body_field": "final_user_facing_text",
+            "body": "較短的 worker 預覽，不是契約指定的完整正文。",
+            "observed_at": int(openclaw_async_executor.time.time()),
+            "assets": [],
+        }
     }
 
     handled = make_loop_contract_terminal_handler()(
@@ -1934,6 +2128,31 @@ def test_human_approved_zero_effect_correction_recovers_same_card_from_triage(
         assert rejected["status"] == "blocked"
 
     with kb.connect() as conn:
+        latest_block = conn.execute(
+            """
+            SELECT id FROM task_events
+             WHERE task_id = ? AND kind = 'block_loop_detected'
+             ORDER BY id DESC LIMIT 1
+            """,
+            (started["execution_task_id"],),
+        ).fetchone()
+        assert latest_block is not None
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (
+                json.dumps({
+                    "reason": (
+                        "Required content package is missing or invalid. "
+                        "Pinned inline evidence must be rebuilt."
+                    ),
+                    "kind": "capability",
+                    "recurrences": 2,
+                    "limit": 2,
+                }),
+                latest_block["id"],
+            ),
+        )
+        conn.commit()
         triaged_task = kb.get_task(conn, started["execution_task_id"])
         triaged_run = kb.latest_run(conn, started["execution_task_id"])
     assert triaged_task is not None and triaged_task.status == "triage"
@@ -2187,6 +2406,14 @@ def test_readonly_correction_scope_projection_and_target_binding(
         admitted_contract = first_run.metadata["loop_contract"]
         assert "external_targets" not in admitted_contract
         assert "durable_evidence_snapshot" in admitted_contract
+        assert admitted_contract["routing"]["resolved"]["output_schema"] == {
+            "format": "json",
+            "required_sections": [],
+        }
+        assert (
+            admitted_contract["routing"]["resolved"]["backend_role_card"]["output_format"]
+            == "json"
+        )
         assert first_run.metadata["execution_card_fingerprint"]
         if legacy_metadata:
             legacy_run_metadata = dict(first_run.metadata)
@@ -2926,6 +3153,400 @@ def test_loop_contract_terminal_synthesizes_commerce_status_report(kanban_home):
     assert report["rows"][0]["status"] == "not_posted"
     assert len(coverage) == 1
     assert coverage[0]["complete"] == 1
+
+
+def test_loop_contract_terminal_synthesizes_membership_status_report(kanban_home):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-membership-status-report-1"
+    contract["goal"]["objective"] = (
+        "Verify membership for Marketplace listing 27700220586305145"
+    )
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "body_field": "membership_action_report",
+        "subject_keys": ["1205843739455996", "641996293109847"],
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="browser_ops",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-membership-status-report-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["result"]["acceptanceEvidence"] = {
+        "forbiddenActionsAudit": {
+            "listing_id": "27700220586305145",
+            "post_publish_submit_share_performed": False,
+        },
+        "groups": [
+            {
+                "group_id": "1205843739455996",
+                "live_name": "台灣全新（二手）大買賣",
+                "membership_status": "joined",
+                "observed_at": "2026-09-05T19:36:34+08:00",
+                "ui_result": "Top group action changed to Joined.",
+            },
+            {
+                "group_id": "641996293109847",
+                "live_name": "全台灣全新二手交流買賣平台",
+                "membership_status": "unchanged_not_joined",
+                "observed_at": "2026-09-05T19:36:34+08:00",
+                "ui_result": "Button still showed Join group.",
+            },
+        ],
+    }
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": "terminal-membership-status-report-digest",
+    })
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        ended_run = kb.latest_run(conn, started["execution_task_id"])
+    assert ended_run is not None
+    report = ended_run.metadata["user_facing_report"]
+    assert report["complete"] is False
+    assert [row["status"] for row in report["rows"]] == [
+        "not_posted",
+        "unknown",
+    ]
+    assert [item["complete"] for item in report["coverage"]] == [True, False]
+
+
+@pytest.mark.parametrize(
+    "invalid_observation",
+    ["duplicate", "naive_timestamp", "future_timestamp"],
+)
+def test_membership_status_report_rejects_ambiguous_observations(
+    invalid_observation,
+):
+    subject_keys = ["1205843739455996", "641996293109847"]
+    groups = [
+        {
+            "group_id": "1205843739455996",
+            "live_name": "台灣全新（二手）大買賣",
+            "membership_status": "joined",
+            "observed_at": "2026-09-05T19:36:34+08:00",
+            "ui_result": "Top group action changed to Joined.",
+        },
+        {
+            "group_id": "641996293109847",
+            "live_name": "全台灣全新二手交流買賣平台",
+            "membership_status": "unchanged_not_joined",
+            "observed_at": "2026-09-05T19:36:34+08:00",
+            "ui_result": "Button still showed Join group.",
+        },
+    ]
+    if invalid_observation == "duplicate":
+        groups[1]["group_id"] = groups[0]["group_id"]
+    elif invalid_observation == "naive_timestamp":
+        groups[1]["observed_at"] = "2026-09-05T19:36:34"
+    else:
+        groups[1]["observed_at"] = "2999-09-05T19:36:34+08:00"
+
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "forbiddenActionsAudit": {
+                    "listing_id": "27700220586305145",
+                    "post_publish_submit_share_performed": False,
+                },
+                "groups": groups,
+            }
+        },
+        metadata={
+            "loop_contract": {
+                "source_listing_id": "27700220586305145",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "body_field": "membership_action_report",
+                    "subject_keys": subject_keys,
+                }
+            }
+        },
+    )
+
+    assert result == {}
+
+
+def test_legacy_commerce_report_ignores_incidental_groups_list():
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "groups": [],
+                "inlineReport": {
+                    "listing_id": "37276725125275496",
+                    "group_numeric_id": "1333742673375089",
+                    "group_name": "北市新北中古買賣",
+                    "status": "not_posted",
+                    "observed_at": 1_788_094_528,
+                    "evidence": "No checkbox was selected.",
+                },
+            }
+        },
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": [
+                        "kolin-kd-291m06:37276725125275496:1333742673375089"
+                    ],
+                }
+            }
+        },
+    )
+
+    assert result["user_facing_report"]["rows"][0]["status"] == "not_posted"
+
+
+@pytest.mark.parametrize(
+    "audit",
+    [
+        {},
+        {"listing_id": "27700220586305145"},
+    ],
+)
+def test_membership_status_report_requires_listing_and_nonpublication_audit(audit):
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "forbiddenActionsAudit": audit,
+                "groups": [{
+                    "group_id": "1205843739455996",
+                    "live_name": "台灣全新（二手）大買賣",
+                    "membership_status": "joined",
+                    "observed_at": "2026-09-05T19:36:34+08:00",
+                    "ui_result": "Top group action changed to Joined.",
+                }],
+            }
+        },
+        metadata={
+            "loop_contract": {
+                "source_listing_id": "27700220586305145",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "body_field": "membership_action_report",
+                    "subject_keys": ["1205843739455996"],
+                }
+            }
+        },
+    )
+
+    assert result == {}
+
+
+def test_current_listing_binding_ignores_durable_snapshot_history():
+    contract = {
+        "goal": {
+            "objective": "Inspect Marketplace listing 27700220586305145",
+        },
+        "scope": {
+            "allowed": ["Read Marketplace listing 27700220586305145"],
+            "forbidden": ["Do not use old listing 27909676598721497"],
+        },
+        "durable_evidence_snapshot": {
+            "referenced_task_evidence": [{
+                "source_listing_id": "37276725125275496",
+            }],
+        },
+    }
+
+    assert openclaw_async_executor._loop_contract_marketplace_listing_ids(contract) == {
+        "27700220586305145"
+    }
+
+
+def test_multi_group_preflight_synthesizes_partial_status_report():
+    subject_keys = ["1205843739455996", "641996293109847"]
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "observed_at": 1_788_613_930,
+                "sourceListing": {"source_listing_id": "27700220586305145"},
+                "coverageReconciliation": {
+                    "expected_named_destinations": 2,
+                    "returned_rows": 2,
+                },
+                "rows": [
+                    {
+                        "group_id": "1205843739455996",
+                        "name": "台灣全新（二手）大買賣",
+                        "membership_state": "joined",
+                        "chooser_presence": "present_visible",
+                        "chooser_selectability": "selectable_unchecked",
+                        "evidence": "Chooser row was visible and unchecked.",
+                    },
+                    {
+                        "group_id": "641996293109847",
+                        "name": "全台灣全新二手交流買賣平台",
+                        "membership_state": "joined",
+                        "chooser_presence": "unknown_not_visible_in_inspected_viewport",
+                        "chooser_selectability": "unknown",
+                        "evidence": "The inspected viewport did not show this group.",
+                    },
+                ],
+            }
+        },
+        metadata={
+            "loop_contract": {
+                "source_listing_id": "27700220586305145",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": subject_keys,
+                }
+            }
+        },
+    )
+
+    report = result["user_facing_report"]
+    assert report["complete"] is False
+    assert [row["status"] for row in report["rows"]] == ["not_posted", "unknown"]
+    assert [item["complete"] for item in report["coverage"]] == [False, False]
+
+
+def test_multi_group_preflight_rejects_out_of_range_observed_at():
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "observed_at": 10**100,
+                "sourceListing": {"source_listing_id": "27700220586305145"},
+                "coverageReconciliation": {
+                    "expected_named_destinations": 1,
+                    "returned_rows": 1,
+                },
+                "rows": [{
+                    "group_id": "1205843739455996",
+                    "name": "台灣全新（二手）大買賣",
+                    "membership_state": "joined",
+                    "chooser_presence": "present_visible",
+                    "chooser_selectability": "selectable_unchecked",
+                    "evidence": "Chooser row was visible and unchecked.",
+                }],
+            }
+        },
+        metadata={
+            "loop_contract": {
+                "source_listing_id": "27700220586305145",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": ["1205843739455996"],
+                }
+            }
+        },
+    )
+
+    assert result == {}
+
+
+def test_multi_group_preflight_rejects_contradictory_coverage():
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "observed_at": 1_788_613_930,
+                "sourceListing": {"source_listing_id": "27700220586305145"},
+                "coverageReconciliation": {
+                    "expected_named_destinations": 2,
+                    "returned_rows": 1,
+                    "identity_gap_count": 1,
+                },
+                "rows": [{
+                    "group_id": "1205843739455996",
+                    "name": "台灣全新（二手）大買賣",
+                    "membership_state": "joined",
+                    "chooser_presence": "present_visible",
+                    "chooser_selectability": "selectable_unchecked",
+                    "evidence": "Chooser row was visible and unchecked.",
+                }],
+            }
+        },
+        metadata={
+            "loop_contract": {
+                "source_listing_id": "27700220586305145",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": ["1205843739455996"],
+                }
+            }
+        },
+    )
+
+    assert result == {}
+
+
+def test_correction_group_preflight_schema_is_normalized():
+    result = openclaw_async_executor._commerce_status_report_metadata(
+        {
+            "acceptanceEvidence": {
+                "sourceListing": {
+                    "listing_id": "27700220586305145",
+                    "observed_at": 1_788_614_777,
+                },
+                "coverageReconciliation": {
+                    "expected_named_destinations": 1,
+                    "returned_rows": 1,
+                },
+                "groups": [{
+                    "group_id": "1205843739455996",
+                    "readable_name": "台灣全新（二手）大買賣",
+                    "live_membership_state": "Joined",
+                    "chooser_presence": "present",
+                    "chooser_selectability": "selectable_unchecked",
+                    "membership_evidence": "Group page showed Joined.",
+                    "chooser_evidence": "Chooser row was visible and unchecked.",
+                }],
+            }
+        },
+        metadata={
+            "task_type": "facebook_marketplace_readonly",
+            "loop_contract": {
+                "source_listing_id": "27700220586305145",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": ["1205843739455996"],
+                }
+            },
+        },
+    )
+
+    report = result["user_facing_report"]
+    assert report["complete"] is False
+    assert report["rows"][0]["status"] == "not_posted"
+    assert report["coverage"][0]["complete"] is False
+    assert report["rows"][0]["source_listing_id"] == "27700220586305145"
 
 
 def test_zero_budget_terminal_accepts_internal_image_generation_receipts(

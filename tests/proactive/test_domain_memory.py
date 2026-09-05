@@ -118,6 +118,140 @@ def test_mutation_delta_is_canonical_and_cites_external_effect():
     assert deltas[0]["artifacts"][0]["artifact_key"].startswith("facebook_page_post:")
 
 
+def test_builtin_artifact_shorthand_is_canonicalized() -> None:
+    spec = normalize_domain_memory_contract({
+        "schema_id": "secondhand.item.v1",
+        "mode": "mutate",
+    })
+    raw = {
+        "entity_id": "celestron-130eq",
+        "label": "Celestron 130EQ",
+        "status": "listed",
+        "artifacts": [
+            {
+                "artifact_type": "facebook_marketplace_listing",
+                "status": "unknown",
+                "artifact_key": "facebook_marketplace_listing:current",
+                "evidence_ref": "accepted_preflight:t_source",
+            },
+            {
+                "artifact_type": "shopee_listing",
+                "status": "unknown",
+                "artifact_key": "shopee_listing:current",
+            },
+            {
+                "artifact_type": "facebook_group_post",
+                "status": "not_published",
+                "group_id": "1205843739455996",
+                "group_name": "台灣全新（二手）大買賣",
+                "membership_status": "joined",
+                "evidence_ref": (
+                    "task_external_effect:facebook:group:1205843739455996"
+                ),
+            },
+        ],
+    }
+
+    delta = normalize_memory_deltas([raw], spec)[0]
+
+    assert [item["platform"] for item in delta["artifacts"]] == [
+        "facebook",
+        "shopee",
+        "facebook",
+    ]
+    group = delta["artifacts"][2]
+    assert group["external_id"] == "1205843739455996"
+    assert group["attributes"] == {
+        "group_name": "台灣全新（二手）大買賣",
+        "membership_status": "joined",
+    }
+    assert delta["evidence_refs"] == [
+        "accepted_preflight:t_source",
+        "task_external_effect:facebook:group:1205843739455996",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("group_id", ["1205843739455996"], "group_id must be ASCII digits"),
+        ("group_name", ["not", "text"], "group_name must be a string"),
+        ("membership_status", ["not", "a", "slug"], "stable lowercase slug"),
+    ],
+)
+def test_builtin_artifact_shorthand_rejects_invalid_values(
+    field, value, message
+) -> None:
+    spec = normalize_domain_memory_contract({
+        "schema_id": "secondhand.item.v1",
+        "mode": "mutate",
+    })
+    raw = {
+        "entity_id": "celestron-130eq",
+        "label": "Celestron 130EQ",
+        "status": "listed",
+        "artifacts": [
+            {
+                "artifact_type": "facebook_marketplace_listing",
+                "platform": "facebook",
+                "status": "unknown",
+                "artifact_key": "facebook_marketplace_listing:current",
+            },
+            {
+                "artifact_type": "shopee_listing",
+                "platform": "shopee",
+                "status": "unknown",
+                "artifact_key": "shopee_listing:current",
+            },
+            {
+                "artifact_type": "facebook_group_post",
+                "platform": "facebook",
+                "status": "not_published",
+                "group_id": (
+                    value if field == "group_id" else "1205843739455996"
+                ),
+                field: value,
+            },
+        ],
+    }
+
+    with pytest.raises(DomainMemoryError, match=message):
+        normalize_memory_deltas([raw], spec)
+
+
+def test_group_id_shorthand_must_match_external_id() -> None:
+    spec = normalize_domain_memory_contract({
+        "schema_id": "secondhand.item.v1",
+        "mode": "mutate",
+    })
+    raw = {
+        "entity_id": "celestron-130eq",
+        "label": "Celestron 130EQ",
+        "status": "listed",
+        "artifacts": [
+            {
+                "artifact_type": "facebook_marketplace_listing",
+                "status": "unknown",
+                "artifact_key": "facebook_marketplace_listing:current",
+            },
+            {
+                "artifact_type": "shopee_listing",
+                "status": "unknown",
+                "artifact_key": "shopee_listing:current",
+            },
+            {
+                "artifact_type": "facebook_group_post",
+                "status": "not_published",
+                "group_id": "1205843739455996",
+                "external_id": "641996293109847",
+            },
+        ],
+    }
+
+    with pytest.raises(DomainMemoryError, match="group_id must match external_id"):
+        normalize_memory_deltas([raw], spec)
+
+
 def test_mutation_delta_rejects_unlinked_external_artifact():
     spec = attach_domain_memory_contract(
         _contract(task_type="facebook_page_api_publish")

@@ -12,6 +12,7 @@ from proactive.grace_task_compiler import (
     contract_internal_hermes_runtime,
     contract_requires_image_generation,
     render_execution_body,
+    render_review_body,
 )
 from proactive.hubops_routing import resolved_route_binding, route_clawops_objective
 from proactive.loop_contract import contract_fingerprint, validate_loop_contract
@@ -145,12 +146,101 @@ def test_domain_query_keeps_contracted_live_readonly_collection() -> None:
         "task_type": "facebook_marketplace_readonly",
         "risk_level": "low",
     }
+    contract = validate_loop_contract(contract)
 
     body = render_execution_body(contract)
 
     assert "does not forbid other read-only evidence collection" in body
     assert "contracted live readback, search, navigation" in body
     assert "This is a registry-only inventory query" not in body
+    assert "metadata.user_facing_report exactly shaped" in body
+    assert "metadata.acceptance_evidence.domain_inventory_report" in body
+
+    review = render_review_body(contract, "t_execution")
+    assert "For the requested user-facing delivery" in review
+    assert "metadata.user_facing_report matches user_facing_delivery" in review
+
+
+@pytest.mark.parametrize(
+    "policy_id",
+    ["secondhand-commerce-topic-governance", "ai-bizweek-shared-reference"],
+)
+def test_secondhand_policy_does_not_inject_ai_bizweek_asset_rules(policy_id) -> None:
+    contract = _image_contract()
+    contract["identity"]["project"] = "secondhand_commerce"
+    contract["identity"]["topic_name"] = "二手拍賣"
+    contract["policy_snapshots"] = [{
+        "policy_id": policy_id,
+        "version": "2026-09-05.1",
+        "sha256": "a" * 64,
+    }]
+    contract["policy_binding_snapshot"] = {
+        "namespace": "topic:secondhand",
+        "sha256": "b" * 64,
+    }
+
+    body = render_execution_body(contract)
+
+    assert "Mandatory policy snapshots" in body
+    assert "policy_receipts" in body
+    assert "For AI BizWeek" not in body
+    assert "contract's asset_filenames" not in body
+
+
+def test_explicit_user_facing_delivery_keeps_report_guidance() -> None:
+    contract = _image_contract()
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "final_text",
+    }
+
+    body = render_execution_body(contract)
+
+    assert "contract requires user_facing_delivery" in body
+    assert "metadata.user_facing_report" in body
+
+
+def test_optional_inline_content_package_does_not_require_report() -> None:
+    contract = _image_contract()
+    contract["domain_memory"] = {
+        "schema_id": "secondhand.item.v1",
+        "mode": "query",
+        "require_delta_on_acceptance": False,
+        "expected_total": None,
+    }
+    contract["user_facing_delivery"] = {
+        "required": False,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "final_text",
+    }
+
+    body = render_execution_body(contract)
+
+    assert "metadata.acceptance_evidence.domain_inventory_report" not in body
+    assert "metadata.user_facing_report exactly shaped" not in body
+
+
+def test_required_commerce_report_keeps_row_and_coverage_schema() -> None:
+    contract = _image_contract()
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "subject_keys": ["celestron"],
+    }
+
+    execution = render_execution_body(contract)
+    review = render_review_body(contract, "t_execution")
+
+    for body in (execution, review):
+        assert "one row per product/group with readable names" in body
+        assert "reconcile named_count + gap_count" in body
+        assert "complete=false" in body
+        assert "never treat it as completion" in body
+        assert "close the originating objective" in body
 
 
 def _openclaw_loop_result(task: dict, backend_agent_id: str = "missioncrew-content") -> dict:
