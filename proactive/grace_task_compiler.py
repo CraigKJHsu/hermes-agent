@@ -552,7 +552,10 @@ def _render_user_facing_delivery_guidance(
             "For the requested user-facing delivery, reject the parent unless "
             "metadata.user_facing_report matches user_facing_delivery and truthfully exposes "
             "every known gap. Never accept a Markdown attachment path as a substitute for an "
-            "inline payload."
+            "inline payload. If the parent is blocked and has no promoted "
+            "metadata.user_facing_report, inspect "
+            "metadata.loop_contract_blocked_result.metadata.user_facing_report from the "
+            "parent run as blocked-draft evidence before saying the deliverable is absent."
         ]
     return [
         "The contract requires user_facing_delivery. Return a validated "

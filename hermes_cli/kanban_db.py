@@ -16868,6 +16868,37 @@ def grace_inline_content_package_report(
             return None
         from hermes_cli.user_facing_report import normalize_user_facing_report
 
+        stored_report = metadata.get("user_facing_report")
+        if not isinstance(stored_report, Mapping):
+            blocked_result = metadata.get("loop_contract_blocked_result")
+            blocked_metadata = (
+                blocked_result.get("metadata")
+                if isinstance(blocked_result, Mapping)
+                else None
+            )
+            blocked_report = (
+                blocked_metadata.get("user_facing_report")
+                if isinstance(blocked_metadata, Mapping)
+                else None
+            )
+            if isinstance(blocked_report, Mapping):
+                stored_report = blocked_report
+        stored_complete = (
+            stored_report.get("complete")
+            if isinstance(stored_report, Mapping)
+            else None
+        )
+        if type(stored_complete) is not bool:
+            stored_complete = True
+        if isinstance(stored_report, Mapping) and stored_report.get("body") == body:
+            try:
+                return normalize_user_facing_report({
+                    **stored_report,
+                    "complete": stored_complete,
+                })
+            except ValueError:
+                return None
+
         observed_at = int(
             getattr(run, "ended_at", 0) or getattr(run, "started_at", 0) or time.time()
         )

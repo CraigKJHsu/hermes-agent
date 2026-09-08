@@ -1562,6 +1562,93 @@ def test_loop_contract_terminal_promotes_inline_text_content_package(
 
 
 @pytest.mark.parametrize(
+    ("project", "topic_name", "thread_id"),
+    [
+        # KJ Profile is a historical failure sample from t_2917fee0, not
+        # hardcoded behavior.
+        ("kj_profile", "KJ Profile", "2120"),
+        ("course_marketing", "Course Marketing", "general"),
+    ],
+)
+def test_kj_profile_historical_false_complete_fixture_accepts_terminal_content_package(
+    kanban_home,
+    project,
+    topic_name,
+    thread_id,
+):
+    contract = _contract()
+    contract["identity"].update(
+        {
+            "project": project,
+            "topic_name": topic_name,
+            "thread_id": thread_id,
+            "request_instance_id": f"loop-terminal-content-package-{project}",
+        }
+    )
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "service_description",
+    }
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id=f"delegation-loop-terminal-content-package-{project}",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    body = "完整、未截斷、可直接貼用的服務介紹與亮點內容。"
+    output["result"]["summary"] = "完整內容包"
+    output["result"]["acceptanceEvidence"] = {"service_description": body}
+    output["result"]["metadata"] = {"user_facing_report": {
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "complete": False,
+        "title": "完整內容包",
+        "body_field": "service_description",
+        "body": body,
+        "observed_at": int(openclaw_async_executor.time.time()),
+        "assets": [],
+    }}
+
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {"status": "succeeded", "delegated_result": terminal,
+         "result_digest": "terminal-content-package-digest"},
+    )
+
+    assert handled["accepted"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, started["execution_task_id"]).status == "done"
+        completed_run = kb.latest_run(conn, started["execution_task_id"])
+        report = kb.grace_inline_content_package_report(
+            conn, started["execution_task_id"],
+        )
+    assert completed_run is not None
+    assert completed_run.metadata["user_facing_report"]["complete"] is True
+    assert report is not None
+    assert report["complete"] is True
+    assert report["body"] == body
+
+
+@pytest.mark.parametrize(
     "malformed_body", [{"text": "proposal"}, ["proposal"], True, 1]
 )
 def test_inline_text_content_package_rejects_non_string_body(malformed_body):
@@ -1588,6 +1675,82 @@ def test_inline_text_content_package_rejects_non_string_body(malformed_body):
     )
 
     assert result == {}
+
+
+def test_objective_inline_report_uses_canonical_body_and_system_completion(
+    kanban_home,
+):
+    contract = {
+        "objective_ref": {"objective_id": "go_test", "stage_key": "prepare"},
+        "completion_mode": "intermediate",
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "inventory",
+        },
+    }
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "summary": "Verified preflight",
+            "acceptanceEvidence": {"inventory": "0 published; 20 remain"},
+            "metadata": {
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "complete": True,
+                    "title": "Worker preview",
+                    "body_field": "inventory",
+                    "body": "0 published; 20 remain",
+                    "observed_at": int(openclaw_async_executor.time.time()),
+                    "assets": [],
+                }
+            },
+        },
+        metadata={"loop_contract": contract},
+        task_id="t_inventory",
+        board=None,
+    )
+    report = result["user_facing_report"]
+    assert report["complete"] is False
+    assert report["body"] == "0 published; 20 remain"
+
+
+def test_terminal_objective_canonicalizes_incomplete_worker_report(kanban_home):
+    now = int(openclaw_async_executor.time.time())
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "complete": False,
+        "title": "Terminal report",
+        "body_field": "inventory",
+        "body": "20 published",
+        "observed_at": now,
+        "assets": [],
+    }
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "summary": "Terminal attempt",
+            "acceptanceEvidence": {"inventory": report["body"]},
+            "metadata": {"user_facing_report": report},
+        },
+        metadata={
+            "loop_contract": {
+                "objective_ref": {"objective_id": "go_test", "stage_key": "publish"},
+                "completion_mode": "terminal",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "body_field": "inventory",
+                },
+            }
+        },
+        task_id="t_terminal_inventory",
+        board=None,
+    )
+
+    assert result["user_facing_report"] == {**report, "complete": True}
 
 
 def test_loop_contract_terminal_defaults_missing_policy_receipts(kanban_home):

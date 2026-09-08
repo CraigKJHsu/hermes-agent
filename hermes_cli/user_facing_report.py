@@ -297,9 +297,9 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
             "metadata.user_facing_report content_package delivery must be "
             "inline_only or inline_with_attachment"
         )
-    if raw.get("complete") is not True:
+    if not isinstance(raw.get("complete"), bool):
         raise ValueError(
-            "metadata.user_facing_report content_package complete must be true"
+            "metadata.user_facing_report content_package complete must be boolean"
         )
     title = _required_text(raw.get("title"), "title")
     body = _required_text(raw.get("body"), "body")
@@ -361,7 +361,7 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
     normalized = {
         "kind": CONTENT_PACKAGE_REPORT_KIND,
         "delivery": delivery,
-        "complete": True,
+        "complete": raw["complete"],
         "title": title,
         "body": body,
         "observed_at": observed_at,

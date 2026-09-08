@@ -4943,6 +4943,7 @@ def _materialize_content_package_report(
 ) -> dict[str, Any]:
     from hermes_cli.user_facing_report import (
         normalize_user_facing_report,
+        report_matches_user_facing_delivery,
         report_satisfies_user_facing_delivery,
     )
 
@@ -4959,7 +4960,12 @@ def _materialize_content_package_report(
         normalized = normalize_user_facing_report(report)
     except ValueError:
         return {}
-    if not report_satisfies_user_facing_delivery(normalized, delivery):
+    delivery_matches = (
+        report_matches_user_facing_delivery(normalized, delivery)
+        if normalized["delivery"] == "inline_only"
+        else report_satisfies_user_facing_delivery(normalized, delivery)
+    )
+    if not delivery_matches:
         return {}
     paths = []
     verified_assets = []
@@ -5028,15 +5034,24 @@ def _content_package_completion_metadata(
         contract.get("user_facing_delivery") if isinstance(contract, Mapping) else None
     )
     worker_metadata = audited_result.get("metadata")
+    inline_only = isinstance(delivery, Mapping) and delivery.get("delivery") == "inline_only"
+    objective_inline = inline_only and bool(contract.get("objective_ref"))
     if isinstance(worker_metadata, Mapping) and "user_facing_report" in worker_metadata:
         report = worker_metadata["user_facing_report"]
         if not isinstance(report, Mapping):
             return {}
-        if isinstance(delivery, Mapping) and delivery.get("delivery") == "inline_only":
+        if inline_only:
             # Gateway rebuilds inline-only reports from this pinned evidence field.
             if acceptance.get(str(delivery.get("body_field") or "")) == report.get(
                 "body"
             ):
+                report = {
+                    **report,
+                    "complete": (
+                        contract.get("completion_mode") != "intermediate"
+                        or not bool(contract.get("objective_ref"))
+                    ),
+                }
                 return _materialize_content_package_report(
                     report,
                     delivery=delivery,
@@ -5052,6 +5067,8 @@ def _content_package_completion_metadata(
                 task_id=task_id,
                 board=board,
             )
+    if objective_inline and contract.get("completion_mode") != "intermediate":
+        return {}
     if (
         isinstance(delivery, Mapping)
         and delivery.get("required") is True
@@ -5068,7 +5085,10 @@ def _content_package_completion_metadata(
         report = {
             "kind": "content_package",
             "delivery": "inline_only",
-            "complete": True,
+            "complete": not (
+                bool(contract.get("objective_ref"))
+                and contract.get("completion_mode") == "intermediate"
+            ),
             "title": str(audited_result.get("summary") or "完整內容").strip(),
             "body_field": body_field,
             "body": body,

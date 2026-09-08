@@ -3513,6 +3513,70 @@ def test_inline_content_package_is_derived_from_acceptance_evidence(kanban_home)
         assert report["assets"] == []
 
 
+def test_kj_profile_historical_blocked_content_package_readback(tmp_path):
+    db_path = tmp_path / "kj-profile-blocked-content-package.db"
+    kb.init_db(db_path)
+    body = "完整、未截斷、可直接貼用的服務介紹與亮點內容。"
+    contract = {
+        "completion_mode": "terminal",
+        "identity": {
+            "project": "kj_profile",
+            "topic_name": "KJ Profile",
+            "thread_id": "2120",
+        },
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "service_description",
+        },
+    }
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "complete": False,
+        "title": "MissionCrew.ai 二手拍賣輔助 Agent 服務介紹與亮點",
+        "body_field": "service_description",
+        "body": body,
+        "observed_at": int(time.time()),
+        "assets": [],
+    }
+    with kb.connect_closing(db_path) as conn:
+        # KJ Profile mirrors the historical t_2917fee0 blocked-result shape; it
+        # is a fixture, not Topic-specific production behavior.
+        task_id = kb.create_task(
+            conn,
+            title="KJ Profile historical content package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps(contract)
+            + "\n```",
+        )
+        conn.execute(
+            "INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome,metadata) "
+            "VALUES (?,'blocked',?,?,?,?)",
+            (
+                task_id,
+                int(time.time()) - 1,
+                int(time.time()),
+                "blocked",
+                json.dumps(
+                    {
+                        "acceptance_evidence": {"service_description": body},
+                        "loop_contract_blocked_result": {
+                            "status": "succeeded",
+                            "metadata": {"user_facing_report": report},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+        rebuilt = kb.grace_inline_content_package_report(conn, task_id)
+
+    assert rebuilt == report
+
+
 @pytest.mark.parametrize(
     "malformed_body", [{"text": "proposal"}, ["proposal"], True, 1]
 )
