@@ -179,6 +179,24 @@ line-level account of where the fix acts beats a plausible-sounding rationale
 every time. When in doubt about intent, it is cheaper to ask than to ship a
 fix that fights the design.
 
+### Grace / ClawOps / Topic / Loop Contract Fix Classification
+
+Before fixing Grace, ClawOps, Topic, or Loop Contract related problems,
+classify the correction:
+
+1. **contract invariant** — all Topics must follow it.
+2. **project policy** — limited to one project.
+3. **topic-specific exception** — limited to one Topic.
+
+Do not put a topic-specific exception into shared logic.
+
+If KJ Profile or another specific Topic is used as a regression fixture, the
+test name or comment must state that it is a historical failure sample, not
+hardcoded behavior.
+
+If a fix claims to be a shared rule, add cross-Topic regression coverage for
+at least the original failing Topic and one non-failing-Topic case.
+
 ### The Footprint Ladder (new capability decision)
 
 Each rung adds more permanent surface than the one above. Choose the highest
