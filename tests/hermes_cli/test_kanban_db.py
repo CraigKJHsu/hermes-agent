@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import sqlite3
@@ -14,6 +15,7 @@ import unittest.mock
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from hermes_cli import kanban_db as kb
 from proactive.model_routing import (
@@ -80,6 +82,155 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+def test_unpinned_review_fallback_uses_latest_completed_execution_run(tmp_path):
+    db_path = tmp_path / "reviewed-execution-fallback.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="legacy execution")
+        completed_id = conn.execute(
+            "INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome) "
+            "VALUES (?,'done',1,2,'completed')",
+            (task_id,),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome) "
+            "VALUES (?,'blocked',3,4,'blocked')",
+            (task_id,),
+        )
+
+        resolved = kb.reviewed_execution_run(conn, None, task_id)
+
+        assert resolved is not None
+        assert resolved.id == completed_id
+
+
+def test_attachment_report_rebuild_preserves_explicit_incomplete_status(tmp_path):
+    db_path = tmp_path / "attachment-report-incomplete.db"
+    kb.init_db(db_path)
+    markdown = tmp_path / "report.md"
+    image = tmp_path / "report.png"
+    markdown.write_text("Draft body", encoding="utf-8")
+    Image.new("RGB", (1200, 1200)).save(image)
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "asset_filenames": [image.name],
+        },
+    }
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Incomplete attachment package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps(contract) + "\n```",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={
+                "artifacts": [str(markdown), str(image)],
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": False,
+                        "title": "Incomplete attachment package",
+                        "body": "Draft body",
+                        "observed_at": int(time.time()),
+                        "assets": [{
+                            "filename": image.name,
+                            "label": image.name,
+                            "path": str(image),
+                            "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+                        }],
+                },
+            },
+        )
+        report = kb.grace_inline_content_package_report(conn, task_id)
+
+        assert report is not None
+        assert report["complete"] is False
+        stored_image = next(
+            attachment
+            for attachment in kb.list_attachments(conn, task_id)
+            if attachment.filename == image.name
+        )
+        Path(stored_image.stored_path).write_bytes(b"not-an-image")
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+        Image.new("RGB", (1200, 1200)).save(stored_image.stored_path)
+        assert kb.grace_inline_content_package_report(conn, task_id) is not None
+        extra = tmp_path / "unreviewed.png"
+        extra.write_bytes(b"unreviewed")
+        kb.add_attachment(
+            conn, task_id, filename=extra.name, stored_path=str(extra),
+        )
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+
+
+def test_kj_profile_historical_blocked_content_package_readback(tmp_path):
+    db_path = tmp_path / "kj-profile-blocked-content-package.db"
+    kb.init_db(db_path)
+    body = "完整、未截斷、可直接貼用的服務介紹與亮點內容。"
+    contract = {
+        "completion_mode": "terminal",
+        "identity": {
+            "project": "kj_profile",
+            "topic_name": "KJ Profile",
+            "thread_id": "2120",
+        },
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "service_description",
+        },
+    }
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "complete": False,
+        "title": "MissionCrew.ai 二手拍賣輔助 Agent 服務介紹與亮點",
+        "body_field": "service_description",
+        "body": body,
+        "observed_at": int(time.time()),
+        "assets": [],
+    }
+    with kb.connect_closing(db_path) as conn:
+        # KJ Profile mirrors the historical t_2917fee0 blocked-result shape; it
+        # is a fixture, not Topic-specific production behavior.
+        task_id = kb.create_task(
+            conn,
+            title="KJ Profile historical content package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps(contract) + "\n```",
+        )
+        conn.execute(
+            "INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome,metadata) "
+            "VALUES (?,'blocked',?,?,?,?)",
+            (
+                task_id,
+                int(time.time()) - 1,
+                int(time.time()),
+                "blocked",
+                json.dumps(
+                    {
+                        "acceptance_evidence": {"service_description": body},
+                        "loop_contract_blocked_result": {
+                            "status": "succeeded",
+                            "metadata": {"user_facing_report": report},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+        rebuilt = kb.grace_inline_content_package_report(conn, task_id)
+
+    assert rebuilt == report
 
 
 def test_complete_task_accepts_generic_terminal_external_effect(tmp_path):
@@ -199,6 +350,7 @@ def _bind_queued_grace_delegation(
     review_task_id: str,
     *,
     suffix: str,
+    claim_review: bool = True,
 ) -> None:
     """Attach callback unit tests to the queued delegation they require."""
     now = int(time.time())
@@ -224,6 +376,20 @@ def _bind_queued_grace_delegation(
             now,
         ),
     )
+    review = kb.get_task(conn, review_task_id)
+    execution_run = kb.latest_run(conn, execution_task_id)
+    if (
+        claim_review
+        and review is not None
+        and review.status == "ready"
+        and execution_run is not None
+        and execution_run.ended_at is not None
+    ):
+        assert kb.claim_task(
+            conn,
+            review_task_id,
+            claimer=f"test-review:{suffix}",
+        ) is not None
 
 
 def _commerce_report(*, complete: bool, observed_at: int = 1_785_657_600):
@@ -786,7 +952,11 @@ def test_policy_stale_review_block_does_not_reopen_completed_execution(tmp_path)
             parents=(execution_id,),
         )
         _bind_queued_grace_delegation(
-            conn, execution_id, review_id, suffix="policy-stale-review",
+            conn,
+            execution_id,
+            review_id,
+            suffix="policy-stale-review",
+            claim_review=False,
         )
         review = kb.get_task(conn, review_id)
         assert review is not None
@@ -1022,6 +1192,24 @@ def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
             event_id=event_id,
             lease_owner="owner-a",
         )
+        challenge = kb.create_grace_approval_challenge(
+            conn,
+            contract_fingerprint="c" * 64,
+            request_instance_id="gri-session-rebind",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-before-compression",
+            user_id_sha256="d" * 64,
+            requested_message_id=f"callback:{review_id}:{event_id}",
+            action_summary="publish one item",
+            approval_platform="facebook",
+            approval_scope='["one item"]',
+            origin_review_task_id=review_id,
+            origin_event_id=event_id,
+            callback_lease_owner="owner-a",
+        )
         with pytest.raises(ValueError, match="not owned"):
             kb.rebind_active_grace_callback_session(
                 conn,
@@ -1044,6 +1232,12 @@ def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
             lease_owner="owner-a",
         )
         assert rebound["session_id"] == "grace-session-after-compression"
+        rebound_challenge = kb.get_grace_approval_challenge(
+            conn, challenge["token"],
+        )
+        assert rebound_challenge["session_id"] == (
+            "grace-session-after-compression"
+        )
         recorded = kb.record_grace_loop_callback_outcome(
             conn,
             review_task_id=review_id,
@@ -1053,10 +1247,15 @@ def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
             thread_id="2",
             session_id="grace-session-after-compression",
             lease_owner="owner-a",
-            outcome_kind="closed",
-            payload={"summary": "done after compression"},
+            outcome_kind="approval_blocked",
+            payload={
+                "action": "publish one item",
+                "platform": "facebook",
+                "scope": ["one item"],
+                "exact_question": f"核准 {challenge['token']}",
+            },
         )
-        assert recorded["outcome_kind"] == "closed"
+        assert recorded["outcome_kind"] == "approval_blocked"
 
 
 def test_intermediate_callback_cannot_record_closed_outcome(tmp_path):
@@ -1167,6 +1366,48 @@ def test_incomplete_user_facing_report_cannot_close_callback(tmp_path):
                 outcome_kind="closed",
                 payload={"summary": "incorrectly closed"},
             )
+
+
+def test_nonterminal_generic_objective_report_is_always_incomplete(tmp_path):
+    db_path = tmp_path / "nonterminal-generic-report.db"
+    with kb.connect_closing(db_path) as conn:
+        objective_id = "go_ext_" + "a" * 24
+        kb.create_grace_objective(
+            conn,
+            objective_id=objective_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            title="Generic content objective",
+            objective="Prepare then deliver",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["prepare", "terminal"],
+            terminal_stage_key="terminal",
+            acceptance_criteria=["Deliver the accepted package"],
+            current_stage_key="prepare",
+        )
+        execution_id = kb.create_task(conn, title="prepare content")
+        review_id = kb.create_task(
+            conn, title="review content", parents=(execution_id,)
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="generic-report"
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key='prepare' "
+            "WHERE execution_task_id=?",
+            (objective_id, execution_id),
+        )
+        report = {
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "complete": True,
+        }
+
+        canonical = kb.canonical_objective_report(conn, execution_id, report)
+
+        assert canonical["complete"] is False
 
 
 def test_terminal_blocked_callback_accepts_delivered_incomplete_report(tmp_path):
@@ -1775,6 +2016,46 @@ def test_callback_finish_rejects_a_superseded_trigger_event(tmp_path):
     assert stored["last_event_id"] == 0
 
 
+def test_callback_suppresses_scheduled_retry_but_reports_exhausted_failure(tmp_path):
+    db_path = tmp_path / "callback-transient-retry.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            contract_fingerprint="a" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="transient-retry",
+        )
+        assert kb.block_task(
+            conn, execution_id, reason="temporary overload", kind="transient",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, execution_id, "backend_retry_scheduled")
+        assert kb.list_due_grace_loop_callbacks(conn) == []
+
+        assert kb.unblock_task(conn, execution_id)
+        claimed = kb.claim_task(conn, execution_id, claimer="retry")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="retry budget exhausted",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+        due = kb.list_due_grace_loop_callbacks(conn)
+        assert len(due) == 1
+        assert due[0]["event_task_id"] == execution_id
+        assert due[0]["event_kind"] == "blocked"
+
+
 def test_new_callback_generation_clears_the_previous_structured_outcome(tmp_path):
     db_path = tmp_path / "callback-new-generation.db"
     with kb.connect_closing(db_path) as conn:
@@ -1916,6 +2197,11 @@ def test_callback_attempt_budget_resets_for_a_new_trigger_event(tmp_path):
 
         assert kb.unblock_task(conn, execution_id)
         assert kb.complete_task(conn, execution_id, summary="done")
+        assert kb.claim_task(
+            conn,
+            review_id,
+            claimer="test-review:attempt-reset",
+        ) is not None
         assert kb.complete_task(
             conn,
             review_id,
@@ -1964,6 +2250,11 @@ def test_callback_claim_rejects_a_superseded_event(tmp_path):
 
         assert kb.unblock_task(conn, execution_id)
         assert kb.complete_task(conn, execution_id, summary="done")
+        assert kb.claim_task(
+            conn,
+            review_id,
+            claimer="test-review:superseded",
+        ) is not None
         assert kb.complete_task(
             conn,
             review_id,
@@ -2236,7 +2527,7 @@ def test_group_completion_effect_allows_canonical_url_per_group_contract(tmp_pat
     ] == [("group:897927458651235", "897927458651235", "verified")]
 
 
-def test_partial_report_cannot_omit_known_destinations(tmp_path):
+def test_incomplete_partial_report_preserves_omitted_known_destinations(tmp_path):
     db_path = tmp_path / "commerce-ledger-omission.db"
     with kb.connect_closing(db_path) as conn:
         first_id = kb.create_task(conn, title="known destination")
@@ -2264,12 +2555,56 @@ def test_partial_report_cannot_omit_known_destinations(tmp_path):
                 "note": "錯誤地省略已知目的地。",
             }],
         }
-        second_id = kb.create_task(conn, title="omitted destination")
+        second_id = kb.create_task(conn, title="scoped partial report")
+        assert kb.complete_task(
+            conn,
+            second_id,
+            summary="scoped partial",
+            metadata={"user_facing_report": omitted},
+        )
+        rows = kb.list_commerce_group_ledger(conn)
+        coverage = kb.list_commerce_group_coverage(conn)
+
+    assert len(rows) == 1
+    assert rows[0]["source_task_id"] == first_id
+    assert coverage[0]["named_count"] == 1
+    assert coverage[0]["complete"] == 0
+
+
+def test_complete_report_cannot_omit_known_destinations(tmp_path):
+    db_path = tmp_path / "commerce-ledger-complete-omission.db"
+    with kb.connect_closing(db_path) as conn:
+        first_id = kb.create_task(conn, title="known destination")
+        assert kb.complete_task(
+            conn,
+            first_id,
+            summary="known",
+            metadata={"user_facing_report": _commerce_report(complete=False)},
+        )
+        omitted = {
+            "kind": "commerce_group_status",
+            "delivery": "inline_only",
+            "complete": True,
+            "as_of": "2026-08-02 16:02 Asia/Taipei",
+            "observed_at": 1_785_657_720,
+            "rows": [],
+            "coverage": [{
+                "subject_key": "kolin-kd291m06",
+                "subject_label": "Kolin KD-291M06",
+                "complete": True,
+                "named_count": 0,
+                "gap_count": 0,
+                "expected_total": 0,
+                "expected_total_label": "0",
+                "note": "錯誤地宣稱完整但省略已知目的地。",
+            }],
+        }
+        second_id = kb.create_task(conn, title="invalid complete omission")
         with pytest.raises(ValueError, match="every known destination"):
             kb.complete_task(
                 conn,
                 second_id,
-                summary="omitted",
+                summary="invalid complete omission",
                 metadata={"user_facing_report": omitted},
             )
 
@@ -2538,6 +2873,25 @@ def test_future_report_timestamp_is_rejected(tmp_path):
                 conn,
                 task_id,
                 summary="future clock",
+                metadata={"user_facing_report": report},
+            )
+
+
+@pytest.mark.parametrize("field", ["report", "row"])
+def test_truncated_report_timestamp_is_rejected(tmp_path, field):
+    db_path = tmp_path / f"commerce-ledger-truncated-{field}-clock.db"
+    report = _commerce_report(complete=False)
+    if field == "report":
+        report["observed_at"] = 17_887_758
+    else:
+        report["rows"][0]["observed_at"] = 17_887_758
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="truncated clock")
+        with pytest.raises(ValueError, match="plausible Unix-seconds"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="truncated clock",
                 metadata={"user_facing_report": report},
             )
 
@@ -3505,8 +3859,12 @@ def test_inline_content_package_is_derived_from_acceptance_evidence(kanban_home)
         )
 
         report = kb.grace_inline_content_package_report(conn, execution)
+        run = kb.latest_run(conn, execution)
 
         assert report is not None
+        assert run is not None
+        assert run.status == "done"
+        assert run.outcome == "completed"
         assert report["delivery"] == "inline_only"
         assert report["body_field"] == "finalPasteReadyDraft"
         assert report["body"] == "完整繁體中文提案正文"
@@ -3681,6 +4039,139 @@ def test_claim_once_wins_second_loses(kanban_home):
         assert first is not None and first.status == "running"
         second = kb.claim_task(conn, t, claimer="host:2")
         assert second is None
+
+
+def test_claim_pins_exact_source_for_delegated_review_without_workflow(kanban_home):
+    with kb.connect() as conn:
+        execution_id = kb.create_task(conn, title="execution", assignee="worker")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            parents=[execution_id],
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            metadata={"acceptance_evidence": {"verified": True}},
+        )
+        execution_run = kb.latest_run(conn, execution_id)
+        assert execution_run is not None
+        conn.execute(
+            "INSERT INTO grace_delegations ("
+            "delegation_id, contract_fingerprint, request_instance_id, platform, "
+            "chat_id, thread_id, session_key, session_id, resolved_route, "
+            "approval_required, state, execution_task_id, review_task_id, "
+            "created_at, updated_at"
+            ") VALUES ("
+            "'gd_standalone', ?, 'request', 'telegram', 'chat', 'thread', "
+            "'session', 'session', '{}', 0, 'queued', ?, ?, 1, 1"
+            ")",
+            ("a" * 64, execution_id, review_id),
+        )
+
+        claimed = kb.claim_task(conn, review_id, claimer="controller")
+        assert claimed is not None
+        review_run = kb.latest_run(conn, review_id)
+        assert review_run is not None
+        source = review_run.metadata["workflow_review_source"]
+        assert source == {
+            "parent_execution_task_id": execution_id,
+            "parent_execution_run_id": execution_run.id,
+            "parent_execution_evidence_sha256": (
+                kb.workflow_review_evidence_hash(execution_run)
+            ),
+            "parent_task_body_sha256": hashlib.sha256(b"").hexdigest(),
+            "review_task_body_sha256": hashlib.sha256(b"").hexdigest(),
+            "review_runtime_sha256": kb._REVIEW_RUNTIME_SHA256.hex(),
+        }
+
+
+def test_review_claim_rejects_acceptance_dependency_drift(
+    kanban_home,
+    tmp_path,
+    monkeypatch,
+):
+    runtime_source = tmp_path / "acceptance_runtime.py"
+    runtime_source.write_text("VERSION = 1\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SOURCES", (runtime_source,))
+    monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SHA256", kb._review_runtime_digest())
+    with kb.connect() as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(conn, title="review", parents=[execution_id])
+        assert kb.complete_task(conn, execution_id)
+        conn.execute(
+            "INSERT INTO grace_delegations ("
+            "delegation_id, contract_fingerprint, request_instance_id, platform, "
+            "chat_id, thread_id, session_key, session_id, resolved_route, "
+            "approval_required, state, execution_task_id, review_task_id, "
+            "created_at, updated_at"
+            ") VALUES ("
+            "'gd_runtime_drift', ?, 'request-runtime', 'telegram', 'chat', '', "
+            "'session', 'session', '{}', 0, 'queued', ?, ?, 1, 1"
+            ")",
+            ("c" * 64, execution_id, review_id),
+        )
+        runtime_source.write_text("VERSION = 2\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="runtime source changed"):
+            kb.claim_task(conn, review_id, claimer="controller")
+
+        assert kb.get_task(conn, review_id).status == "ready"
+
+
+def test_review_context_uses_claim_pinned_run_after_newer_parent_run(kanban_home):
+    with kb.connect() as conn:
+        execution_id = kb.create_task(conn, title="execution", assignee="worker")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            parents=[execution_id],
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="first evidence",
+            metadata={"acceptance_evidence": {"version": 1}},
+        )
+        first_run = kb.latest_run(conn, execution_id)
+        assert first_run is not None
+        conn.execute(
+            "INSERT INTO grace_delegations ("
+            "delegation_id, contract_fingerprint, request_instance_id, platform, "
+            "chat_id, thread_id, session_key, session_id, resolved_route, "
+            "approval_required, state, execution_task_id, review_task_id, "
+            "created_at, updated_at"
+            ") VALUES ("
+            "'gd_context_pin', ?, 'request-context', 'telegram', 'chat', 'thread', "
+            "'session', 'session', '{}', 0, 'queued', ?, ?, 1, 1"
+            ")",
+            ("b" * 64, execution_id, review_id),
+        )
+        assert kb.claim_task(conn, review_id, claimer="controller") is not None
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, completed_at=NULL "
+            "WHERE id=?",
+            (execution_id,),
+        )
+        assert kb.claim_task(conn, execution_id, claimer="retry") is not None
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="second evidence",
+            metadata={"acceptance_evidence": {"version": 2}},
+        )
+        second_run = kb.latest_run(conn, execution_id)
+        assert second_run is not None and second_run.id != first_run.id
+
+        context = kb.build_worker_context(conn, review_id)
+
+        assert f'"parent_execution_run_id": {first_run.id}' in context
+        assert "first evidence" in context
+        assert f'"parent_execution_run_id": {second_run.id}' not in context
+        assert "second evidence" not in context
 
 
 def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):

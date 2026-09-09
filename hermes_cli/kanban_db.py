@@ -94,12 +94,46 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from hermes_cli.grace_review_metadata import (
     grace_review_acceptance_error,
     grace_review_accepted,
+    grace_review_rejected,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from proactive.policy_registry import serialize_with_policy_registry
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+# A long-lived dispatcher must not pin evidence using acceptance code older
+# than the freshly spawned reviewer. Stop before claiming instead of burning a
+# retry. Keep this list path-based to avoid circular imports during bootstrap.
+_REVIEW_RUNTIME_SOURCES = (
+    Path(__file__).resolve(),
+    Path(__file__).with_name("grace_review_metadata.py").resolve(),
+    Path(__file__).with_name("user_facing_report.py").resolve(),
+    Path(__file__).with_name("facebook_group_preflight.py").resolve(),
+    Path(__file__).with_name("objective_workflow.py").resolve(),
+    (Path(__file__).resolve().parent.parent / "proactive" / "policy_registry.py"),
+    (Path(__file__).resolve().parent.parent / "proactive" / "model_routing.py"),
+)
+
+
+def _review_runtime_digest() -> bytes:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent.parent
+    for source in _REVIEW_RUNTIME_SOURCES:
+        try:
+            source_name = source.relative_to(root)
+        except ValueError:
+            source_name = source
+        relative = str(source_name).encode("utf-8")
+        payload = source.read_bytes()
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.digest()
+
+
+_REVIEW_RUNTIME_SHA256 = _review_runtime_digest()
 
 
 # ---------------------------------------------------------------------------
@@ -2836,6 +2870,20 @@ CREATE TABLE IF NOT EXISTS grace_approval_challenges (
     approved_message_id  TEXT
 );
 
+-- An authenticated, on-time decision survives later dispatch failures.
+CREATE TABLE IF NOT EXISTS grace_approval_receipts (
+    token TEXT PRIMARY KEY REFERENCES grace_approval_challenges(token),
+    contract_fingerprint TEXT NOT NULL,
+    approved_message_id TEXT NOT NULL,
+    accepted_at INTEGER NOT NULL,
+    context TEXT NOT NULL,
+    args TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL,
+    last_result TEXT
+);
+
 -- Durable authorization and idempotency record for one exact Grace -> ClawOps
 -- delegation.  Authorization is committed before card creation; execution is
 -- kept blocked until the review card, callback, and subscriptions exist.
@@ -4211,6 +4259,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "WHERE delegation_id IS NOT NULL"
     )
 
+    from hermes_cli.objective_workflow import migrate as migrate_objective_workflow
+    migrate_objective_workflow(conn)
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -5504,6 +5555,12 @@ def _commerce_report_has_current_subject_coverage(
         or (require_complete and report.get("complete") is not True)
     ):
         return False
+    if report.get("evidence_mode") == "historical_verified":
+        try:
+            _validate_historical_commerce_report(conn, task_id=execution_task_id, report=report)
+        except ValueError:
+            return False
+        return not require_complete
     observed_at = int(report.get("observed_at") or 0)
     owner_ids = {
         str(task_id or "").strip()
@@ -5562,6 +5619,206 @@ def commerce_report_is_single_destination_status(
     return expected_total == 1 and named_count == 1 and gap_count == 0
 
 
+def _validate_historical_commerce_report(
+    conn: sqlite3.Connection, *, task_id: str, report: Mapping[str, Any],
+) -> None:
+    """Validate exact accepted evidence; a historical report never updates live state."""
+    from datetime import datetime, timezone
+    from hermes_cli.user_facing_report import (
+        COMMERCE_COVERAGE_COUNTERS, COMMERCE_DERIVED_COUNTERS, _commerce_report_details,
+    )
+
+    source = report["evidence_source"]
+    execution = get_run(conn, source["execution_run_id"])
+    review = get_run(conn, source["review_run_id"])
+    if not (
+        execution and review and execution.status in {"done", "completed"} and review.status in {"done", "completed"}
+        and execution.outcome == "completed" and review.outcome == "completed"
+        and grace_review_accepted(review.metadata or {})
+    ):
+        raise ValueError("historical_verified requires completed execution and accepted review runs")
+    later_reviews = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id=? AND id>? ORDER BY id",
+        (review.task_id, review.id),
+    ).fetchall()
+    if any(
+        grace_review_rejected(json.loads(row[0] or "{}"))
+        for row in later_reviews
+    ):
+        raise ValueError("historical_verified review acceptance was later revoked")
+    expected_source = {
+        "parent_execution_task_id": execution.task_id,
+        "parent_execution_run_id": execution.id,
+        "parent_execution_evidence_sha256": workflow_review_evidence_hash(execution),
+    }
+    admission = conn.execute(
+        "SELECT d.platform,d.chat_id,d.thread_id,t.project_namespace "
+        "FROM grace_delegations d JOIN tasks t ON t.id=d.execution_task_id "
+        "WHERE d.execution_task_id=? AND d.review_task_id=?",
+        (execution.task_id, review.task_id),
+    ).fetchone()
+    review_source = (review.metadata or {}).get("workflow_review_source")
+    if (
+        not isinstance(review_source, Mapping)
+        or any(review_source.get(key) != value for key, value in expected_source.items())
+        or not admission
+    ):
+        raise ValueError("historical_verified review does not bind the exact unchanged source evidence")
+    current_task = get_task(conn, task_id)
+    current_contract = _grace_compiled_contract(current_task.body or "") if current_task else None
+    # Native admission binds this exact execution/review pair to its lane, even
+    # for accepted legacy runs that predate contract snapshots. Never derive
+    # historical identity from a mutable task body or worker-authored metadata.
+    source_identity = {
+        key: admission[key] or "" for key in ("platform", "chat_id", "thread_id")
+    }
+    source_identity["project"] = str(admission["project_namespace"] or "")
+    current_identity = (current_contract or {}).get("identity") or {}
+    if not isinstance(current_identity, Mapping) or not isinstance(source_identity, Mapping):
+        raise ValueError("historical_verified requires structured Topic identities")
+    if not all(current_identity.get(key) for key in ("platform", "chat_id", "project")) or any(
+        current_identity.get(key, "") != source_identity.get(key, "")
+        for key in ("platform", "chat_id", "thread_id", "project")
+    ):
+        raise ValueError("historical_verified source must belong to the same Topic and project")
+    metadata = execution.metadata or {}
+    originals = (metadata.get("acceptance_evidence") or {}).get("publication_reconciliation")
+    commerce_rows = not isinstance(originals, list) or not originals
+    canonical_rows = (metadata.get("user_facing_report") or {}).get("rows")
+    if commerce_rows:
+        originals = canonical_rows
+    elif isinstance(canonical_rows, list):
+        canonical_by_identity = {
+            (
+                row.get("subject_key")
+                or f"facebook_marketplace_listing:{row.get('source_listing_id') or ''}",
+                str(row.get("destination_id") or row.get("group_id") or ""),
+            ): row
+            for row in canonical_rows
+            if isinstance(row, Mapping)
+        }
+        canonical_by_listing_destination = {}
+        ambiguous_listing_destinations = set()
+        for row in canonical_rows:
+            if not isinstance(row, Mapping):
+                continue
+            key = (
+                str(row.get("source_listing_id") or ""),
+                str(row.get("destination_id") or row.get("group_id") or ""),
+            )
+            if key in canonical_by_listing_destination:
+                ambiguous_listing_destinations.add(key)
+            else:
+                canonical_by_listing_destination[key] = row
+        originals = [
+            {
+                **(
+                    canonical_by_identity.get(
+                        (
+                            row.get("subject_key"),
+                            str(row.get("destination_id") or row.get("group_id") or ""),
+                        ),
+                        {},
+                    )
+                    if row.get("subject_key")
+                    else canonical_by_listing_destination.get(
+                        (
+                            str(row.get("source_listing_id") or ""),
+                            str(row.get("destination_id") or row.get("group_id") or ""),
+                        ),
+                        {},
+                    )
+                    if (
+                        str(row.get("source_listing_id") or ""),
+                        str(row.get("destination_id") or row.get("group_id") or ""),
+                    ) not in ambiguous_listing_destinations
+                    else {}
+                ),
+                **row,
+            }
+            for row in originals
+        ]
+    if not isinstance(originals, list) or not originals or not all(isinstance(row, Mapping) for row in originals):
+        raise ValueError("historical_verified source has no structured destination evidence")
+    indexed = {}
+    for original in originals:
+        listing_id = str(original.get("source_listing_id") or "")
+        identity = (
+            original.get("subject_key") or f"facebook_marketplace_listing:{listing_id}",
+            str(original.get("destination_id") or original.get("group_id") or ""),
+        )
+        if not listing_id or identity in indexed:
+            raise ValueError("historical_verified source destination identity is missing or ambiguous")
+        indexed[identity] = original
+    if {(row["subject_key"], row["destination_id"]) for row in report["rows"]} != set(indexed):
+        raise ValueError("historical_verified must preserve every accepted source destination")
+    for row in report["rows"]:
+        original = indexed[(row["subject_key"], row["destination_id"])]
+        # Apply the same legacy empty-URL normalization to both sides.
+        original = {**original, **_commerce_report_details(original, level="row")}
+        expected = {
+            "source_task_id": original.get("source_task_id") or execution.task_id,
+            "source_listing_id": str(original["source_listing_id"]),
+            "destination_name": original.get("destination_name") or original.get("group_name"),
+            "status": "public" if original.get("status") == "published" else original.get("status"),
+            "observed_at": original.get("observed_at"),
+            "verified_at": original.get("verified_at") or datetime.fromtimestamp(
+                original["observed_at"], timezone.utc
+            ).isoformat(),
+            "visible": original.get("visible"),
+            "pending_review": original.get("pending_review"),
+            "post_url": original.get("post_url"),
+        }
+        expected.update({
+            key: original.get(key)
+            for key in ("subject_label", "status_label", "evidence")
+            if key in original
+        })
+        for key, value in expected.items():
+            if row.get(key) != value:
+                raise ValueError(f"historical_verified row {row['destination_id']} must preserve source {key}")
+        if "evidence_gaps" in original and row["evidence_gaps"] != original["evidence_gaps"]:
+            raise ValueError("historical_verified must preserve accepted row evidence_gaps")
+        canonical_url = original.get("canonical_url") if commerce_rows else (
+            original.get("canonical_url") or f"https://www.facebook.com/groups/{row['destination_id']}/"
+        )
+        evidence_url = original.get("evidence_url") if commerce_rows else (
+            original.get("evidence_url") or original.get("post_url")
+            or (original.get("fresh_visible_evidence") or {}).get("checked_area")
+        )
+        if row.get("canonical_url") != canonical_url or row.get("evidence_url") != evidence_url:
+            raise ValueError("historical_verified URLs must preserve accepted source evidence")
+    original_coverage = {
+        item["subject_key"]: item for item in (metadata.get("user_facing_report") or {}).get("coverage", [])
+    }
+    report_coverage_keys = {item["subject_key"] for item in report["coverage"]}
+    if original_coverage and report_coverage_keys != set(original_coverage):
+        raise ValueError(
+            "historical_verified must preserve every accepted coverage subject"
+        )
+    for gap in (metadata.get("user_facing_report") or {}).get("evidence_gaps", []):
+        if gap not in report["evidence_gaps"]:
+            raise ValueError("historical_verified must retain accepted report evidence_gaps")
+    for item in report["coverage"]:
+        accepted_coverage = original_coverage.get(item["subject_key"], {})
+        for key in ("subject_label", "complete", "note"):
+            if key in accepted_coverage and item.get(key) != accepted_coverage[key]:
+                raise ValueError(f"historical_verified must preserve source coverage.{key}")
+        for key in ("expected_total", "named_count", "gap_count"):
+            if key in accepted_coverage and item[key] != accepted_coverage[key]:
+                raise ValueError(f"historical_verified must preserve source coverage.{key}")
+        for key in COMMERCE_COVERAGE_COUNTERS:
+            source_count = accepted_coverage.get(key)
+            # Derived counters can be calculated from accepted rows. All other
+            # counts stay unknown unless the accepted source supplies them.
+            if key in COMMERCE_DERIVED_COUNTERS and source_count is None:
+                continue
+            if item.get(key) != source_count:
+                raise ValueError(f"historical_verified coverage.{key} must preserve the accepted count, or null when absent")
+    if report["observed_at"] != max(row["observed_at"] for row in report["rows"]):
+        raise ValueError("historical_verified observed_at must retain the source observation time")
+
+
 def _upsert_commerce_user_facing_report(
     conn: sqlite3.Connection,
     *,
@@ -5570,7 +5827,10 @@ def _upsert_commerce_user_facing_report(
     report: Mapping[str, Any],
     now: int,
 ) -> None:
-    """Project a validated commerce report into the cross-task ledger."""
+    """Project live observations only; preserve historical reports in their task run."""
+    if report.get("evidence_mode") == "historical_verified":
+        _validate_historical_commerce_report(conn, task_id=task_id, report=report)
+        return
     for row in report["rows"]:
         source_task_id = str(row.get("source_task_id") or task_id).strip()
         existing = conn.execute(
@@ -5644,8 +5904,17 @@ def _upsert_commerce_user_facing_report(
                 (item["subject_key"],),
             ).fetchall()
         }
-        if known_destinations != reported_destinations.get(
-            item["subject_key"], set()
+        # An incomplete report may intentionally cover only the destinations
+        # inspected by this phase.  The durable ledger is an upsert projection,
+        # so omitted rows remain intact and the merged coverage calculation
+        # below still counts them.  Requiring every worker to reproduce the
+        # entire Objective history made small read-only checks grow into
+        # repeated report-repair runs.  A report that claims completion keeps
+        # the stricter full-inventory requirement.
+        if (
+            report.get("complete") is True
+            and known_destinations
+            != reported_destinations.get(item["subject_key"], set())
         ):
             raise ValueError(
                 "metadata.user_facing_report must include every known "
@@ -6882,6 +7151,37 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
     ]
 
 
+def task_attachment_manifest(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pending_records: Iterable[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    """Return the content-bound manifest used by exact workflow review."""
+    records = [
+        {
+            "filename": attachment.filename,
+            "stored_path": attachment.stored_path,
+            "size": attachment.size,
+        }
+        for attachment in list_attachments(conn, task_id)
+    ]
+    records.extend(dict(record) for record in pending_records)
+    manifest = []
+    for record in records:
+        path = Path(str(record.get("stored_path") or ""))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        manifest.append({
+            "filename": str(record.get("filename") or ""),
+            "size": int(record.get("size") or 0),
+            "sha256": digest,
+        })
+    return sorted(
+        manifest,
+        key=lambda item: (item["filename"], item["sha256"], item["size"]),
+    )
+
+
 def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     r = conn.execute(
         "SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)
@@ -7016,6 +7316,8 @@ def _end_run(
     # immutable spawn audit across the terminal transition, then layer it on
     # top so worker-supplied metadata cannot rewrite startup evidence.
     spawn_audit = prior_metadata.get("worker_spawn")
+    objective_plan_request = prior_metadata.get("objective_plan_request")
+    workflow_review_source = prior_metadata.get("workflow_review_source")
     merged_metadata = (
         {
             **(
@@ -7028,6 +7330,17 @@ def _end_run(
     )
     if isinstance(spawn_audit, dict):
         merged_metadata["worker_spawn"] = spawn_audit
+    if isinstance(objective_plan_request, dict):
+        # request_plan writes this while the execution is active. Preserve the
+        # controller-owned bytes across worker completion so the reviewer sees
+        # and accepts the exact proposal that can later be applied.
+        merged_metadata["objective_plan_request"] = objective_plan_request
+    if isinstance(workflow_review_source, dict):
+        # This binding is created by claim_task/claim_review_task. Completion
+        # metadata may repeat it, but can never mint or replace it.
+        merged_metadata["workflow_review_source"] = workflow_review_source
+    else:
+        merged_metadata.pop("workflow_review_source", None)
     conn.execute(
         """
         UPDATE task_runs
@@ -7101,6 +7414,7 @@ def _synthesize_ended_run(
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    run_status = "done" if outcome == "completed" else outcome
     cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -7114,7 +7428,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             trow["executor_backend"] if trow else "hermes",
             trow["routing_decision"] if trow else None,
-            outcome, outcome,
+            run_status, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now, now,
@@ -7335,6 +7649,99 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def workflow_review_evidence_hash(run):
+    """Digest the canonical evidence shown to a workflow reviewer, not prose edits."""
+    metadata = run.metadata or {}
+    return hashlib.sha256(_canonical_json({
+        "started_at": run.started_at, "ended_at": run.ended_at, "outcome": run.outcome,
+        "evidence": {key: metadata[key] for key in (
+            "acceptance_evidence", "external_effects", "user_facing_report", "policy_receipts",
+            "loop_contract", "objective_plan_request", "read_only_zero_external_effects",
+            "attachment_manifest", "external_effect_budget",
+        ) if key in metadata},
+    }).encode("utf-8")).hexdigest()
+
+
+def reviewed_execution_run(conn, review_run, execution_task_id):
+    """Resolve the exact execution attempt pinned by a completed review."""
+    source = (
+        (review_run.metadata or {}).get("workflow_review_source")
+        if review_run is not None and isinstance(review_run.metadata, Mapping)
+        else None
+    )
+    if not isinstance(source, Mapping):
+        row = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND outcome='completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (execution_task_id,),
+        ).fetchone()
+        return get_run(conn, row["id"]) if row is not None else None
+    source_task_id = str(source.get("parent_execution_task_id") or "")
+    source_run_id = source.get("parent_execution_run_id")
+    run = (
+        get_run(conn, int(source_run_id))
+        if type(source_run_id) is int and source_run_id > 0
+        else None
+    )
+    if not (
+        source_task_id == execution_task_id
+        and run is not None
+        and run.task_id == execution_task_id
+        and source.get("parent_execution_evidence_sha256")
+        == workflow_review_evidence_hash(run)
+    ):
+        raise ValueError(
+            "Review completion does not bind unchanged execution evidence."
+        )
+    return run
+
+
+def _workflow_review_source(conn, task_id):
+    """Pin the exact input when a delegated review is claimed, not at card creation."""
+    row = conn.execute(
+        "SELECT d.execution_task_id FROM grace_delegations d "
+        "WHERE d.review_task_id=? AND d.execution_task_id IS NOT NULL",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if _review_runtime_digest() != _REVIEW_RUNTIME_SHA256:
+        raise RuntimeError(
+            "Kanban review runtime source changed; restart the dispatcher/gateway "
+            "before claiming or completing workflow reviews"
+        )
+    parent = latest_run(conn, row["execution_task_id"])
+    if parent is None or not parent.ended_at:
+        raise ValueError("Workflow review requires a terminal parent before claiming")
+    task_bodies = conn.execute(
+        "SELECT id, body FROM tasks WHERE id IN (?, ?)",
+        (row["execution_task_id"], task_id),
+    ).fetchall()
+    bodies = {record["id"]: str(record["body"] or "") for record in task_bodies}
+    if set(bodies) != {row["execution_task_id"], task_id}:
+        raise ValueError("Workflow review tasks disappeared before claim")
+    source = {"parent_execution_task_id": row["execution_task_id"],
+              "parent_execution_run_id": parent.id,
+              "parent_execution_evidence_sha256": workflow_review_evidence_hash(parent),
+              "parent_task_body_sha256": hashlib.sha256(
+                  bodies[row["execution_task_id"]].encode("utf-8")
+              ).hexdigest(),
+              "review_task_body_sha256": hashlib.sha256(
+                  bodies[task_id].encode("utf-8")
+              ).hexdigest(),
+              "review_runtime_sha256": _REVIEW_RUNTIME_SHA256.hex()}
+    plan_request = (parent.metadata or {}).get("objective_plan_request")
+    if isinstance(plan_request, Mapping):
+        request_id = str(plan_request.get("request_id") or "")
+        specification_sha256 = str(plan_request.get("specification_sha256") or "")
+        if request_id and re.fullmatch(r"[0-9a-f]{64}", specification_sha256):
+            source.update(
+                objective_plan_request_id=request_id,
+                objective_plan_specification_sha256=specification_sha256,
+            )
+    return source
+
+
 def _new_worker_auth() -> tuple[str, str]:
     """Return a raw per-run credential and the JSON metadata persisted for it."""
     token = secrets.token_urlsafe(32)
@@ -7420,6 +7827,14 @@ def validate_kanban_worker_auth(
         actual_digest,
     ):
         return False
+    review_source = metadata.get("workflow_review_source")
+    if isinstance(review_source, Mapping) and (
+        review_source.get("review_runtime_sha256") != _REVIEW_RUNTIME_SHA256.hex()
+    ):
+        raise WorkerAuthorizationError(
+            "Kanban review runtime changed after claim; restart the dispatcher/gateway "
+            "and reclaim the review before starting a worker"
+        )
     return True
 
 
@@ -7580,6 +7995,10 @@ def claim_task(
             (task_id,),
         ).fetchone()
         worker_auth_token, worker_auth_metadata = _new_worker_auth()
+        review_source = _workflow_review_source(conn, task_id)
+        if review_source is not None:
+            worker_auth_metadata = json.dumps({**json.loads(worker_auth_metadata),
+                                               "workflow_review_source": review_source})
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
@@ -7671,6 +8090,10 @@ def claim_review_task(
             (task_id,),
         ).fetchone()
         worker_auth_token, worker_auth_metadata = _new_worker_auth()
+        review_source = _workflow_review_source(conn, task_id)
+        if review_source is not None:
+            worker_auth_metadata = json.dumps({**json.loads(worker_auth_metadata),
+                                               "workflow_review_source": review_source})
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
@@ -8506,7 +8929,9 @@ def complete_task(
             user_facing_report = normalize_user_facing_report(
                 user_facing_report
             )
-            metadata["user_facing_report"] = user_facing_report
+            metadata["user_facing_report"] = canonical_objective_report(
+                conn, task_id, user_facing_report
+            )
         md_artifacts = metadata.get("artifacts")
         if isinstance(md_artifacts, (list, tuple)):
             cleaned_artifacts = [
@@ -8620,6 +9045,18 @@ def complete_task(
                 task_id,
                 cleaned_artifacts,
             )
+        delivery_contract = grace_user_facing_delivery_contract(conn, task_id)
+        content_package_delivery = (
+            isinstance(delivery_contract, Mapping)
+            and delivery_contract.get("kind") == "content_package"
+        )
+        if (
+            (user_facing_report is not None and user_facing_report["kind"] == "content_package")
+            or (content_package_delivery and artifact_records)
+        ):
+            metadata["attachment_manifest"] = task_attachment_manifest(
+                conn, task_id, pending_records=artifact_records,
+            )
     elif (
         grace_loop_stage == "execution"
         and domain_memory_spec is not None
@@ -8630,7 +9067,89 @@ def complete_task(
         )
 
     with write_txn(conn):
+        if isinstance(metadata, dict) and grace_review_rejected(metadata):
+            workflow_parent = conn.execute(
+                "SELECT d.execution_task_id FROM grace_delegations d "
+                "WHERE d.review_task_id=? AND d.execution_task_id IS NOT NULL",
+                (task_id,),
+            ).fetchone()
+            if workflow_parent is not None:
+                review_run_id = _current_run_id(conn, task_id)
+                review_attempt = get_run(conn, review_run_id) if review_run_id else None
+                review_source = (
+                    (review_attempt.metadata or {}).get("workflow_review_source")
+                    if review_attempt else None
+                )
+                if review_source is not None:
+                    if review_source != _workflow_review_source(conn, task_id):
+                        raise ValueError(
+                            "Workflow review source changed after claim; start a new review attempt"
+                        )
+                    metadata["evidence"] = {
+                        **(metadata.get("evidence") if isinstance(metadata.get("evidence"), dict) else {}),
+                        **review_source,
+                    }
+                    metadata["workflow_review_source"] = review_source
         if isinstance(metadata, dict) and grace_review_accepted(metadata):
+            # Planned publication workflows consume exact-run acceptance. Reject
+            # incomplete receipts here so the reviewer can correct this same run.
+            workflow_parent = conn.execute(
+                "SELECT d.execution_task_id, w.specification FROM grace_delegations d "
+                "LEFT JOIN grace_objective_workflows w ON w.objective_id=d.objective_id "
+                "WHERE d.review_task_id=? AND d.execution_task_id IS NOT NULL",
+                (task_id,),
+            ).fetchone()
+            if workflow_parent is not None:
+                parent_id = workflow_parent["execution_task_id"]
+                parent_run = latest_run(conn, parent_id)
+                evidence = metadata.get("evidence")
+                review_run_id = _current_run_id(conn, task_id)
+                review_attempt = get_run(conn, review_run_id) if review_run_id else None
+                review_source = (review_attempt.metadata or {}).get("workflow_review_source") if review_attempt else None
+                # Only a controller-created run can pin what the reviewer saw.
+                # A ready card completed directly has no such run and must not
+                # mint Objective authority from caller-authored evidence IDs.
+                if review_source is None:
+                    raise ValueError(
+                        "Workflow review requires a claimed attempt before acceptance so the "
+                        "controller can pin the exact execution run reviewed"
+                    )
+                if parent_run is None or review_source != _workflow_review_source(conn, task_id):
+                    raise ValueError("Workflow review source changed after claim; start a new review attempt")
+                evidence = {**(evidence if isinstance(evidence, dict) else {}), **review_source}
+                metadata["evidence"] = evidence
+                metadata["workflow_review_source"] = review_source
+                if not (
+                    parent_run is not None and parent_run.ended_at
+                    and parent_run.outcome == "completed"
+                    and get_task(conn, parent_id).status == "done"
+                    and isinstance(evidence, dict)
+                    and evidence.get("parent_execution_task_id") == parent_id
+                    and type(evidence.get("parent_execution_run_id")) is int
+                    and evidence["parent_execution_run_id"] == parent_run.id
+                ):
+                    raise ValueError(
+                        "Workflow review requires metadata.evidence with "
+                        "parent_execution_task_id and the exact integer "
+                        "parent_execution_run_id of the latest terminal parent run "
+                        "actually reviewed. Keep this review active and retry "
+                        "kanban_complete after verifying that run; do not rerun "
+                        "the parent or infer acceptance from prose."
+                    )
+                metadata["evidence"] = {**evidence,
+                    "parent_execution_evidence_sha256": workflow_review_evidence_hash(parent_run)}
+                parent_evidence = (parent_run.metadata or {}).get("acceptance_evidence") or {}
+                from hermes_cli.facebook_group_preflight import requested, validate as validate_preflight
+
+                parent_contract = (parent_run.metadata or {}).get("loop_contract") or {}
+                # Schema selection comes from the contract, never from fields
+                # that a malformed result can omit. Generic Marketplace reads
+                # are not necessarily chooser preflights; publication is separate.
+                if requested(parent_contract) and workflow_parent["specification"]:
+                    workflow_spec = json.loads(workflow_parent["specification"])
+                    validate_preflight(parent_evidence, started_at=parent_run.started_at,
+                                       ended_at=parent_run.ended_at,
+                                       listing_id=workflow_spec["source_listing_id"])
             review_row = conn.execute(
                 "SELECT body FROM tasks WHERE id = ?",
                 (task_id,),
@@ -9459,6 +9978,15 @@ def edit_completed_task_result(
                 (handoff_summary, run_id),
             )
             if metadata is not None:
+                previous = get_run(conn, run_id).metadata or {}
+                if (
+                    isinstance(previous.get("workflow_review_source"), Mapping)
+                    and metadata != previous
+                ):
+                    raise ValueError(
+                        "Completed workflow review metadata is immutable; "
+                        "start a new review attempt"
+                    )
                 conn.execute(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(metadata, ensure_ascii=False), run_id),
@@ -9957,6 +10485,19 @@ def cancel_grace_delegation(
                 f"Only the authenticated {authority} may cancel this ClawOps Loop."
             )
 
+        if delegation.get("state") in {"queued", "cancelled"}:
+            # Withdrawal ends this stage's lifecycle, not its business outcome.
+            # Preserve task/run history and the publication-progress closure gate.
+            conn.execute(
+                "UPDATE grace_objective_stages SET status='done', "
+                "outcome_kind='cancelled', evidence=?, completed_at=?, updated_at=? "
+                "WHERE delegation_id=? AND status<>'done' AND objective_id IN "
+                "(SELECT objective_id FROM grace_objective_workflows)",
+                (_canonical_json({"cancelled": True, "accepted": False,
+                                  "delegation_id": delegation["delegation_id"],
+                                  "reason": clean_reason}), now, now,
+                 delegation["delegation_id"]),
+            )
         if delegation.get("state") == "cancelled":
             for card_id in (execution_task_id, review_task_id):
                 row = conn.execute(
@@ -9979,7 +10520,8 @@ def cancel_grace_delegation(
                 "workers": [],
                 "cards": cards,
             }
-        if delegation.get("state") != "queued":
+        cancellable_states = {"queued", "authorized", "building"}
+        if delegation.get("state") not in cancellable_states:
             raise ValueError(
                 "Grace delegation is not queued and cannot be cancelled safely "
                 f"(state={delegation.get('state')!r})."
@@ -9990,7 +10532,7 @@ def cancel_grace_delegation(
             UPDATE grace_delegations
                SET state = 'cancelled', build_owner = NULL,
                    build_lease_expires = NULL, updated_at = ?
-             WHERE delegation_id = ? AND state = 'queued'
+             WHERE delegation_id = ? AND state IN ('queued', 'authorized', 'building')
             """,
             (now, str(delegation["delegation_id"])),
         )
@@ -14074,6 +14616,74 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         wrote_header = False
         for pid in parent_ids:
             pt = get_task(conn, pid)
+            workflow_review = conn.execute(
+                "SELECT 1 FROM grace_delegations d "
+                "WHERE d.review_task_id=? AND d.execution_task_id=? "
+                "AND d.execution_task_id IS NOT NULL",
+                (task_id, pid),
+            ).fetchone()
+            if workflow_review and pt:
+                review_run_id = _current_run_id(conn, task_id)
+                review_attempt = (
+                    get_run(conn, review_run_id)
+                    if review_run_id is not None
+                    else latest_run(conn, task_id)
+                )
+                review_source = (
+                    (review_attempt.metadata or {}).get("workflow_review_source")
+                    if review_attempt is not None
+                    else None
+                )
+                if not isinstance(review_source, Mapping):
+                    lines.append("## Exact parent run for workflow review")
+                    lines.append(
+                        "Controller-pinned review source is unavailable. Do not review "
+                        "or infer acceptance from another parent run."
+                    )
+                    continue
+                try:
+                    pinned_parent = reviewed_execution_run(
+                        conn,
+                        review_attempt,
+                        pid,
+                    )
+                except ValueError:
+                    pinned_parent = None
+                if pinned_parent is None or not pinned_parent.ended_at:
+                    lines.append("## Exact parent run for workflow review")
+                    lines.append(
+                        "Controller-pinned parent evidence changed or is unavailable. "
+                        "Do not review or infer acceptance from another parent run."
+                    )
+                    continue
+                parent_metadata = pinned_parent.metadata or {}
+                lines.append("## Exact parent run for workflow review")
+                lines.append(json.dumps({
+                    "parent_execution_task_id": pid,
+                    "parent_execution_run_id": pinned_parent.id,
+                    "parent_run_started_at": pinned_parent.started_at,
+                    "parent_run_ended_at": pinned_parent.ended_at,
+                    "task_status": pt.status,
+                    "run_outcome": pinned_parent.outcome,
+                    "summary": pinned_parent.summary,
+                    "acceptance_not_established": True,
+                    "evidence": {key: parent_metadata[key] for key in (
+                        "acceptance_evidence", "external_effects",
+                        "read_only_zero_external_effects", "external_effect_budget",
+                        "user_facing_report", "policy_receipts",
+                        "objective_plan_request",
+                    ) if key in parent_metadata},
+                }, ensure_ascii=False))
+                lines.append(
+                    "Review this exact controller-pinned run. A blocked parent remains "
+                    "unaccepted; use its actual evidence to request the smallest "
+                    "correction. Do not infer missing evidence from an absent completion "
+                    "summary. Compare source observation time against "
+                    "parent_run_started_at and parent_run_ended_at above, never against "
+                    "review-card creation time. Execution and review cards are created "
+                    "together before execution."
+                )
+                continue
             if not pt or pt.status != "done":
                 continue
             runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
@@ -15189,49 +15799,6 @@ def ensure_grace_objective_stage(
             if terminal_stage not in stages:
                 raise ValueError("Grace objective terminal stage is not declared")
             terminal_index = stages.index(terminal_stage)
-            retry_base_stage_key = _grace_objective_retry_base_stage_key(
-                clean_stage_key
-            )
-            if retry_base_stage_key:
-                base_stage = conn.execute(
-                    """
-                    SELECT delegation_id, execution_task_id, review_task_id
-                      FROM grace_objective_stages
-                     WHERE objective_id = ? AND stage_key = ?
-                       AND status <> 'done'
-                    """,
-                    (clean_objective_id, retry_base_stage_key),
-                ).fetchone()
-                if base_stage is not None and base_stage["delegation_id"]:
-                    superseded_evidence = _canonical_json(
-                        {
-                            "summary": (
-                                "Previous retry stage was superseded by a "
-                                "new retry stage."
-                            ),
-                            "next_stage_key": clean_stage_key,
-                            "delegation_id": base_stage["delegation_id"],
-                            "execution_task_id": base_stage["execution_task_id"],
-                            "review_task_id": base_stage["review_task_id"],
-                        }
-                    )
-                    conn.execute(
-                        """
-                        UPDATE grace_objective_stages
-                           SET status = 'done',
-                               outcome_kind = 'superseded_by_retry',
-                               evidence = ?, completed_at = ?,
-                               updated_at = ?
-                         WHERE objective_id = ? AND stage_key = ?
-                        """,
-                        (
-                            superseded_evidence,
-                            now,
-                            now,
-                            clean_objective_id,
-                            retry_base_stage_key,
-                        ),
-                    )
             stages.insert(terminal_index, clean_stage_key)
             conn.execute(
                 """
@@ -15425,6 +15992,97 @@ def _bind_grace_objective_stage(
         raise ValueError("Grace objective stage does not exist")
     if stage["delegation_id"] and stage["delegation_id"] != delegation_id:
         raise ValueError("Grace objective stage is already bound to another delegation")
+    retry_root = _grace_objective_retry_root_stage_key(stage_key)
+    current_stage = conn.execute(
+        """
+        SELECT current.position, current.stage_key, current.status
+          FROM grace_objectives AS objective
+          JOIN grace_objective_stages AS current
+            ON current.objective_id = objective.objective_id
+           AND current.stage_key = objective.current_stage_key
+         WHERE objective.objective_id = ?
+        """,
+        (objective_id,),
+    ).fetchone()
+    if (
+        current_stage is not None
+        and current_stage["position"] > stage["position"]
+        and _grace_objective_retry_root_stage_key(current_stage["stage_key"])
+        == retry_root
+    ):
+        raise ValueError("Grace objective retry stage cannot move backward")
+    if retry_root != stage_key:
+        open_stages = conn.execute(
+            """
+            SELECT stage_key, delegation_id, execution_task_id, review_task_id
+              FROM grace_objective_stages
+             WHERE objective_id = ? AND position < ? AND status <> 'done'
+             ORDER BY position
+            """,
+            (objective_id, stage["position"]),
+        ).fetchall()
+        superseded_stages = [
+            prior_stage for prior_stage in open_stages
+            if _grace_objective_retry_root_stage_key(
+                str(prior_stage["stage_key"] or "").strip()
+            ) == retry_root
+        ]
+        for prior_stage in superseded_stages:
+            execution_task_id = str(prior_stage["execution_task_id"] or "").strip()
+            review_task_id = str(prior_stage["review_task_id"] or "").strip()
+            activity = conn.execute(
+                "SELECT (SELECT status FROM tasks WHERE id=?) AS execution_status,"
+                "(SELECT status FROM tasks WHERE id=?) AS review_status,"
+                "EXISTS(SELECT 1 FROM task_runs WHERE task_id IN (?,?) AND ended_at IS NULL) "
+                "AS active_run",
+                (execution_task_id, review_task_id, execution_task_id, review_task_id),
+            ).fetchone()
+            execution_status = str(activity["execution_status"] or "")
+            review_status = str(activity["review_status"] or "")
+            if (activity["active_run"]
+                    or execution_status in {"triage", "todo", "scheduled", "ready", "running", "review"}
+                    or review_status in {"scheduled", "triage", "ready", "running", "review"}
+                    or (review_status == "todo" and execution_status == "done")):
+                raise ValueError("Previous retry stage still has in-flight work")
+        for prior_stage in superseded_stages:
+            prior_stage_key = str(prior_stage["stage_key"] or "").strip()
+            evidence = _canonical_json(
+                {
+                    "summary": (
+                        "Previous retry stage was superseded by a "
+                        "new bound retry stage."
+                    ),
+                    "next_stage_key": stage_key,
+                    "delegation_id": prior_stage["delegation_id"],
+                    "execution_task_id": prior_stage["execution_task_id"],
+                    "review_task_id": prior_stage["review_task_id"],
+                }
+            )
+            conn.execute(
+                """
+                UPDATE grace_objective_stages
+                   SET status = 'done', outcome_kind = 'superseded_by_retry',
+                       evidence = ?, completed_at = ?, updated_at = ?
+                 WHERE objective_id = ? AND stage_key = ? AND status <> 'done'
+                """,
+                (evidence, now, now, objective_id, prior_stage_key),
+            )
+            review_task_id = str(prior_stage["review_task_id"] or "").strip()
+            if review_task_id:
+                conn.execute(
+                    """
+                    UPDATE grace_loop_callbacks
+                       SET state = 'cancelled', lease_event_id = NULL,
+                           lease_owner = NULL, lease_expires = NULL,
+                           last_error = ?
+                     WHERE review_task_id = ?
+                       AND state <> 'cancelled'
+                    """,
+                    (
+                        f"Superseded by bound objective stage {stage_key}.",
+                        review_task_id,
+                    ),
+                )
     conn.execute(
         """
         UPDATE grace_objective_stages
@@ -15531,6 +16189,7 @@ def reserve_grace_delegation(
     objective_id: str = "",
     stage_key: str = "",
     telegram_message_path: Optional[Mapping[str, Any]] = None,
+    publication_contract: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Reserve one delegation and consume approval in the same transaction.
 
@@ -15628,6 +16287,7 @@ def reserve_grace_delegation(
                 thread_id=clean_thread_id,
                 session_id=clean_session_id,
                 lease_owner=callback_lease_owner,
+                allow_recoverable_blocker=True,
             )
         if origin_review_task_id and origin_event_id is not None:
             origin_row = conn.execute(
@@ -15729,6 +16389,19 @@ def reserve_grace_delegation(
                     )
             return row
 
+        if publication_contract is not None:
+            from hermes_cli.objective_workflow import validate_publication, has_in_flight_delegation
+            if (publication_contract.get("objective_ref") or {}) != {"objective_id": clean_objective_id, "stage_key": clean_stage_key}:
+                raise ValueError("Publication contract objective/stage differs from reservation")
+            publication_identity = publication_contract.get("identity") or {}
+            if any(publication_identity.get(key) != value for key, value in (
+                ("platform", clean_platform), ("chat_id", clean_chat_id), ("thread_id", clean_thread_id),
+            )):
+                raise ValueError("Publication contract Topic differs from reservation")
+            validate_publication(conn, publication_contract)
+            if has_in_flight_delegation(conn, clean_objective_id):
+                raise ValueError("Objective already has an in-flight delegation; observe it before publishing")
+
         clean_token = challenge_token.strip()
         clean_user_hash = user_id_sha256.strip()
         clean_approved_message = approved_message_id.strip()
@@ -15752,7 +16425,15 @@ def reserve_grace_delegation(
                    AND session_id = ?
                    AND user_id_sha256 = ?
                    AND state = 'pending'
-                   AND expires_at > ?
+                   AND ((expires_at > ? AND NOT EXISTS (
+                       SELECT 1 FROM grace_approval_receipts r
+                       WHERE r.token=grace_approval_challenges.token)) OR EXISTS (
+                       SELECT 1 FROM grace_approval_receipts r
+                       WHERE r.token=grace_approval_challenges.token
+                         AND r.contract_fingerprint=grace_approval_challenges.contract_fingerprint
+                         AND r.approved_message_id=?
+                         AND r.state='pending'
+                         AND r.accepted_at < grace_approval_challenges.expires_at))
                    AND requested_message_id <> ?
                 """,
                 (
@@ -15767,6 +16448,7 @@ def reserve_grace_delegation(
                     clean_challenge_session_id,
                     clean_user_hash,
                     now,
+                    clean_approved_message,
                     clean_approved_message,
                 ),
             )
@@ -16046,6 +16728,7 @@ def mark_grace_delegation_queued(
                     thread_id=str(existing.get("thread_id") or ""),
                     session_id=str(existing.get("session_id") or ""),
                     lease_owner=callback_lease_owner,
+                    allow_recoverable_blocker=True,
                 )
             elif int(existing.get("approval_required") or 0) == 1:
                 validate_completed_approval_blocker(
@@ -16372,7 +17055,7 @@ def validate_active_grace_callback_origin(
                          AND e3.id > e2.id
                          AND e3.kind IN (
                              'unblocked', 'promoted', 'claimed',
-                             'spawned', 'completed'
+                             'spawned', 'completed', 'backend_retry_scheduled'
                          )
                   )
            )
@@ -16455,7 +17138,7 @@ def rebind_active_grace_callback_session(
                              AND e3.id > e2.id
                              AND e3.kind IN (
                                  'unblocked', 'promoted', 'claimed',
-                                 'spawned', 'completed'
+                                 'spawned', 'completed', 'backend_retry_scheduled'
                              )
                       )
                )
@@ -16476,6 +17159,47 @@ def rebind_active_grace_callback_session(
             raise ValueError(
                 "Compression session rebind is not owned by this callback lease."
             )
+        conn.execute(
+            """
+            UPDATE grace_approval_challenges
+               SET session_id = ?
+             WHERE origin_review_task_id = ?
+               AND origin_event_id = ?
+               AND platform = ?
+               AND chat_id = ?
+               AND thread_id = ?
+               AND state = 'pending'
+            """,
+            (
+                session_id.strip(),
+                review_task_id.strip(),
+                int(event_id),
+                platform.strip().lower(),
+                chat_id.strip(),
+                (thread_id or "").strip(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE grace_delegations
+               SET session_id = ?, updated_at = ?
+             WHERE origin_review_task_id = ?
+               AND origin_event_id = ?
+               AND platform = ?
+               AND chat_id = ?
+               AND thread_id = ?
+               AND state IN ('authorized', 'building', 'queued')
+            """,
+            (
+                session_id.strip(),
+                now,
+                review_task_id.strip(),
+                int(event_id),
+                platform.strip().lower(),
+                chat_id.strip(),
+                (thread_id or "").strip(),
+            ),
+        )
     return validate_active_grace_callback_origin(
         conn,
         review_task_id=review_task_id,
@@ -16497,8 +17221,9 @@ def validate_accepted_grace_callback_origin(
     thread_id: str,
     session_id: str,
     lease_owner: str,
+    allow_recoverable_blocker: bool = False,
 ) -> dict:
-    """Require the exact active lease for an accepted review continuation."""
+    """Require the exact active lease for an accepted or safe continuation."""
     callback = validate_active_grace_callback_origin(
         conn,
         review_task_id=review_task_id,
@@ -16513,7 +17238,7 @@ def validate_accepted_grace_callback_origin(
             "Internal continuation is not owned by this callback lease."
         )
     trigger = conn.execute(
-        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        "SELECT id, task_id, kind, payload FROM task_events WHERE id = ?",
         (int(event_id),),
     ).fetchone()
     review_run = conn.execute(
@@ -16534,17 +17259,89 @@ def validate_accepted_grace_callback_origin(
         )
     except (TypeError, ValueError):
         metadata = {}
-    if (
-        trigger is None
-        or trigger["task_id"] != review_task_id.strip()
-        or trigger["kind"] != "completed"
-        or not grace_review_accepted(metadata)
-    ):
+    accepted_review = bool(
+        trigger is not None
+        and trigger["task_id"] == review_task_id.strip()
+        and trigger["kind"] == "completed"
+        and grace_review_accepted(metadata)
+    )
+    recoverable_blocker = bool(
+        allow_recoverable_blocker
+        and _grace_callback_is_recoverable_blocker(
+            conn, callback=callback, trigger=trigger,
+        )
+    )
+    if not accepted_review and not recoverable_blocker:
         raise ValueError(
-            "Internal continuation requires an accepted Grace-review "
-            "completion event."
+            "Internal continuation requires an accepted Grace-review event "
+            "or an objective-linked capability, dependency, or transient blocker "
+            "with no outstanding approval."
         )
     return callback
+
+
+def grace_callback_has_outstanding_approval(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+) -> bool:
+    """Keep a callback open for an unexpired challenge or retained receipt."""
+    return conn.execute(
+        """
+        SELECT 1 FROM grace_approval_challenges AS c
+         WHERE c.origin_review_task_id = ? AND c.origin_event_id = ?
+           AND (
+                (c.state = 'pending' AND c.expires_at > ?)
+                OR EXISTS (
+                    SELECT 1 FROM grace_approval_receipts AS r
+                     WHERE r.token = c.token AND r.state = 'pending'
+                )
+           )
+         LIMIT 1
+        """,
+        (review_task_id.strip(), int(event_id), int(time.time())),
+    ).fetchone() is not None
+
+
+def _grace_callback_is_recoverable_blocker(
+    conn: sqlite3.Connection,
+    *,
+    callback: Mapping[str, Any],
+    trigger: Optional[sqlite3.Row],
+) -> bool:
+    """Return whether one exact blocker may create an internal successor."""
+    if not callback.get("objective_id") or trigger is None:
+        return False
+    event_task_id = str(trigger["task_id"] or "")
+    if (
+        str(trigger["kind"] or "") != "blocked"
+        or event_task_id
+        not in {
+            str(callback.get("execution_task_id") or ""),
+            str(callback.get("review_task_id") or ""),
+        }
+    ):
+        return False
+    task = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?",
+        (event_task_id,),
+    ).fetchone()
+    try:
+        event_payload = json.loads(trigger["payload"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        event_payload = {}
+    durable_kind = str(task["block_kind"] or "").strip().lower() if task else ""
+    event_kind = str(event_payload.get("kind") or "").strip().lower()
+    if durable_kind not in {"capability", "dependency", "transient"}:
+        return False
+    if event_kind != durable_kind:
+        return False
+    return not grace_callback_has_outstanding_approval(
+        conn,
+        review_task_id=str(callback.get("review_task_id") or ""),
+        event_id=int(trigger["id"] if "id" in trigger.keys() else 0),
+    )
 
 
 def validate_completed_approval_blocker(
@@ -16639,7 +17436,7 @@ def validate_delivered_human_blocker(
                    AND later.id > trigger.id
                    AND later.kind IN (
                        'unblocked', 'promoted', 'claimed',
-                       'spawned', 'completed'
+                       'spawned', 'completed', 'backend_retry_scheduled'
                    )
            )
         """,
@@ -16838,6 +17635,30 @@ def _legacy_inline_content_package_contract(contract: Any) -> bool:
     )
 
 
+def canonical_objective_report(
+    conn: sqlite3.Connection, execution_task_id: str, report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Never promote an intermediate content delivery into Objective success."""
+    canonical = dict(report)
+    if canonical.get("kind") not in {"content_package", "commerce_group_status"}:
+        return canonical
+    row = conn.execute(
+        "SELECT d.objective_id,d.stage_key,o.terminal_stage_key "
+        "FROM grace_delegations d LEFT JOIN grace_objectives o "
+        "ON o.objective_id=d.objective_id WHERE d.execution_task_id=?",
+        (execution_task_id,),
+    ).fetchone()
+    if row and row[0]:
+        terminal_stage = bool(
+            row["stage_key"]
+            and row["terminal_stage_key"]
+            and row["stage_key"] == row["terminal_stage_key"]
+        )
+        if not terminal_stage:
+            canonical["complete"] = False
+    return canonical
+
+
 def grace_inline_content_package_report(
     conn: sqlite3.Connection,
     execution_task_id: str,
@@ -16888,31 +17709,32 @@ def grace_inline_content_package_report(
             if isinstance(stored_report, Mapping)
             else None
         )
+        stored_complete = stored_report.get("complete") if isinstance(stored_report, Mapping) else None
         if type(stored_complete) is not bool:
             stored_complete = True
         if isinstance(stored_report, Mapping) and stored_report.get("body") == body:
             try:
-                return normalize_user_facing_report({
-                    **stored_report,
-                    "complete": stored_complete,
-                })
+                return canonical_objective_report(
+                    conn,
+                    execution_task_id,
+                    normalize_user_facing_report({**stored_report, "complete": stored_complete}),
+                )
             except ValueError:
                 return None
-
         observed_at = int(
             getattr(run, "ended_at", 0) or getattr(run, "started_at", 0) or time.time()
         )
         try:
-            return normalize_user_facing_report({
+            return canonical_objective_report(conn, execution_task_id, normalize_user_facing_report({
                 "kind": "content_package",
                 "delivery": "inline_only",
-                "complete": True,
+                "complete": stored_complete,
                 "title": task.title if task is not None else "Content package",
                 "body": body,
                 "body_field": body_field,
                 "observed_at": observed_at,
                 "assets": [],
-            })
+            }))
         except ValueError:
             return None
     attachments = list_attachments(conn, execution_task_id)
@@ -16945,6 +17767,12 @@ def grace_inline_content_package_report(
             delivery=delivery,
             task=task,
         )
+    run = latest_run(conn, execution_task_id)
+    metadata = getattr(run, "metadata", None) or {}
+    if metadata.get("attachment_manifest") != task_attachment_manifest(
+        conn, execution_task_id,
+    ):
+        return None
     body_path = Path(markdown[0].stored_path)
     if not body_path.is_file():
         return None
@@ -16952,11 +17780,38 @@ def grace_inline_content_package_report(
     if not body:
         return None
     report_assets = []
+    decoded_images: dict[str, tuple[str, tuple[int, int]]] = {}
+    from PIL import Image
+
+    extensions_by_format = {
+        "JPEG": {".jpg", ".jpeg"},
+        "PNG": {".png"},
+        "WEBP": {".webp"},
+    }
     for image in images:
         image_path = Path(image.stored_path)
         if not image_path.is_file():
             return None
         digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        try:
+            with Image.open(image_path) as decoded:
+                actual_format = str(decoded.format or "")
+                actual_dimensions = decoded.size
+                decoded.verify()
+            with Image.open(image_path) as decoded:
+                decoded.load()
+                if (
+                    str(decoded.format or "") != actual_format
+                    or decoded.size != actual_dimensions
+                ):
+                    return None
+        except (OSError, ValueError):
+            return None
+        if image_path.suffix.lower() not in extensions_by_format.get(
+            actual_format, set()
+        ):
+            return None
+        decoded_images[image.filename] = (actual_format, actual_dimensions)
         report_assets.append({
             "filename": image.filename,
             "label": image.filename,
@@ -16965,15 +17820,273 @@ def grace_inline_content_package_report(
         })
     from hermes_cli.user_facing_report import normalize_user_facing_report
 
-    return normalize_user_facing_report({
+    stored_report = metadata.get("user_facing_report")
+    stored_complete = (
+        stored_report.get("complete")
+        if isinstance(stored_report, Mapping)
+        else None
+    )
+    if type(stored_complete) is not bool:
+        stored_complete = True
+
+    if (
+        isinstance(stored_report, Mapping)
+        and stored_report.get("package_kind") == "full_publication_package"
+        and stored_report.get("body") == body
+    ):
+        stored_assets = {
+            asset.get("filename"): asset
+            for asset in stored_report.get("assets", [])
+            if isinstance(asset, Mapping)
+        }
+        if set(stored_assets) != {asset["filename"] for asset in report_assets}:
+            return None
+        canonical_assets = []
+        for attachment_asset in report_assets:
+            stored_asset = stored_assets[attachment_asset["filename"]]
+            _, actual_dimensions = decoded_images[attachment_asset["filename"]]
+            if (
+                stored_asset.get("sha256") != attachment_asset["sha256"]
+                or actual_dimensions
+                != (stored_asset.get("width"), stored_asset.get("height"))
+            ):
+                return None
+            canonical_assets.append({
+                **stored_asset,
+                "path": attachment_asset["path"],
+            })
+        try:
+            return canonical_objective_report(
+                conn,
+                execution_task_id,
+                normalize_user_facing_report({
+                    **stored_report,
+                    "complete": stored_complete,
+                    "assets": canonical_assets,
+                }),
+            )
+        except ValueError:
+            return None
+
+    return canonical_objective_report(conn, execution_task_id, normalize_user_facing_report({
         "kind": "content_package",
         "delivery": "inline_with_attachment",
-        "complete": True,
+        "complete": stored_complete,
         "title": task.title if task is not None else "Content package",
         "body": body,
         "observed_at": max(attachment.created_at for attachment in attachments),
         "assets": report_assets,
-    })
+    }))
+
+
+def accepted_full_publication_package(
+    conn: sqlite3.Connection,
+    *,
+    execution_task_id: str,
+    review_task_id: str,
+    identity: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Resolve one exact reviewed full package; partial updates never qualify."""
+    execution_id = str(execution_task_id or "").strip()
+    review_id = str(review_task_id or "").strip()
+    link = conn.execute(
+        "SELECT d.platform,d.chat_id,d.thread_id,t.project_namespace "
+        "FROM grace_delegations d "
+        "JOIN task_links l ON l.parent_id=d.execution_task_id "
+        "AND l.child_id=d.review_task_id "
+        "JOIN tasks t ON t.id=d.execution_task_id "
+        "WHERE d.execution_task_id=? AND d.review_task_id=?",
+        (execution_id, review_id),
+    ).fetchone()
+    if link is None:
+        raise ValueError("Full publication package requires one exact review link.")
+    identity_fields = {
+        "platform": "platform",
+        "chat_id": "chat_id",
+        "thread_id": "thread_id",
+        "project": "project_namespace",
+    }
+    if (
+        not isinstance(identity, Mapping)
+        or any(key not in identity for key in identity_fields)
+        or not all(str(identity.get(key) or "").strip() for key in ("platform", "chat_id", "project"))
+        or any(
+        str(identity.get(key) or "") != str(link[column] or "")
+        for key, column in identity_fields.items()
+        )
+    ):
+        raise ValueError("Full publication package belongs to another Topic or project.")
+
+    review_run = latest_run(conn, review_id)
+    review_source = (
+        (review_run.metadata or {}).get("workflow_review_source")
+        if review_run is not None and isinstance(review_run.metadata, Mapping)
+        else None
+    )
+    if not isinstance(review_source, Mapping):
+        raise ValueError(
+            "Full publication package review does not bind exact execution evidence."
+        )
+    if review_source.get("review_runtime_sha256") != _REVIEW_RUNTIME_SHA256.hex():
+        raise ValueError(
+            "Full publication package review lacks controller-pinned runtime provenance."
+        )
+    source_run = reviewed_execution_run(conn, review_run, execution_id)
+    latest_execution = latest_run(conn, execution_id)
+    if (
+        review_run is None
+        or source_run is None
+        or latest_execution is None
+        or source_run.id != latest_execution.id
+        or source_run.status != "done"
+        or source_run.outcome != "completed"
+        or review_run.status != "done"
+        or review_run.outcome != "completed"
+        or not source_run.ended_at
+        or not review_run.started_at
+        or review_run.started_at < source_run.ended_at
+        or not grace_review_accepted(review_run.metadata)
+    ):
+        raise ValueError("Full publication package has no accepted review of its latest run.")
+
+    from hermes_cli.user_facing_report import (
+        FULL_PUBLICATION_PACKAGE_KIND,
+        normalize_user_facing_report,
+    )
+
+    source_metadata = source_run.metadata or {}
+    review_metadata = review_run.metadata or {}
+    execution_task = get_task(conn, execution_id)
+    review_task = get_task(conn, review_id)
+    if not (
+        execution_task is not None
+        and review_task is not None
+        and review_source.get("parent_task_body_sha256")
+        == hashlib.sha256((execution_task.body or "").encode("utf-8")).hexdigest()
+        and review_source.get("review_task_body_sha256")
+        == hashlib.sha256((review_task.body or "").encode("utf-8")).hexdigest()
+    ):
+        raise ValueError("Full publication package task contract changed after review.")
+    execution_contract = (
+        source_metadata.get("loop_contract")
+        if isinstance(source_metadata.get("loop_contract"), Mapping)
+        else None
+    )
+    review_contract = (
+        _grace_compiled_contract(review_task.body or "")
+        if review_task is not None
+        else None
+    )
+    if not (
+        source_metadata.get("external_effect_budget") == 0
+        and type(source_metadata.get("external_effect_budget")) is int
+        and source_metadata.get("read_only_zero_external_effects") is True
+        and isinstance(execution_contract, Mapping)
+        and _grace_compiled_contract(execution_task.body or "") == execution_contract
+        and _grace_loop_stage_header(execution_task.body or "") == "execution"
+        and type(execution_contract.get("external_effect_budget")) is int
+        and execution_contract.get("external_effect_budget") == 0
+        and isinstance(review_contract, Mapping)
+        and _grace_loop_stage_header(review_task.body or "") == "review"
+        and type(review_contract.get("external_effect_budget")) is int
+        and review_contract.get("external_effect_budget") == 0
+    ):
+        raise ValueError(
+            "Full publication package lacks controller-attested zero-effect admission."
+        )
+    report = normalize_user_facing_report(source_metadata.get("user_facing_report"))
+    if (
+        report.get("package_kind") != FULL_PUBLICATION_PACKAGE_KIND
+        or report.get("complete") is not True
+    ):
+        raise ValueError("Selected package is not a full publication package.")
+    if not report.get("policy_receipts"):
+        raise ValueError("Full publication package lacks execution policy receipts.")
+    if any(receipt.get("role") != "execution" for receipt in report["policy_receipts"]):
+        raise ValueError("Full publication package execution policy receipts have the wrong role.")
+    if (
+        source_metadata.get("external_effects") != []
+        or review_metadata.get("external_effects") != []
+        or report.get("external_effects") != []
+        or list_external_effects(conn, execution_id)
+        or list_external_effects(conn, review_id)
+    ):
+        raise ValueError("Full publication package must have zero external effects.")
+    if report.get("policy_receipts") != source_metadata.get("policy_receipts"):
+        raise ValueError("Full publication package policy receipts are not controller-bound.")
+    review_receipts = review_metadata.get("policy_receipts")
+    if not isinstance(review_receipts, list) or not review_receipts or not all(
+        isinstance(receipt, Mapping)
+        and receipt.get("role") == "review"
+        and receipt.get("loaded") is True
+        and receipt.get("latest_active_verified") is True
+        and re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256") or ""))
+        for receipt in review_receipts
+    ):
+        raise ValueError("Full publication package lacks verified review policy receipts.")
+    from proactive.policy_registry import (
+        PolicyRegistryError,
+        policy_refs_from_task_body,
+        validate_policy_completion,
+    )
+
+    try:
+        if execution_task is None or not policy_refs_from_task_body(execution_task.body):
+            raise PolicyRegistryError("execution policy snapshot is missing")
+        if review_task is None or not policy_refs_from_task_body(review_task.body):
+            raise PolicyRegistryError("review policy snapshot is missing")
+        validate_policy_completion(execution_task.body, source_metadata, role="execution")
+        validate_policy_completion(review_task.body, review_metadata, role="review")
+    except PolicyRegistryError as exc:
+        raise ValueError(
+            "Full publication package policy receipts are not registry-verified."
+        ) from exc
+    if source_metadata.get("attachment_manifest") != task_attachment_manifest(
+        conn,
+        execution_id,
+    ):
+        raise ValueError("Full publication package attachment manifest changed after review.")
+    from PIL import Image
+
+    supported_formats = {"PNG", "JPEG", "WEBP"}
+    for asset in report["assets"]:
+        path = Path(asset["path"])
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != asset["sha256"]:
+            raise ValueError("Full publication package asset is missing or changed.")
+        try:
+            with Image.open(path) as image:
+                actual_dimensions = image.size
+                actual_format = image.format
+                image.verify()
+            with Image.open(path) as image:
+                image.load()
+                if image.size != actual_dimensions or image.format != actual_format:
+                    raise ValueError(
+                        "Full publication package asset decode is inconsistent."
+                    )
+        except (OSError, ValueError) as exc:
+            raise ValueError("Full publication package asset is not a valid image.") from exc
+        if (
+            actual_format not in supported_formats
+            or actual_dimensions != (asset["width"], asset["height"])
+        ):
+            raise ValueError(
+                "Full publication package asset format or dimensions do not match."
+            )
+    return {
+        "package_kind": FULL_PUBLICATION_PACKAGE_KIND,
+        "execution_task_id": execution_id,
+        "execution_run_id": source_run.id,
+        "review_task_id": review_id,
+        "review_run_id": review_run.id,
+        "sections": report["sections"],
+        "assets": report["assets"],
+        "policy_receipts": {
+            "execution": report["policy_receipts"],
+            "review": review_receipts,
+        },
+        "external_effects": [],
+    }
 
 
 def _grace_facebook_page_preflight_report(
@@ -17351,7 +18464,14 @@ def _apply_grace_objective_callback_outcome(
     if not stage_key:
         raise ValueError("Objective-linked callback is missing its stage key")
     objective = get_grace_objective(conn, objective_id)
-    if objective is None or objective.get("status") not in _ACTIVE_GRACE_OBJECTIVE_STATUSES:
+    successor_already_progressed = bool(
+        kind == "continued"
+        and (successor or {}).get("_objective_already_progressed")
+    )
+    if objective is None or (
+        objective.get("status") not in _ACTIVE_GRACE_OBJECTIVE_STATUSES
+        and not successor_already_progressed
+    ):
         raise ValueError("Objective-linked callback references an inactive objective")
     stage = conn.execute(
         "SELECT * FROM grace_objective_stages WHERE objective_id = ? AND stage_key = ?",
@@ -17362,12 +18482,21 @@ def _apply_grace_objective_callback_outcome(
     now = int(time.time())
     evidence = _canonical_json(dict(payload or {}))
     if kind == "closed":
+        from hermes_cli.objective_workflow import progress as objective_progress
+        publication = objective_progress(conn, objective_id)
+        if publication is not None and not publication["complete"]:
+            raise ValueError(
+                "Objective publication remains incomplete: "
+                f"{publication['published_count']}/{publication['expected_destinations']} verified; "
+                "candidate, membership, pending, and repair results cannot close it"
+            )
         if stage_key != objective["terminal_stage_key"]:
             raise ValueError("Only the declared terminal objective stage may close the outcome")
         incomplete = conn.execute(
             """
             SELECT stage_key FROM grace_objective_stages
-             WHERE objective_id = ? AND stage_key <> ? AND status <> 'done'
+             WHERE objective_id = ? AND stage_key <> ?
+               AND (status <> 'done' OR outcome_kind = 'cancelled')
              ORDER BY position
             """,
             (objective_id, stage_key),
@@ -17410,7 +18539,7 @@ def _apply_grace_objective_callback_outcome(
         )
         conn.execute(
             """
-            UPDATE grace_objectives
+             UPDATE grace_objectives
                SET status = 'blocked', current_stage_key = ?,
                    next_action = ?, waiting_for = ?, updated_at = ?
              WHERE objective_id = ?
@@ -17434,6 +18563,17 @@ def _apply_grace_objective_callback_outcome(
         successor_stage = str((successor or {}).get("stage_key") or "").strip()
         if successor_id != objective_id or not successor_stage:
             raise ValueError("Continuation must queue the next stage of the same Grace objective")
+        if successor_already_progressed:
+            conn.execute(
+                """
+                UPDATE grace_objective_stages
+                   SET status = 'done', outcome_kind = 'continued', evidence = ?,
+                       completed_at = ?, updated_at = ?
+                 WHERE objective_id = ? AND stage_key = ? AND status <> 'done'
+                """,
+                (evidence, now, now, objective_id, stage_key),
+            )
+            return
         conn.execute(
             """
             UPDATE grace_objective_stages
@@ -17528,57 +18668,72 @@ def record_grace_loop_callback_outcome(
             "Structured callback outcome is not owned by this callback lease."
         )
     trigger = conn.execute(
-        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        "SELECT id, task_id, kind, payload, run_id FROM task_events WHERE id = ?",
         (int(event_id),),
     ).fetchone()
-    review_run = conn.execute(
-        """
-        SELECT metadata
-          FROM task_runs
-         WHERE task_id = ? AND outcome = 'completed'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (review_task_id.strip(),),
-    ).fetchone()
-    try:
-        review_metadata = (
-            json.loads(review_run["metadata"])
-            if review_run is not None and review_run["metadata"]
-            else {}
-        )
-    except (TypeError, ValueError):
-        review_metadata = {}
-    execution_run = conn.execute(
-        """
-        SELECT metadata
-          FROM task_runs
-         WHERE task_id = ? AND outcome = 'completed'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (str(callback.get("execution_task_id") or "").strip(),),
-    ).fetchone()
-    try:
-        execution_metadata = (
-            json.loads(execution_run["metadata"])
-            if execution_run is not None and execution_run["metadata"]
-            else {}
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        execution_metadata = {}
+    review_run = (
+        get_run(conn, int(trigger["run_id"]))
+        if trigger is not None and trigger["run_id"] is not None
+        else None
+    )
+    review_metadata = (
+        review_run.metadata
+        if review_run is not None and review_run.task_id == review_task_id.strip()
+        else {}
+    )
+    execution_task_id = str(callback.get("execution_task_id") or "").strip()
+    execution_run = reviewed_execution_run(
+        conn, review_run, execution_task_id,
+    )
+    execution_metadata = (
+        (execution_run.metadata or {}) if execution_run is not None else {}
+    )
+    kind = str(outcome_kind or "").strip()
     review_accepted = grace_review_accepted(review_metadata)
-    if (
-        trigger is None
-        or trigger["task_id"] != review_task_id.strip()
-        or trigger["kind"] != "completed"
-        or not review_accepted
+    blocker_event_kinds = {
+        "blocked", "block_loop_detected", "gave_up", "crashed", "timed_out",
+    }
+    accepted_review_event = bool(
+        trigger is not None
+        and trigger["task_id"] == review_task_id.strip()
+        and trigger["kind"] == "completed"
+        and review_accepted
+    )
+    rejected_review_event = bool(
+        trigger is not None
+        and trigger["task_id"] == review_task_id.strip()
+        and trigger["kind"] == "completed"
+        and grace_review_rejected(review_metadata)
+    )
+    objective_blocker_event = bool(
+        callback.get("objective_id")
+        and trigger is not None
+        and (
+            rejected_review_event
+            or (
+                trigger["kind"] in blocker_event_kinds
+                and trigger["task_id"] in {
+                    review_task_id.strip(),
+                    str(callback.get("execution_task_id") or ""),
+                }
+            )
+        )
+    )
+    recoverable_objective_blocker = bool(
+        objective_blocker_event
+        and _grace_callback_is_recoverable_blocker(
+            conn, callback=callback, trigger=trigger,
+        )
+    )
+    if not accepted_review_event and not (
+        kind == "continued" and recoverable_objective_blocker
     ):
         raise ValueError(
-            "Structured callback outcomes are allowed only for an accepted "
-            "Grace-review completion event."
+            "Structured callback outcomes require an accepted Grace-review "
+            "completion event, except a same-objective continuation created for "
+            "an eligible capability, dependency, or transient blocker with no "
+            "outstanding approval."
         )
-    kind = str(outcome_kind or "").strip()
     if kind not in {"closed", "continued", "approval_blocked", "terminal_blocked"}:
         raise ValueError(
             "Callback outcome must be closed, continued, approval_blocked, or terminal_blocked."
@@ -17611,19 +18766,18 @@ def record_grace_loop_callback_outcome(
             "SELECT body FROM tasks WHERE id = ?",
             (str(callback.get("execution_task_id") or "").strip(),),
         ).fetchone()
-        execution_contract = _grace_compiled_contract(
-            str(execution_task["body"] or "")
-            if execution_task is not None
-            else ""
-        )
+        execution_contract = execution_metadata.get("loop_contract")
+        if not isinstance(execution_contract, Mapping):
+            execution_contract = _grace_compiled_contract(
+                str(execution_task["body"] or "")
+                if execution_task is not None
+                else ""
+            )
         user_facing_delivery = (
             execution_contract.get("user_facing_delivery")
             if isinstance(execution_contract, Mapping)
             else None
         )
-        execution_task_id = str(
-            callback.get("execution_task_id") or ""
-        ).strip()
         if not isinstance(user_facing_delivery, Mapping):
             user_facing_delivery = grace_user_facing_delivery_contract(
                 conn, execution_task_id,
@@ -17650,9 +18804,16 @@ def record_grace_loop_callback_outcome(
             # Content-package paths and hashes are authority-bearing. Always
             # rebuild them from this task's durable attachment records rather
             # than trusting worker-authored metadata.
-            user_facing_report = grace_inline_content_package_report(
-                conn, execution_task_id,
-            )
+            latest_execution = latest_run(conn, execution_task_id)
+            if (
+                execution_run is not None
+                and latest_execution is not None
+                and execution_run.id != latest_execution.id
+            ):
+                raise ValueError(
+                    "Reviewed content package is no longer the latest execution run."
+                )
+            user_facing_report = grace_inline_content_package_report(conn, execution_task_id)
         if commerce_status_route and not isinstance(
             user_facing_delivery, Mapping
         ):
@@ -17743,7 +18904,16 @@ def record_grace_loop_callback_outcome(
                     "user outcome; continue the read-only reconciliation or "
                     "record the exact approval blocker."
                 )
-            if user_facing_report.get("kind") == "commerce_group_status":
+            if (
+                user_facing_report.get("kind") == "commerce_group_status"
+                and user_facing_report.get("evidence_mode") == "historical_verified"
+            ):
+                # Historical delivery is bound to accepted source runs, not the
+                # current ledger projection owned by a later observation task.
+                _validate_historical_commerce_report(
+                    conn, task_id=execution_task_id, report=user_facing_report,
+                )
+            elif user_facing_report.get("kind") == "commerce_group_status":
                 report_observed_at = int(
                     user_facing_report.get("observed_at") or 0
                 )
@@ -17851,11 +19021,13 @@ def record_grace_loop_callback_outcome(
             conn, delegation_id=delegation_id,
         )
         objective_existing_successor = False
+        objective_exact_origin_successor = False
+        objective_successor_is_current = False
+        objective_successor_already_progressed = False
         if (
             delegation is not None
             and callback.get("objective_id")
             and delegation.get("objective_id") == callback.get("objective_id")
-            and delegation.get("session_key") == callback.get("session_key")
             and delegation.get("stage_key")
             and delegation.get("stage_key") != callback.get("stage_key")
         ):
@@ -17879,7 +19051,8 @@ def record_grace_loop_callback_outcome(
                 (next_review_task_id,),
             ).fetchone()
             objective_existing_successor = bool(
-                objective_stage is not None
+                delegation.get("session_key") == callback.get("session_key")
+                and objective_stage is not None
                 and objective_stage["delegation_id"] == delegation_id
                 and objective_stage["status"] != "done"
                 and successor_execution is not None
@@ -17895,13 +19068,39 @@ def record_grace_loop_callback_outcome(
                     "blocked", "review",
                 }
             )
+            objective_exact_origin_successor = bool(
+                objective_stage is not None
+                and objective_stage["delegation_id"] == delegation_id
+                and delegation.get("origin_review_task_id") == review_task_id
+                and int(delegation.get("origin_event_id") or 0) == int(event_id)
+            )
+            objective = get_grace_objective(
+                conn, str(callback.get("objective_id") or "")
+            )
+            objective_successor_is_current = bool(
+                objective_exact_origin_successor
+                and objective_stage["status"] != "done"
+                and objective is not None
+                and objective.get("current_stage_key") == delegation.get("stage_key")
+            )
+            objective_successor_already_progressed = bool(
+                objective_exact_origin_successor
+                and objective_stage["status"] == "done"
+            )
         if (
             delegation is None
             or delegation.get("state") != "queued"
             or delegation.get("execution_task_id") != execution_task_id
             or delegation.get("review_task_id") != next_review_task_id
             or (
-                not objective_existing_successor
+                objective_blocker_event
+                and not (
+                    objective_successor_is_current
+                    or objective_successor_already_progressed
+                )
+            )
+            or (
+                (not objective_existing_successor or objective_blocker_event)
                 and (
                     delegation.get("origin_review_task_id") != review_task_id
                     or int(delegation.get("origin_event_id") or 0)
@@ -17912,7 +19111,7 @@ def record_grace_loop_callback_outcome(
             or delegation.get("chat_id") != chat_id.strip()
             or delegation.get("thread_id") != (thread_id or "").strip()
             or (
-                not objective_existing_successor
+                (not objective_existing_successor or objective_blocker_event)
                 and delegation.get("session_id") != session_id.strip()
             )
             or (
@@ -17926,7 +19125,10 @@ def record_grace_loop_callback_outcome(
             raise ValueError(
                 "Continuation tasks are not the queued delegation created by "
                 "this exact callback."
-    )
+            )
+        if objective_successor_already_progressed:
+            delegation = dict(delegation)
+            delegation["_objective_already_progressed"] = True
     with write_txn(conn):
         current_callback = validate_active_grace_callback_origin(
             conn,
@@ -18092,27 +19294,19 @@ def record_grace_intermediate_callback_without_structured_continuation(
     if str(callback.get("completion_mode") or "terminal") != "intermediate":
         raise ValueError("Only intermediate callbacks can use this fallback.")
     trigger = conn.execute(
-        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        "SELECT task_id, kind, run_id FROM task_events WHERE id = ?",
         (int(event_id),),
     ).fetchone()
-    review_run = conn.execute(
-        """
-        SELECT summary, metadata
-          FROM task_runs
-         WHERE task_id = ? AND outcome = 'completed'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (review_task_id.strip(),),
-    ).fetchone()
-    try:
-        review_metadata = (
-            json.loads(review_run["metadata"])
-            if review_run is not None and review_run["metadata"]
-            else {}
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        review_metadata = {}
+    review_run = (
+        get_run(conn, int(trigger["run_id"]))
+        if trigger is not None and trigger["run_id"] is not None
+        else None
+    )
+    review_metadata = (
+        review_run.metadata
+        if review_run is not None and review_run.task_id == review_task_id.strip()
+        else {}
+    )
     if (
         trigger is None
         or trigger["task_id"] != review_task_id.strip()
@@ -18127,7 +19321,7 @@ def record_grace_intermediate_callback_without_structured_continuation(
     summary = str(
         review_metadata.get("remaining_blocker")
         or review_metadata.get("verification_notes")
-        or (review_run["summary"] if review_run is not None else "")
+        or (review_run.summary if review_run is not None else "")
         or reason
     ).strip()
     payload = {
@@ -18205,9 +19399,9 @@ def record_grace_intermediate_callback_without_structured_continuation(
                 UPDATE grace_objectives
                    SET status = 'blocked', current_stage_key = ?,
                        next_action = '', waiting_for = ?, updated_at = ?
-                 WHERE objective_id = ?
+                 WHERE objective_id = ? AND current_stage_key = ?
                 """,
-                (stage_key, summary, now, objective_id),
+                (stage_key, summary, now, objective_id, stage_key),
             )
         row = conn.execute(
             "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
@@ -18239,7 +19433,8 @@ def record_grace_loop_callback_blocker_outcome(
     with write_txn(conn):
         row = conn.execute(
             """
-            SELECT c.*, e.task_id AS event_task_id, e.kind AS event_kind
+            SELECT c.*, e.task_id AS event_task_id, e.kind AS event_kind,
+                   e.run_id AS event_run_id
               FROM grace_loop_callbacks AS c
               JOIN task_events AS e ON e.id = ?
              WHERE c.review_task_id = ?
@@ -18263,37 +19458,70 @@ def record_grace_loop_callback_blocker_outcome(
         current = dict(row)
         event_task_id = str(current.get("event_task_id") or "")
         event_kind = str(current.get("event_kind") or "")
-        is_execution_blocker = (
+        review = (
+            get_run(conn, int(current["event_run_id"]))
+            if current.get("event_run_id") is not None
+            else None
+        )
+        is_rejected_review_completion = bool(
+            event_task_id == str(current.get("review_task_id") or "")
+            and event_kind == "completed"
+            and review
+            and review.task_id == event_task_id
+            and grace_review_rejected(review.metadata)
+        )
+        is_execution_blocked_event = (
             event_task_id == str(current.get("execution_task_id") or "")
             and event_kind == "blocked"
         )
-        is_terminal_review_blocker = (
-            kind == "terminal_blocked"
-            and event_task_id == str(current.get("review_task_id") or "")
+        is_execution_blocker = (
+            event_task_id == str(current.get("execution_task_id") or "")
             and event_kind
             in {"blocked", "block_loop_detected", "gave_up", "crashed", "timed_out"}
-            and str(current.get("completion_mode") or "terminal") == "terminal"
+        )
+        is_review_blocker = (
+            (
+                event_task_id == str(current.get("review_task_id") or "")
+                and event_kind in {
+                    "blocked", "block_loop_detected", "gave_up", "crashed", "timed_out",
+                }
+            )
+            or is_rejected_review_completion
+        )
+        completion_mode = str(current.get("completion_mode") or "terminal")
+        objective_execution_blocker = bool(
+            is_execution_blocker
+            and str(current.get("objective_id") or "").strip()
+        )
+        is_terminal_review_blocker = (
+            kind == "terminal_blocked"
+            and is_review_blocker
+            and completion_mode == "terminal"
             and str(current.get("objective_id") or "").strip()
         )
         is_intermediate_review_blocker = (
             kind == "intermediate_blocked"
-            and event_task_id == str(current.get("review_task_id") or "")
-            and event_kind
-            in {"blocked", "block_loop_detected", "gave_up", "crashed", "timed_out"}
-            and str(current.get("completion_mode") or "terminal") == "intermediate"
+            and is_review_blocker
+            and completion_mode == "intermediate"
             and str(current.get("objective_id") or "").strip()
         )
-        if kind == "quota_blocked" and not is_execution_blocker:
+        if kind == "quota_blocked" and not is_execution_blocked_event:
             raise ValueError(
                 "Structured quota blocker outcomes are allowed only for execution blocked events."
             )
-        if kind == "terminal_blocked" and not is_terminal_review_blocker:
+        if kind == "terminal_blocked" and not (
+            is_terminal_review_blocker
+            or (objective_execution_blocker and completion_mode == "terminal")
+        ):
             raise ValueError(
-                "Structured terminal blockers are allowed only for objective-linked terminal review blockers."
+                "Structured terminal blockers are allowed only for objective-linked terminal blockers."
             )
-        if kind == "intermediate_blocked" and not is_intermediate_review_blocker:
+        if kind == "intermediate_blocked" and not (
+            is_intermediate_review_blocker
+            or (objective_execution_blocker and completion_mode == "intermediate")
+        ):
             raise ValueError(
-                "Structured intermediate blockers are allowed only for objective-linked intermediate review blockers."
+                "Structured intermediate blockers are allowed only for objective-linked intermediate blockers."
             )
         if kind in {"terminal_blocked", "intermediate_blocked"}:
             clean_payload = dict(payload or {})
@@ -18362,12 +19590,13 @@ def record_grace_loop_callback_blocker_outcome(
                 """,
                 (payload_json, now, now, objective_id, stage_key),
             )
-            conn.execute(
+            objective_update = conn.execute(
                 """
                 UPDATE grace_objectives
                    SET status = 'blocked', current_stage_key = ?,
                        next_action = ?, waiting_for = ?, updated_at = ?
-                 WHERE objective_id = ?
+                 WHERE objective_id = ? AND current_stage_key = ?
+                   AND status IN ('active', 'waiting_approval', 'blocked', 'verifying')
                 """,
                 (
                     stage_key,
@@ -18380,8 +19609,13 @@ def record_grace_loop_callback_blocker_outcome(
                     ).strip(),
                     now,
                     objective_id,
+                    stage_key,
                 ),
             )
+            if objective_update.rowcount != 1:
+                raise ValueError(
+                    "Objective current stage changed without an exact callback successor"
+                )
         updated = conn.execute(
             "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
             (review_task_id.strip(),),
@@ -18405,7 +19639,7 @@ def grace_loop_callback_has_outcome(
            AND lease_event_id = ?
            AND lease_owner = ?
            AND outcome_event_id = ?
-           AND outcome_kind IN ('closed', 'continued', 'approval_blocked', 'terminal_blocked')
+           AND outcome_kind IN ('closed', 'continued', 'approval_blocked', 'terminal_blocked', 'intermediate_blocked')
            AND outcome_payload IS NOT NULL
         """,
         (
@@ -18456,6 +19690,7 @@ def list_due_grace_loop_callbacks(
     rows = conn.execute(
         """
         SELECT c.*, e.id AS event_id, e.task_id AS event_task_id,
+               e.run_id AS event_run_id,
                e.kind AS event_kind, e.payload AS event_payload,
                CASE
                    WHEN e.task_id = c.execution_task_id THEN 'execution'
@@ -18495,11 +19730,11 @@ def list_due_grace_loop_callbacks(
                          AND e3.id > e2.id
                          AND e3.kind IN (
                              'unblocked', 'promoted', 'claimed',
-                             'spawned', 'completed'
+                             'spawned', 'completed', 'backend_retry_scheduled'
                          )
                   )
            )
-         WHERE c.state != 'attention'
+         WHERE c.state NOT IN ('attention', 'cancelled')
            AND (c.lease_expires IS NULL OR c.lease_expires <= ?)
          ORDER BY e.id
         """,
@@ -18546,6 +19781,7 @@ def claim_grace_loop_callback(
                        ELSE NULL
                    END
              WHERE review_task_id = ?
+               AND state NOT IN ('attention', 'cancelled')
                AND last_event_id < ?
                AND (lease_expires IS NULL OR lease_expires <= ?)
                AND EXISTS (
@@ -18585,7 +19821,7 @@ def claim_grace_loop_callback(
                              AND e3.id > e2.id
                              AND e3.kind IN (
                                  'unblocked', 'promoted', 'claimed',
-                                 'spawned', 'completed'
+                                 'spawned', 'completed', 'backend_retry_scheduled'
                              )
                       )
                )
@@ -18597,6 +19833,47 @@ def claim_grace_loop_callback(
                 review_task_id, int(event_id), now, int(event_id),
             ),
         )
+        if cur.rowcount == 1:
+            trigger = conn.execute(
+                "SELECT task_id,kind,run_id FROM task_events WHERE id=?", (int(event_id),),
+            ).fetchone()
+            if (trigger and trigger["task_id"] == review_task_id.strip()
+                    and trigger["kind"] == "completed"):
+                from hermes_cli.objective_workflow import apply_reviewed_plan_request
+                try:
+                    apply_reviewed_plan_request(
+                        conn, review_task_id=review_task_id,
+                        review_run_id=trigger["run_id"],
+                    )
+                except ValueError as exc:
+                    # A proposal can become stale while its execution and review
+                    # finish. Preserve the rejection, but never turn it into a
+                    # permanently unclaimable callback.
+                    error = str(exc)
+                    review_attempt = (
+                        get_run(conn, trigger["run_id"])
+                        if trigger["run_id"] is not None
+                        else None
+                    )
+                    review_evidence = (
+                        (review_attempt.metadata or {}).get("evidence") or {}
+                        if review_attempt is not None
+                        else {}
+                    )
+                    execution_run_id = review_evidence.get("parent_execution_run_id")
+                    conn.execute(
+                        "UPDATE grace_objective_plan_requests SET state='rejected',result=? "
+                        "WHERE state='pending' AND execution_run_id=? AND delegation_id IN "
+                        "(SELECT delegation_id FROM grace_delegations WHERE review_task_id=?)",
+                        (
+                            _canonical_json({"error": error}), execution_run_id,
+                            review_task_id.strip(),
+                        ),
+                    )
+                    _append_event(
+                        conn, review_task_id.strip(), "objective_plan_rejected",
+                        {"reason": error},
+                    )
     return cur.rowcount == 1
 
 
@@ -18679,6 +19956,45 @@ def finish_grace_loop_callback(
 ) -> bool:
     now = int(time.time())
     with write_txn(conn):
+        callback = get_grace_loop_callback(conn, review_task_id)
+        trigger = conn.execute(
+            "SELECT task_id,kind,run_id FROM task_events WHERE id=?", (event_id,),
+        ).fetchone()
+        review = (
+            get_run(conn, int(trigger["run_id"]))
+            if trigger is not None and trigger["run_id"] is not None
+            else None
+        )
+        objective = (
+            get_grace_objective(conn, str(callback.get("objective_id") or ""))
+            if callback and callback.get("objective_id")
+            else None
+        )
+        terminal_objective = bool(
+            objective and objective.get("status") in {"completed", "cancelled"}
+        )
+        requires_outcome = bool(
+            callback and callback.get("objective_id") and not terminal_objective
+        )
+        if (
+            not terminal_objective
+            and callback
+            and callback.get("completion_mode") == "intermediate"
+            and trigger and trigger["task_id"] == review_task_id
+            and trigger["kind"] == "completed"
+            and review and review.task_id == review_task_id
+            and grace_review_accepted(review.metadata)
+        ):
+            requires_outcome = True
+        if (
+            requires_outcome
+            and trigger
+            and not grace_loop_callback_has_outcome(
+                conn, review_task_id=review_task_id,
+                event_id=event_id, lease_owner=lease_owner,
+            )
+        ):
+            return False
         cur = conn.execute(
             """
             UPDATE grace_loop_callbacks
@@ -18719,7 +20035,7 @@ def finish_grace_loop_callback(
                              AND e3.id > e2.id
                              AND e3.kind IN (
                                  'unblocked', 'promoted', 'claimed',
-                                 'spawned', 'completed'
+                                 'spawned', 'completed', 'backend_retry_scheduled'
                              )
                       )
                )

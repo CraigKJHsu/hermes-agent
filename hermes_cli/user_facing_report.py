@@ -14,11 +14,20 @@ import re
 import time
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 
 COMMERCE_GROUP_REPORT_KIND = "commerce_group_status"
 CONTENT_PACKAGE_REPORT_KIND = "content_package"
+FULL_PUBLICATION_PACKAGE_KIND = "full_publication_package"
 INLINE_ONLY_DELIVERY = "inline_only"
+FULL_PUBLICATION_SECTION_FIELDS = (
+    "facebook_page_post",
+    "facebook_group_post",
+    "gemini_notebook_prompt",
+    "podcast_title",
+    "podcast_description",
+)
 SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS = frozenset({
     "carimali-armonia-soft-plus",
     "kolin-kd291m06",
@@ -38,9 +47,21 @@ UNRESOLVED_COMMERCE_GROUP_STATUSES = frozenset({
     "ambiguous_after_submit",
     "unknown",
 })
+COMMERCE_COVERAGE_COUNTERS = (
+    "destination_target", "verified_published_count", "unknown_count",
+    "remaining_verified_publication_gap", "unnamed_gap",
+    "candidate_count", "joined_count", "selectable_count", "submitted_count",
+    "pending_count", "rejected_count", "not_submitted_count",
+    "ready_count", "conditional_count", "excluded_count",
+)
+COMMERCE_DERIVED_COUNTERS = frozenset({
+    "destination_target", "verified_published_count", "unknown_count",
+    "remaining_verified_publication_gap", "unnamed_gap",
+})
 MAX_REPORT_JSON_CHARS = 12_000
 MAX_CONTENT_PACKAGE_JSON_CHARS = 80_000
 MAX_FUTURE_SKEW_SECONDS = 300
+MIN_PLAUSIBLE_UNIX_SECONDS = 946_684_800  # 2000-01-01T00:00:00Z
 
 
 def _required_text(value: Any, field: str) -> str:
@@ -54,7 +75,7 @@ def _unix_seconds(value: Any, field: str) -> int:
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
-        or value <= 0
+        or value < MIN_PLAUSIBLE_UNIX_SECONDS
         or value > int(time.time()) + MAX_FUTURE_SKEW_SECONDS
     ):
         raise ValueError(
@@ -62,6 +83,52 @@ def _unix_seconds(value: Any, field: str) -> int:
             "Unix-seconds timestamp"
         )
     return value
+
+
+def _commerce_report_details(raw: Mapping[str, Any], *, level: str) -> dict[str, Any]:
+    """Preserve typed report fields instead of silently dropping contract evidence."""
+    fields = {
+        "report": {
+            "title": "text", "body_field": "text", "body": "text",
+            "assets": "empty", "evidence_gaps": "gaps",
+        },
+        "row": {
+            "canonical_url": "url", "post_url": "url", "evidence_url": "url",
+            "visible": "bool", "pending_review": "bool", "evidence_gaps": "gaps",
+        },
+        "coverage": {key: "count" for key in COMMERCE_COVERAGE_COUNTERS},
+    }[level]
+    result = {}
+    for key, kind in fields.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        # Older controller builders use an empty URL for an unknown location.
+        if kind == "url" and isinstance(value, str) and not value.strip():
+            value = None
+        valid = True
+        if kind == "text":
+            valid = isinstance(value, str) and bool(value.strip())
+        elif kind == "empty":
+            valid = value == []
+        elif kind == "gaps":
+            valid = isinstance(value, list) and all(isinstance(v, str) and v.strip() for v in value)
+        elif kind == "bool":
+            valid = value is None or isinstance(value, bool)
+        elif kind == "count":
+            valid = value is None or (type(value) is int and value >= 0)
+        elif kind == "url" and value is not None:
+            valid = isinstance(value, str)
+            if valid:
+                try:
+                    url = urlsplit(value)
+                    valid = url.scheme == "https" and bool(url.hostname) and not url.username and not url.password
+                except ValueError:
+                    valid = False
+        if not valid:
+            raise ValueError(f"metadata.user_facing_report {level}.{key} has an invalid {kind} value")
+        result[key] = value
+    return result
 
 
 def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -151,6 +218,11 @@ def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
             "source_listing_id": str(raw_row.get("source_listing_id") or "").strip(),
             "source_task_id": str(raw_row.get("source_task_id") or "").strip(),
         }
+        row.update(_commerce_report_details(raw_row, level="row"))
+        if row.get("canonical_url") is not None and row["canonical_url"].rstrip("/") != (
+            f"https://www.facebook.com/groups/{destination_id}"
+        ):
+            raise ValueError("metadata.user_facing_report canonical_url must match destination_id")
         rows.append(row)
 
     raw_coverage = raw.get("coverage")
@@ -237,6 +309,7 @@ def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
                 raw_item.get("expected_total_label") or ""
             ).strip(),
             "note": _required_text(raw_item.get("note"), f"coverage[{index}].note"),
+            **_commerce_report_details(raw_item, level="coverage"),
         })
 
     row_subjects = {row["subject_key"] for row in rows}
@@ -266,7 +339,7 @@ def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
         and item["subject_key"] not in unresolved_subjects
         for item in coverage
     )
-    if bool(raw["complete"]) != calculated_complete:
+    if raw["complete"] and not calculated_complete:
         raise ValueError(
             "metadata.user_facing_report complete must match coverage completeness"
         )
@@ -274,12 +347,59 @@ def _normalize_commerce_group_report(raw: Mapping[str, Any]) -> dict[str, Any]:
     normalized = {
         "kind": kind,
         "delivery": delivery,
-        "complete": calculated_complete,
+        "complete": raw["complete"],
         "as_of": as_of,
         "observed_at": report_observed_at,
         "rows": rows,
         "coverage": coverage,
+        **_commerce_report_details(raw, level="report"),
     }
+    if "body" in raw:
+        for key in ("title", "body_field", "body"):
+            if key not in normalized:
+                raise ValueError(f"metadata.user_facing_report requires {key} with an inline body")
+    for item in coverage:
+        subject_rows = [row for row in rows if row["subject_key"] == item["subject_key"]]
+        published = sum(row["status"] == "public" for row in subject_rows)
+        unknown = sum(row["status"] in UNRESOLVED_COMMERCE_GROUP_STATUSES for row in subject_rows)
+        expected = {
+            "destination_target": item["expected_total"],
+            "verified_published_count": published, "unknown_count": unknown,
+            "unnamed_gap": item["gap_count"],
+            "remaining_verified_publication_gap": (
+                max(item["expected_total"] - published, 0) if item["expected_total"] is not None else None
+            ),
+        }
+        for key, value in expected.items():
+            if key in item and item[key] != value and (
+                item[key] is not None or raw.get("evidence_mode") == "historical_verified"
+            ):
+                raise ValueError(f"metadata.user_facing_report coverage.{key} does not reconcile with rows")
+    mode = raw.get("evidence_mode")
+    if mode is not None:
+        if mode != "historical_verified" or raw["complete"] or any(item["complete"] for item in coverage):
+            raise ValueError("historical_verified reports must remain incomplete")
+        source = raw.get("evidence_source")
+        if not isinstance(source, Mapping) or any(
+            type(source.get(key)) is not int or source[key] <= 0
+            for key in ("execution_run_id", "review_run_id")
+        ):
+            raise ValueError("historical_verified requires exact execution_run_id and review_run_id")
+        for key in ("title", "body_field", "body", "assets", "evidence_gaps"):
+            if key not in normalized:
+                raise ValueError(f"historical_verified requires report.{key}")
+        for row in rows:
+            if not all(key in row for key in (
+                "canonical_url", "visible", "pending_review", "post_url", "evidence_url", "evidence_gaps",
+            )):
+                raise ValueError("historical_verified requires explicit status, URLs and evidence_gaps on every row")
+        for item in coverage:
+            if not all(key in item for key in COMMERCE_COVERAGE_COUNTERS):
+                raise ValueError("historical_verified requires explicit coverage counts; use null for unverified counts")
+        normalized["evidence_mode"] = mode
+        normalized["evidence_source"] = {key: source[key] for key in ("execution_run_id", "review_run_id")}
+    elif "evidence_source" in raw:
+        raise ValueError("evidence_source requires historical_verified evidence_mode")
     if len(json.dumps(normalized, ensure_ascii=False, sort_keys=True)) > (
         MAX_REPORT_JSON_CHARS
     ):
@@ -325,7 +445,24 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
             "metadata.user_facing_report content_package assets must be a "
             "non-empty list for inline_with_attachment delivery"
         )
-    assets: list[dict[str, str]] = []
+    package_kind = str(raw.get("package_kind") or "").strip()
+    if package_kind and package_kind != FULL_PUBLICATION_PACKAGE_KIND:
+        raise ValueError(
+            "metadata.user_facing_report content_package package_kind is unsupported"
+        )
+    sections: dict[str, str] = {}
+    if package_kind == FULL_PUBLICATION_PACKAGE_KIND:
+        raw_sections = raw.get("sections")
+        if not isinstance(raw_sections, Mapping):
+            raise ValueError(
+                "metadata.user_facing_report full publication package requires sections"
+            )
+        sections = {
+            field: _required_text(raw_sections.get(field), f"sections.{field}")
+            for field in FULL_PUBLICATION_SECTION_FIELDS
+        }
+
+    assets: list[dict[str, Any]] = []
     seen_filenames: set[str] = set()
     for index, raw_asset in enumerate(raw_assets):
         if not isinstance(raw_asset, Mapping):
@@ -350,14 +487,70 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
                 f"metadata.user_facing_report assets[{index}].sha256 must be "
                 "64 lowercase hexadecimal characters"
             )
-        assets.append({
+        asset = {
             "filename": filename,
             "label": _required_text(
                 raw_asset.get("label"), f"assets[{index}].label"
             ),
             "path": path,
             "sha256": digest,
-        })
+        }
+        family = str(raw_asset.get("asset_family") or "").strip()
+        if family:
+            dimensions = raw_asset.get("dimensions")
+            match = re.fullmatch(
+                r"\s*([1-9][0-9]*)\s*[x×]\s*([1-9][0-9]*)\s*",
+                dimensions,
+                flags=re.IGNORECASE,
+            ) if isinstance(dimensions, str) else None
+            width = raw_asset.get("width")
+            height = raw_asset.get("height")
+            if match is not None:
+                parsed = (int(match.group(1)), int(match.group(2)))
+                if width is None and height is None:
+                    width, height = parsed
+                elif (width, height) != parsed:
+                    raise ValueError(
+                        f"metadata.user_facing_report assets[{index}] dimensions conflict"
+                    )
+            if (
+                isinstance(width, bool)
+                or isinstance(height, bool)
+                or not isinstance(width, int)
+                or not isinstance(height, int)
+                or width <= 0
+                or height <= 0
+            ):
+                raise ValueError(
+                    f"metadata.user_facing_report assets[{index}] family requires dimensions"
+                )
+            asset.update({
+                "asset_family": family,
+                "width": width,
+                "height": height,
+                "dimensions": f"{width}x{height}",
+            })
+        assets.append(asset)
+    if package_kind == FULL_PUBLICATION_PACKAGE_KIND:
+        by_family = {asset.get("asset_family"): asset for asset in assets}
+        if len(by_family) != len(assets) or set(by_family) != {"page_hero", "audio_brief"}:
+            raise ValueError(
+                "metadata.user_facing_report full publication package requires exactly "
+                "one page_hero and one audio_brief"
+            )
+        if (
+            by_family["page_hero"]["width"] * 9
+            != by_family["page_hero"]["height"] * 16
+            or by_family["audio_brief"]["width"]
+            != by_family["audio_brief"]["height"]
+        ):
+            raise ValueError(
+                "metadata.user_facing_report full publication package asset ratios are invalid"
+            )
+        if any(value not in body for value in sections.values()):
+            raise ValueError(
+                "metadata.user_facing_report full publication package body must contain every section"
+            )
     normalized = {
         "kind": CONTENT_PACKAGE_REPORT_KIND,
         "delivery": delivery,
@@ -369,6 +562,31 @@ def _normalize_content_package_report(raw: Mapping[str, Any]) -> dict[str, Any]:
     }
     if body_field:
         normalized["body_field"] = body_field
+    if package_kind:
+        normalized["package_kind"] = package_kind
+        normalized["sections"] = sections
+        receipts = raw.get("policy_receipts")
+        if not isinstance(receipts, list):
+            raise ValueError(
+                "metadata.user_facing_report full publication package requires policy_receipts"
+            )
+        if not all(
+            isinstance(receipt, Mapping)
+            and receipt.get("loaded") is True
+            and _required_text(receipt.get("policy_id"), "policy_receipts.policy_id")
+            and _required_text(receipt.get("version"), "policy_receipts.version")
+            and re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256") or ""))
+            for receipt in receipts
+        ):
+            raise ValueError(
+                "metadata.user_facing_report full publication package policy_receipts are invalid"
+            )
+        normalized["policy_receipts"] = [dict(receipt) for receipt in receipts]
+        if raw.get("external_effects") != []:
+            raise ValueError(
+                "metadata.user_facing_report full publication package requires external_effects=[]"
+            )
+        normalized["external_effects"] = []
     if len(json.dumps(normalized, ensure_ascii=False, sort_keys=True)) > (
         MAX_CONTENT_PACKAGE_JSON_CHARS
     ):
@@ -421,6 +639,7 @@ def delivery_contract_from_report(report: Any) -> dict[str, Any]:
         "subject_keys": [
             item["subject_key"] for item in normalized["coverage"]
         ],
+        **({"body_field": normalized["body_field"]} if normalized.get("body_field") else {}),
     }
 
 
@@ -456,6 +675,10 @@ def report_satisfies_user_facing_delivery(
             == {asset["filename"] for asset in normalized["assets"]}
             and bool(normalized["complete"])
         )
+    # Legacy commerce builders use body_field as a format discriminator and
+    # render rows directly. Bind the field when an explicit inline body exists.
+    if delivery_contract.get("body_field") and delivery_contract["body_field"] != normalized.get("body_field"):
+        return False
     requested_subjects = delivery_contract.get("subject_keys")
     if (
         delivery_contract.get("required") is not True
@@ -508,6 +731,10 @@ def report_matches_user_facing_delivery(
             and set(requested_assets)
             == {asset["filename"] for asset in normalized["assets"]}
         )
+    # Legacy commerce builders use body_field as a format discriminator and
+    # render rows directly. Bind the field when an explicit inline body exists.
+    if delivery_contract.get("body_field") and delivery_contract["body_field"] != normalized.get("body_field"):
+        return False
     requested_subjects = delivery_contract.get("subject_keys")
     if (
         delivery_contract.get("required") is not True
@@ -572,7 +799,10 @@ def render_user_facing_report_chunks(
     rows_by_subject: dict[str, list[dict[str, Any]]] = {}
     for row in normalized["rows"]:
         rows_by_subject.setdefault(row["subject_key"], []).append(row)
-    sections = [f"社團刊登狀態（截至 {normalized['as_of']}）"]
+    sections = []
+    if normalized.get("evidence_mode") == "historical_verified":
+        sections.append("歷史已驗收證據；本次未重新查核 Facebook，目前狀態未驗證。")
+    sections.append(f"社團刊登狀態（截至 {normalized['as_of']}）")
     for coverage in normalized["coverage"]:
         subject_rows = rows_by_subject.get(coverage["subject_key"], [])
         lines = [f"\n{coverage['subject_label']}"]
