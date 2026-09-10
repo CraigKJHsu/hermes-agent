@@ -5,7 +5,7 @@
   "route_snapshot": "v1/secondhand_commerce",
   "contract_schema_version": "1.0",
   "files": {
-    "v1/compiler.py": "b0a7d4eede1a19c1670e3baee12d5c517617bbdb11a88ac5696fa111c2758663",
+    "v1/compiler.py": "2ceea5a0a494bc478886967f44964e8de23bed612e6bc8fbfa9e62442cb641a8",
     "v1/contract.py": "7fb84519b1621d6e67b0e4e50b14089da4a1718bd5f462d95adedb18e209347b",
     "v1/domain.py": "e39fbf96d5eea36ddb131ac94cbdfabc475641828cb5c677f1a173c52a00ed90",
     "v1/preflight.py": "708f1961f85f5f58d8a889d1daa7e76de8f9de7d32ac541badab8a3076af121c",

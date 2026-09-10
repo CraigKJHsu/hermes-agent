@@ -843,5 +843,3 @@ def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         else "Grace session history only; not disclosed to ClawOps"
     )
     return safe
-
-

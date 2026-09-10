@@ -56,7 +56,9 @@ python scripts/shadow_behavior_profiles.py --output /absolute/new/output-directo
 
 Each of four representative fixtures runs through actual contract/compiler,
 SQLite tasks, review, Objective stages and callback handling under legacy and v1.
-The process denies network and subprocess execution. Compare decisions, review
+A CPython audit hook denies socket APIs (including UDP/DNS) and process APIs
+(including direct forks). This is a guard for the trusted Python replay, not an
+OS sandbox for hostile native code. Compare decisions, review
 outcomes, stages, packages, task states, approvals and external-effect counts.
 Pin metadata and compiled policy instructions intentionally differ. These are
 synthetic transport receipts: shadow does not claim real Grace/model execution,
