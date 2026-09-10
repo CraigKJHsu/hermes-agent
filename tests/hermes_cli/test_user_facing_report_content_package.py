@@ -158,7 +158,8 @@ def test_full_publication_package_fails_closed_when_manifest_is_incomplete(mutat
         normalize_user_facing_report(report)
 
 
-def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("versioned,empty_policy", [(False, False), (True, False), (True, True)])
+def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, monkeypatch, versioned, empty_policy):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()
     page = tmp_path / "page.png"
@@ -180,6 +181,21 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
         "thread_id": "4641",
         "project": "d-squared",
     }
+    behavior = {}
+    if versioned:
+        from proactive.behavior_profiles import registry as br
+        policy_registry.create_policy_version("full-package-test", "v1", "Pinned policy", owner_scope="topic", owner_id="fixture", activate=True)
+        policy_registry.bind_topic_policies("telegram:chat-1:4641/d-squared", [] if empty_policy else [{"policy_id": "full-package-test", "resolution": "latest_active"}])
+        with kb.connect_closing() as conn:
+            br.set_selection(conn, platform="telegram", chat_id="chat-1", thread_id="4641", project="d-squared", profile_id="ai_bizweek", version="v1", expected_revision=0, reason="Package test")
+            kb.create_grace_objective(conn, objective_id="go_package", platform="telegram", chat_id="chat-1", thread_id="4641", session_key="test", title="Package", objective="Package", original_request_sha256="a" * 64, required_stage_keys=["prepare"], terminal_stage_key="prepare", acceptance_criteria=["verified"], behavior_project="d-squared")
+            behavior = {"memory": {"namespace": "telegram:chat-1:4641/d-squared"}, "objective_ref": {"objective_id": "go_package"}, "behavior_pin": br.get_pin(conn, "go_package")}
+        review_receipts[0].pop("latest_active_verified")
+        review_receipts[0]["pinned_version_verified"] = True
+    if empty_policy:
+        report["policy_receipts"] = []
+        execution_receipts = []
+        review_receipts = []
     claim_sources = {}
     policy_validation_roles = []
     monkeypatch.setattr(
@@ -192,11 +208,11 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
         "policy_refs_from_task_body",
         lambda _body: [{"policy_id": "ai-bizweek-brand-channel"}],
     )
-    monkeypatch.setattr(
-        policy_registry,
-        "validate_policy_completion",
-        lambda _body, _metadata, *, role: policy_validation_roles.append(role),
-    )
+    def verify_policies(body, metadata, *, role):
+        policy_validation_roles.append(role)
+        if empty_policy:
+            br.validate_task_policy_completion(body, metadata, role)
+    monkeypatch.setattr(policy_registry, "validate_policy_completion", verify_policies)
     monkeypatch.setattr(
         model_routing,
         "execution_receipt_from_env",
@@ -209,10 +225,11 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
     )
 
     def contract_body(stage):
-        contract = {"identity": identity, "external_effect_budget": 0}
+        contract = {"identity": identity, "external_effect_budget": 0, **behavior}
         return (
             f"GRACE_LOOP_CONTRACT_STAGE: {stage}\n"
-            "HERMES_LOOP_CONTRACT:\n```json\n"
+            + ("GRACE_BEHAVIOR_PIN: " + json.dumps(contract) + "\n" if versioned else "")
+            + "HERMES_LOOP_CONTRACT:\n```json\n"
             f"{json.dumps(contract)}\n```"
         )
 
@@ -233,7 +250,7 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
         )
         assert kb.claim_task(conn, execution_id)
         assert kb.complete_task(conn, execution_id, metadata={
-            "loop_contract": {"identity": identity, "external_effect_budget": 0},
+            "loop_contract": {"identity": identity, "external_effect_budget": 0, **behavior},
             "user_facing_report": source_report,
             "policy_receipts": execution_receipts,
             "external_effects": [],
@@ -264,7 +281,7 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
             "review_task_body_sha256": hashlib.sha256(
                 contract_body("grace_review").encode("utf-8")
             ).hexdigest(),
-            "review_runtime_sha256": kb._REVIEW_RUNTIME_SHA256.hex(),
+            **kb._review_runtime_receipt(conn, review_id),
         }
         if bind_review:
             claim_sources[review_id] = review_source
@@ -307,6 +324,7 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
         Image.new("RGB", (800, 800)).save(wrong_size)
         wrong_size_report = _full_publication_report()
         wrong_size_report["complete"] = True
+        wrong_size_report["policy_receipts"] = execution_receipts
         wrong_size_report["assets"][0].update(
             path=str(wrong_size),
             sha256=hashlib.sha256(wrong_size.read_bytes()).hexdigest(),
@@ -363,6 +381,12 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
             size=added.stat().st_size,
         )
 
+        if versioned:
+            # Installing another profile changes the process source inventory,
+            # while this accepted package retains its own immutable provenance.
+            changed_process = hashlib.sha256(b"another profile installed").digest()
+            monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SHA256", changed_process)
+            monkeypatch.setattr(kb, "_review_runtime_digest", lambda: changed_process)
         selected = kb.accepted_full_publication_package(
             conn,
             execution_task_id=full_execution,

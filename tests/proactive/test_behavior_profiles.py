@@ -1,0 +1,424 @@
+"""Version pins exercise real SQLite, policy files, validator and compiler paths."""
+from copy import deepcopy
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from proactive.behavior_profiles import registry as br
+from proactive.grace_task_compiler import render_execution_body, render_review_body
+from proactive.loop_contract import validate_loop_contract
+from proactive.policy_registry import (
+    bind_topic_policies, create_policy_version, resolve_task_policy_snapshots,
+    validate_policy_completion,
+)
+from scripts.replay_behavior_observation import load_cases, make_contract, replay_case
+
+
+def setup_objective(project="ai_bizweek", *, enabled=True, oid="go_profile", project_namespace=None):
+    case = load_cases()["cases"][0 if project == "ai_bizweek" else 2]
+    contract = make_contract(load_cases(), case)
+    contract["objective_ref"]["objective_id"] = oid
+    identity = contract["identity"]
+    project_namespace = project_namespace or project
+    identity["project"] = project_namespace
+    namespace = f"telegram:{identity['chat_id']}:{identity['thread_id']}/{project_namespace}"
+    contract["memory"]["namespace"] = namespace
+    create_policy_version(project + "-policy", "v1", "Original complete policy", owner_scope="topic",
+                          owner_id=project, activate=True)
+    bind_topic_policies(namespace, [{"policy_id": project + "-policy", "resolution": "latest_active"}])
+    with kb.connect_closing() as conn:
+        if enabled:
+            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"],
+                             thread_id=identity["thread_id"], project=project_namespace, profile_id=project,
+                             version="v1", expected_revision=0, reason="Local canary")
+        kb.create_grace_objective(conn, objective_id=oid, platform="telegram", chat_id=identity["chat_id"],
+                                  thread_id=identity["thread_id"], session_key="fixture", title="fixture",
+                                  objective="fixture", original_request_sha256="a" * 64,
+                                  required_stage_keys=["prepare", "publish"], terminal_stage_key="publish",
+                                  acceptance_criteria=["verified"], behavior_project=project_namespace)
+        return br.bind_contract(conn, contract)
+
+
+@pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
+def test_pin_survives_policy_activation_and_uses_actual_versioned_compiler(project):
+    contract = setup_objective(project)
+    normalized = validate_loop_contract(contract)
+    before = render_execution_body(normalized)
+    create_policy_version(project + "-policy", "v2", "Changed complete policy", owner_scope="topic",
+                          owner_id=project, activate=True, expected_active_version="v1")
+    assert validate_loop_contract(normalized) == normalized
+    assert render_execution_body(normalized) == before
+    loaded = resolve_task_policy_snapshots(before)
+    assert loaded["policies"][0]["content"] == "Original complete policy"
+    receipt = {**{k: loaded["policies"][0][k] for k in ("policy_id", "version", "sha256")},
+               "role": "review", "loaded": True, "pinned_version_verified": True}
+    validate_policy_completion(render_review_body(normalized, "t_parent"), {"policy_receipts": [receipt]}, role="review")
+    assert br.implementation(normalized, "compiler").__name__.endswith(".v1.compiler")
+
+
+def test_contract_cannot_remove_or_replace_pin_or_change_topic():
+    contract = setup_objective()
+    for edit in (lambda c: c.pop("behavior_pin"),
+                 lambda c: c["behavior_pin"].update(behavior_profile_version="v99"),
+                 lambda c: c["identity"].update(thread_id="elsewhere")):
+        altered = deepcopy(contract)
+        edit(altered)
+        with pytest.raises(br.BehaviorProfileError):
+            validate_loop_contract(altered)
+
+
+def test_disabling_canary_does_not_relabel_existing_objective():
+    contract = setup_objective()
+    identity = contract["identity"]
+    with kb.connect_closing() as conn:
+        before = br.get_pin(conn, "go_profile")
+        br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"],
+                         thread_id=identity["thread_id"], project="ai_bizweek", profile_id=None,
+                         version=None, expected_revision=1, reason="Rollback new admissions")
+        assert br.get_pin(conn, "go_profile") == before
+        with pytest.raises(br.BehaviorProfileError, match="selection_cas"):
+            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"],
+                             thread_id=identity["thread_id"], project="ai_bizweek", profile_id=None,
+                             version=None, expected_revision=1, reason="Stale concurrent operator")
+    assert validate_loop_contract(contract)["behavior_pin"] == before
+
+
+def test_legacy_objective_remains_unpinned():
+    contract = setup_objective(enabled=False)
+    assert "behavior_pin" not in contract
+    with kb.connect_closing() as conn:
+        assert br.get_pin(conn, "go_profile") is None
+    assert "behavior_pin" not in validate_loop_contract(contract)
+
+
+def test_migration_cas_and_rollback_keep_history_and_reject_old_task_generation():
+    contract = setup_objective()
+    normalized = validate_loop_contract(contract)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="old generation", body=render_execution_body(normalized))
+        kb.block_task(conn, task_id, reason="Paused for migration", kind="needs_input")
+        saved_body = kb.get_task(conn, task_id).body
+        pin = br.get_pin(conn, "go_profile")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"],
+                    thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1",
+                    expected_revision=1, expected_pin_hash=br.digest(pin), reason="Explicit compatibility checkpoint")
+        preview = br.migrate_objective(conn, **spec)
+        assert preview["applied"] is False
+        assert br.get_pin(conn, "go_profile") == pin
+        result = br.migrate_objective(conn, **spec, apply=True)
+        assert result["next_pin"]["generation"] == 2
+        assert kb.get_task(conn, task_id).body == saved_body
+        assert resolve_task_policy_snapshots(saved_body)["policies"][0]["content"] == "Original complete policy"
+        with pytest.raises(br.BehaviorProfileError):
+            br.validate_task_policy_completion(saved_body, {"policy_receipts": []}, "execution")
+        with pytest.raises(br.BehaviorProfileError):
+            kb.claim_task(conn, task_id)
+        with pytest.raises(br.BehaviorProfileError, match="migration_cas"):
+            br.migrate_objective(conn, **spec, apply=True)
+        restored = br.migrate_objective(conn, **{**spec, "expected_revision": 2,
+            "expected_pin_hash": br.digest(result["next_pin"]), "rollback_generation": 2}, apply=True)
+        assert restored["next_pin"]["generation"] == 3
+        assert restored["next_pin"]["policy_snapshot_hash"] == pin["policy_snapshot_hash"]
+        assert conn.execute("SELECT count(*) FROM grace_behavior_migrations").fetchone()[0] == 2
+        assert conn.execute("SELECT count(*) FROM task_external_effects").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("case", load_cases()["cases"], ids=lambda case: case["id"])
+def test_profile_full_local_replay_preserves_decision_stage_and_package(tmp_path, case):
+    fixture = load_cases()
+    legacy = replay_case(fixture, case, tmp_path / "legacy.db")
+    pinned = replay_case(fixture, case, tmp_path / "pinned.db", behavior_version="v1")
+    for key in ("decision", "review_outcome", "objective", "stages", "callback", "package",
+                "task_states", "external_effect_count", "successor_task_count", "approval_states"):
+        assert pinned.get(key) == legacy.get(key), key
+    if "normalized_contract" in pinned:
+        assert pinned["normalized_contract"]["behavior_pin"]["behavior_profile_id"] == case["project"]
+
+
+def test_secondhand_v2_route_change_does_not_change_ai_bizweek_replay(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import shutil
+    import yaml
+
+    fixture = load_cases()
+    case = fixture["cases"][0]
+    before = replay_case(fixture, case, tmp_path / "before.db", behavior_version="v1")
+    catalog = tmp_path / "catalog"
+    shutil.copytree(br.ROOT, catalog)
+    monkeypatch.setattr(br, "ROOT", catalog)
+    manifest = json.loads((catalog / "secondhand_commerce@v1.json").read_text())
+    old_routes = manifest["route_snapshot"]
+    new_routes = "v2/secondhand_commerce"
+    shutil.copytree(catalog / old_routes, catalog / new_routes)
+    route_path = catalog / new_routes / "routing-rules.yaml"
+    rules = yaml.safe_load(route_path.read_text())
+    rules["worker_routes"] = [r for r in rules["worker_routes"] if r.get("match", {}).get("task_type") != "facebook_marketplace_readonly"]
+    route_path.write_text(yaml.safe_dump(rules, allow_unicode=True))
+    manifest.update(version="v2", route_snapshot=new_routes)
+    for name in ("routing-rules.yaml", "agent-registry.yaml"):
+        del manifest["files"][old_routes + "/" + name]
+        manifest["files"][new_routes + "/" + name] = hashlib.sha256((catalog / new_routes / name).read_bytes()).hexdigest()
+    (catalog / "secondhand_commerce@v2.json").write_text(json.dumps(manifest))
+    contract = setup_objective("secondhand_commerce")
+    normalized = validate_loop_contract(contract)
+    routing = br.implementation(normalized, "routing")
+    before_route = routing.route_clawops_objective("Read listing", task_type="facebook_marketplace_readonly", hub_ops_dir=br.route_directory(normalized))
+    with kb.connect_closing() as conn:
+        pin = br.get_pin(conn, "go_profile")
+        br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="secondhand_commerce", version="v2", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Test changed route", apply=True)
+        contract.pop("behavior_pin")
+        candidate = br.bind_contract(conn, contract)
+    after_route = routing.route_clawops_objective("Read listing", task_type="facebook_marketplace_readonly", hub_ops_dir=br.route_directory(candidate))
+    assert "Unsupported task_type" in str(after_route)
+    assert "Unsupported task_type" not in str(before_route)
+    # Preserve the same input binding bytes; rebinding changes its timestamp hash.
+    monkeypatch.setattr("proactive.policy_registry.bind_topic_policies", lambda *a, **k: None)
+    after = replay_case(fixture, case, tmp_path / "after.db", behavior_version="v1")
+    assert after == before
+
+
+def test_migration_refuses_unfinished_card_before_delegation_link():
+    contract = setup_objective()
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="Pending pinned work", body=render_execution_body(validate_loop_contract(contract)))
+        pin = br.get_pin(conn, "go_profile")
+        with pytest.raises(br.BehaviorProfileError, match="migration_inflight"):
+            br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Cannot bypass unfinished work", apply=True)
+        assert br.get_pin(conn, "go_profile") == pin
+        assert conn.execute("SELECT count(*) FROM grace_behavior_migrations").fetchone()[0] == 0
+
+
+def test_changed_profile_bytes_block_existing_pin(tmp_path, monkeypatch):
+    import shutil
+    contract = setup_objective()
+    catalog = tmp_path / "catalog"
+    shutil.copytree(br.ROOT, catalog)
+    monkeypatch.setattr(br, "ROOT", catalog)
+    (catalog / "v1" / "contract.py").write_text("# incompatible replacement\n")
+    with pytest.raises(br.BehaviorProfileError, match="bundle_changed"):
+        validate_loop_contract(contract)
+
+
+def test_real_ai_namespace_is_bound_separately_from_business_profile():
+    namespace = "telegram_1003938559457_4641_bff429b6e587"
+    contract = setup_objective(project_namespace=namespace)
+    normalized = validate_loop_contract(contract)
+    assert normalized["identity"]["project"] == namespace
+    assert normalized["behavior_pin"]["behavior_profile_id"] == "ai_bizweek"
+    assert normalized["behavior_pin"]["project_namespace"] == namespace
+    assert br.implementation(normalized, "compiler").__name__.endswith(".v1.compiler")
+    saved_body = render_execution_body(normalized)
+    with kb.connect_closing() as conn:
+        pin = br.get_pin(conn, "go_profile")
+        result = br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Preserve actual project namespace", apply=True)
+        assert result["next_pin"]["project_namespace"] == namespace
+    assert resolve_task_policy_snapshots(saved_body)["policies"][0]["content"] == "Original complete policy"
+    wrong = deepcopy(contract)
+    wrong.pop("behavior_pin")
+    wrong["identity"]["project"] = "ai_bizweek"
+    with pytest.raises(br.BehaviorProfileError, match="project_mismatch"):
+        br.attach_contract(wrong)
+
+
+def test_migration_cli_preview_is_read_only(tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+    from hermes_cli.behavior_profiles import main
+
+    contract = setup_objective()
+    with kb.connect_closing() as conn:
+        pin = br.get_pin(conn, "go_profile")
+    spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Read-only CLI preview")
+    path = tmp_path / "migration.json"
+    path.write_text(json.dumps(spec))
+    monkeypatch.setattr(sys, "argv", ["behavior_profiles", "migrate", str(path)])
+    main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["applied"] is False
+    with kb.connect_closing() as conn:
+        assert br.get_pin(conn, "go_profile") == pin
+        assert kb.get_grace_objective(conn, "go_profile")["revision"] == 1
+        assert conn.execute("SELECT count(*) FROM grace_behavior_migrations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+def test_disabled_bridge_rejects_even_when_tool_names_are_present(tmp_path, monkeypatch, versioned):
+    import json
+    from proactive import hubops_routing
+
+    routing = br.implementation(setup_objective(), "routing") if versioned else hubops_routing
+    home = tmp_path / "bridge-home"
+    config_dir = home / ".openclaw"
+    config_dir.mkdir(parents=True)
+    required = ["facebook_page_graph_status", "facebook_page_graph_publish"]
+    (config_dir / "openclaw.json").write_text(json.dumps({
+        "agents": {"list": [{"id": routing.OPENCLAW_FACEBOOK_PAGE_PROFILE, "tools": {"allow": required}}]},
+        "plugins": {"entries": {"hermes-bridge": {"enabled": False, "config": {"allowedTools": required}}}},
+    }))
+    monkeypatch.setenv("HOME", str(home))
+    probe = routing._probe_openclaw_facebook_page_tools(set(required))
+    assert probe["available_tools"] == sorted(required)
+    assert probe["ok"] is False
+    result = routing.route_clawops_objective("Read reviewed page package", project="ai_bizweek", task_type="facebook_page_api_publish", approved=True, hub_ops_dir=br.ROOT / "v1" / "ai_bizweek")
+    assert result["status"] == "blocked"
+    assert "bridge plugin is disabled" in str(result)
+
+
+def test_failed_birth_pin_rolls_back_the_objective(monkeypatch):
+    def unavailable(*args):
+        raise br.BehaviorProfileError("policy unavailable")
+    monkeypatch.setattr(br, "_policy_snapshot", unavailable)
+    with pytest.raises(br.BehaviorProfileError, match="policy unavailable"):
+        setup_objective()
+    with kb.connect_closing() as conn:
+        assert kb.get_grace_objective(conn, "go_profile") is None
+        assert br.get_pin(conn, "go_profile") is None
+        assert conn.execute("SELECT count(*) FROM grace_objective_stages").fetchone()[0] == 0
+
+
+def test_legacy_migration_requires_explicit_current_policy_and_project():
+    contract = setup_objective(enabled=False)
+    with kb.connect_closing() as conn:
+        original = kb.get_grace_objective(conn, "go_profile")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(None), reason="Explicit legacy adoption")
+        with pytest.raises(br.BehaviorProfileError, match="legacy_policy_unknown"):
+            br.migrate_objective(conn, **spec, apply=True)
+        with pytest.raises(br.BehaviorProfileError, match="migration_project_unknown"):
+            br.migrate_objective(conn, **spec, policy_mode="current", apply=True)
+        assert br.get_pin(conn, "go_profile") is None
+        result = br.migrate_objective(conn, **spec, policy_mode="current", project_namespace="ai_bizweek", apply=True)
+        assert result["previous_pin"] is None
+        assert result["next_pin"]["generation"] == 1
+        now = kb.get_grace_objective(conn, "go_profile")
+        for key in ("current_stage_key", "status", "objective", "original_request_sha256"):
+            assert now[key] == original[key]
+        assert conn.execute("SELECT previous_pin FROM grace_behavior_migrations").fetchone()[0] is None
+
+
+@pytest.mark.parametrize("initially_pinned", [False, True])
+def test_idempotent_objective_reuse_never_rebinds(initially_pinned):
+    contract = setup_objective(enabled=initially_pinned)
+    identity = contract["identity"]
+    with kb.connect_closing() as conn:
+        before = kb.get_grace_objective(conn, "go_profile")
+        pin = br.get_pin(conn, "go_profile")
+        if not initially_pinned:
+            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], project="ai_bizweek", profile_id="ai_bizweek", version="v1", expected_revision=0, reason="Enable after this legacy Objective already exists")
+        reused = kb.create_grace_objective(conn, objective_id="go_profile", platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], session_key="fixture", title="fixture", objective="fixture", original_request_sha256="a" * 64, required_stage_keys=["prepare", "publish"], terminal_stage_key="publish", acceptance_criteria=["verified"], behavior_project="ai_bizweek")
+        assert reused == before
+        assert br.get_pin(conn, "go_profile") == pin
+
+
+def test_generated_commerce_namespace_uses_pinned_business_route():
+    from proactive.hubops_routing import route_clawops_objective
+
+    namespace = "telegram_generated_commerce_namespace"
+    contract = setup_objective("secondhand_commerce", project_namespace=namespace)
+    routed = route_clawops_objective("Prepare scoped commerce work", project=namespace, task_type="facebook_marketplace_group_publish", approved=True, behavior_contract=contract)
+    assert routed["status"] == "routed"
+    assert routed["project"] == namespace
+    assert routed["agent_assignment"]["assigned_agent"] == "secondhand_commerce"
+    with pytest.raises(br.BehaviorProfileError, match="routing_project_mismatch"):
+        route_clawops_objective("Mismatched routing identity", project="secondhand_commerce", behavior_contract=contract)
+
+
+@pytest.mark.parametrize("initially_pinned", [False, True])
+@pytest.mark.parametrize("operation", ["plan", "request_plan"])
+def test_workflow_dispatch_holds_off_concurrent_migration(monkeypatch, initially_pinned, operation):
+    import sqlite3
+    from contextlib import closing
+    from hermes_cli import objective_workflow as workflow
+
+    contract = setup_objective(enabled=initially_pinned)
+    original = br.workflow_implementation
+    observations = []
+    def checked_dispatch(conn, objective_id):
+        implementation = original(conn, objective_id)
+        # A second connection cannot start the write transaction required by
+        # migration between selecting a behavior and executing its operation.
+        with closing(sqlite3.connect(kb.kanban_db_path(), timeout=0)) as competitor:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                competitor.execute("BEGIN IMMEDIATE")
+        observations.append(objective_id)
+        return implementation
+    monkeypatch.setattr(br, "workflow_implementation", checked_dispatch)
+    specification = dict(objective_id="go_profile", expected_revision=1, platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], required_stage_keys=["prepare", "extra", "publish"], current_stage_key="extra", reason="Check dispatch/migration serialization")
+    with kb.connect_closing() as conn:
+        before = br.get_pin(conn, "go_profile")
+        if operation == "plan":
+            workflow.plan(conn, **specification)
+            assert kb.get_grace_objective(conn, "go_profile")["revision"] == 2
+        else:
+            with pytest.raises(ValueError, match="active objective execution"):
+                workflow.request_plan(conn, origin_execution_task_id="missing", **specification)
+            assert kb.get_grace_objective(conn, "go_profile")["revision"] == 1
+        assert br.get_pin(conn, "go_profile") == before
+    assert observations
+
+
+def test_generated_ai_namespace_keeps_business_requirements():
+    contract = setup_objective(project_namespace="opaque_123")
+    body = render_execution_body(validate_loop_contract(contract))
+    assert "Page Hero must be exact 16:9" in body
+    domain = br.implementation(contract, "domain")
+    generic = deepcopy(contract)
+    generic["goal"]["objective"] = "Prepare the deliverable"
+    generic["identity"].pop("topic_name", None)
+    generic["routing"]["task_type"] = "generic"
+    assert "ai_bizweek" in domain._contract_text(generic)
+    assert domain.infer_builtin_domain_memory(generic)
+
+
+def test_named_board_is_persisted_before_dispatch(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.create_board("profile-test")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "profile-test")
+    contract = setup_objective()
+    assert contract["identity"]["board"] == "profile-test"
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    assert validate_loop_contract(contract)["behavior_pin"] == contract["behavior_pin"]
+
+
+def test_preupgrade_migration_preview_needs_no_schema_write():
+    contract = setup_objective(enabled=False)
+    with kb.connect_closing() as conn:
+        conn.execute("DROP TABLE grace_objective_behavior_pins")
+        conn.execute("DROP TABLE grace_behavior_migrations")
+        conn.execute("DROP TABLE grace_behavior_selections")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(None), reason="Preview legacy adoption", policy_mode="current", project_namespace="ai_bizweek")
+        conn.execute("PRAGMA query_only=ON")
+        assert br.migrate_objective(conn, **spec)["applied"] is False
+        with pytest.raises(br.BehaviorProfileError, match="rollback_target_unavailable"):
+            br.migrate_objective(conn, **spec, rollback_generation=1)
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='grace_objective_behavior_pins'").fetchone()
+
+
+def test_catalog_install_requires_restart_then_preserves_pinned_review_auth(tmp_path, monkeypatch):
+    import json
+    contract = setup_objective()
+    catalog = tmp_path / "process-catalog"
+    catalog.mkdir()
+    monkeypatch.setattr(kb, "_behavior_root", catalog)
+    monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SHA256", kb._review_runtime_digest())
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="Pinned auth", body=render_execution_body(contract))
+        claimed = kb.claim_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        receipt = kb._review_runtime_receipt(conn, task_id)
+        metadata = dict(run.metadata or {}, workflow_review_source=receipt)
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run.id))
+        auth = dict(task_id=task_id, run_id=str(run.id), claim_lock=claimed.claim_lock, worker_auth_token=claimed.worker_auth_token)
+        assert kb.validate_kanban_worker_auth(conn, **auth)
+        (catalog / "new-profile.json").write_text('{}')
+        with pytest.raises(br.BehaviorProfileError, match="runtime_reload_required"):
+            kb.validate_kanban_worker_auth(conn, **auth)
+        # Model a fresh process importing the expanded catalog. The selected
+        # profile/kernel/policy remain identical across that restart.
+        monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SHA256", kb._review_runtime_digest())
+        assert kb._review_runtime_receipt(conn, task_id) == receipt
+        assert kb.validate_kanban_worker_auth(conn, **auth)
+        metadata['workflow_review_source'] = {**receipt, 'review_runtime_sha256': '0' * 64}
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run.id))
+        with pytest.raises(kb.WorkerAuthorizationError):
+            kb.validate_kanban_worker_auth(conn, **auth)

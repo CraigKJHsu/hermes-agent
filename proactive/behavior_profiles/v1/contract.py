@@ -9,8 +9,9 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 from proactive.behavior_observation import emit, observe_contract
-from proactive.policy_registry import PolicyRegistryError, resolve_contract_policies
-from proactive.domain_memory import (
+from proactive.policy_registry import PolicyRegistryError
+from proactive.behavior_profiles.registry import resolve_pinned_policies as resolve_contract_policies
+from .domain import (
     DomainMemoryError,
     attach_domain_memory_contract,
 )
@@ -88,8 +89,7 @@ _FACEBOOK_GROUP_CANONICAL_URL_RE = re.compile(
 )
 
 
-class LoopContractError(ValueError):
-    """Raised when Grace has not supplied an executable contract."""
+from proactive.loop_contract import LoopContractError
 
 
 def is_internal_only_target(value: object) -> bool:
@@ -423,10 +423,6 @@ def contract_fingerprint(contract: Mapping[str, Any]) -> str:
 @observe_contract("loop_contract.validate", phase="contract")
 def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Return a normalized contract or reject it before a task is created."""
-    from proactive.behavior_profiles.registry import implementation
-    behavior = implementation(contract, "contract")
-    if behavior is not None:
-        return behavior.validate_loop_contract(contract)
     try:
         value = attach_domain_memory_contract(
             resolve_contract_policies(contract)
@@ -467,7 +463,7 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         }
     errors: list[str] = []
     if value.get("evidence_contract") is not None:
-        from hermes_cli.facebook_group_preflight import requested
+        from .preflight import requested
 
         try:
             requested(value)

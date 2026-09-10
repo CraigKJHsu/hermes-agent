@@ -1574,6 +1574,7 @@ def _ensure_loop_contract_routing(
         risk_level=risk_level,
         approved=True,
         contract_fingerprint=contract_fingerprint(normalized),
+        **({"behavior_contract": normalized} if normalized.get("behavior_pin") else {}),
     )
     if preview.get("status") != "routed":
         return normalized

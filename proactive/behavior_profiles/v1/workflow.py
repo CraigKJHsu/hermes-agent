@@ -46,7 +46,7 @@ def configuration(conn, objective_id):
 
 def _history_reference(conn, objective, project, listing_id, reference):
     """Pin legacy evidence without rewriting old contracts or granting permission."""
-    from hermes_cli.grace_review_metadata import grace_review_accepted
+    from .review import grace_review_accepted
 
     execution_id = reference["execution_task_id"]
     review_id = reference["review_task_id"]
@@ -98,21 +98,16 @@ def plan(conn, *, objective_id, expected_revision, platform, chat_id, thread_id,
          title=None, workflow=None, next_action=None,
          _excluding_delegation_id=""):
     """Add/reorder planned stages atomically, retaining all bound and finished work."""
+    stages = list(required_stage_keys)
+    # current_stage_key is the operator's intended resume point, not a claim
+    # that predecessors have completed. Repair stages may still await review;
+    # planning does not dispatch or change their status. Closure checks every
+    # required stage separately, so this cursor cannot bypass acceptance.
+    if (not stages or any(not isinstance(s, str) or not s.strip() for s in stages)
+            or len(set(stages)) != len(stages) or current_stage_key not in stages
+            or not str(reason).strip()):
+        raise ValueError("Plan requires unique stages, a declared current stage, and a reason")
     with kb.write_txn(conn):
-        # Select behavior while holding the same lock as its durable writes.
-        from proactive.behavior_profiles.registry import workflow_implementation
-        behavior = workflow_implementation(conn, objective_id)
-        if behavior is not None:
-            return behavior.plan(conn, objective_id=objective_id, expected_revision=expected_revision, platform=platform, chat_id=chat_id, thread_id=thread_id, required_stage_keys=required_stage_keys, current_stage_key=current_stage_key, reason=reason, acceptance_criteria=acceptance_criteria, title=title, workflow=workflow, next_action=next_action, _excluding_delegation_id=_excluding_delegation_id)
-        stages = list(required_stage_keys)
-        # current_stage_key is the operator's intended resume point, not a claim
-        # that predecessors have completed. Repair stages may still await review;
-        # planning does not dispatch or change their status. Closure checks every
-        # required stage separately, so this cursor cannot bypass acceptance.
-        if (not stages or any(not isinstance(s, str) or not s.strip() for s in stages)
-                or len(set(stages)) != len(stages) or current_stage_key not in stages
-                or not str(reason).strip()):
-            raise ValueError("Plan requires unique stages, a declared current stage, and a reason")
         objective = kb.get_grace_objective(conn, objective_id)
         if not objective or objective["status"] not in kb._ACTIVE_GRACE_OBJECTIVE_STATUSES:
             raise ValueError("Objective is unknown or inactive")
@@ -259,32 +254,27 @@ def plan(conn, *, objective_id, expected_revision, platform, chat_id, thread_id,
 
 def request_plan(conn, *, origin_execution_task_id, **specification):
     """Record a self-planner's proposal for application after exact review."""
+    allowed_fields = {
+        "objective_id", "expected_revision", "platform", "chat_id", "thread_id",
+        "required_stage_keys", "current_stage_key", "reason", "acceptance_criteria",
+        "title", "workflow", "next_action",
+    }
+    unsupported = set(specification) - allowed_fields
+    if unsupported:
+        raise ValueError(
+            "Deferred plan contains unsupported fields: "
+            + ", ".join(sorted(str(key) for key in unsupported))
+        )
+    objective_id = str(specification.get("objective_id") or "").strip()
+    execution_task_id = str(origin_execution_task_id or "").strip()
+    if not objective_id or not execution_task_id:
+        raise ValueError("Deferred plan requires objective and execution task IDs")
+    expected_revision = specification.get("expected_revision")
+    if type(expected_revision) is not int:
+        raise ValueError("Deferred plan expected_revision must be an integer")
+    encoded = json.dumps(specification, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
     with kb.write_txn(conn):
-        # Select behavior while holding the same lock as its durable writes.
-        from proactive.behavior_profiles.registry import workflow_implementation
-        behavior = workflow_implementation(conn, specification.get("objective_id"))
-        if behavior is not None:
-            return behavior.request_plan(conn, origin_execution_task_id=origin_execution_task_id, **specification)
-        allowed_fields = {
-            "objective_id", "expected_revision", "platform", "chat_id", "thread_id",
-            "required_stage_keys", "current_stage_key", "reason", "acceptance_criteria",
-            "title", "workflow", "next_action",
-        }
-        unsupported = set(specification) - allowed_fields
-        if unsupported:
-            raise ValueError(
-                "Deferred plan contains unsupported fields: "
-                + ", ".join(sorted(str(key) for key in unsupported))
-            )
-        objective_id = str(specification.get("objective_id") or "").strip()
-        execution_task_id = str(origin_execution_task_id or "").strip()
-        if not objective_id or not execution_task_id:
-            raise ValueError("Deferred plan requires objective and execution task IDs")
-        expected_revision = specification.get("expected_revision")
-        if type(expected_revision) is not int:
-            raise ValueError("Deferred plan expected_revision must be an integer")
-        encoded = json.dumps(specification, ensure_ascii=False, sort_keys=True,
-                             separators=(",", ":"))
         objective = kb.get_grace_objective(conn, objective_id)
         delegation = conn.execute(
             "SELECT * FROM grace_delegations WHERE objective_id=? "
@@ -374,7 +364,7 @@ def apply_reviewed_plan_request(conn, *, review_task_id, review_run_id):
         if (not review or review.task_id != delegation["review_task_id"]
                 or review.outcome != "completed"):
             return None
-        from hermes_cli.grace_review_metadata import grace_review_accepted
+        from .review import grace_review_accepted
         evidence = (review.metadata or {}).get("evidence") or {}
         execution_run_id = evidence.get("parent_execution_run_id")
         if (not grace_review_accepted(review.metadata)
@@ -457,7 +447,7 @@ def _accepted_execution_runs(conn, objective_id, task_id):
     # Task status describes its latest attempt, not every historical run. A new
     # attempt cannot revoke an older accepted run; a newer review explicitly
     # bound to that same run supersedes its prior verdict below.
-    from hermes_cli.grace_review_metadata import (
+    from .review import (
         grace_review_accepted,
         grace_review_rejected,
     )
@@ -574,10 +564,6 @@ def _readonly_contract_scope(contract, listing_id, group_id=None, group_alias=No
 
 def progress(conn, objective_id):
     """Project durable effects; candidate/Join counts can never close publication."""
-    from proactive.behavior_profiles.registry import workflow_implementation
-    behavior = workflow_implementation(conn, objective_id)
-    if behavior is not None:
-        return behavior.progress(conn, objective_id)
     spec = configuration(conn, objective_id)
     if spec is None:
         return None
@@ -749,11 +735,7 @@ def progress(conn, objective_id):
 
 def resolve_preflight(conn, contract):
     """Resolve an accepted preflight into the only writable UI route it proved."""
-    from proactive.behavior_profiles.registry import workflow_implementation
-    behavior = workflow_implementation(conn, (contract.get("objective_ref") or {}).get("objective_id"))
-    if behavior is not None:
-        return behavior.resolve_preflight(conn, contract)
-    from hermes_cli.grace_review_metadata import grace_review_accepted
+    from .review import grace_review_accepted
 
     publish = dict(contract.get("facebook_group_publish") or {})
     if publish.get("mode") != "accepted_preflight":
@@ -827,7 +809,7 @@ def resolve_preflight(conn, contract):
             "Accepted group preflight requires controller-pinned workflow review source"
         )
     source_contract = (execution_run.metadata or {}).get("loop_contract") or {}
-    from hermes_cli.facebook_group_preflight import requested as preflight_requested
+    from .preflight import requested as preflight_requested
 
     try:
         source_requested_preflight = preflight_requested(source_contract)
@@ -874,7 +856,7 @@ def resolve_preflight(conn, contract):
             "Accepted group preflight did not prove a zero-effect List in more places route"
         )
     listing_id = str(publish.get("source_listing_id") or "").strip()
-    from hermes_cli.facebook_group_preflight import validate as validate_preflight
+    from .preflight import validate as validate_preflight
 
     rows = validate_preflight(evidence, started_at=execution_run.started_at,
                               ended_at=execution_run.ended_at, listing_id=listing_id)
@@ -940,10 +922,6 @@ def resolve_preflight(conn, contract):
 
 def validate_publication(conn, contract):
     """Reject stale/repeated publication before approval or task admission."""
-    from proactive.behavior_profiles.registry import workflow_implementation
-    behavior = workflow_implementation(conn, (contract.get("objective_ref") or {}).get("objective_id"))
-    if behavior is not None:
-        return behavior.validate_publication(conn, contract)
     publish = contract.get("facebook_group_publish")
     if not publish:
         return

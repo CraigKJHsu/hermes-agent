@@ -58,7 +58,14 @@ def complete_fixture_review(conn, review_id, case, run_id):
                                 expected_run_id=run_id)
 
 
-def replay_case(fixture, case, db_path):
+def replay_case(fixture, case, db_path, *, behavior_version=None):
+    if behavior_version is None:
+        return _replay_case(fixture, case, db_path)
+    with patch.dict(os.environ, {"HERMES_KANBAN_DB": str(db_path)}):
+        return _replay_case(fixture, case, db_path, behavior_version=behavior_version)
+
+
+def _replay_case(fixture, case, db_path, *, behavior_version=None):
     from hermes_cli import kanban_db as kb
     from proactive.grace_task_compiler import render_execution_body, render_review_body
     from proactive.hubops_routing import _match_worker_route
@@ -69,13 +76,22 @@ def replay_case(fixture, case, db_path):
     scope = dict(platform="telegram", chat_id="fixture-chat", thread_id=case["thread_id"])
     session_key = f"agent:main:telegram:fixture-chat:{case['thread_id']}"
     with kb.connect_closing(db_path) as conn:
+        if behavior_version is not None:
+            from proactive.behavior_profiles import registry as br
+            from proactive.policy_registry import bind_topic_policies
+            bind_topic_policies(contract["memory"]["namespace"], [])
+            br.set_selection(conn, **scope, project=case["project"], profile_id=case["project"],
+                             version=behavior_version, expected_revision=0, reason="Isolated replay")
         kb.create_grace_objective(
             conn, objective_id=objective_id, **scope, session_key=session_key,
             title=case["id"], objective=contract["goal"]["objective"],
             original_request_sha256=hashlib.sha256(contract["original_request"].encode()).hexdigest(),
             required_stage_keys=["prepare", "publish"], terminal_stage_key="publish",
             acceptance_criteria=["Reviewed package and separately authorized publication"],
+            **({"behavior_project": case["project"]} if behavior_version is not None else {}),
         )
+        if behavior_version is not None:
+            contract = br.bind_contract(conn, contract)
         try:
             normalized = validate_loop_contract(contract)
         except LoopContractError as exc:

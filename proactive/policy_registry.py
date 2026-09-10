@@ -507,6 +507,10 @@ def resolve_topic_policies_for_scope(
 
 def resolve_task_policy_snapshots(task_body: str) -> dict[str, Any]:
     """Resolve and verify the immutable policy refs pinned into a task body."""
+    from proactive.behavior_profiles.registry import task_policy
+    pinned = task_policy(task_body)
+    if pinned is not None:
+        return pinned
     binding, refs = _policy_context_from_task_body(task_body)
     if binding is None and not refs:
         raise PolicyRegistryError("task has no managed policy snapshot")
@@ -835,6 +839,9 @@ def validate_policy_completion(
     role: str,
 ) -> None:
     """Require exact receipts and reject stale policy reviews at write time."""
+    from proactive.behavior_profiles.registry import validate_task_policy_completion
+    if validate_task_policy_completion(task_body, metadata, role):
+        return
     binding, expected = _policy_context_from_task_body(task_body)
     policy_refs_from_task_body(task_body)
     if binding is None and not expected:

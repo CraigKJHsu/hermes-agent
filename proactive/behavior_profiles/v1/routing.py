@@ -156,22 +156,10 @@ def route_clawops_objective(
     contract_fingerprint: str = "",
     hub_ops_dir: str | Path | None = None,
     runtime_callable_tools: Mapping[str, Iterable[str]] | None = None,
-    behavior_contract: Mapping[str, Any] | None = None,
+    routing_project: str | None = None,
 ) -> dict[str, Any]:
-    if behavior_contract is not None:
-        from proactive.behavior_profiles.registry import BehaviorProfileError, implementation, route_directory
-        behavior = implementation(behavior_contract, "routing")
-        if behavior is not None:
-            pin = behavior_contract["behavior_pin"]
-            if project != pin["project_namespace"]:
-                raise BehaviorProfileError("behavior.routing_project_mismatch")
-            return behavior.route_clawops_objective(
-                objective, project=project, task_type=task_type, risk_level=risk_level,
-                approved=approved, contract_fingerprint=contract_fingerprint,
-                hub_ops_dir=route_directory(behavior_contract),
-                runtime_callable_tools=runtime_callable_tools,
-                routing_project=pin["behavior_profile_id"],
-            )
+    # Business matching is independent from the durable project namespace.
+    match_project = routing_project or project
     clean_objective = " ".join((objective or "").split())
     if not clean_objective:
         return _blocked("objective is required", objective="", project=project, task_type=task_type, risk_level=risk_level)
@@ -211,7 +199,7 @@ def route_clawops_objective(
 
     route = _match_worker_route(
         worker_routes,
-        project=project,
+        project=match_project,
         task_type=canonical_task_type,
         risk_level=risk_level,
     )
@@ -403,7 +391,7 @@ def route_clawops_objective(
     agent_id = _match_agent_id(
         agent_routes if isinstance(agent_routes, list) else [],
         agents if isinstance(agents, Mapping) else {},
-        project=project,
+        project=match_project,
         task_type=canonical_task_type,
         risk_level=risk,
     )

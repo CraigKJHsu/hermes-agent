@@ -1452,6 +1452,7 @@ def _ensure_external_action_objective_ref(
     request_instance_id: str = "",
     board: str | None = None,
     origin_objective_id: str = "",
+    behavior_project: str = "",
 ) -> dict[str, str] | None:
     """Create/reuse a lane-bound objective for any external-action request."""
     original_request = str(args.get("original_request") or "").strip()
@@ -1550,6 +1551,7 @@ def _ensure_external_action_objective_ref(
             kb.create_grace_objective(
                 conn,
                 objective_id=objective_id,
+                behavior_project=behavior_project,
                 platform=clean_platform,
                 chat_id=clean_chat,
                 thread_id=clean_thread,
@@ -3419,6 +3421,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             request_instance_id=request_instance_id,
             board=board,
             origin_objective_id=origin_objective_id,
+            behavior_project=project,
         )
         if (
             isinstance(args.get("facebook_group_publish"), dict)
@@ -3619,6 +3622,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         "use its returned final_message and manifest verbatim. Do not reconstruct text "
                         "or request general file-reading tools."
                     )
+        from proactive.behavior_profiles.registry import attach_contract
+        contract = attach_contract(contract)
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -3628,6 +3633,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             risk_level=risk_level,
             approved=True,
             contract_fingerprint=preliminary_fingerprint,
+            **({"behavior_contract": preliminary_contract} if preliminary_contract.get("behavior_pin") else {}),
         )
         if routing_preview.get("status") != "routed":
             raise ValueError(

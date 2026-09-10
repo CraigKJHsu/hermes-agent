@@ -58,7 +58,7 @@ def metadata(contract=None):
     contract = contract or {}
     snapshot_at, sources = source_snapshot()
     validators = {name: sources[name] for name in VALIDATOR_SOURCES}
-    return {
+    result = {
         "mode": "observe_only",
         "behavior_profile_id": "legacy_shared",
         "behavior_profile_version": None,
@@ -80,6 +80,16 @@ def metadata(contract=None):
         "source_manifest": dict(sources),
         "runtime_version_verified": False,
     }
+
+    pin = contract.get("behavior_pin")
+    if isinstance(pin, dict):
+        result.update({key: pin.get(key) for key in (
+            "behavior_profile_id", "behavior_profile_version", "contract_schema_version",
+            "validator_set_hash", "behavior_bundle_hash", "safety_kernel_version", "policy_snapshot_hash",
+        )})
+        result["mode"] = "pinned_claim"
+        result["validator_set_scope"] = "immutable_profile_manifest"
+    return result
 
 
 @contextmanager

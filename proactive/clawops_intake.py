@@ -194,6 +194,7 @@ def create_clawops_task(
         clean_objective,
         enriched_source,
         contract_fingerprint=contract_fingerprint,
+        **({"behavior_contract": contract} if contract and contract.get("behavior_pin") else {}),
     )
     if hubops_envelope and hubops_envelope.get("status") == "blocked":
         raise ValueError(str(hubops_envelope.get("blocked_reason") or "HubOps routing blocked this task."))
@@ -453,6 +454,7 @@ def _route_hubops_if_requested(
     source: Optional[Mapping[str, Any]],
     *,
     contract_fingerprint: str = "",
+    behavior_contract: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     if not source or not any(key in source for key in ("project", "task_type", "risk_level", "approved")):
         return None
@@ -463,6 +465,7 @@ def _route_hubops_if_requested(
         risk_level=str(source.get("risk_level") or "low"),
         approved=_read_bool(source.get("approved")),
         contract_fingerprint=contract_fingerprint,
+        **({"behavior_contract": behavior_contract} if behavior_contract is not None else {}),
     )
 
 

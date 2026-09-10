@@ -99,6 +99,7 @@ from hermes_cli.grace_review_metadata import (
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from proactive.policy_registry import serialize_with_policy_registry
+from proactive.behavior_profiles.registry import guard_task as _guard_behavior_task
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -117,10 +118,24 @@ _REVIEW_RUNTIME_SOURCES = (
 )
 
 
+_behavior_root = Path(__file__).resolve().parent.parent / "proactive" / "behavior_profiles"
+def _review_runtime_sources():
+    # Directory membership is part of the process attestation: installing a
+    # new profile requires restart before it can be admitted by this process.
+    return tuple(dict.fromkeys([
+        *_REVIEW_RUNTIME_SOURCES,
+        *(_behavior_root.parent.parent / relative
+          for manifest in sorted(_behavior_root.glob("kernel-v*.json"))
+          for relative in json.loads(manifest.read_text())),
+        *sorted(path for path in _behavior_root.rglob("*")
+                if path.suffix in {".py", ".json", ".yaml"}),
+    ]))
+
+
 def _review_runtime_digest() -> bytes:
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent.parent
-    for source in _REVIEW_RUNTIME_SOURCES:
+    for source in _review_runtime_sources():
         try:
             source_name = source.relative_to(root)
         except ValueError:
@@ -487,6 +502,10 @@ def grace_domain_memory_spec(body: str) -> Optional[dict[str, Any]]:
         normalize_domain_memory_contract,
     )
 
+    from proactive.behavior_profiles.registry import implementation_for_body
+    behavior_domain = implementation_for_body(body, "domain")
+    if behavior_domain is not None:
+        normalize_domain_memory_contract = behavior_domain.normalize_domain_memory_contract
     try:
         return normalize_domain_memory_contract(raw_spec)
     except DomainMemoryError:
@@ -560,6 +579,10 @@ def _accepted_parent_domain_projection(
     )
     from proactive.domain_memory import normalize_memory_deltas
 
+    from proactive.behavior_profiles.registry import implementation_for_body
+    behavior_domain = implementation_for_body(review_body, "domain")
+    if behavior_domain is not None:
+        normalize_memory_deltas = behavior_domain.normalize_memory_deltas
     deltas = normalize_memory_deltas(raw_deltas, review_spec)
     return {
         "spec": review_spec,
@@ -4293,6 +4316,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     from hermes_cli.objective_workflow import migrate as migrate_objective_workflow
     migrate_objective_workflow(conn)
+    from proactive.behavior_profiles.registry import migrate as migrate_behavior_profiles
+    migrate_behavior_profiles(conn)
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -7728,6 +7753,26 @@ def reviewed_execution_run(conn, review_run, execution_task_id):
     return run
 
 
+def _review_runtime_receipt(conn, task_id):
+    """Bind business provenance to the selected immutable profile and kernel.
+
+    guard_task verifies this process against current disk sources. The receipt
+    remains stable across a restart that only adds an unrelated profile; the
+    selected bundle, kernel, policy and generation must still match exactly.
+    """
+    from proactive.behavior_profiles import registry as br
+    pin = br.guard_task(conn, task_id)
+    if pin is None:
+        return {"review_runtime_sha256": _REVIEW_RUNTIME_SHA256.hex()}
+    return {
+        "review_runtime_sha256": br.digest({
+            "bundle": pin["behavior_bundle_hash"], "kernel": pin["safety_kernel_hash"],
+        }),
+        "behavior_pin": pin,
+        "review_runtime_scope": "immutable_behavior_profile",
+    }
+
+
 def _workflow_review_source(conn, task_id):
     """Pin the exact input when a delegated review is claimed, not at card creation."""
     row = conn.execute(
@@ -7761,7 +7806,7 @@ def _workflow_review_source(conn, task_id):
               "review_task_body_sha256": hashlib.sha256(
                   bodies[task_id].encode("utf-8")
               ).hexdigest(),
-              "review_runtime_sha256": _REVIEW_RUNTIME_SHA256.hex()}
+              **_review_runtime_receipt(conn, task_id)}
     plan_request = (parent.metadata or {}).get("objective_plan_request")
     if isinstance(plan_request, Mapping):
         request_id = str(plan_request.get("request_id") or "")
@@ -7878,7 +7923,8 @@ def validate_kanban_worker_auth(
         return False
     review_source = metadata.get("workflow_review_source")
     if isinstance(review_source, Mapping) and (
-        review_source.get("review_runtime_sha256") != _REVIEW_RUNTIME_SHA256.hex()
+        any(review_source.get(key) != value for key, value in
+            _review_runtime_receipt(conn, task_id).items())
     ):
         raise WorkerAuthorizationError(
             "Kanban review runtime changed after claim; restart the dispatcher/gateway "
@@ -7954,6 +8000,7 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    _guard_behavior_task(conn, task_id)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -7966,6 +8013,7 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        _guard_behavior_task(conn, task_id)
         child_row = conn.execute(
             "SELECT executor_profile FROM tasks WHERE id = ?",
             (task_id,),
@@ -8114,10 +8162,12 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    _guard_behavior_task(conn, task_id)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        _guard_behavior_task(conn, task_id)
         cur = conn.execute(
             """
             UPDATE tasks
@@ -8838,6 +8888,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    _guard_behavior_task(conn, task_id)
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -8851,6 +8902,7 @@ def complete_task(
         )
         if phantom_cards:
             with write_txn(conn):
+                _guard_behavior_task(conn, task_id)
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -8872,6 +8924,10 @@ def complete_task(
         (task_id,),
     ).fetchone()
     task_body = str(task_scope["body"] or "") if task_scope is not None else ""
+    from proactive.behavior_profiles.registry import implementation_for_body
+    behavior_review = implementation_for_body(task_body, "review")
+    _review_accepted = behavior_review.grace_review_accepted if behavior_review else grace_review_accepted
+    _review_error = behavior_review.grace_review_acceptance_error if behavior_review else grace_review_acceptance_error
     grace_loop_stage = _grace_loop_stage_header(task_body)
     if (
         task_scope is not None
@@ -8930,6 +8986,11 @@ def complete_task(
         # Normalize into a fresh mapping so callers do not observe an in-place
         # rewrite of their metadata object.
         metadata = dict(metadata)
+        behavior_pin = _guard_behavior_task(conn, task_id)
+        if behavior_pin is not None:
+            if "behavior_pin" in metadata and metadata["behavior_pin"] != behavior_pin:
+                raise ValueError("behavior.result_pin_mismatch")
+            metadata["behavior_pin"] = behavior_pin
         if system_model_receipt is None:
             from proactive.model_routing import execution_receipt_from_env
 
@@ -8953,7 +9014,7 @@ def complete_task(
                     "review_outcome='accepted'. Keep the review task active "
                     "and retry kanban_complete with the verified evidence."
                 )
-            accepted_by_metadata = grace_review_accepted(metadata)
+            accepted_by_metadata = _review_accepted(metadata)
             if canonical_verdict and canonical_verdict != "accepted":
                 raise ValueError(
                     "Grace review completion requires canonical metadata."
@@ -8961,7 +9022,7 @@ def complete_task(
                     "and retry kanban_complete with the verified evidence."
                 )
             if not accepted_by_metadata:
-                raise ValueError(grace_review_acceptance_error(metadata))
+                raise ValueError(_review_error(metadata))
             # Persist one canonical verdict at the write boundary. Models may
             # vary whitespace or case, but downstream consumers should observe
             # one exact accepted form.
@@ -9081,6 +9142,9 @@ def complete_task(
                 validate_delta_external_effect_refs,
             )
 
+            behavior_domain = implementation_for_body(task_body, "domain")
+            if behavior_domain is not None:
+                normalize_memory_deltas = behavior_domain.normalize_memory_deltas
             domain_memory_deltas = normalize_memory_deltas(
                 raw_domain_deltas,
                 domain_memory_spec,
@@ -9118,6 +9182,7 @@ def complete_task(
         )
 
     with write_txn(conn):
+        _guard_behavior_task(conn, task_id)
         if isinstance(metadata, dict) and grace_review_rejected(metadata):
             workflow_parent = conn.execute(
                 "SELECT d.execution_task_id FROM grace_delegations d "
@@ -9141,7 +9206,7 @@ def complete_task(
                         **review_source,
                     }
                     metadata["workflow_review_source"] = review_source
-        if isinstance(metadata, dict) and grace_review_accepted(metadata):
+        if isinstance(metadata, dict) and _review_accepted(metadata):
             # Planned publication workflows consume exact-run acceptance. Reject
             # incomplete receipts here so the reviewer can correct this same run.
             workflow_parent = conn.execute(
@@ -9488,6 +9553,7 @@ def complete_task(
         phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
         if phantom_refs:
             with write_txn(conn):
+                _guard_behavior_task(conn, task_id)
                 _append_event(
                     conn, task_id, "suspected_hallucinated_references",
                     {
@@ -10097,6 +10163,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    _guard_behavior_task(conn, task_id)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -10129,6 +10196,7 @@ def block_task(
         if review_row is not None:
             review_task_id = str(review_row["review_task_id"])
             with write_txn(conn):
+                _guard_behavior_task(conn, task_id)
                 _append_event(
                     conn,
                     task_id,
@@ -10151,6 +10219,7 @@ def block_task(
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
+        _guard_behavior_task(conn, task_id)
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -15524,6 +15593,7 @@ def create_grace_objective(
     current_stage_key: str = "",
     next_action: str = "",
     waiting_for: str = "",
+    behavior_project: str = "",
 ) -> dict:
     """Create one idempotent, durable originating-user objective.
 
@@ -15624,6 +15694,10 @@ def create_grace_objective(
         row = conn.execute(
             "SELECT * FROM grace_objectives WHERE objective_id = ?", (clean_id,)
         ).fetchone()
+        # Existing IDs return above in this same IMMEDIATE transaction. Only
+        # the row inserted by this call may receive a creation-time pin.
+        from proactive.behavior_profiles.registry import pin_new_objective
+        pin_new_objective(conn, dict(row), behavior_project)
     record_created_objective(conn, clean_id)
     return dict(row)
 
@@ -16288,6 +16362,12 @@ def reserve_grace_delegation(
         sort_keys=True,
         separators=(",", ":"),
     )
+    from proactive.behavior_profiles.registry import guard_objective, bind_contract
+    pin = guard_objective(conn, clean_objective_id) if clean_objective_id else None
+    if pin and (not compiled_contract or compiled_contract.get("behavior_pin") != pin):
+        raise ValueError("behavior.delegation_pin_mismatch")
+    if compiled_contract is not None:
+        bind_contract(conn, compiled_contract)
     contract_snapshot_json = None
     if compiled_contract is not None:
         contract_snapshot_json = json.dumps(
@@ -16348,6 +16428,9 @@ def reserve_grace_delegation(
     message_path_json = dumps_message_path(clean_message_path) or None
     now = int(time.time())
     with write_txn(conn):
+        current_pin = guard_objective(conn, clean_objective_id) if clean_objective_id else None
+        if current_pin != pin:
+            raise ValueError("behavior.delegation_pin_changed")
         if callback_lease_owner:
             if not origin_review_task_id or origin_event_id is None:
                 raise ValueError(
@@ -18135,7 +18218,8 @@ def accepted_full_publication_package(
         raise ValueError(
             "Full publication package review does not bind exact execution evidence."
         )
-    if review_source.get("review_runtime_sha256") != _REVIEW_RUNTIME_SHA256.hex():
+    expected_runtime = _review_runtime_receipt(conn, review_id)
+    if any(review_source.get(key) != value for key, value in expected_runtime.items()):
         raise ValueError(
             "Full publication package review lacks controller-pinned runtime provenance."
         )
@@ -18208,7 +18292,7 @@ def accepted_full_publication_package(
         or report.get("complete") is not True
     ):
         raise ValueError("Selected package is not a full publication package.")
-    if not report.get("policy_receipts"):
+    if not report.get("policy_receipts") and not expected_runtime.get("behavior_pin"):
         raise ValueError("Full publication package lacks execution policy receipts.")
     if any(receipt.get("role") != "execution" for receipt in report["policy_receipts"]):
         raise ValueError("Full publication package execution policy receipts have the wrong role.")
@@ -18223,11 +18307,11 @@ def accepted_full_publication_package(
     if report.get("policy_receipts") != source_metadata.get("policy_receipts"):
         raise ValueError("Full publication package policy receipts are not controller-bound.")
     review_receipts = review_metadata.get("policy_receipts")
-    if not isinstance(review_receipts, list) or not review_receipts or not all(
+    if not isinstance(review_receipts, list) or (not review_receipts and not expected_runtime.get("behavior_pin")) or not all(
         isinstance(receipt, Mapping)
         and receipt.get("role") == "review"
         and receipt.get("loaded") is True
-        and receipt.get("latest_active_verified") is True
+        and receipt.get("pinned_version_verified" if expected_runtime.get("behavior_pin") else "latest_active_verified") is True
         and re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256") or ""))
         for receipt in review_receipts
     ):
@@ -18239,9 +18323,9 @@ def accepted_full_publication_package(
     )
 
     try:
-        if execution_task is None or not policy_refs_from_task_body(execution_task.body):
+        if execution_task is None or (not expected_runtime.get("behavior_pin") and not policy_refs_from_task_body(execution_task.body)):
             raise PolicyRegistryError("execution policy snapshot is missing")
-        if review_task is None or not policy_refs_from_task_body(review_task.body):
+        if review_task is None or (not expected_runtime.get("behavior_pin") and not policy_refs_from_task_body(review_task.body)):
             raise PolicyRegistryError("review policy snapshot is missing")
         validate_policy_completion(execution_task.body, source_metadata, role="execution")
         validate_policy_completion(review_task.body, review_metadata, role="review")
@@ -18670,6 +18754,8 @@ def _apply_grace_objective_callback_outcome(
     stage_key = str(callback.get("stage_key") or "").strip()
     if not objective_id:
         return
+    _guard_behavior_task(conn, str(callback.get("execution_task_id") or ""))
+    _guard_behavior_task(conn, str(callback.get("review_task_id") or ""))
     if not stage_key:
         raise ValueError("Objective-linked callback is missing its stage key")
     objective = get_grace_objective(conn, objective_id)
