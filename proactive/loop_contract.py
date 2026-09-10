@@ -8,6 +8,7 @@ import re
 from copy import deepcopy
 from typing import Any, Mapping
 
+from proactive.behavior_observation import emit, observe_contract
 from proactive.policy_registry import PolicyRegistryError, resolve_contract_policies
 from proactive.domain_memory import (
     DomainMemoryError,
@@ -419,6 +420,7 @@ def contract_fingerprint(contract: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+@observe_contract("loop_contract.validate", phase="contract")
 def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Return a normalized contract or reject it before a task is created."""
     try:
@@ -426,8 +428,12 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             resolve_contract_policies(contract)
         )
     except PolicyRegistryError as exc:
+        emit(rule_id="loop_contract.policy_resolution", owner="proactive.policy_registry",
+             phase="contract", decision="rejected", contract=contract, reason=exc)
         raise LoopContractError(f"policy resolution failed: {exc}") from exc
     except DomainMemoryError as exc:
+        emit(rule_id="loop_contract.domain_memory", owner="proactive.domain_memory",
+             phase="contract", decision="rejected", contract=contract, reason=exc)
         raise LoopContractError(f"domain memory validation failed: {exc}") from exc
     domain_memory = value.get("domain_memory")
     routing = value.get("routing")
@@ -528,7 +534,12 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         )
     if "external_targets" in value:
         required_list("external_targets")
-    errors.extend(_validate_facebook_group_publish_scope(value))
+    publish_errors = _validate_facebook_group_publish_scope(value)
+    if publish_errors:
+        emit(rule_id="loop_contract.facebook_group_publish_scope",
+             owner=__name__, phase="contract", decision="rejected",
+             contract=value, reason="; ".join(publish_errors))
+    errors.extend(publish_errors)
 
     objective_ref = value.get("objective_ref")
     if objective_ref is not None:
@@ -596,6 +607,10 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         errors.append("stop_rules.max_runtime_seconds must be 60..14400")
 
     if errors:
+        emit(rule_id="loop_contract.schema", owner=__name__, phase="contract",
+             decision="rejected", contract=value, reason="; ".join(errors))
         raise LoopContractError("; ".join(errors))
     value["contract_version"] = CONTRACT_VERSION
+    emit(rule_id="loop_contract.schema", owner=__name__, phase="contract",
+         decision="accepted", contract=value, policy_snapshot_verified=True)
     return value

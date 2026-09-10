@@ -91,6 +91,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from proactive.behavior_observation import observe_objective, record_created_objective
 from hermes_cli.grace_review_metadata import (
     grace_review_acceptance_error,
     grace_review_accepted,
@@ -2942,6 +2943,20 @@ CREATE TABLE IF NOT EXISTS grace_objectives (
     updated_at              INTEGER NOT NULL,
     completed_at            INTEGER,
     cancelled_at            INTEGER
+);
+
+-- Observed provenance only. No execution path resolves behavior from this table.
+CREATE TABLE IF NOT EXISTS grace_objective_behavior_observations (
+    objective_id TEXT PRIMARY KEY,
+    behavior_profile_id TEXT NOT NULL,
+    behavior_profile_version TEXT,
+    contract_schema_version TEXT,
+    validator_set_hash TEXT,
+    policy_snapshot_hash TEXT,
+    behavior_bundle_hash TEXT,
+    safety_kernel_version TEXT,
+    observation TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS grace_objective_stages (
@@ -10046,6 +10061,7 @@ def edit_completed_task_result(
     return True
 
 
+@observe_objective("objective.review_block")
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15490,6 +15506,7 @@ _ACTIVE_GRACE_OBJECTIVE_STATUSES = frozenset(
 )
 
 
+@observe_objective("objective.create")
 def create_grace_objective(
     conn: sqlite3.Connection,
     *,
@@ -15607,6 +15624,7 @@ def create_grace_objective(
         row = conn.execute(
             "SELECT * FROM grace_objectives WHERE objective_id = ?", (clean_id,)
         ).fetchone()
+    record_created_objective(conn, clean_id)
     return dict(row)
 
 
@@ -18638,6 +18656,7 @@ def grace_user_facing_report_delivery_matches(
     )
 
 
+@observe_objective("objective.callback_transition")
 def _apply_grace_objective_callback_outcome(
     conn: sqlite3.Connection,
     *,
@@ -18830,6 +18849,7 @@ def _apply_grace_objective_callback_outcome(
     )
 
 
+@observe_objective("objective.callback_outcome")
 def record_grace_loop_callback_outcome(
     conn: sqlite3.Connection,
     *,
@@ -19600,6 +19620,7 @@ def record_grace_intermediate_callback_without_structured_continuation(
     return dict(row)
 
 
+@observe_objective("objective.callback_blocker")
 def record_grace_loop_callback_blocker_outcome(
     conn: sqlite3.Connection,
     *,

@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
+from proactive.behavior_observation import observe_objective
 
 
 def migrate(conn):
@@ -91,6 +92,7 @@ def _history_reference(conn, objective, project, listing_id, reference):
     }
 
 
+@observe_objective("objective.workflow_plan")
 def plan(conn, *, objective_id, expected_revision, platform, chat_id, thread_id,
          required_stage_keys, current_stage_key, reason, acceptance_criteria=None,
          title=None, workflow=None, next_action=None,

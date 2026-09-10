@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
+from proactive.behavior_observation import observe_contract
 from proactive.clawops_intake import create_clawops_task, subscribe_clawops_task
 from proactive.loop_contract import (
     contract_fingerprint,
@@ -626,6 +627,7 @@ def _render_user_facing_delivery_guidance(
     ]
 
 
+@observe_contract("compiler.execution_body", phase="compile")
 def render_execution_body(contract: Mapping[str, Any]) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
@@ -668,6 +670,7 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
     )
 
 
+@observe_contract("compiler.review_body", phase="compile")
 def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
