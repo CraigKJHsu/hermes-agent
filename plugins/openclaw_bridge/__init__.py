@@ -11,10 +11,12 @@ from plugins.openclaw_bridge.clawops_delegate import (
     CLAWOPS_DELEGATE_SCHEMA,
     CLAWOPS_RETRY_REVIEW_SCHEMA,
     GRACE_CALLBACK_OUTCOME_SCHEMA,
+    GRACE_RECONCILE_SCHEMA,
     handle_clawops_cancel,
     handle_clawops_delegate,
     handle_clawops_retry_review,
     handle_grace_callback_outcome,
+    handle_grace_reconcile,
 )
 from proactive.grace_execution_policy import enforce_grace_execution_boundary
 
@@ -67,6 +69,17 @@ def register(ctx) -> None:
             "blocked on one exact approval question."
         ),
         emoji="GO",
+    )
+    ctx.register_tool(
+        name="grace_reconcile",
+        toolset="openclaw",
+        schema=GRACE_RECONCILE_SCHEMA,
+        handler=handle_grace_reconcile,
+        description=(
+            "Inside the exact originating Grace callback, repair one stranded "
+            "authorized zero-effect delegation from its durable contract snapshot."
+        ),
+        emoji="FIX",
     )
     ctx.register_tool(
         name="openclaw_delegate",

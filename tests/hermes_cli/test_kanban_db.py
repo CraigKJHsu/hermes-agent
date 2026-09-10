@@ -666,6 +666,51 @@ def test_delegation_request_instance_rejects_changed_contract(tmp_path):
             )
 
 
+def test_superseded_delegation_releases_callback_and_request_reservations(tmp_path):
+    db_path = tmp_path / "superseded-reservation.db"
+    common = {
+        "request_instance_id": "gri-callback-repair",
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "2",
+        "session_key": "agent:main:telegram:group:chat-1:2",
+        "session_id": "grace-session-1",
+        "resolved_route": {"assignment": {"agent": "clawops"}},
+        "approval_required": False,
+        "origin_review_task_id": "review-origin",
+        "origin_event_id": 42,
+    }
+    with kb.connect_closing(db_path) as conn:
+        first = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="a" * 64,
+            **common,
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET state='superseded' "
+            "WHERE delegation_id=? AND state='authorized'",
+            (first["delegation_id"],),
+        )
+
+        corrected = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="b" * 64,
+            **common,
+        )
+        rows = conn.execute(
+            "SELECT delegation_id,state,origin_review_task_id,origin_event_id,"
+            "request_instance_id FROM grace_delegations ORDER BY created_at"
+        ).fetchall()
+
+    assert corrected["delegation_id"] != first["delegation_id"]
+    assert [row["state"] for row in rows] == ["superseded", "authorized"]
+    assert all(row["origin_review_task_id"] == "review-origin" for row in rows)
+    assert all(row["origin_event_id"] == 42 for row in rows)
+    assert all(
+        row["request_instance_id"] == "gri-callback-repair" for row in rows
+    )
+
+
 def test_callback_lease_renewal_and_outcome_are_owner_fenced(tmp_path):
     db_path = tmp_path / "callback.db"
     with kb.connect_closing(db_path) as conn:
@@ -1210,6 +1255,20 @@ def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
             origin_event_id=event_id,
             callback_lease_owner="owner-a",
         )
+        stranded = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="f" * 64,
+            request_instance_id="gri-stranded-session-rebind",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-before-compression",
+            resolved_route={"backend": "openclaw"},
+            approval_required=False,
+            origin_review_task_id=review_id,
+            origin_event_id=event_id,
+        )
         with pytest.raises(ValueError, match="not owned"):
             kb.rebind_active_grace_callback_session(
                 conn,
@@ -1237,6 +1296,26 @@ def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
         )
         assert rebound_challenge["session_id"] == (
             "grace-session-after-compression"
+        )
+        rebound_delegation = conn.execute(
+            "SELECT session_id FROM grace_delegations WHERE review_task_id = ?",
+            (review_id,),
+        ).fetchone()
+        assert rebound_delegation["session_id"] == (
+            "grace-session-after-compression"
+        )
+        rebound_stranded = kb.get_grace_delegation(
+            conn,
+            delegation_id=stranded["delegation_id"],
+        )
+        assert rebound_stranded["execution_task_id"] is None
+        assert rebound_stranded["review_task_id"] is None
+        assert rebound_stranded["session_id"] == (
+            "grace-session-after-compression"
+        )
+        conn.execute(
+            "DELETE FROM grace_delegations WHERE delegation_id = ?",
+            (stranded["delegation_id"],),
         )
         recorded = kb.record_grace_loop_callback_outcome(
             conn,
@@ -7643,6 +7722,42 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
     assert second is None
 
 
+def test_delegated_review_claim_never_creates_unpinned_attempt(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            parents=[execution_id],
+            executor_profile="grace-policy-review",
+        )
+        kb.claim_task(conn, execution_id, claimer="worker")
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            metadata={"acceptance_evidence": {"verified": True}},
+        )
+        conn.execute(
+            "INSERT INTO grace_delegations ("
+            "delegation_id, contract_fingerprint, request_instance_id, platform, "
+            "chat_id, thread_id, session_key, session_id, resolved_route, "
+            "approval_required, state, execution_task_id, review_task_id, "
+            "created_at, updated_at"
+            ") VALUES ("
+            "'gd_missing_pin', ?, 'request', 'telegram', 'chat', 'thread', "
+            "'session', 'session', '{}', 0, 'queued', ?, ?, 1, 1)",
+            ("d" * 64, execution_id, review_id),
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (review_id,))
+        monkeypatch.setattr(kb, "_workflow_review_source", lambda conn, task_id: None)
+        with pytest.raises(ValueError, match="pinned execution attempt"):
+            kb.claim_review_task(conn, review_id, claimer="controller")
+        assert kb.get_task(conn, review_id).current_run_id is None
+
+
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
     with kb.connect() as conn:
@@ -8707,3 +8822,24 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_grace_delegation_reservation_persists_contract_snapshot(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    contract = {"identity": {"project": "p"}, "goal": {"objective": "repair"}}
+    with kb.connect_closing(db_path=db_path) as conn:
+        row = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="snapshot-test",
+            request_instance_id="gri_snapshot",
+            platform="telegram",
+            chat_id="chat",
+            thread_id="thread",
+            session_key="session-key",
+            session_id="session-id",
+            resolved_route={"task_type": "devops"},
+            approval_required=False,
+            compiled_contract=contract,
+        )
+        assert json.loads(row["contract_snapshot"]) == contract

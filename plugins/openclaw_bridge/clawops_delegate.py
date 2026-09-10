@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import secrets
 import struct
 import time
@@ -23,7 +24,10 @@ from hermes_cli.telegram_message_path import (
     build_telegram_message_path,
     normalize_message_path,
 )
-from proactive.grace_task_compiler import compile_and_delegate
+from proactive.grace_task_compiler import (
+    _contract_requires_backend_original_request,
+    compile_and_delegate,
+)
 from proactive.hubops_routing import (
     normalize_clawops_task_type,
     registered_worker_task_types,
@@ -159,6 +163,15 @@ def _bind_facebook_page_publish_manifest(
         "image_sha256": next(iter(image_hashes)),
         "page_id": next(iter(page_ids)),
     }
+
+
+def _bind_accepted_facebook_group_preflight(
+    contract: dict[str, Any], *, board: str | None,
+) -> dict[str, Any]:
+    from hermes_cli.objective_workflow import resolve_preflight
+
+    with kb.connect_closing(board=board) as conn:
+        return resolve_preflight(conn, contract)
 
 
 def _is_safe_approval_message(message_text: str, approval_token: str) -> bool:
@@ -320,7 +333,7 @@ _FACEBOOK_GROUP_PUBLISH = {
     "properties": {
         "mode": {
             "type": "string",
-            "enum": ["canonical_url_per_group"],
+            "enum": ["accepted_preflight"],
         },
         "source_listing_id": {"type": "string"},
         "management_listing_id": {"type": "string"},
@@ -329,8 +342,17 @@ _FACEBOOK_GROUP_PUBLISH = {
             "items": _FACEBOOK_GROUP_PUBLISH_DESTINATION,
             "minItems": 1,
         },
+        "preflight_source": {
+            "type": "object",
+            "properties": {
+                "execution_task_id": {"type": "string", "pattern": "^t_[0-9a-f]+$"},
+                "review_task_id": {"type": "string", "pattern": "^t_[0-9a-f]+$"},
+            },
+            "required": ["execution_task_id", "review_task_id"],
+            "additionalProperties": False,
+        },
     },
-    "required": ["mode", "source_listing_id", "destinations"],
+    "required": ["mode", "source_listing_id", "destinations", "preflight_source"],
     "additionalProperties": False,
 }
 
@@ -367,8 +389,10 @@ CLAWOPS_DELEGATE_PARAMETERS = {
             **_FACEBOOK_GROUP_PUBLISH,
             "description": (
                 "Use for Facebook group publishing that must avoid Marketplace "
-                "chooser identity. Each destination is bound to exact numeric "
-                "group_id, canonical_name, and canonical_url."
+                "chooser identity, or set mode=accepted_preflight to let a same-Topic "
+                "Grace-accepted preflight select the listing-bound chooser route. "
+                "Each destination remains bound to exact numeric group_id, canonical_name, "
+                "and canonical_url."
             ),
         },
         "task_type": {
@@ -531,6 +555,25 @@ GRACE_CALLBACK_OUTCOME_SCHEMA = {
     "parameters": GRACE_CALLBACK_OUTCOME_PARAMETERS,
 }
 
+GRACE_RECONCILE_SCHEMA = {
+    "description": (
+        "Repair one existing authorized, zero-external-effect Grace delegation "
+        "from its durable contract snapshot. Use the exact originating callback "
+        "when active, or the authenticated owner in the same Telegram Topic when "
+        "the delivered callback session has ended. Never accepts a new contract."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "delegation_id": {"type": "string"},
+            "objective_id": {"type": "string"},
+            "stage_key": {"type": "string"},
+        },
+        "required": ["delegation_id", "objective_id", "stage_key"],
+        "additionalProperties": False,
+    },
+}
+
 
 def _canonical_sections(args: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     """Accept the canonical nested contract and preserve legacy callers during rollout."""
@@ -627,16 +670,28 @@ def _resolve_completed_callback_board(
                     )
                     origin_kind = "approval_blocked"
                 except ValueError:
-                    kb.validate_delivered_human_blocker(
-                        conn,
-                        review_task_id=review_task_id,
-                        event_id=event_id,
-                        platform=platform,
-                        chat_id=chat_id,
-                        thread_id=thread_id,
-                        session_id=callback_session_id,
-                    )
-                    origin_kind = "human_blocker"
+                    try:
+                        kb.validate_delivered_human_blocker(
+                            conn,
+                            review_task_id=review_task_id,
+                            event_id=event_id,
+                            platform=platform,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            session_id=callback_session_id,
+                        )
+                        origin_kind = "human_blocker"
+                    except ValueError:
+                        kb.validate_recoverable_blocked_callback(
+                            conn,
+                            review_task_id=review_task_id,
+                            event_id=event_id,
+                            platform=platform,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            session_id=callback_session_id,
+                        )
+                        origin_kind = "recoverable_blocker"
         except (ValueError, OSError):
             continue
         matches.append((slug, callback_session_id, origin_kind))
@@ -821,7 +876,8 @@ _EXTERNAL_ACTION_OBJECTIVE = re.compile(
     r"(?:"
     r"重新刊登(?:至|到)|刊登(?:至|到)|發布(?:至|到)|跨貼(?:至|到)|"
     r"提交(?:至|到)|上架(?:至|到)|傳送(?:至|到)|"
-    r"\b(?:publish|post|submit|send|cross[-\s]?post)\s+(?:to|into)\b"
+    r"\b(?:publish|post|submit|send|cross[-\s]?post)\s+(?:to|into|in|on|via|through)\b|"
+    r"\brelist(?:\s+[^.!?\n]{1,100}?)?\s+(?:to|into|in|on|via|through)\b"
     r")",
     re.IGNORECASE,
 )
@@ -832,6 +888,310 @@ _PREPARATORY_OR_TEXT_ONLY_OBJECTIVE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+_FACEBOOK_GROUP_REFERENCE = re.compile(
+    r"(?:group\s*:\s*[1-9][0-9]*|facebook\.com/groups(?:/[0-9]+)?|"
+    r"(?:facebook|fb|臉書).{0,24}(?:groups?\b|社團|群組)|"
+    r"(?:groups?\b|社團|群組).{0,24}(?:facebook|fb|臉書))",
+    re.IGNORECASE,
+)
+_BARE_GROUP_REFERENCE = re.compile(r"(?:\bgroups?\b|社團|群組)", re.IGNORECASE)
+_GROUP_PUBLICATION_VERB = re.compile(
+    r"(?:刊登|上架|發布|貼文|發文|重刊|送出|提交|分享|轉貼|跨貼|傳送|新增|加入|貼到|貼至|"
+    r"放到|放入|置入|投遞|"
+    r"\b(?:publish(?:ing|ed)?|republish(?:ing|ed)?|post(?:ing|ed)?|repost(?:ing|ed)?|"
+    r"relist(?:ing|ed)?|redistribut(?:e|ing|ed)|submit(?:ting|ted)?|"
+    r"share(?:d)?|send|sent|list(?:ed)?|add(?:ed)?|put|place(?:d)?|receive(?:d)?|"
+    r"cross[- ]?post(?:ing|ed)?)\b)",
+    re.IGNORECASE,
+)
+_PUBLICATION_NEGATION = re.compile(
+    r"(?:不得|禁止|不要|不可|不准|避免|無需|毋須|"
+    r"不(?=\s*(?:刊登|上架|發布|貼文|發文|重刊|送出|提交|分享|轉貼|跨貼|傳送|新增|加入|貼到|貼至|投遞))|"
+    r"\bdo\s+not\b|\bdon't\b|\bmust\s+not\b|\bnot\b|\bnever\b|\bwithout\b)",
+    re.IGNORECASE,
+)
+
+
+def _has_facebook_group_reference(text: str) -> bool:
+    value = str(text or "")
+    named_shorthand_platform = re.search(
+        r"\b(?:to|into|in|on|via|through)\s+([A-Za-z][A-Za-z0-9.-]*)\s+group\s*:",
+        value,
+        re.IGNORECASE,
+    )
+    if (
+        (
+            re.search(r"\b(?:telegram|whatsapp|signal|discord|line|linkedin)\b", value, re.I)
+            or (
+                named_shorthand_platform is not None
+                and named_shorthand_platform.group(1).lower() not in {"facebook", "fb"}
+            )
+        )
+        and re.search(r"(?:facebook|\bfb\b|臉書)", value, re.I) is None
+    ):
+        return False
+    return _FACEBOOK_GROUP_REFERENCE.search(value) is not None
+
+
+def _facebook_group_destination_is_negated(clause: str, group_start: int) -> bool:
+    """Return whether the group reference itself is a negated destination."""
+    prefix = clause[max(0, group_start - 80):group_start]
+    return bool(
+        re.search(
+            r"\b(?:not|never)\s+(?:(?:to|in|into|on|via|through)\s+)?"
+            r"(?:any\s+)?$",
+            prefix,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"(?:不|不要|不得|禁止|避免)\s*(?:到|至|向|往|在|經由|透過)?\s*$",
+            prefix,
+        )
+    )
+
+
+def _facebook_group_clause_is_readonly_observation(clause: str) -> bool:
+    observation = re.search(
+        r"\b(?:check|verify|inspect|determine|report|see)\b.{0,80}"
+        r"\b(?:whether|if)\b.{0,40}\b(?:is|are|was|were|has\s+been|have\s+been)\s+"
+        r"(?:already\s+)?(?:published|posted|reposted|relisted|shared|listed)\b",
+        clause,
+        re.IGNORECASE,
+    )
+    return bool(
+        observation
+        and _GROUP_PUBLICATION_VERB.search(clause[observation.end():]) is None
+    )
+
+
+def _has_positive_facebook_group_publication(
+    text: str, *, facebook_context: bool = False,
+) -> bool:
+    """Recognize one non-negated clause that publishes to a Facebook group."""
+    clauses = re.split(
+        r"[\n。！？；;]|(?:,\s*|\s+)(?:but|except)\s+|[，,]\s*(?:但|但是|惟|唯獨)",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    for clause in clauses:
+        if _facebook_group_clause_is_readonly_observation(clause):
+            continue
+        explicit_reference = _has_facebook_group_reference(clause)
+        if not explicit_reference and not (
+            facebook_context
+            and _BARE_GROUP_REFERENCE.search(clause)
+            and re.search(
+                r"\b(?:telegram|whatsapp|signal|discord|line|linkedin)\b",
+                clause,
+                re.IGNORECASE,
+            ) is None
+        ):
+            continue
+        groups = list(
+            (_FACEBOOK_GROUP_REFERENCE if explicit_reference else _BARE_GROUP_REFERENCE)
+            .finditer(clause)
+        )
+        verbs = list(_GROUP_PUBLICATION_VERB.finditer(clause))
+        for group in groups:
+            if _facebook_group_destination_is_negated(clause, group.start()):
+                continue
+            if group.group(0).lower().startswith("group") and re.search(
+                r"\b(?:telegram|whatsapp|signal|discord|line)\b",
+                clause[max(0, group.start() - 40):group.end()],
+                re.IGNORECASE,
+            ):
+                continue
+            preceding = [
+                verb for verb in verbs
+                if verb.start() < group.start() and group.start() - verb.start() <= 120
+            ]
+            following = [
+                verb for verb in verbs
+                if group.start() < verb.start() and verb.start() - group.start() <= 120
+            ]
+            candidates = preceding[-1:] or following[:1]
+            for verb in candidates:
+                verb_prefix = clause[max(0, verb.start() - 120):verb.start()]
+                english_verb = re.fullmatch(
+                    r"publish(?:ing|ed)?|republish(?:ing|ed)?|post(?:ing|ed)?|"
+                    r"repost(?:ing|ed)?|relist(?:ing|ed)?|redistribut(?:e|ing|ed)|"
+                    r"submit(?:ting|ted)?|share(?:d)?|send|sent|list(?:ed)?|add(?:ed)?|"
+                    r"put|place(?:d)?|receive(?:d)?|cross[- ]?post(?:ing|ed)?",
+                    verb.group(0),
+                    re.IGNORECASE,
+                )
+                if english_verb and re.search(
+                    r"(?:\bavoid\b|\brefrain\s+from\b|\bnot\s+allowed\s+to\b|"
+                    r"\bdo\s+not\b|\bdon't\b|\bmust\s+not\b|\bnot\b|\bnever\b)"
+                    r"(?:\s+(?:ever|again|directly|also|yet))?\s*$|"
+                    r"\b(?:should|must|will|shall|may|can|could|would)\s+not\s+be\s*$|"
+                    r"\b(?:is|are|was|were)\s+not\s+to\s+be\s*$|\bwithout\b\s*$",
+                    verb_prefix,
+                    re.IGNORECASE,
+                ):
+                    continue
+                if english_verb and group.start() < verb.start() and (
+                    re.search(
+                        r"\bno\b",
+                        clause[max(0, group.start() - 30):group.start()],
+                        re.IGNORECASE,
+                    )
+                    or re.search(
+                        r"\b(?:cannot|can't|can\s+not)\b",
+                        clause[group.end():verb.start()],
+                        re.IGNORECASE,
+                    )
+                ):
+                    continue
+                if not english_verb:
+                    chinese_prefix = re.split(r"[，,。！？；;]", verb_prefix)[-1]
+                    if re.search(
+                        r"(?:不得|禁止|不要|不可|不准|避免|無需|毋須|不)\s*$",
+                        chinese_prefix,
+                    ) or (
+                        group.start() < verb.start()
+                        and _PUBLICATION_NEGATION.search(chinese_prefix)
+                    ):
+                        continue
+                clause_tail = clause[max(group.end(), verb.end()):]
+                if re.search(
+                    r"\b(?:is|are|was|were|remains?)\s+"
+                    r"(?:strictly\s+)?(?:forbidden|prohibited|not\s+allowed)\b",
+                    clause_tail,
+                    re.IGNORECASE,
+                ):
+                    continue
+                if verb.start() < group.start():
+                    between = clause[verb.end():group.start()]
+                    if english_verb:
+                        connectors = list(re.finditer(
+                            r"\b(to|into|in|on|with|via|through)\b", between, re.I,
+                        ))
+                        if not connectors or (
+                            connectors[-1].group(1).lower() == "with"
+                            and verb.group(0).lower() != "share"
+                        ):
+                            continue
+                        destination_phrase = between[connectors[-1].end():]
+                    else:
+                        connector = re.search(r"(?:到|至|向|往|在|給)", between)
+                        if connector is None and verb.group(0) not in {
+                            "貼到", "貼至", "放到", "放入", "置入",
+                        }:
+                            continue
+                        destination_phrase = between[
+                            connector.end() if connector is not None else 0:
+                        ]
+                    if re.search(
+                        r"(?:\b(?:and|then|while|mention|reference|note|describe)\b|"
+                        r"並|且|以及|提及|註記|備註)",
+                        destination_phrase,
+                        re.IGNORECASE,
+                    ):
+                        continue
+                return True
+    return False
+
+
+def _has_unexcluded_facebook_group_destination(
+    text: str, *, facebook_context: bool = False,
+) -> bool:
+    """Fail closed on group destinations unless the clause clearly excludes them."""
+    candidate_text = str(text or "")
+    if re.search(
+        r"\b(?:do\s+not|don't|not)\s+only\b.{0,160}\bbut\s+also\b"
+        r".{0,80}(?:facebook|\bfb\b|\bgroups?\b)",
+        candidate_text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        r"\b(?:do\s+not|don't|must\s+not|never)\b.{0,80}"
+        r"\b(?:publish|post|repost|relist|share|send|list|add|put|place)\w*\b"
+        r".{0,50}\b(?:except|other\s+than)\b.{0,50}"
+        r"(?:facebook|\bfb\b|\bgroups?\b)|"
+        r"(?:除了|唯獨).{0,30}(?:facebook|臉書|社團|群組)"
+        r".{0,40}(?:不要|不得|禁止|不可|不准|不).{0,30}(?:其他|別的|其餘)",
+        candidate_text,
+        re.IGNORECASE,
+    ):
+        return True
+    candidate_text = re.sub(
+        r"\b(?:except|other\s+than)\b\s*(?:any\s+)?"
+        r"(?:facebook|\bfb\b|臉書)?\s*(?:groups?|社團|群組)\b|"
+        r"(?:除了|除外|唯獨)\s*(?:facebook|臉書)?\s*(?:社團|群組)",
+        "",
+        candidate_text,
+        flags=re.IGNORECASE,
+    )
+    for clause in re.split(r"[\n。！？；;，,]", candidate_text):
+        if _facebook_group_clause_is_readonly_observation(clause):
+            continue
+        explicit = _has_facebook_group_reference(clause)
+        contextual = bool(
+            facebook_context
+            and _BARE_GROUP_REFERENCE.search(clause)
+            and re.search(
+                r"\b(?:telegram|whatsapp|signal|discord|line|linkedin)\b",
+                clause,
+                re.IGNORECASE,
+            ) is None
+        )
+        if not (explicit or contextual):
+            continue
+        group_match = (
+            (_FACEBOOK_GROUP_REFERENCE if explicit else _BARE_GROUP_REFERENCE)
+            .search(clause)
+        )
+        if group_match and _facebook_group_destination_is_negated(
+            clause, group_match.start()
+        ):
+            continue
+        if re.search(
+            r"\b(?:mention|reference|note|describe)\b|提及|註記|備註",
+            clause,
+            re.IGNORECASE,
+        ) and not re.search(
+            r"\bas\s+(?:the\s+)?destination\b|作為(?:發布)?目的地|指定為(?:發布)?目的地",
+            clause,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.search(
+            r"(?:\b(?:avoid|refrain\s+from|do\s+not|don't|must\s+not|not|never|"
+            r"not\s+allowed\s+to|without)\b.{0,80}\b(?:publish|republish|post|"
+            r"repost|relist|redistribute|submit|share|send|list|add|put|place|receive)|"
+            r"\b(?:should|must|will|shall|may|can|could|would)\s+not\s+be\s+"
+            r"(?:published|posted|reposted|relisted|shared|sent|listed|added|placed)|"
+            r"\b(?:is|are|was|were)\s+not\s+to\s+be\s+"
+            r"(?:published|posted|reposted|relisted|shared|sent|listed|added|placed)|"
+            r"\bno\b.{0,40}\bgroups?\b|\bgroups?\b.{0,40}\b(?:cannot|can't|can\s+not)\b|"
+            r"\b(?:is|are|was|were|remains?)\s+(?:strictly\s+)?"
+            r"(?:forbidden|prohibited|not\s+allowed)\b|"
+            r"(?:不得|禁止|不要|不可|不准|避免|無需|毋須|不)"
+            r".{0,30}(?:社團|群組))",
+            clause,
+            re.IGNORECASE,
+        ):
+            continue
+        return True
+    return False
+
+
+def _is_external_action_objective(text: str) -> bool:
+    facebook_context = re.search(
+        r"(?:facebook|\bfb\b|臉書|marketplace)", text, re.IGNORECASE,
+    ) is not None
+    return bool(
+        _EXTERNAL_ACTION_OBJECTIVE.search(text)
+        or _has_positive_facebook_group_publication(
+            text, facebook_context=facebook_context,
+        )
+        or _has_unexcluded_facebook_group_destination(
+            text, facebook_context=facebook_context,
+        )
+    )
 
 
 def _approval_contract_is_checkpoint_only(contract: Mapping[str, Any]) -> bool:
@@ -1040,7 +1400,7 @@ def _guard_external_action_objective_downgrade(
     if isinstance(contract.get("objective_ref"), dict):
         return
     original_request = str(args.get("original_request") or "").strip()
-    if _EXTERNAL_ACTION_OBJECTIVE.search(original_request) is None:
+    if not _is_external_action_objective(original_request):
         return
     goal = contract.get("goal") if isinstance(contract.get("goal"), dict) else {}
     scope = contract.get("scope") if isinstance(contract.get("scope"), dict) else {}
@@ -1091,12 +1451,28 @@ def _ensure_external_action_objective_ref(
     internal_only_contract: bool,
     request_instance_id: str = "",
     board: str | None = None,
+    origin_objective_id: str = "",
 ) -> dict[str, str] | None:
     """Create/reuse a lane-bound objective for any external-action request."""
-    if isinstance(args.get("objective_ref"), dict):
-        return None
     original_request = str(args.get("original_request") or "").strip()
-    if _EXTERNAL_ACTION_OBJECTIVE.search(original_request) is None:
+    # Auto-created objectives have this canonical identity; ordinary code tokens
+    # such as go_router are not control-plane references.
+    mentioned = set(re.findall(r"\bgo_ext_[0-9a-f]{24}\b", original_request))
+    supplied = args.get("objective_ref")
+    if origin_objective_id:
+        if (mentioned and mentioned != {origin_objective_id}) or (
+            isinstance(supplied, dict)
+            and supplied.get("objective_id") != origin_objective_id
+        ):
+            raise ValueError("Objective reference conflicts with the verified callback origin")
+        mentioned.add(origin_objective_id)
+    if isinstance(supplied, dict):
+        if mentioned and supplied.get("objective_id") not in mentioned:
+            raise ValueError("Objective reference conflicts with the explicitly named originating objective")
+        return None
+    if len(mentioned) > 1:
+        raise ValueError("Multiple objectives are named; supply an explicit same-Topic objective_ref")
+    if not mentioned and not _is_external_action_objective(original_request):
         return None
     clean_platform = str(platform or "").strip().lower()
     clean_chat = str(chat_id or "").strip()
@@ -1135,7 +1511,7 @@ def _ensure_external_action_objective_ref(
         or _ZERO_EXTERNAL_EFFECT_CONSTRAINT.search(stage_text) is not None
         or _PREPARATORY_OR_TEXT_ONLY_OBJECTIVE.search(stage_text) is not None
     )
-    objective_id = "go_ext_" + objective_hash[:24]
+    objective_id = next(iter(mentioned)) if mentioned else "go_ext_" + objective_hash[:24]
     if preparatory_stage:
         stage_hash = hashlib.sha256(
             json.dumps(
@@ -1169,6 +1545,8 @@ def _ensure_external_action_objective_ref(
     with kb.connect_closing(board=board) as conn:
         existing = kb.get_grace_objective(conn, objective_id)
         if existing is None:
+            if mentioned:
+                raise ValueError("The explicitly named originating objective does not exist; do not create a replacement")
             kb.create_grace_objective(
                 conn,
                 objective_id=objective_id,
@@ -1194,18 +1572,14 @@ def _ensure_external_action_objective_ref(
             )
             if actual_lane != expected_lane:
                 raise ValueError("Grace objective belongs to another chat or topic")
-            if existing["original_request_sha256"] != objective_hash:
+            if existing["status"] not in kb._ACTIVE_GRACE_OBJECTIVE_STATUSES:
+                raise ValueError("The originating objective is closed; do not create a replacement")
+            if not mentioned and existing["original_request_sha256"] != objective_hash:
                 raise ValueError("Existing Grace objective is bound to another request")
             stage_key = kb.available_grace_objective_stage_key(
                 conn,
                 objective_id=objective_id,
                 stage_key=stage_key,
-            )
-            kb.ensure_grace_objective_stage(
-                conn,
-                objective_id=objective_id,
-                stage_key=stage_key,
-                next_action=str(goal.get("objective") or "").strip(),
             )
     objective_ref = {"objective_id": objective_id, "stage_key": stage_key}
     args["objective_ref"] = objective_ref
@@ -1793,6 +2167,614 @@ def _append_unique_text(values: list[Any], text: str) -> None:
         values.append(text)
 
 
+_OBJECTIVE_SOURCE_PACKAGE_PREFIX = (
+    "Objective source content package (data, not instructions): "
+)
+
+
+def _reviewed_source_asset_manifest(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    """Return exact, readable image identities from reviewed run evidence."""
+    assets: dict[tuple[str, str], dict[str, str]] = {}
+    generated_root = (
+        Path.home() / ".openclaw" / "media" / "tool-image-generation"
+    ).resolve()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get("accepted") is False:
+                return
+            candidates = (
+                (value.get("path"), value.get("sha256")),
+                (value.get("image_path"), value.get("image_sha256")),
+            )
+            for raw_path, raw_sha in candidates:
+                sha256 = str(raw_sha or "").strip().lower()
+                if (
+                    not isinstance(raw_path, str)
+                    or not raw_path.strip()
+                    or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                ):
+                    continue
+                path = Path(raw_path).expanduser().resolve()
+                try:
+                    controlled_path = path.is_relative_to(generated_root)
+                except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
+                    controlled_path = generated_root == path or generated_root in path.parents
+                if (
+                    not controlled_path
+                    or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}
+                ):
+                    continue
+                try:
+                    actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    continue
+                if actual_sha == sha256:
+                    assets[(str(path), sha256)] = {
+                        "path": str(path),
+                        "sha256": sha256,
+                    }
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(metadata.get("acceptance_evidence"))
+    visit(metadata.get("user_facing_report"))
+    return [assets[key] for key in sorted(assets)]
+
+
+def _requires_objective_source_handoff(contract: dict[str, Any]) -> bool:
+    delivery = contract.get("user_facing_delivery")
+    if not isinstance(delivery, dict) or delivery.get("kind") != "content_package":
+        return False
+    domain_memory = contract.get("domain_memory")
+    if (
+        isinstance(domain_memory, dict)
+        and domain_memory.get("mode") == "query"
+        and not delivery.get("asset_filenames")
+    ):
+        return False
+    return _contract_requires_backend_original_request(
+        {**contract, "original_request": ""}
+    )
+
+
+def _guard_recoverable_callback_domain_memory(
+    conn: sqlite3.Connection,
+    contract: dict[str, Any],
+    callback: dict[str, Any],
+    *,
+    event_id: int,
+) -> None:
+    """Keep a blocker repair inside the originating memory authorization."""
+    trigger = conn.execute(
+        "SELECT id, task_id, kind, payload FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    if not kb._grace_callback_is_recoverable_blocker(
+        conn,
+        callback=callback,
+        trigger=trigger,
+    ):
+        return
+    rows = conn.execute(
+        "SELECT contract_snapshot FROM grace_delegations "
+        "WHERE execution_task_id = ? AND review_task_id = ?",
+        (
+            str(callback.get("execution_task_id") or "").strip(),
+            str(callback.get("review_task_id") or "").strip(),
+        ),
+    ).fetchall()
+    if len(rows) != 1:
+        raise ValueError(
+            "Recoverable callback has no unique originating contract; "
+            "stop internal recovery."
+        )
+    try:
+        source_contract = json.loads(rows[0]["contract_snapshot"] or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        source_contract = None
+    if not isinstance(source_contract, dict):
+        raise ValueError(
+            "Recoverable callback has no valid originating contract snapshot; "
+            "stop internal recovery."
+        )
+
+    from proactive.domain_memory import normalize_domain_memory_contract
+
+    def normalized_spec(value: object) -> dict[str, Any] | None:
+        return (
+            normalize_domain_memory_contract(value)
+            if isinstance(value, dict)
+            else None
+        )
+
+    if normalized_spec(contract.get("domain_memory")) != normalized_spec(
+        source_contract.get("domain_memory")
+    ):
+        raise ValueError(
+            "Recoverable callback successor cannot add, remove, or change "
+            "domain_memory authorization. Correct the worker output within "
+            "the originating contract."
+        )
+
+
+def _active_callback_reservation(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        "SELECT objective_id,stage_key FROM grace_delegations "
+        "WHERE origin_review_task_id=? AND origin_event_id=? "
+        "AND state IN ('authorized','building','queued')",
+        (review_task_id, event_id),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ValueError(
+            "This callback has ambiguous active continuation reservations; "
+            "reconcile its lineage before another delegation"
+        )
+    return dict(rows[0]) if rows else None
+
+
+def _objective_source_handoff(
+    conn: sqlite3.Connection,
+    contract: dict[str, Any],
+    callback: dict[str, Any],
+) -> list[str]:
+    """Recover exact source bytes only through the verified Objective lineage."""
+    if not _requires_objective_source_handoff(contract):
+        return []
+    identity = contract.get("identity") or {}
+    objective_ref = contract.get("objective_ref") or {}
+    objective_id = str(objective_ref.get("objective_id") or "").strip()
+    project = str(identity.get("project") or "").strip()
+    objective = kb.get_grace_objective(conn, objective_id)
+    lane = (
+        str(identity.get("platform") or "").strip().lower(),
+        str(identity.get("chat_id") or "").strip(),
+        str(identity.get("thread_id") or "").strip(),
+    )
+    if not project or objective is None or (
+        objective["platform"], objective["chat_id"], objective["thread_id"]
+    ) != lane:
+        raise ValueError(
+            "Source-bound content package belongs to another Objective or Topic; "
+            "stop internal handoff."
+        )
+    workflow = conn.execute(
+        "SELECT specification FROM grace_objective_workflows WHERE objective_id = ?",
+        (objective_id,),
+    ).fetchone()
+    if workflow is not None:
+        try:
+            workflow_project = str(
+                (json.loads(workflow["specification"] or "{}") or {}).get("project")
+                or ""
+            ).strip()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            workflow_project = ""
+        if not workflow_project or workflow_project != project:
+            raise ValueError(
+                "Source-bound content package belongs to another project; "
+                "stop internal handoff."
+            )
+
+    execution_id = str(callback.get("execution_task_id") or "").strip()
+    review_id = str(callback.get("review_task_id") or "").strip()
+    lineage: list[tuple[str, list[sqlite3.Row]]] = []
+    reviewed_source_run_ids: set[int] = set()
+    seen: set[str] = set()
+
+    def accepted_source_run(
+        stage_callback: dict[str, Any],
+        *,
+        stage_execution_id: str,
+        stage_review_id: str,
+    ) -> sqlite3.Row:
+        event_id = next(
+            (
+                int(stage_callback.get(key) or 0)
+                for key in ("lease_event_id", "outcome_event_id", "last_event_id")
+                if int(stage_callback.get(key) or 0) > 0
+            ),
+            0,
+        )
+        event = conn.execute(
+            "SELECT task_id, kind, run_id FROM task_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        review_run = (
+            kb.get_run(conn, int(event["run_id"]))
+            if event is not None and event["run_id"] is not None
+            else None
+        )
+        review_source = (
+            (review_run.metadata or {}).get("workflow_review_source")
+            if review_run is not None
+            else None
+        )
+        if (
+            event is None
+            or event["task_id"] != stage_review_id
+            or event["kind"] != "completed"
+            or review_run is None
+            or review_run.task_id != stage_review_id
+            or review_run.status not in {"done", "completed"}
+            or review_run.outcome != "completed"
+            or not kb.grace_review_accepted(review_run.metadata or {})
+            or not isinstance(review_source, dict)
+        ):
+            raise ValueError(
+                "Objective source lineage has no exact accepted review event; "
+                "stop internal handoff."
+            )
+        try:
+            source_run = kb.reviewed_execution_run(
+                conn, review_run, stage_execution_id,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Objective source lineage review does not bind unchanged "
+                "execution evidence; stop internal handoff."
+            ) from exc
+        if (
+            source_run is None
+            or source_run.task_id != stage_execution_id
+            or source_run.status not in {"done", "completed"}
+            or source_run.outcome != "completed"
+            or not source_run.ended_at
+        ):
+            raise ValueError(
+                "Objective source lineage review did not accept a terminal execution run; "
+                "stop internal handoff."
+            )
+        row = conn.execute(
+            "SELECT id, task_id, metadata FROM task_runs WHERE id = ?",
+            (source_run.id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "Objective source lineage accepted execution run is missing; "
+                "stop internal handoff."
+            )
+        reviewed_source_run_ids.add(int(row["id"]))
+        return row
+
+    def authenticated_root_source_run(
+        delegation: dict[str, Any],
+        trigger: sqlite3.Row | None,
+    ) -> sqlite3.Row:
+        """Recover only the compiler-sealed user request from a blocked root run."""
+        if (
+            trigger is None
+            or str(trigger["task_id"] or "") != execution_id
+            or trigger["run_id"] is None
+            or delegation.get("origin_event_id") is not None
+        ):
+            raise ValueError(
+                "Recoverable source blocker has no authenticated root execution; "
+                "stop internal handoff."
+            )
+        run = kb.get_run(conn, int(trigger["run_id"]))
+        task = conn.execute(
+            "SELECT body, project_namespace FROM tasks WHERE id = ?",
+            (execution_id,),
+        ).fetchone()
+        row = conn.execute(
+            "SELECT id, task_id, metadata FROM task_runs WHERE id = ?",
+            (int(trigger["run_id"]),),
+        ).fetchone()
+        try:
+            snapshot = json.loads(delegation.get("contract_snapshot") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = None
+        compiled = kb._grace_compiled_contract(str(task["body"] or "")) if task else None
+        source_contract = (
+            (run.metadata or {}).get("loop_contract") if run is not None else None
+        )
+        source_audit = (
+            source_contract.get("audit")
+            if isinstance(source_contract, dict)
+            else None
+        )
+        trusted_identity = snapshot.get("identity") if isinstance(snapshot, dict) else None
+        trusted_ref = snapshot.get("objective_ref") if isinstance(snapshot, dict) else None
+        original = snapshot.get("original_request") if isinstance(snapshot, dict) else None
+        compiled_audit = compiled.get("audit") if isinstance(compiled, dict) else None
+        digest = (
+            str(compiled_audit.get("original_request_sha256") or "").strip().lower()
+            if isinstance(compiled_audit, dict)
+            else ""
+        )
+        expected_identity = {
+            "platform": lane[0],
+            "chat_id": lane[1],
+            "thread_id": lane[2],
+            "project": project,
+            "requested_by": "authenticated_user",
+            "compiled_by": "Grace",
+        }
+        expected_ref = {
+            "objective_id": objective_id,
+            "stage_key": str(delegation.get("stage_key") or "").strip(),
+        }
+        if (
+            run is None
+            or run.task_id != execution_id
+            or run.status != "blocked"
+            or run.outcome != "blocked"
+            or not run.ended_at
+            or row is None
+            or task is None
+            or str(task["project_namespace"] or "").strip() != project
+            or not isinstance(snapshot, dict)
+            or not isinstance(compiled, dict)
+            or not isinstance(source_contract, dict)
+            or not isinstance(trusted_identity, dict)
+            or any(trusted_identity.get(key) != value for key, value in expected_identity.items())
+            or trusted_ref != expected_ref
+            or compiled.get("identity") != trusted_identity
+            or compiled.get("objective_ref") != trusted_ref
+            or compiled.get("original_request") != original
+            or source_contract.get("identity") != trusted_identity
+            or source_contract.get("objective_ref") != trusted_ref
+            or source_contract.get("original_request") != original
+            or not isinstance(original, str)
+            or not original
+            or original.lstrip().startswith("[SYSTEM: Grace Loop callback]")
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or hashlib.sha256(original.encode("utf-8")).hexdigest() != digest
+            or not isinstance(source_audit, dict)
+            or source_audit.get("original_request_sha256") != digest
+        ):
+            raise ValueError(
+                "Recoverable source blocker has no compiler-sealed authenticated "
+                "root request; stop internal handoff."
+            )
+        return row
+
+    while execution_id:
+        if execution_id in seen or len(seen) >= 64:
+            raise ValueError("Objective source lineage is cyclic or exceeds 64 stages.")
+        seen.add(execution_id)
+        delegations = conn.execute(
+            "SELECT * FROM grace_delegations WHERE execution_task_id = ?",
+            (execution_id,),
+        ).fetchall()
+        if len(delegations) != 1:
+            raise ValueError(
+                "Objective source lineage has no unique parent delegation; "
+                "stop internal handoff."
+            )
+        delegation = dict(delegations[0])
+        task_projects = conn.execute(
+            "SELECT id, project_namespace FROM tasks WHERE id IN (?, ?)",
+            (execution_id, review_id),
+        ).fetchall()
+        if (
+            str(delegation.get("objective_id") or "") != objective_id
+            or str(delegation.get("review_task_id") or "") != review_id
+            or len(task_projects) != 2
+            or any(
+                str(task["project_namespace"] or "").strip() != project
+                for task in task_projects
+            )
+            or conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (execution_id, review_id),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError(
+                "Objective source lineage has a mismatched Objective or parent link; "
+                "stop internal handoff."
+            )
+        stage_callback = kb.get_grace_loop_callback(conn, review_id)
+        if stage_callback is None or any(
+            str(stage_callback.get(key) or "").strip() != expected
+            for key, expected in (
+                ("execution_task_id", execution_id),
+                ("objective_id", objective_id),
+                ("platform", lane[0]),
+                ("chat_id", lane[1]),
+                ("thread_id", lane[2]),
+            )
+        ) or str(stage_callback.get("stage_key") or "").strip() != str(
+            delegation.get("stage_key") or ""
+        ).strip():
+            raise ValueError(
+                "Objective source lineage has a callback from another Objective or Topic; "
+                "stop internal handoff."
+            )
+        event_id = next(
+            (
+                int(stage_callback.get(key) or 0)
+                for key in ("lease_event_id", "outcome_event_id", "last_event_id")
+                if int(stage_callback.get(key) or 0) > 0
+            ),
+            0,
+        )
+        trigger = conn.execute(
+            "SELECT id, task_id, kind, payload, run_id FROM task_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        recoverable_blocker = kb._grace_callback_is_recoverable_blocker(
+            conn,
+            callback=stage_callback,
+            trigger=trigger,
+        )
+        if not recoverable_blocker:
+            source_run = accepted_source_run(
+                stage_callback,
+                stage_execution_id=execution_id,
+                stage_review_id=review_id,
+            )
+            lineage.append((execution_id, [source_run]))
+        review_id = str(delegation.get("origin_review_task_id") or "").strip()
+        if not review_id:
+            if recoverable_blocker:
+                lineage.append(
+                    (execution_id, [authenticated_root_source_run(delegation, trigger)])
+                )
+            break
+        parent_callback = kb.get_grace_loop_callback(conn, review_id)
+        parent_execution_id = str(
+            (parent_callback or {}).get("execution_task_id") or ""
+        ).strip()
+        origin_event_id = delegation.get("origin_event_id")
+        origin_event = (
+            conn.execute(
+                "SELECT task_id FROM task_events WHERE id = ?",
+                (int(origin_event_id),),
+            ).fetchone()
+            if origin_event_id is not None
+            else None
+        )
+        if (
+            not parent_execution_id
+            or origin_event is None
+            or str(origin_event["task_id"] or "")
+            not in {review_id, parent_execution_id}
+        ):
+            raise ValueError(
+                "Objective source lineage is missing its parent callback event; "
+                "stop internal handoff."
+            )
+        execution_id = parent_execution_id
+
+    trusted_lineage_runs = {
+        (task_id, int(row["id"]))
+        for task_id, runs in lineage
+        for row in runs
+    }
+
+    def verified_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        source_text = payload.get("original_request")
+        source_task_id = str(payload.get("execution_task_id") or "").strip()
+        source_run_id = payload.get("run_id")
+        digest = str(payload.get("utf8_sha256") or "").strip().lower()
+        if (
+            payload.get("objective_id") != objective_id
+            or not isinstance(source_text, str)
+            or not source_text
+            or not isinstance(source_run_id, int)
+            or (source_task_id, source_run_id) not in trusted_lineage_runs
+            or hashlib.sha256(source_text.encode("utf-8")).hexdigest() != digest
+        ):
+            raise ValueError(
+                "Objective source content package is malformed or outside its lineage."
+            )
+        source_run = kb.get_run(conn, source_run_id)
+        source_contract = (
+            (source_run.metadata or {}).get("loop_contract")
+            if source_run is not None and source_run.task_id == source_task_id
+            else None
+        )
+        source_audit = (
+            source_contract.get("audit")
+            if isinstance(source_contract, dict)
+            else None
+        )
+        source_identity = (
+            source_contract.get("identity")
+            if isinstance(source_contract, dict)
+            else None
+        )
+        if (
+            not isinstance(source_contract, dict)
+            or source_contract.get("original_request") != source_text
+            or not isinstance(source_identity, dict)
+            or source_identity.get("project") != project
+            or not isinstance(source_audit, dict)
+            or source_audit.get("original_request_sha256") != digest
+        ):
+            raise ValueError(
+                "Objective source content package does not match its referenced run."
+            )
+        verified = dict(payload)
+        verified.pop("assets", None)
+        assets = (
+            _reviewed_source_asset_manifest(source_run.metadata or {})
+            if source_run.id in reviewed_source_run_ids
+            else []
+        )
+        if assets:
+            verified["assets"] = assets
+        return verified
+
+    for task_id, runs in lineage:
+        for row in runs:
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            source_contract = metadata.get("loop_contract")
+            if not isinstance(source_contract, dict):
+                continue
+            original = source_contract.get("original_request")
+            audit = source_contract.get("audit")
+            digest = (
+                str(audit.get("original_request_sha256") or "").strip().lower()
+                if isinstance(audit, dict)
+                else ""
+            )
+            if (
+                isinstance(original, str)
+                and original
+                and not original.lstrip().startswith("[SYSTEM: Grace Loop callback]")
+                and _contract_requires_backend_original_request(source_contract)
+            ):
+                return [
+                    _OBJECTIVE_SOURCE_PACKAGE_PREFIX
+                    + json.dumps(
+                        verified_payload(
+                            {
+                                "objective_id": objective_id,
+                                "execution_task_id": task_id,
+                                "run_id": int(row["id"]),
+                                "original_request": original,
+                                "utf8_sha256": digest,
+                            }
+                        ),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ]
+            memory = source_contract.get("memory")
+            working = memory.get("working") if isinstance(memory, dict) else []
+            for entry in reversed(working or []):
+                text = str(entry)
+                if not text.startswith(_OBJECTIVE_SOURCE_PACKAGE_PREFIX):
+                    continue
+                try:
+                    payload = json.loads(
+                        text[len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX) :]
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise ValueError("Objective source content package is invalid JSON.")
+                if not isinstance(payload, dict):
+                    raise ValueError("Objective source content package must be an object.")
+                return [
+                    _OBJECTIVE_SOURCE_PACKAGE_PREFIX
+                    + json.dumps(
+                        verified_payload(payload),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ]
+    raise ValueError(
+        "Source-bound content package has no exact original request in its "
+        "verified Objective lineage; stop internal handoff."
+    )
+
+
 def _contract_requests_ai_bizweek_source(contract: dict[str, Any]) -> bool:
     text = json.dumps(contract, ensure_ascii=False, sort_keys=True).casefold()
     return (
@@ -1810,16 +2792,6 @@ def _augment_ai_bizweek_source_evidence(
     session_id: str,
 ) -> dict[str, Any]:
     """Embed managed Page source text before fingerprinting worker contracts."""
-    domain_memory = contract.get("domain_memory")
-    if (
-        isinstance(domain_memory, dict)
-        and domain_memory.get("mode") == "query"
-    ):
-        # A typed inventory/count/status query must stay registry-only.  Page
-        # source fidelity is relevant to content production, but injecting it
-        # here contaminates the query contract with copy/CTA/asset work and can
-        # prevent a valid inventory result from completing.
-        return contract
     if not session_id or not _contract_requests_ai_bizweek_source(contract):
         return contract
     try:
@@ -1902,6 +2874,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     """Create execution + Grace-review cards only after a complete contract exists."""
     args = dict(args or {})
     supplied_approval_args = dict(args)
+    approval_receipt_saved = False
     approval_refresh_token = str(
         args.pop("_approval_refresh_token", "") or ""
     ).strip()
@@ -1925,6 +2898,12 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     trusted_message_path = normalize_message_path(
         get_session_env("HERMES_TELEGRAM_MESSAGE_PATH", "")
     )
+    if not message_id and trusted_message_path:
+        # The trusted Gateway trace is the durable fallback when an in-band
+        # follow-up lost the ContextVar message anchor during compression.
+        message_id = str(
+            trusted_message_path.get("inbound_message_id") or ""
+        ).strip()
     if platform == "telegram" and not trusted_message_path:
         trusted_message_path = build_telegram_message_path(
             chat_id=chat_id,
@@ -2335,6 +3314,97 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "Delegation requires a stable request_instance_id when no "
                 "originating message or callback event exists."
             )
+        origin_objective_id = ""
+        verified_origin: dict[str, Any] = {}
+        if internal_turn and origin_review_id and origin_event_id is not None:
+            with kb.connect_closing(board=board) as conn:
+                if callback_lease_owner:
+                    kb.rebind_active_grace_callback_session(
+                        conn, review_task_id=origin_review_id, event_id=origin_event_id,
+                        platform=platform, chat_id=chat_id, thread_id=thread_id,
+                        session_id=session_id, lease_owner=callback_lease_owner,
+                    )
+                    verified_origin = kb.validate_accepted_grace_callback_origin(
+                        conn, review_task_id=origin_review_id, event_id=origin_event_id,
+                        platform=platform, chat_id=chat_id, thread_id=thread_id,
+                        session_id=session_id, lease_owner=callback_lease_owner,
+                        allow_recoverable_blocker=True,
+                    )
+                else:
+                    if not internal_only_contract or bool(args.get("approved")):
+                        raise ValueError(
+                            "Internal continuation without an active lease is limited "
+                            "to unapproved zero-external-effect recovery."
+                        )
+                    verified_origin = kb.validate_recoverable_blocked_callback(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                    )
+                origin_objective_id = str(verified_origin.get("objective_id") or "")
+                if not callback_lease_owner and not origin_objective_id:
+                    raise ValueError(
+                        "Delivered repair callback has no originating Objective; "
+                        "stop internal recovery."
+                    )
+                reserved = _active_callback_reservation(
+                    conn,
+                    review_task_id=origin_review_id,
+                    event_id=origin_event_id,
+                )
+                if reserved is not None and origin_objective_id:
+                    if reserved["objective_id"] != origin_objective_id or not reserved["stage_key"]:
+                        raise ValueError("This callback already reserved an unbound continuation; reconcile its lineage before another delegation")
+                    args.setdefault("objective_ref", {"objective_id": reserved["objective_id"], "stage_key": reserved["stage_key"]})
+        elif (
+            not internal_turn
+            and fresh_callback_origin_kind == "recoverable_blocker"
+            and origin_review_id
+            and origin_event_id is not None
+        ):
+            with kb.connect_closing(board=board) as conn:
+                verified_origin = kb.validate_recoverable_blocked_callback(
+                    conn,
+                    review_task_id=origin_review_id,
+                    event_id=origin_event_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    session_id=approval_callback_session_id or session_id,
+                )
+                origin_objective_id = str(
+                    verified_origin.get("objective_id") or ""
+                )
+                if not origin_objective_id:
+                    raise ValueError(
+                        "Fresh repair callback has no originating Objective; "
+                        "stop recovery."
+                    )
+                reserved = _active_callback_reservation(
+                    conn,
+                    review_task_id=origin_review_id,
+                    event_id=origin_event_id,
+                )
+                if reserved is not None:
+                    if (
+                        reserved["objective_id"] != origin_objective_id
+                        or not reserved["stage_key"]
+                    ):
+                        raise ValueError(
+                            "This callback already reserved an unbound continuation; "
+                            "reconcile its lineage before another delegation"
+                        )
+                    args.setdefault(
+                        "objective_ref",
+                        {
+                            "objective_id": reserved["objective_id"],
+                            "stage_key": reserved["stage_key"],
+                        },
+                    )
         _ensure_external_action_objective_ref(
             args,
             platform=platform,
@@ -2348,7 +3418,16 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             internal_only_contract=internal_only_contract,
             request_instance_id=request_instance_id,
             board=board,
+            origin_objective_id=origin_objective_id,
         )
+        if (
+            isinstance(args.get("facebook_group_publish"), dict)
+            and not isinstance(args.get("objective_ref"), dict)
+        ):
+            raise ValueError(
+                "Facebook group publishing requires a durable objective_ref so "
+                "preflight, approval, publication, and remaining coverage stay linked"
+            )
         contract = {
             "identity": {
                 "platform": platform,
@@ -2399,10 +3478,44 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
         if external_targets:
             contract["external_targets"] = external_targets
-        if isinstance(args.get("facebook_group_publish"), dict):
-            contract["facebook_group_publish"] = dict(
-                args["facebook_group_publish"]
+        publication_fields = [
+            str(args.get("original_request") or ""),
+            str(goal.get("objective") or ""),
+            *[str(item) for item in (goal.get("deliverables") or [])],
+            *[str(item) for item in (scope.get("allowed") or [])],
+            *external_targets,
+        ]
+        publication_context = "\n".join(publication_fields)
+        facebook_publication_context = re.search(
+            r"(?:facebook|\bfb\b|臉書|marketplace)",
+            publication_context,
+            re.IGNORECASE,
+        ) is not None
+        group_publication = task_type == "facebook_marketplace_group_publish" or (
+            task_type in {"secondhand_commerce_cross_platform_listing", "browser_publish"}
+            and (
+                any(
+                    _has_unexcluded_facebook_group_destination(
+                        target, facebook_context=facebook_publication_context,
+                    )
+                    for target in external_targets
+                )
+                or any(
+                    _has_positive_facebook_group_publication(
+                        item, facebook_context=facebook_publication_context,
+                    )
+                    for item in publication_fields
+                )
+                or any(
+                    _has_unexcluded_facebook_group_destination(
+                        item, facebook_context=facebook_publication_context,
+                    )
+                    for item in publication_fields
+                )
             )
+        )
+        if group_publication and not isinstance(args.get("facebook_group_publish"), dict):
+            raise ValueError("Facebook group publication requires structured facebook_group_publish scope and accepted_preflight")
         if task_type == "facebook_page_api_publish":
             contract["facebook_page_post"] = _bind_facebook_page_publish_manifest(
                 scope,
@@ -2424,8 +3537,44 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     platform=platform,
                     chat_id=chat_id,
                     thread_id=thread_id,
+                    ensure_stage=False,
                 )
             contract["objective_ref"] = clean_objective_ref
+        if verified_origin and isinstance(contract.get("objective_ref"), dict):
+            with kb.connect_closing(board=board) as conn:
+                _guard_recoverable_callback_domain_memory(
+                    conn,
+                    contract,
+                    verified_origin,
+                    event_id=int(origin_event_id or 0),
+                )
+                source_handoff = _objective_source_handoff(
+                    conn,
+                    contract,
+                    verified_origin,
+                )
+            for entry in source_handoff:
+                _append_unique_text(contract["memory"]["working"], entry)
+            if source_handoff:
+                _append_unique_text(
+                    contract["memory"]["working"],
+                    "For this source-bound content package, use only the exact UTF-8 "
+                    "original_request bytes in the Objective source content package. "
+                    "Compare the final output to its utf8_sha256. Do not use the Grace "
+                    "callback envelope as source text or search Topic history for a replacement. "
+                    "If the package cannot be verified, report an internal source-handoff failure.",
+                )
+        if isinstance(args.get("facebook_group_publish"), dict):
+            contract["facebook_group_publish"] = _bind_accepted_facebook_group_preflight(
+                {
+                    **contract,
+                    "facebook_group_publish": dict(args["facebook_group_publish"]),
+                },
+                board=board,
+            )
+            from hermes_cli.objective_workflow import validate_publication
+            with kb.connect_closing(board=board) as conn:
+                validate_publication(conn, contract)
         _guard_external_action_objective_downgrade(
             args,
             contract,
@@ -2506,6 +3655,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             sealed_identity = sealed_contract.get("identity") or {}
             sealed_routing = sealed_contract.get("routing") or {}
+            if sealed_contract.get("facebook_group_publish") != contract.get("facebook_group_publish"):
+                raise ValueError("Accepted group preflight changed since approval; inspect and rebuild the exact publication contract")
             if task_type == "facebook_page_api_publish" and (
                 sealed_contract.get("facebook_page_preflight_source")
                 != contract.get("facebook_page_preflight_source")
@@ -2590,14 +3741,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 and existing_approved_delegation.get("challenge_token")
                 == approval_token
             )
-            if challenge_state == "pending":
-                if int(approval_challenge.get("expires_at") or 0) <= int(
-                    time.time()
-                ):
-                    raise ValueError(
-                        "Approval token is expired and no longer valid."
-                    )
-            elif not is_exact_consumed_replay:
+            if challenge_state != "pending" and not is_exact_consumed_replay:
                 raise ValueError(
                     "Approval token is expired, consumed, or no longer pending."
                 )
@@ -2628,6 +3772,39 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "Approval token must be confirmed in a fresh authenticated "
                     "message."
                 )
+            # Commit the verified owner decision separately from dispatch. A
+            # later in-flight/stage failure must not erase this receipt.
+            if challenge_state == "pending":
+                from hermes_cli.approval_recovery import record, valid_receipt
+                observed_text = get_session_env(
+                    "HERMES_SESSION_MESSAGE_TIMESTAMP", ""
+                )
+                observed_at = None
+                if observed_text:
+                    try:
+                        observed_at = int(observed_text)
+                    except ValueError:
+                        observed_at = None
+                receipt_context = {key: get_session_env("HERMES_SESSION_" + key.upper(), "")
+                                   for key in ("platform", "source", "chat_id", "thread_id", "user_id",
+                                               "session_key", "session_id", "message_id", "message_text",
+                                               "message_timestamp", "owner_user_id")}
+                receipt_context["session_key"] = session_key
+                receipt_context["session_id"] = session_id
+                receipt_context["telegram_message_path"] = json.dumps(trusted_message_path)
+                with kb.connect_closing(board=board) as receipt_conn:
+                    try:
+                        record(receipt_conn, token=approval_token, fingerprint=exact_fingerprint,
+                               context=receipt_context, args=supplied_approval_args,
+                               observed_at=observed_at)
+                    except ValueError as exc:
+                        if not valid_receipt(receipt_conn, approval_token, exact_fingerprint, message_id):
+                            if int(approval_challenge.get("expires_at") or 0) <= int(time.time()):
+                                raise ValueError(
+                                    "Approval token is expired and no longer valid."
+                                ) from exc
+                            raise
+                approval_receipt_saved = True
         elif approval_refresh_token:
             if approval_challenge is None:
                 raise ValueError("Approval challenge was not found.")
@@ -2689,31 +3866,48 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "Internal continuation requires the active callback review "
                     "and event identifiers."
                 )
-            if not callback_lease_owner:
-                raise ValueError(
-                    "Internal continuation requires the trusted callback lease owner."
-                )
             with kb.connect_closing(board=board) as conn:
-                kb.rebind_active_grace_callback_session(
-                    conn,
-                    review_task_id=origin_review_id,
-                    event_id=origin_event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                    lease_owner=callback_lease_owner,
-                )
-                kb.validate_accepted_grace_callback_origin(
-                    conn,
-                    review_task_id=origin_review_id,
-                    event_id=origin_event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                    lease_owner=callback_lease_owner,
-                )
+                if callback_lease_owner:
+                    kb.rebind_active_grace_callback_session(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
+                    kb.validate_accepted_grace_callback_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                        allow_recoverable_blocker=True,
+                    )
+                else:
+                    # A callback may be durably delivered before Grace gets to
+                    # issue its continuation.  For internal, zero-effect repair
+                    # only, the durable blocker record is the recovery fence;
+                    # never treat a missing lease as approval for external work.
+                    if not internal_only_contract or bool(args.get("approved")):
+                        raise ValueError(
+                            "Internal continuation without an active lease is limited "
+                            "to unapproved zero-external-effect recovery."
+                        )
+                    kb.validate_recoverable_blocked_callback(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                    )
         elif (
             origin_review_id
             or origin_event_id is not None
@@ -2731,6 +3925,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 validator = (
                     kb.validate_delivered_human_blocker
                     if fresh_callback_origin_kind == "human_blocker"
+                    else kb.validate_recoverable_blocked_callback
+                    if fresh_callback_origin_kind == "recoverable_blocker"
                     else kb.validate_completed_approval_blocker
                 )
                 validator(
@@ -2744,6 +3940,13 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
         effective_approved = False
         approval_provenance: dict[str, Any] = {}
+        if (
+            internal_turn
+            and not message_id
+            and origin_review_id
+            and origin_event_id is not None
+        ):
+            message_id = f"callback:{origin_review_id}:{origin_event_id}"
         if scheduled_turn and approval_needed:
             raise ValueError(
                 "Scheduled jobs cannot authorize external actions with approved=true. "
@@ -2833,6 +4036,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_key=session_key,
                         session_id=session_id,
                         resolved_route=contract["routing"]["resolved"],
+                        publication_contract=contract if contract.get("facebook_group_publish") else None,
                         approval_required=True,
                         challenge_token=str(challenge["token"]),
                         user_id_sha256=user_id_sha256,
@@ -2852,6 +4056,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                             or ""
                         ),
                         telegram_message_path=trusted_message_path,
+                        compiled_contract=normalized_contract,
                     )
                 approval_provenance = {
                     "source": "codex_local_operator",
@@ -2974,6 +4179,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_key=session_key,
                         session_id=(approval_callback_session_id or session_id),
                         resolved_route=contract["routing"]["resolved"],
+                        publication_contract=contract if contract.get("facebook_group_publish") else None,
                         approval_required=True,
                         approval_challenge_session_id=(
                             approval_bound_session_id
@@ -2997,6 +4203,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                             or ""
                         ),
                         telegram_message_path=approval_message_path,
+                        compiled_contract=normalized_contract,
                     )
                 if challenge_row is None:
                     raise ValueError("Approval challenge was not found.")
@@ -3027,6 +4234,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     session_id=(approval_callback_session_id or session_id),
                     telegram_message_path_session_id=session_id,
                     resolved_route=contract["routing"]["resolved"],
+                    publication_contract=contract if contract.get("facebook_group_publish") else None,
                     approval_required=False,
                     origin_review_task_id=origin_review_id,
                     origin_event_id=origin_event_id,
@@ -3040,6 +4248,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         (contract.get("objective_ref") or {}).get("stage_key") or ""
                     ),
                     telegram_message_path=trusted_message_path,
+                    compiled_contract=normalized_contract,
                 )
         if approval_provenance:
             contract["approval_provenance"] = approval_provenance
@@ -3099,20 +4308,41 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     build_owner=build_owner,
                 )
             raise
-    except (ValueError, TypeError, RuntimeError) as exc:
+    except Exception as exc:
         reason = str(exc).strip() or type(exc).__name__
         if scheduled_turn:
             record_cron_functional_error(reason)
-        return json.dumps(
-            {"status": "rejected", "reason": reason, "task_created": False},
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        if scheduled_turn:
-            record_cron_functional_error(
-                str(exc).strip() or type(exc).__name__
+        # The local flag is set only after the receipt transaction commits.
+        # Replays may instead recover the fact from the durable registry; that
+        # lookup must never replace the original failure with a second error.
+        if not approval_receipt_saved and approval_token and "exact_fingerprint" in locals():
+            try:
+                from hermes_cli.approval_recovery import valid_receipt
+                with kb.connect_closing(board=board) as receipt_conn:
+                    approval_receipt_saved = valid_receipt(receipt_conn, approval_token, exact_fingerprint, message_id)
+            except Exception:
+                pass
+        retained_retryable = approval_receipt_saved and (
+            isinstance(exc, (OSError, sqlite3.Error, RuntimeError))
+            or (
+                isinstance(exc, ValueError)
+                and any(marker in reason.lower() for marker in (
+                    "in-flight delegation",
+                    "already being built",
+                    "builder lease",
+                ))
             )
-        raise
+        )
+        recoverable_failure = isinstance(exc, (ValueError, TypeError, RuntimeError)) or (
+            isinstance(exc, (OSError, sqlite3.Error)) and approval_receipt_saved
+        )
+        if not recoverable_failure:
+            raise
+        rejection = {"status": "rejected", "reason": reason, "task_created": False}
+        if approval_receipt_saved:
+            rejection["approval_saved"] = True
+            rejection["retryable"] = retained_retryable
+        return json.dumps(rejection, ensure_ascii=False)
     if scheduled_turn:
         record_cron_functional_error("")
     return json.dumps(
@@ -3132,6 +4362,175 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         },
         ensure_ascii=False,
     )
+
+
+def handle_grace_reconcile(args: dict[str, Any] | None = None, **_kwargs: Any) -> str:
+    """Rebuild one stranded internal delegation without accepting new work."""
+    args = dict(args or {})
+    try:
+        internal_turn = get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower() == "true"
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        current_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        current_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+        current_user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+        board = get_session_env("HERMES_GRACE_CALLBACK_BOARD", "").strip() or None
+        lease_owner = get_session_env("HERMES_GRACE_CALLBACK_LEASE_OWNER", "").strip()
+        review_id = get_session_env("HERMES_GRACE_CALLBACK_REVIEW_ID", "").strip()
+        event_id = int(get_session_env("HERMES_GRACE_CALLBACK_EVENT_ID", "0") or 0)
+        if internal_turn and (not lease_owner or not review_id or event_id <= 0):
+            raise ValueError("Trusted callback lineage is missing.")
+        if not internal_turn and (platform != "telegram" or not current_chat_id or not current_thread_id):
+            raise ValueError("Authenticated Telegram Topic context is required.")
+        delegation_id = str(args.get("delegation_id") or "").strip()
+        objective_id = str(args.get("objective_id") or "").strip()
+        stage_key = str(args.get("stage_key") or "").strip()
+        if not delegation_id or not objective_id or not stage_key:
+            raise ValueError("Delegation, objective, and stage are required.")
+        with kb.connect_closing(board=board) as conn:
+            row = kb.get_grace_delegation(conn, delegation_id=delegation_id)
+            if row is None:
+                raise ValueError("Unknown Grace delegation.")
+            retry_existing = (
+                row.get("state") == "queued"
+                and bool(row.get("execution_task_id"))
+                and bool(row.get("review_task_id"))
+                and (kb.get_task(conn, str(row["execution_task_id"])).status == "blocked")
+            )
+            if row.get("state") != "authorized" and not retry_existing:
+                raise ValueError("Only an authorized stranded delegation or retryable blocked execution can be reconciled.")
+            if (row.get("execution_task_id") or row.get("review_task_id")) and not retry_existing:
+                raise ValueError("Delegation already has task ids; observe the existing saga.")
+            if row.get("approval_required") or row.get("origin_review_task_id") != review_id \
+                    or int(row.get("origin_event_id") or 0) != event_id:
+                if not internal_turn:
+                    review_id = str(row.get("origin_review_task_id") or "").strip()
+                    event_id = int(row.get("origin_event_id") or 0)
+                else:
+                    raise ValueError("Delegation is not bound to this exact callback lineage.")
+            if not internal_turn:
+                if platform != str(row.get("platform") or "").strip().lower() \
+                        or current_chat_id != str(row.get("chat_id") or "").strip() \
+                        or current_thread_id != str(row.get("thread_id") or "").strip():
+                    raise ValueError("Authenticated Topic does not match the reservation.")
+                owner = get_session_env("HERMES_SESSION_OWNER_USER_ID", "").strip()
+                if not owner or not current_user_id or current_user_id != owner:
+                    raise ValueError("Authenticated owner context is required for recovery.")
+                stored_user_hash = str(row.get("user_id_sha256") or "").strip()
+                if stored_user_hash and stored_user_hash != hashlib.sha256(owner.encode("utf-8")).hexdigest():
+                    raise ValueError("Authenticated owner does not match the reservation.")
+            if row.get("objective_id") != objective_id or row.get("stage_key") != stage_key:
+                raise ValueError("Delegation is not bound to this exact objective stage.")
+            snapshot_text = str(row.get("contract_snapshot") or "")
+            if not snapshot_text:
+                raise ValueError("Delegation has no durable contract snapshot; refusing reconstruction.")
+            try:
+                contract = json.loads(snapshot_text)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("Delegation contract snapshot is invalid.") from exc
+            normalized = validate_loop_contract(contract)
+            if contract_fingerprint(normalized) != row.get("contract_fingerprint"):
+                raise ValueError("Delegation contract snapshot fingerprint does not match.")
+            callback = kb.get_grace_loop_callback(conn, review_id)
+            if callback is None:
+                raise ValueError("Delegation callback lineage is missing.")
+            _guard_recoverable_callback_domain_memory(
+                conn,
+                normalized,
+                callback,
+                event_id=event_id,
+            )
+            if normalized.get("external_targets") or any(
+                key in normalized for key in ("facebook_group_publish", "facebook_page_post", "facebook_page_preflight_source")
+            ):
+                raise ValueError("Only zero-external-effect contracts can be reconciled.")
+            context = resolve_thread_context(
+                platform=str(row.get("platform") or ""),
+                chat_id=str(row.get("chat_id") or ""),
+                thread_id=str(row.get("thread_id") or ""),
+            )
+            if str(context.get("project") or "") != str((normalized.get("identity") or {}).get("project") or "") \
+                    or str(context.get("topic_name") or "") != str((normalized.get("identity") or {}).get("topic_name") or ""):
+                raise ValueError("Contract Topic context does not match the registered lane.")
+            callback_kwargs = dict(
+                review_task_id=review_id,
+                event_id=event_id,
+                platform=str(row.get("platform") or ""),
+                chat_id=str(row.get("chat_id") or ""),
+                thread_id=str(row.get("thread_id") or ""),
+                session_id=(get_session_env("HERMES_SESSION_ID", "") if internal_turn else str(row.get("session_id") or "")),
+            )
+            if internal_turn and lease_owner:
+                kb.validate_accepted_grace_callback_origin(
+                    conn, **callback_kwargs, lease_owner=lease_owner,
+                    allow_recoverable_blocker=True,
+                )
+            else:
+                kb.validate_recoverable_blocked_callback(conn, **callback_kwargs)
+            if retry_existing:
+                execution_id = str(row["execution_task_id"])
+                blocked = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? "
+                    "AND kind IN ('blocked', 'block_loop_detected') ORDER BY id DESC LIMIT 1",
+                    (execution_id,),
+                ).fetchone()
+                blocked_text = str(blocked["payload"] or "") if blocked else ""
+                if "facebook" in blocked_text.lower() or "external" in blocked_text.lower():
+                    raise ValueError("Existing execution is not a zero-effect capability retry.")
+                kb._append_event(
+                    conn, execution_id, "grace_correction_requested",
+                    {"reason": "Control-plane capability grant repaired; retry exact zero-effect runtime contract."},
+                )
+                from proactive.openclaw_async_executor import retry_ready_loop_contract_execution
+                retry_result = retry_ready_loop_contract_execution(execution_id, board=board)
+                return json.dumps({
+                    "status": "queued" if retry_result.get("status") != "blocked" else "blocked",
+                    "task_created": False, "retry": True,
+                    "delegation_id": delegation_id,
+                    "execution_task_id": execution_id,
+                    "grace_review_task_id": str(row["review_task_id"]),
+                    "result": retry_result,
+                }, ensure_ascii=False)
+            build_owner = "reconciler_" + secrets.token_hex(12)
+            if not kb.claim_grace_delegation_build(
+                conn, delegation_id=delegation_id, build_owner=build_owner
+            ):
+                raise RuntimeError("Delegation is already being built.")
+        try:
+            routing = normalized.get("routing") or {}
+            result = compile_and_delegate(
+                normalized,
+                context=context,
+                task_type=str(routing.get("task_type") or ""),
+                risk_level=str(routing.get("risk_level") or "low"),
+                approved=False,
+                delegation_id=delegation_id,
+                delegation_build_owner=build_owner,
+                platform=str(row.get("platform") or ""),
+                chat_id=str(row.get("chat_id") or ""),
+                thread_id=str(row.get("thread_id") or ""),
+                user_id=get_session_env("HERMES_SESSION_USER_ID", ""),
+                session_key=str(row.get("session_key") or ""),
+                session_id=get_session_env("HERMES_SESSION_ID", ""),
+                message_id=get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+                notifier_profile=get_session_env("HERMES_PROFILE", ""),
+                board=board,
+                callback_lease_owner=lease_owner if internal_turn else "",
+                telegram_message_path=normalize_message_path(row.get("telegram_message_path")),
+            )
+        except Exception:
+            with kb.connect_closing(board=board) as conn:
+                kb.release_grace_delegation_build(
+                    conn, delegation_id=delegation_id, build_owner=build_owner
+                )
+            raise
+        return json.dumps({
+            "status": "queued", "task_created": True,
+            "delegation_id": delegation_id,
+            "execution_task_id": result.execution_task_id,
+            "grace_review_task_id": result.review_task_id,
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"status": "rejected", "task_created": False, "reason": str(exc)}, ensure_ascii=False)
 
 
 def handle_grace_callback_outcome(

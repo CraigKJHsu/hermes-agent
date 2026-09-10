@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import pytest
@@ -57,7 +58,14 @@ def _bind_queued_delegation(conn, execution_id: str, review_id: str, *, suffix: 
 
 def _accepted_callback(conn, *, objective_id: str, stage_key: str, requested_mode: str):
     execution_id = kb.create_task(conn, title=f"execute {stage_key}")
-    assert kb.complete_task(conn, execution_id, summary="done")
+    execution = kb.claim_task(conn, execution_id, claimer=f"execute-{stage_key}")
+    assert execution is not None and execution.current_run_id is not None
+    assert kb.complete_task(
+        conn,
+        execution_id,
+        summary="done",
+        expected_run_id=execution.current_run_id,
+    )
     review_id = kb.create_task(conn, title=f"review {stage_key}", parents=(execution_id,))
     kb.add_grace_loop_callback(
         conn,
@@ -74,11 +82,14 @@ def _accepted_callback(conn, *, objective_id: str, stage_key: str, requested_mod
         stage_key=stage_key,
     )
     _bind_queued_delegation(conn, execution_id, review_id, suffix=stage_key)
+    review = kb.claim_task(conn, review_id, claimer=f"review-{stage_key}")
+    assert review is not None and review.current_run_id is not None
     assert kb.complete_task(
         conn,
         review_id,
         summary="accepted",
         metadata={"review_outcome": "accepted"},
+        expected_run_id=review.current_run_id,
     )
     callback = kb.list_due_grace_loop_callbacks(conn)[0]
     assert kb.claim_grace_loop_callback(
@@ -138,6 +149,32 @@ def test_objective_authoritatively_forces_intermediate_stage(tmp_path):
         assert callback["completion_mode"] == "intermediate"
         assert callback["objective_id"] == "go_test"
         assert callback["stage_key"] == "prepare_asset"
+
+
+def test_accepted_intermediate_fallback_finishes_delivery_without_closing_objective(tmp_path):
+    with kb.connect_closing(tmp_path / "fallback.db") as conn:
+        _create_objective(conn)
+        review_id, event_id = _accepted_callback(
+            conn, objective_id="go_test", stage_key="prepare_asset", requested_mode="intermediate",
+        )
+        assert not kb.finish_grace_loop_callback(
+            conn, review_task_id=review_id, event_id=event_id, lease_owner="owner-a",
+        )
+        kb.record_grace_intermediate_callback_without_structured_continuation(
+            conn, review_task_id=review_id, event_id=event_id, lease_owner="owner-a",
+            platform="telegram", chat_id="chat-1", thread_id="4641", session_id="session-1",
+            reason="Accepted read-only evidence; publication still incomplete",
+        )
+        assert not kb.finish_grace_loop_callback(
+            conn, review_task_id=review_id, event_id=event_id, lease_owner="other-owner",
+        )
+        assert kb.finish_grace_loop_callback(
+            conn, review_task_id=review_id, event_id=event_id, lease_owner="owner-a",
+        )
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback["state"] == "delivered"
+        assert callback["last_event_id"] == event_id
+        assert kb.get_grace_objective(conn, "go_test")["status"] == "blocked"
 
 
 def test_terminal_review_blocker_records_objective_terminal_blocked(tmp_path):
@@ -239,6 +276,12 @@ def test_retry_stage_supersedes_previous_bound_retry_stage(tmp_path):
             stage_key="prepare_asset_r2",
             next_action="Retry preparation.",
         )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            delegation_id="gd-retry",
+        )
         prior = conn.execute(
             """
             SELECT status, outcome_kind, evidence
@@ -251,6 +294,369 @@ def test_retry_stage_supersedes_previous_bound_retry_stage(tmp_path):
         assert prior["status"] == "done"
         assert prior["outcome_kind"] == "superseded_by_retry"
         assert "prepare_asset_r2" in prior["evidence"]
+
+
+def test_later_retry_supersedes_open_retry_sibling_and_callback(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-retry-sibling.db") as conn:
+        _create_objective(conn)
+        first_execution = kb.create_task(conn, title="first execution")
+        first_review = kb.create_task(
+            conn, title="first review", parents=(first_execution,),
+        )
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (first_execution,))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (first_review,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=first_review,
+            execution_task_id=first_execution,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            contract_fingerprint="b" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset",
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued', delegation_id = 'gd-first',
+                   execution_task_id = ?, review_task_id = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """,
+            (first_execution, first_review),
+        )
+        kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+        )
+
+        second_execution = kb.create_task(conn, title="second execution")
+        second_review = kb.create_task(
+            conn, title="second review", parents=(second_execution,),
+        )
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (second_execution,))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (second_review,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=second_review,
+            execution_task_id=second_execution,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-2",
+            contract_fingerprint="c" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued', delegation_id = 'gd-second',
+                   execution_task_id = ?, review_task_id = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset_r2'
+            """,
+            (second_execution, second_review),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            delegation_id="gd-second",
+        )
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r3",
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r3",
+            delegation_id="gd-third",
+        )
+        prior = conn.execute(
+            """
+            SELECT status, outcome_kind
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_test'
+               AND stage_key = 'prepare_asset_r2'
+            """
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, second_review)
+
+        assert objective["current_stage_key"] == "prepare_asset_r3"
+        assert (prior["status"], prior["outcome_kind"]) == (
+            "done", "superseded_by_retry",
+        )
+        assert callback["state"] == "cancelled"
+        assert callback["lease_event_id"] is None
+        assert "prepare_asset_r3" in callback["last_error"]
+        assert kb.list_due_grace_loop_callbacks(conn) == []
+
+
+def test_reselecting_existing_retry_repairs_open_older_sibling(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-reselect-retry.db") as conn:
+        _create_objective(conn)
+        execution_id = kb.create_task(conn, title="old execution")
+        review_id = kb.create_task(
+            conn, title="old review", parents=(execution_id,),
+        )
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (execution_id,))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (review_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            contract_fingerprint="d" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset",
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued', delegation_id = 'gd-old',
+                   execution_task_id = ?, review_task_id = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """,
+            (execution_id, review_id),
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            delegation_id="gd-retry",
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued', outcome_kind = NULL,
+                   evidence = NULL, completed_at = NULL
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET state = 'pending', last_error = NULL
+             WHERE review_task_id = ?
+            """,
+            (review_id,),
+        )
+
+        objective = kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            next_action="Resume accepted retry.",
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            delegation_id="gd-retry",
+        )
+        prior = conn.execute(
+            """
+            SELECT status, outcome_kind
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset'
+            """
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, review_id)
+
+        assert objective["current_stage_key"] == "prepare_asset_r2"
+        assert objective["next_action"] == "Resume accepted retry."
+        assert (prior["status"], prior["outcome_kind"]) == (
+            "done", "superseded_by_retry",
+        )
+        assert callback["state"] == "cancelled"
+        assert "prepare_asset_r2" in callback["last_error"]
+
+
+def test_later_retry_cannot_supersede_an_active_execution(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-active-retry.db") as conn:
+        _create_objective(conn)
+        execution_id = kb.create_task(conn, title="active execution")
+        review_id = kb.create_task(
+            conn, title="active review", parents=(execution_id,),
+        )
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (execution_id,))
+        conn.execute(
+            "INSERT INTO task_runs(task_id,profile,status,started_at) "
+            "VALUES (?,'default','running',1)",
+            (execution_id,),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='queued',delegation_id='gd-active',"
+            "execution_task_id=?,review_task_id=? "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'",
+            (execution_id, review_id),
+        )
+
+        with pytest.raises(ValueError, match="still has in-flight work"):
+            with kb.write_txn(conn):
+                kb.ensure_grace_objective_stage(
+                    conn, objective_id="go_test", stage_key="prepare_asset_r2",
+                )
+                kb._bind_grace_objective_stage(
+                    conn, objective_id="go_test", stage_key="prepare_asset_r2",
+                    delegation_id="gd-retry",
+                )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        prior = conn.execute(
+            "SELECT status,outcome_kind FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        ).fetchone()
+        assert objective["current_stage_key"] == "prepare_asset"
+        assert (prior["status"], prior["outcome_kind"]) == ("queued", None)
+        assert conn.execute(
+            "SELECT 1 FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset_r2'"
+        ).fetchone() is None
+
+
+@pytest.mark.parametrize("older_stage", ["prepare_asset", "prepare_asset_r2"])
+@pytest.mark.parametrize("newer_status", ["queued", "done"])
+def test_binding_older_retry_cannot_supersede_newer_sibling(
+    tmp_path, older_stage, newer_status,
+):
+    with kb.connect_closing(tmp_path / "objective-no-retry-rollback.db") as conn:
+        _create_objective(conn)
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+        )
+        kb._bind_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+            delegation_id="gd-r2",
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r3",
+        )
+        kb._bind_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r3",
+            delegation_id="gd-r3",
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset_r3'
+            """,
+            (newer_status,),
+        )
+
+        with pytest.raises(ValueError, match="cannot move backward"):
+            kb._bind_grace_objective_stage(
+                conn, objective_id="go_test", stage_key=older_stage,
+                delegation_id=("gd-r2" if older_stage.endswith("_r2") else "gd-root"),
+            )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        current = conn.execute(
+            """
+            SELECT status, delegation_id
+              FROM grace_objective_stages
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset_r3'
+            """
+        ).fetchone()
+        assert objective["current_stage_key"] == "prepare_asset_r3"
+        assert (current["status"], current["delegation_id"]) == (
+            newer_status, "gd-r3",
+        )
+
+
+def test_bound_retry_cancels_delivered_prior_callback_with_new_event(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-delivered-stale.db") as conn:
+        _create_objective(conn)
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+        )
+        execution_id = kb.create_task(conn, title="prior execution")
+        review_id = kb.create_task(
+            conn, title="prior review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            contract_fingerprint="e" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+        )
+        _bind_queued_delegation(
+            conn, execution_id, review_id, suffix="delivered-stale",
+        )
+        conn.execute(
+            """
+            UPDATE grace_objective_stages
+               SET status = 'queued', delegation_id = 'gd-delivered-stale',
+                   execution_task_id = ?, review_task_id = ?
+             WHERE objective_id = 'go_test' AND stage_key = 'prepare_asset_r2'
+            """,
+            (execution_id, review_id),
+        )
+        kb._bind_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+            delegation_id="gd-delivered-stale",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, review_id, "blocked", {"reason": "first"})
+            first_event_id = conn.execute(
+                "SELECT MAX(id) FROM task_events WHERE task_id = ?", (review_id,),
+            ).fetchone()[0]
+            conn.execute(
+                """
+                UPDATE grace_loop_callbacks
+                   SET state = 'delivered', last_event_id = ?, delivered_at = ?
+                 WHERE review_task_id = ?
+                """,
+                (first_event_id, int(time.time()), review_id),
+            )
+            kb._append_event(conn, review_id, "gave_up", {"reason": "later"})
+            conn.execute(
+                "UPDATE tasks SET status='blocked' WHERE id IN (?, ?)",
+                (execution_id, review_id),
+            )
+
+        assert [
+            item["review_task_id"]
+            for item in kb.list_due_grace_loop_callbacks(conn)
+        ] == [review_id]
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r3",
+        )
+        kb._bind_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r3",
+            delegation_id="gd-r3",
+        )
+
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert callback["state"] == "cancelled"
+        assert callback["last_event_id"] == first_event_id
+        assert callback["delivered_at"] is not None
+        assert kb.list_due_grace_loop_callbacks(conn) == []
 
 
 def test_delegation_reservation_binds_declared_objective_stage(tmp_path):
@@ -470,6 +876,69 @@ def test_stage_mode_rejects_undeclared_non_recovery_stage_family(tmp_path):
                 chat_id="chat-1",
                 thread_id="4641",
             )
+
+
+def test_stage_mode_validates_recovery_without_persisting(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-stage-mode-readonly.db") as conn:
+        _create_objective(conn)
+
+        mode = kb.grace_objective_stage_mode(
+            conn,
+            objective_id="go_test",
+            stage_key="repair_audio_brief_episode_07",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            ensure_stage=False,
+        )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        stage = conn.execute(
+            "SELECT 1 FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='repair_audio_brief_episode_07'"
+        ).fetchone()
+        assert mode == "intermediate"
+        assert objective["current_stage_key"] == "prepare_asset"
+        assert stage is None
+
+
+def test_delegation_reservation_rolls_back_new_stage_on_failure(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-stage-rollback.db") as conn:
+        _create_objective(conn)
+        conn.execute(
+            "CREATE TRIGGER reject_test_delegation BEFORE INSERT ON grace_delegations "
+            "BEGIN SELECT RAISE(ABORT, 'test delegation rejection'); END"
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="test delegation rejection"):
+            kb.reserve_grace_delegation(
+                conn,
+                contract_fingerprint="9" * 64,
+                request_instance_id="request-stage-rollback",
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="4641",
+                session_key="agent:main:telegram:group:chat-1:4641",
+                session_id="session-stage-rollback",
+                resolved_route={"backend": "openclaw"},
+                approval_required=False,
+                objective_id="go_test",
+                stage_key="repair_audio_brief_episode_07",
+            )
+
+        objective = kb.get_grace_objective(conn, "go_test")
+        stage = conn.execute(
+            "SELECT 1 FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='repair_audio_brief_episode_07'"
+        ).fetchone()
+        delegation = conn.execute(
+            "SELECT 1 FROM grace_delegations WHERE contract_fingerprint=?",
+            ("9" * 64,),
+        ).fetchone()
+        assert objective["current_stage_key"] == "prepare_asset"
+        assert stage is None
+        assert delegation is None
 
 
 def test_appending_recovery_stage_supersedes_accepted_prior_prepare(tmp_path):

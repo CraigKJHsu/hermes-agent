@@ -117,6 +117,29 @@ def test_plan_reorders_existing_reverse_spine_without_changing_bindings(db):
         _plan(db)
 
 
+def test_blocked_objective_can_register_internal_repair_stage(db):
+    db.execute(
+        "UPDATE grace_objectives SET status='blocked' WHERE objective_id='go_test'"
+    )
+
+    mode = kb.grace_objective_stage_mode(
+        db,
+        objective_id="go_test",
+        stage_key="repair_runtime_capability_123",
+        platform="telegram",
+        chat_id="chat",
+        thread_id="2",
+    )
+
+    assert mode == "intermediate"
+    objective = kb.get_grace_objective(db, "go_test")
+    assert objective["current_stage_key"] == "repair_runtime_capability_123"
+    assert "repair_runtime_capability_123" in json.loads(
+        objective["required_stage_keys"]
+    )
+    assert json.loads(objective["required_stage_keys"])[-1] == "terminal"
+
+
 def test_transaction_failure_rolls_back_entire_plan(db):
     db.execute("CREATE TRIGGER fail_stage BEFORE INSERT ON grace_objective_stages WHEN NEW.stage_key='publish' BEGIN SELECT RAISE(ABORT,'injected failure'); END")
     with pytest.raises(Exception, match="injected failure"):
@@ -776,6 +799,19 @@ def test_self_planner_rejects_unsupported_fields_before_persisting(db):
     ).fetchone()[0] == 0
 
 
+def test_self_planner_requires_integer_expected_revision(db):
+    execution, _, _, _ = _active_self_planner(db)
+    specification = _deferred_spec(execution)
+    specification["expected_revision"] = "1"
+
+    with pytest.raises(ValueError, match="expected_revision must be an integer"):
+        wf.request_plan(db, **specification)
+
+    assert db.execute(
+        "SELECT COUNT(*) FROM grace_objective_plan_requests"
+    ).fetchone()[0] == 0
+
+
 def test_exact_accepted_review_applies_self_plan_after_execution_ends(db):
     execution, review, run_id, _ = _active_self_planner(db)
     request = wf.request_plan(db, **_deferred_spec(execution))
@@ -802,6 +838,99 @@ def test_exact_accepted_review_applies_self_plan_after_execution_ends(db):
     assert wf.apply_reviewed_plan_request(
         db, review_task_id=review, review_run_id=review_run_id,
     ) is None
+
+
+def test_later_exact_rejection_supersedes_reviewed_self_plan(db):
+    execution, review, run_id, _ = _active_self_planner(db)
+    request = wf.request_plan(db, **_deferred_spec(execution))
+    db.execute(
+        "UPDATE task_runs SET status='done',ended_at=2,outcome='completed' WHERE id=?",
+        (run_id,),
+    )
+    accepted = _plan_review_receipt(db, execution, run_id, request)
+    accepted_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',3,4,'completed',?)",
+        (review, json.dumps(accepted)),
+    ).lastrowid
+    rejected = _plan_review_receipt(db, execution, run_id, request)
+    rejected["review_outcome"] = "rejected"
+    db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',5,6,'completed',?)",
+        (review, json.dumps(rejected)),
+    )
+
+    with pytest.raises(ValueError, match="superseded by a later exact verdict"):
+        wf.apply_reviewed_plan_request(
+            db,
+            review_task_id=review,
+            review_run_id=accepted_run_id,
+        )
+
+    assert kb.get_grace_objective(db, "go_test")["revision"] == 1
+    assert db.execute(
+        "SELECT state FROM grace_objective_plan_requests WHERE request_id=?",
+        (request["request_id"],),
+    ).fetchone()[0] == "pending"
+
+
+def test_reviewed_plan_cannot_replace_controller_pinned_execution_run(db):
+    execution, review, run_id, _ = _active_self_planner(db)
+    request = wf.request_plan(db, **_deferred_spec(execution))
+    db.execute(
+        "UPDATE task_runs SET status='done',ended_at=2,outcome='completed' WHERE id=?",
+        (run_id,),
+    )
+    newer_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',3,4,'completed','{}')",
+        (execution,),
+    ).lastrowid
+    evidence = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": run_id,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, run_id)
+        ),
+        "objective_plan_request_id": request["request_id"],
+        "objective_plan_specification_sha256": hashlib.sha256(
+            request["specification"].encode()
+        ).hexdigest(),
+    }
+    review_source = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": newer_run_id,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, newer_run_id)
+        ),
+    }
+    review_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',5,6,'completed',?)",
+        (
+            review,
+            json.dumps(
+                {
+                    "review_outcome": "accepted",
+                    "evidence": evidence,
+                    "workflow_review_source": review_source,
+                }
+            ),
+        ),
+    ).lastrowid
+
+    with pytest.raises(ValueError, match="controller-pinned"):
+        wf.apply_reviewed_plan_request(
+            db,
+            review_task_id=review,
+            review_run_id=review_run_id,
+        )
+    assert kb.get_grace_objective(db, "go_test")["revision"] == 1
+    assert db.execute(
+        "SELECT state FROM grace_objective_plan_requests WHERE request_id=?",
+        (request["request_id"],),
+    ).fetchone()[0] == "pending"
 
 
 def test_reviewed_self_plan_can_resume_before_its_completed_origin(db):
@@ -1032,9 +1161,10 @@ def test_rejected_or_wrong_run_review_cannot_apply_self_plan(db):
         "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
         "VALUES (?,'default','done',3,4,'completed',?)", (review, json.dumps(metadata)),
     ).lastrowid
-    assert wf.apply_reviewed_plan_request(
-        db, review_task_id=review, review_run_id=review_run_id,
-    ) is None
+    with pytest.raises(ValueError, match="controller-pinned"):
+        wf.apply_reviewed_plan_request(
+            db, review_task_id=review, review_run_id=review_run_id,
+        )
     assert kb.get_grace_objective(db, "go_test")["revision"] == 1
     assert db.execute("SELECT state FROM grace_objective_plan_requests").fetchone()[0] == "pending"
 
@@ -1092,8 +1222,18 @@ def test_effect_approval_remains_bound_to_originating_run_across_retries(db):
     assert wf._accepted_execution_runs(db, "go_test", execution) == {first_run}
     retry = db.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome) VALUES (?,'default','done',5,6,'completed')", (execution,)).lastrowid
     assert wf._accepted_execution_runs(db, "go_test", execution) == {first_run}
-    metadata = {"review_outcome": "accepted", "evidence": {"parent_execution_task_id": execution, "parent_execution_run_id": retry,
-        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(kb.get_run(db, retry))}}
+    review_source = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": retry,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, retry)
+        ),
+    }
+    metadata = {
+        "review_outcome": "accepted",
+        "evidence": review_source,
+        "workflow_review_source": review_source,
+    }
     db.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) VALUES (?,'default','done',7,8,'completed',?)", (review, json.dumps(metadata)))
     assert wf._accepted_execution_runs(db, "go_test", execution) == {first_run, retry}
     db.execute(
@@ -1161,6 +1301,29 @@ def test_hashless_review_cannot_authorize_preflight_or_progress(db):
         preflight_source={"execution_task_id": execution, "review_task_id": review})
     with pytest.raises(ValueError, match="unpinned"):
         wf.resolve_preflight(db, contract)
+
+
+def test_worker_review_evidence_cannot_override_controller_pinned_run(db):
+    _plan(db)
+    execution, review, _, review_run_id = _pair(db, objective_id="go_test")
+    forged_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',203,204,'completed','{}')",
+        (execution,),
+    ).lastrowid
+    review_metadata = kb.get_run(db, review_run_id).metadata
+    review_metadata["evidence"].update(
+        parent_execution_run_id=forged_run_id,
+        parent_execution_evidence_sha256=kb.workflow_review_evidence_hash(
+            kb.get_run(db, forged_run_id)
+        ),
+    )
+    db.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps(review_metadata), review_run_id),
+    )
+
+    assert wf._accepted_execution_runs(db, "go_test", execution) == set()
 
 
 def test_unclaimed_review_metadata_cannot_grant_preflight_authority(db):

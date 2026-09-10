@@ -40,6 +40,7 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _looks_like_context_only_injection,
     _should_clear_resume_pending_after_turn,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
@@ -154,10 +155,18 @@ def _simulate_note_injection(
             else "a gateway interruption"
         )
         if message:
-            resume_guidance = (
-                "Address the user's NEW message below FIRST and focus "
-                "on what the user is asking now."
-            )
+            if _looks_like_context_only_injection(message):
+                resume_guidance = (
+                    "The message below is runtime/environment context "
+                    "only, not a new user task. Recover the active "
+                    "unfinished work from the conversation history and "
+                    "continue or report that work."
+                )
+            else:
+                resume_guidance = (
+                    "Address the user's NEW message below FIRST and focus "
+                    "on what the user is asking now."
+                )
         else:
             resume_guidance = (
                 "Report to the user that the session was restored "
@@ -704,6 +713,45 @@ class TestResumePendingSystemNote:
         assert "NEW message" not in result
         # Nothing appended after the closing bracket (no empty user text).
         assert result.rstrip().endswith("]")
+
+    def test_resume_pending_context_only_injection_continues_active_work(self):
+        """Context refresh payloads must not be mistaken for the user's task."""
+
+        entry = self._pending_entry(reason="restart_timeout")
+        context_only_message = (
+            "<recommended_plugins>\n"
+            "Here is a list of plugins that are available but not installed.\n"
+            "</recommended_plugins>"
+            "# AGENTS.md instructions\n"
+            "<INSTRUCTIONS>\n"
+            "Do not delete files in bulk.\n"
+            "</INSTRUCTIONS>"
+            "<environment_context>\n"
+            "  <cwd>/Users/kj/my_agent_team</cwd>\n"
+            "</environment_context>"
+        )
+
+        assert _looks_like_context_only_injection(context_only_message) is True
+
+        result = _simulate_note_injection(
+            history=[
+                {"role": "user", "content": "核准兩件live動作", "timestamp": time.time() - 2},
+                {"role": "assistant", "content": "我會繼續處理 live 任務。", "timestamp": time.time() - 1},
+            ],
+            user_message=context_only_message,
+            resume_entry=entry,
+        )
+        assert "runtime/environment context only" in result
+        assert "not a new user task" in result
+        assert "Recover the active unfinished work" in result
+        assert "Address the user's NEW message below FIRST" not in result
+
+    def test_context_only_classifier_rejects_mixed_user_text(self):
+        mixed = (
+            "<environment_context><cwd>/tmp</cwd></environment_context>\n"
+            "請繼續剛剛那個"
+        )
+        assert _looks_like_context_only_injection(mixed) is False
 
 
 # ---------------------------------------------------------------------------

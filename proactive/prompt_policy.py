@@ -191,6 +191,7 @@ def active_objectives_prompt(
             return ""
         rendered: list[dict[str, object]] = []
         for objective in objectives:
+            from hermes_cli.objective_workflow import progress
             stages = conn.execute(
                 """
                 SELECT stage_key, position, status, delegation_id,
@@ -214,6 +215,7 @@ def active_objectives_prompt(
                     ),
                     "next_action": objective["next_action"],
                     "waiting_for": objective["waiting_for"],
+                    "publication_progress": progress(conn, objective["objective_id"]),
                     "stages": [dict(row) for row in stages],
                 }
             )
@@ -229,6 +231,13 @@ def active_objectives_prompt(
         "declared stage_key. The database authoritatively forces non-terminal stages "
         "to completion_mode=intermediate. If a safe preparatory stage remains, queue "
         "it before ending the turn; pause only at a specific blocker or external-action "
-        "approval boundary.\n"
+        "approval boundary. Candidate_count, qualified_count, joined_count, selectable_count, "
+        "submitted_count and published_count are different gates; never count conditional "
+        "candidates or Join effects as publications. Historical evidence is context, not "
+        "a fresh publication grant. Use the exact accepted preflight route for publishing. "
+        "For stage planning/repair, the supported operator API is "
+        "python -m hermes_cli.objective_workflow plan <JSON file>: it accepts objective_id, "
+        "expected_revision, platform/chat_id/thread_id, required_stage_keys in FORWARD order, "
+        "current_stage_key and reason. Never assemble a stage spine by repeated ensure calls.\n"
         + json.dumps(rendered, ensure_ascii=False, sort_keys=True)
     )

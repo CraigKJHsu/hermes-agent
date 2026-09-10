@@ -39,6 +39,7 @@ _LOOP_CONTRACT_AGENT_IDS = frozenset(
     }
 )
 _ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "browser"})
+_ZERO_EFFECT_INTERNAL_DEVOPS_TOOLS = frozenset({"read", "write", "web_search"})
 
 
 @dataclass(frozen=True)
@@ -314,6 +315,33 @@ def _requires_external_browser_capability(task: dict[str, Any]) -> bool:
     )
     return any(target in haystack for target in external_targets) and any(
         action in haystack for action in external_actions
+    )
+
+
+def _is_zero_effect_internal_devops_loop(task: dict[str, Any]) -> bool:
+    """Recognize the sealed internal repair contract that may write locally."""
+    return (
+        task.get("protocol_version") == "2.0"
+        and task.get("executor_backend") == "openclaw"
+        and task.get("executor_profile") == "loop-contract"
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+        and task.get("task_type") == "devops"
+        and task.get("backend_agent_id") == "missioncrew-executor"
+        and task.get("external_effect_budget") == 0
+        and task.get("dry_run") is False
+        and task.get("workspace_policy") == "dedicated"
+        and task.get("session_policy") in {"ephemeral", "persistent"}
+        and task.get("credential_refs") == []
+        and str(task.get("approval_grant_id") or "").strip()
+        == str(task.get("delegation_id") or "").strip()
+        and set(task.get("allowed_tools") or []).issubset(
+            _ZERO_EFFECT_INTERNAL_DEVOPS_TOOLS
+        )
     )
 
 
@@ -1391,12 +1419,15 @@ def delegate_to_openclaw(
         }
     )
     scoped_approval = bool(str(task.get("approval_grant_id") or "").strip())
+    zero_effect_internal_devops_loop = _is_zero_effect_internal_devops_loop(task)
     if task["requires_confirmation"] or (
         risk in {"high", "critical"}
         and not (is_loop_contract_async and scoped_approval)
     ):
         return _blocked_result(task, f"Delegated task risk_level={risk} requires approval.")
-    if _requires_clawops_runtime(task) and not is_loop_contract_async:
+    if _requires_clawops_runtime(task) and not (
+        is_loop_contract_async or zero_effect_internal_devops_loop
+    ):
         return _blocked_capability_result(
             task,
             "This work belongs in the Hermes-owned ClawOps runtime queue, not the OpenClaw dry-run bridge.",
@@ -1434,6 +1465,7 @@ def delegate_to_openclaw(
             "openclaw.agent.loop_contract_cancel",
         }
         and _live_async_capability is not _LOOP_CONTRACT_ASYNC_CAPABILITY
+        and not zero_effect_internal_devops_loop
     ):
         return _blocked_capability_result(
             task,
@@ -1478,6 +1510,7 @@ def delegate_to_openclaw(
                 zero_effect_missioncrew_content_loop
                 and action in {"read", "write", "web_search", "image_generate"}
             )
+            and not zero_effect_internal_devops_loop
             and not (
                 zero_effect_facebook_page_preflight
                 and action == "facebook_page_publish_preflight"

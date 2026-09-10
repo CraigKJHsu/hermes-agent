@@ -8,6 +8,7 @@ import re
 import time
 import tempfile
 import warnings
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -141,6 +142,7 @@ _TRANSIENT_RETRY_METADATA_KEYS = frozenset(
         "policy_receipts",
         "raw_external_effects",
         "read_only_zero_external_effects",
+        "worker_internal_tool_claims",
         "required_evidence",
         "result_digest",
         "last_poll_error",
@@ -467,6 +469,17 @@ def _loop_delegation_args(
     metadata = run.metadata or {}
     contract = dict(metadata.get("loop_contract") or {})
     external_effect_budget = int(metadata.get("external_effect_budget") or 0)
+    task_type = str(metadata.get("task_type") or "analysis")
+    backend_agent_id = str(
+        metadata.get("backend_agent_id") or LOOP_CONTRACT_AGENT
+    )
+    approval_grant_id = str(metadata.get("approval_grant_id") or "")
+    if external_effect_budget == 0 and not (
+        task_type == "devops"
+        and backend_agent_id == "missioncrew-executor"
+        and approval_grant_id == str(metadata["delegation_id"])
+    ):
+        approval_grant_id = ""
     args = {
         "task_id": run.task_id,
         "objective": objective,
@@ -485,11 +498,11 @@ def _loop_delegation_args(
         "contract_fingerprint": str(metadata["contract_fingerprint"]),
         "project": str(metadata["project"]),
         "topic_id": str(metadata["topic_id"]),
-        "task_type": str(metadata.get("task_type") or "analysis"),
+        "task_type": task_type,
         "executor_backend": "openclaw",
         "executor_profile": "loop-contract",
-        "backend_agent_id": str(metadata.get("backend_agent_id") or LOOP_CONTRACT_AGENT),
-        "approval_grant_id": str(metadata.get("approval_grant_id") or ""),
+        "backend_agent_id": backend_agent_id,
+        "approval_grant_id": approval_grant_id,
         "external_effect_budget": external_effect_budget,
         "workspace_policy": "dedicated",
         "session_policy": "ephemeral",
@@ -3710,7 +3723,16 @@ def retry_ready_loop_contract_execution(
                     raise ValueError(
                         "Zero-effect correction triage recovery requires persisted external_effect_budget=0."
                     )
-                if str(previous_metadata.get("approval_grant_id") or "").strip():
+                internal_control_grant = (
+                    previous_metadata.get("task_type") == "devops"
+                    and previous_metadata.get("backend_agent_id") == "missioncrew-executor"
+                    and str(previous_metadata.get("approval_grant_id") or "").strip()
+                    == str(previous_metadata.get("delegation_id") or "").strip()
+                )
+                if (
+                    str(previous_metadata.get("approval_grant_id") or "").strip()
+                    and not internal_control_grant
+                ):
                     raise ValueError(
                         "Zero-effect correction triage recovery refuses an external-effect approval grant."
                     )
@@ -3836,7 +3858,16 @@ def retry_ready_loop_contract_execution(
                     "task_type": task_type,
                     "risk_level": str(previous_metadata.get("risk_level") or "medium"),
                     "executor_profile": "loop-contract",
-                    "approval_grant_id": "",
+                    "approval_grant_id": (
+                        str(previous_metadata.get("delegation_id") or "")
+                        if (
+                            recovering_triaged_zero_effect_correction
+                            and external_effect_budget == 0
+                            and task_type == "devops"
+                            and backend_agent_id == "missioncrew-executor"
+                        )
+                        else ""
+                    ),
                     "external_effect_budget": external_effect_budget,
                     "allowed_tools": _loop_allowed_tools(
                         task_type,
@@ -4217,6 +4248,166 @@ def retry_ready_approved_loop_contract_after_capability_repair(
     )
 
 
+def revalidate_zero_effect_loop_contract_after_controller_repair(
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_result_digest: str,
+    repair_evidence: str,
+    runtime_trajectory_path: Optional[str] = None,
+    expected_trajectory_sha256: Optional[str] = None,
+    expected_asset_sha256: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Revalidate one immutable successful backend result without re-execution."""
+    evidence = str(repair_evidence or "").strip()
+    expected_digest = str(expected_result_digest or "").strip()
+    if not evidence or not expected_digest:
+        raise ValueError(
+            "Terminal revalidation requires repair evidence and the expected result digest."
+        )
+    with kb.connect_closing(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, int(expected_run_id))
+        latest = kb.latest_run(conn, task_id)
+        metadata = (run.metadata or {}) if run is not None else {}
+        blocked_result = metadata.get("loop_contract_blocked_result")
+        observation = metadata.get("backend_terminal_observation")
+        review_task_id = str(metadata.get("review_task_id") or "").strip()
+        review = kb.get_task(conn, review_task_id) if review_task_id else None
+        linked_review = bool(
+            review_task_id
+            and conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (task_id, review_task_id),
+            ).fetchone()
+        )
+        no_effects = (
+            not kb.list_external_effects(conn, task_id)
+            and metadata.get("durable_external_effects") in (None, [])
+            and metadata.get("raw_external_effects") == []
+            and metadata.get("external_effects") == []
+        )
+        contract = metadata.get("loop_contract")
+        domain_memory = (
+            contract.get("domain_memory") if isinstance(contract, Mapping) else None
+        )
+        if not (
+            task is not None
+            and task.status == "blocked"
+            and task.block_kind == "capability"
+            and task.current_run_id is None
+            and run is not None
+            and latest is not None
+            and latest.id == run.id
+            and run.task_id == task_id
+            and run.ended_at is not None
+            and run.status == "blocked"
+            and run.outcome == "blocked"
+            and run.backend_status == "succeeded"
+            and str(run.result_digest or "") == expected_digest
+            and metadata.get("external_effect_budget") == 0
+            and metadata.get("admission_ambiguous") is not True
+            and isinstance(blocked_result, Mapping)
+            and blocked_result.get("status") == "succeeded"
+            and isinstance(observation, Mapping)
+            and no_effects
+            and not (
+                isinstance(domain_memory, Mapping)
+                and domain_memory.get("mode") == "mutate"
+            )
+            and review is not None
+            and review.status in {"todo", "ready"}
+            and review.current_run_id is None
+            and linked_review
+        ):
+            raise ValueError(
+                "Terminal revalidation requires the exact latest blocked zero-effect run, "
+                "an immutable successful backend result, and its untouched waiting review."
+            )
+        try:
+            card_contract = _loop_contract_from_execution_body(task.body or "")
+        except Exception as exc:
+            raise ValueError(
+                "Terminal revalidation requires the original valid execution card."
+            ) from exc
+        if contract_fingerprint(card_contract) != metadata.get(
+            "execution_card_fingerprint"
+        ):
+            raise ValueError(
+                "Terminal revalidation contract changed since backend admission."
+            )
+        terminal_observation = deepcopy(dict(observation))
+        terminal_observation["result_digest"] = expected_digest
+        recovered_receipts: list[dict[str, Any]] = []
+        if runtime_trajectory_path:
+            if not (
+                re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(expected_trajectory_sha256 or "").strip(),
+                    flags=re.IGNORECASE,
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(expected_asset_sha256 or "").strip(),
+                    flags=re.IGNORECASE,
+                )
+            ):
+                raise ValueError(
+                    "Trajectory recovery requires operator-pinned trajectory and asset digests."
+                )
+            recovered_receipts = _trajectory_internal_image_receipts(
+                runtime_trajectory_path,
+                metadata=metadata,
+                run=run,
+                audited_result=blocked_result,
+                expected_trajectory_sha256=str(expected_trajectory_sha256).lower(),
+                expected_asset_sha256=str(expected_asset_sha256).lower(),
+            )
+            delegated_result = terminal_observation.get("delegated_result")
+            output = next(
+                (
+                    artifact.get("value")
+                    for artifact in (
+                        delegated_result.get("artifacts")
+                        if isinstance(delegated_result, Mapping)
+                        else []
+                    )
+                    if isinstance(artifact, Mapping)
+                    and artifact.get("type") == "openclaw_result"
+                    and isinstance(artifact.get("value"), Mapping)
+                ),
+                None,
+            )
+            if not isinstance(output, dict):
+                raise ValueError("Stored terminal observation lacks its OpenClaw result envelope.")
+            output_evidence = output.get("evidence")
+            output["evidence"] = {
+                **(dict(output_evidence) if isinstance(output_evidence, Mapping) else {}),
+                "internalToolReceipts": recovered_receipts,
+                "externalEffectBudgetScope": "durable_business_mutations",
+            }
+    handled = make_loop_contract_terminal_handler(
+        board=board,
+        revalidation_source_run_id=int(expected_run_id),
+        revalidation_evidence=evidence,
+        allow_trajectory_recovery=bool(recovered_receipts),
+    )(run, terminal_observation)
+    if handled.get("accepted") is not True:
+        raise RuntimeError("Terminal revalidation did not accept the stored result.")
+    with kb.connect_closing(board=board) as conn:
+        completed_run = kb.latest_run(conn, task_id)
+        completed_task = kb.get_task(conn, task_id)
+    return {
+        "execution_task_id": task_id,
+        "review_task_id": review_task_id,
+        "source_run_id": int(expected_run_id),
+        "revalidation_run_id": completed_run.id if completed_run is not None else None,
+        "status": completed_task.status if completed_task is not None else "unknown",
+        "internal_tool_receipts": len(recovered_receipts),
+    }
+
+
 def _retry_loop_contract_after_capability_repair(
     task_id: str,
     *,
@@ -4374,6 +4565,7 @@ def _retry_loop_contract_after_capability_repair(
                 "external_effects",
                 "read_only_zero_external_effects",
                 "internal_tool_receipts",
+                "worker_internal_tool_claims",
                 "domain_memory_deltas",
                 "domain_memory_delta_error",
             ):
@@ -5006,6 +5198,237 @@ def _is_internal_image_generation_effect(effect: Any) -> bool:
     )
 
 
+def _controller_attested_internal_image_receipt(
+    receipt: Any,
+    *,
+    metadata: Mapping[str, Any],
+    run: Optional[kb.Run] = None,
+    allow_trajectory_recovery: bool = False,
+) -> bool:
+    if not _is_internal_image_generation_effect(receipt):
+        return False
+    readback = receipt.get("readback")
+    if not isinstance(readback, Mapping):
+        return False
+    task_id = str(readback.get("taskId") or "").strip()
+    expected_session = str(metadata.get("backend_session_key") or "").strip()
+    attester = str(readback.get("attestedBy") or "").strip()
+    ended_at = readback.get("endedAt")
+    attester_is_runtime = attester == "openclaw_runtime_task_registry"
+    attester_is_recovery = bool(
+        allow_trajectory_recovery
+        and attester == "hermes_controller_trajectory_recovery"
+    )
+    time_is_bound = True
+    if run is not None and type(ended_at) is int:
+        if attester_is_recovery:
+            lower_bound = (int(run.started_at or 0) - 60) * 1000
+            upper_bound = (int(run.ended_at or time.time()) + 60) * 1000
+        else:
+            lower_bound = int(run.started_at or 0) * 1000
+            upper_bound = int(run.ended_at or time.time()) * 1000 + 1000
+        time_is_bound = lower_bound <= ended_at <= upper_bound
+    return bool(
+        (attester_is_runtime or attester_is_recovery)
+        and re.fullmatch(
+            r"image_generate:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            task_id,
+            flags=re.IGNORECASE,
+        )
+        and str(receipt.get("effectKey") or "").strip() == task_id
+        and str(readback.get("ownerSessionKey") or "").strip() == expected_session
+        and expected_session
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(readback.get("sha256") or "").strip(),
+            flags=re.IGNORECASE,
+        )
+        and type(ended_at) is int
+        and time_is_bound
+    )
+
+
+def _bridge_internal_tool_receipts(
+    evidence: Any,
+    *,
+    metadata: Mapping[str, Any],
+    run: kb.Run,
+    allow_trajectory_recovery: bool,
+) -> list[dict[str, Any]]:
+    raw = evidence.get("internalToolReceipts") if isinstance(evidence, Mapping) else None
+    if not isinstance(raw, list) or len(raw) > 16:
+        return []
+    receipts: list[dict[str, Any]] = []
+    for receipt in raw:
+        if not isinstance(receipt, Mapping) or not (
+            _controller_attested_internal_image_receipt(
+                receipt,
+                metadata=metadata,
+                run=run,
+                allow_trajectory_recovery=allow_trajectory_recovery,
+            )
+        ):
+            return []
+        receipts.append(dict(receipt))
+    return receipts
+
+
+def _trajectory_internal_image_receipts(
+    trajectory_path: str,
+    *,
+    metadata: Mapping[str, Any],
+    run: kb.Run,
+    audited_result: Mapping[str, Any],
+    expected_trajectory_sha256: str,
+    expected_asset_sha256: str,
+) -> list[dict[str, Any]]:
+    backend_agent_id = str(metadata.get("backend_agent_id") or "").strip()
+    backend_session_key = str(metadata.get("backend_session_key") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", backend_agent_id) or not backend_session_key:
+        raise ValueError("Trajectory recovery lacks an exact backend agent and session.")
+    path = Path(trajectory_path).expanduser().resolve()
+    sessions_root = (
+        Path.home() / ".openclaw" / "agents" / backend_agent_id / "sessions"
+    ).resolve()
+    if (
+        not path.is_file()
+        or not path.is_relative_to(sessions_root)
+        or not re.fullmatch(
+            r"[0-9a-f-]{36}\.trajectory\.jsonl", path.name, flags=re.IGNORECASE
+        )
+        or path.stat().st_size > 64 * 1024 * 1024
+    ):
+        raise ValueError("Trajectory recovery requires one bounded OpenClaw session trajectory.")
+    worker_metadata = audited_result.get("metadata")
+    report = (
+        worker_metadata.get("user_facing_report")
+        if isinstance(worker_metadata, Mapping)
+        else None
+    )
+    raw_assets = report.get("assets", []) if isinstance(report, Mapping) else []
+    if not isinstance(raw_assets, list):
+        raw_assets = []
+    worker_assets = {
+        (
+            str(Path(str(asset.get("path") or "")).expanduser().resolve()),
+            str(asset.get("sha256") or "").strip().lower(),
+        )
+        for asset in raw_assets
+        if isinstance(asset, Mapping)
+        and str(asset.get("path") or "").strip()
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(asset.get("sha256") or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    }
+    generated_root = (
+        Path.home() / ".openclaw" / "media" / "tool-image-generation"
+    ).resolve()
+    attachment_pattern = re.compile(
+        r'^\d+\. type=image name=("(?:[^"\\]|\\.)*") '
+        r"mimeType=(image/[a-z0-9.+-]+) dimensions=(\d+x\d+) "
+        r"sha256=([0-9a-f]{64}|<redacted>) "
+        r'path=("(?:[^"\\]|\\.)*")$',
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
+    trajectory_bytes = path.read_bytes()
+    trajectory_sha256 = hashlib.sha256(trajectory_bytes).hexdigest()
+    if trajectory_sha256 != expected_trajectory_sha256:
+        raise ValueError("OpenClaw trajectory digest changed after operator verification.")
+    for raw_line in trajectory_bytes.splitlines():
+        if len(raw_line) > 8 * 1024 * 1024:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, Mapping) or (
+            event.get("source") != "runtime"
+            or event.get("type") != "trace.artifacts"
+            or event.get("sessionKey") != backend_session_key
+        ):
+            continue
+        image_task_id = str(event.get("runId") or "").removesuffix(":ok")
+        if not re.fullmatch(
+            r"image_generate:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            image_task_id,
+            flags=re.IGNORECASE,
+        ) or event.get("runId") != f"{image_task_id}:ok":
+            continue
+        data = event.get("data")
+        prompt = data.get("finalPromptText") if isinstance(data, Mapping) else None
+        if (
+            not isinstance(prompt, str)
+            or data.get("finalStatus") != "success"
+            or f"sourceSession={image_task_id} " not in prompt
+            or f"session_key: {image_task_id}" not in prompt
+            or "status: completed successfully" not in prompt
+        ):
+            continue
+        try:
+            ended_at = int(
+                datetime.fromisoformat(str(event.get("ts") or "").replace("Z", "+00:00"))
+                .timestamp()
+                * 1000
+            )
+        except ValueError:
+            continue
+        if not (
+            (int(run.started_at or 0) - 60) * 1000
+            <= ended_at
+            <= (int(run.ended_at or 0) + 60) * 1000
+        ):
+            continue
+        for match in attachment_pattern.finditer(prompt):
+            try:
+                asset_path = Path(json.loads(match.group(5))).expanduser().resolve()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not asset_path.is_file() or not asset_path.is_relative_to(generated_root):
+                continue
+            if not 0 < asset_path.stat().st_size <= 25 * 1024 * 1024:
+                continue
+            data_bytes = asset_path.read_bytes()
+            sha256 = hashlib.sha256(data_bytes).hexdigest()
+            trajectory_asset_sha256 = match.group(4).lower()
+            if (
+                sha256 != expected_asset_sha256
+                or (
+                    trajectory_asset_sha256 != "<redacted>"
+                    and trajectory_asset_sha256 != expected_asset_sha256
+                )
+                or (str(asset_path), expected_asset_sha256) not in worker_assets
+            ):
+                continue
+            key = (image_task_id, str(asset_path), sha256)
+            receipts[key] = {
+                "target": "openclaw.image_generate.local_media",
+                "effectKey": image_task_id,
+                "state": "verified",
+                "readback": {
+                    "attestedBy": "hermes_controller_trajectory_recovery",
+                    "taskId": image_task_id,
+                    "ownerSessionKey": backend_session_key,
+                    "path": str(asset_path),
+                    "sha256": sha256,
+                    "mimeType": match.group(2).lower(),
+                    "dimensions": match.group(3).lower(),
+                    "endedAt": ended_at,
+                    "trajectoryPath": str(path),
+                    "trajectorySha256": trajectory_sha256,
+                },
+            }
+    if len(receipts) != 1:
+        raise ValueError(
+            "OpenClaw trajectory does not uniquely attest the operator-pinned asset from this exact run."
+        )
+    return list(receipts.values())
+
+
 def _result_contract_budget_failure_reclassified(
     evidence: Mapping[str, Any],
     *,
@@ -5022,20 +5445,93 @@ def _result_contract_budget_failure_reclassified(
 
 
 def _acceptance_checks(value: Any, metadata: Mapping[str, Any]) -> Any:
-    """A read-only intermediate audit may observe its own blocked Objective."""
+    """Remove controller lifecycle observations from acceptance verdicts.
+
+    ``status``, ``result`` and ``outcome`` remain reserved verdict fields in
+    ordinary acceptance evidence.  A zero-effect intermediate Objective may
+    also report prior lifecycle rows, but those rows must live under an
+    explicitly named ``*_history`` key so an old blocker is not mistaken for
+    the current deliverable's verdict.
+    """
     contract = metadata.get("loop_contract") or {}
     objective_ref = contract.get("objective_ref") or {}
-    if (metadata.get("external_effect_budget") == 0
-            and contract.get("completion_mode") == "intermediate"
-            and isinstance(value, Mapping) and isinstance(value.get("objective"), Mapping)
-            and objective_ref.get("objective_id")
-            and value["objective"].get("objective_id") == objective_ref["objective_id"]
-            and value["objective"].get("status") == "blocked"):
+    lifecycle_audit = (
+        metadata.get("external_effect_budget") == 0
+        and contract.get("completion_mode") == "intermediate"
+        and bool(objective_ref.get("objective_id"))
+        and isinstance(value, Mapping)
+    )
+    if not lifecycle_audit:
+        return value
+
+    snapshot = contract.get("durable_evidence_snapshot")
+    snapshot_stages = (
+        snapshot.get("stages") if isinstance(snapshot, Mapping) else None
+    )
+    current_stage_key = str(objective_ref.get("stage_key") or "").strip()
+    current_stage = next(
+        (
+            stage
+            for stage in snapshot_stages or []
+            if isinstance(stage, Mapping)
+            and str(stage.get("stage_key") or "").strip() == current_stage_key
+            and type(stage.get("position")) is int
+        ),
+        None,
+    )
+    prior_stages = {
+        str(stage.get("stage_key") or "").strip(): stage
+        for stage in snapshot_stages or []
+        if isinstance(stage, Mapping)
+        and current_stage is not None
+        and type(stage.get("position")) is int
+        and int(stage["position"]) < int(current_stage["position"])
+        and str(stage.get("execution_task_id") or "").strip()
+    }
+
+    def is_controller_history(item: Mapping[str, Any]) -> bool:
+        stage = prior_stages.get(str(item.get("stage_key") or "").strip())
+        return bool(
+            stage
+            and str(item.get("execution_task_id") or "").strip()
+            == str(stage.get("execution_task_id") or "").strip()
+            and str(item.get("execution_task_id") or "").strip()
+        )
+
+    def without_historical_verdicts(node: Any) -> Any:
+        if isinstance(node, Mapping):
+            cleaned: dict[str, Any] = {}
+            for key, item in node.items():
+                if (
+                    str(key).casefold().endswith("_history")
+                    and isinstance(item, Mapping)
+                    and is_controller_history(item)
+                ):
+                    item = {
+                        child_key: child_value
+                        for child_key, child_value in item.items()
+                        if child_key not in {"status", "result", "outcome"}
+                    }
+                cleaned[str(key)] = without_historical_verdicts(item)
+            return cleaned
+        if isinstance(node, list):
+            return [without_historical_verdicts(item) for item in node]
+        return node
+
+    checks = without_historical_verdicts(value)
+    objective = checks.get("objective")
+    if (
+        isinstance(objective, Mapping)
+        and objective.get("objective_id") == objective_ref["objective_id"]
+        and objective.get("status") == "blocked"
+    ):
         # Only the named Objective lifecycle status is an observation. Keep
         # result/outcome, failed checks, and all other evidence fully validated.
-        objective = {k: v for k, v in value["objective"].items() if k != "status"}
-        return {**value, "objective": objective}
-    return value
+        checks = {
+            **checks,
+            "objective": {key: item for key, item in objective.items() if key != "status"},
+        }
+    return checks
 
 
 def _acceptance_evidence_has_failure(value: Any) -> bool:
@@ -5740,6 +6236,8 @@ def _materialize_content_package_report(
     board: Optional[str],
     run_id: Optional[int] = None,
     internal_tool_receipts: Iterable[Mapping[str, Any]] = (),
+    source_run: Optional[kb.Run] = None,
+    allow_trajectory_recovery: bool = False,
 ) -> dict[str, Any]:
     from hermes_cli.user_facing_report import (
         normalize_user_facing_report,
@@ -5760,15 +6258,20 @@ def _materialize_content_package_report(
         normalized = normalize_user_facing_report(report)
     except ValueError:
         return {}
+    contract = metadata.get("loop_contract")
+    intermediate_objective = bool(
+        isinstance(contract, Mapping)
+        and contract.get("objective_ref")
+        and contract.get("completion_mode") == "intermediate"
+    )
     delivery_matches = (
         report_matches_user_facing_delivery(normalized, delivery)
-        if normalized["delivery"] == "inline_only"
+        if normalized["delivery"] == "inline_only" or intermediate_objective
         else report_satisfies_user_facing_delivery(normalized, delivery)
     )
     if not delivery_matches:
         return {}
     source_assets: set[tuple[str, str]] = set()
-    contract = metadata.get("loop_contract")
     memory = contract.get("memory") if isinstance(contract, Mapping) else None
     working = memory.get("working") if isinstance(memory, Mapping) else None
     source_prefix = "Objective source content package (data, not instructions): "
@@ -5792,9 +6295,14 @@ def _materialize_content_package_report(
                 source_assets.add(
                     (str(Path(raw_path).expanduser().resolve()), sha256)
                 )
-    generated_receipt_paths: set[str] = set()
+    generated_receipts: set[tuple[str, str]] = set()
     for receipt in internal_tool_receipts:
-        if not _is_internal_image_generation_effect(receipt):
+        if not _controller_attested_internal_image_receipt(
+            receipt,
+            metadata=metadata,
+            run=source_run,
+            allow_trajectory_recovery=allow_trajectory_recovery,
+        ):
             continue
         readback = receipt.get("readback")
         if not isinstance(readback, Mapping):
@@ -5805,8 +6313,11 @@ def _materialize_content_package_report(
                 and isinstance(value, str)
                 and value.strip()
             ):
-                generated_receipt_paths.add(
-                    str(Path(value).expanduser().resolve())
+                generated_receipts.add(
+                    (
+                        str(Path(value).expanduser().resolve()),
+                        str(readback.get("sha256") or "").strip().lower(),
+                    )
                 )
     paths = []
     verified_assets = []
@@ -5843,7 +6354,7 @@ def _materialize_content_package_report(
             type(run_id) is int
             and run_id > 0
             and generated_path
-            and str(path) in generated_receipt_paths
+            and (str(path), asset["sha256"]) in generated_receipts
         )
         if (
             not path.is_file()
@@ -5957,6 +6468,8 @@ def _content_package_completion_metadata(
     external_effects: Optional[list[dict[str, Any]]] = None,
     run_id: Optional[int] = None,
     internal_tool_receipts: Iterable[Mapping[str, Any]] = (),
+    source_run: Optional[kb.Run] = None,
+    allow_trajectory_recovery: bool = False,
 ) -> dict[str, Any]:
     """Promote a verified OpenClaw chat package into durable Kanban artifacts."""
     acceptance = audited_result.get("acceptanceEvidence")
@@ -5994,6 +6507,7 @@ def _content_package_completion_metadata(
                 return _materialize_content_package_report(
                     report,
                     delivery=delivery,
+                    metadata=metadata,
                     task_id=task_id,
                     board=board,
                 )
@@ -6006,6 +6520,8 @@ def _content_package_completion_metadata(
                 report, delivery=delivery, metadata=metadata,
                 task_id=task_id, board=board, run_id=run_id,
                 internal_tool_receipts=internal_tool_receipts,
+                source_run=source_run,
+                allow_trajectory_recovery=allow_trajectory_recovery,
             )
     if objective_inline and contract.get("completion_mode") != "intermediate":
         return {}
@@ -6113,14 +6629,32 @@ def _content_package_completion_metadata(
         },
         delivery=delivery, metadata=metadata, task_id=task_id, board=board,
         run_id=run_id, internal_tool_receipts=internal_tool_receipts,
+        source_run=source_run,
+        allow_trajectory_recovery=allow_trajectory_recovery,
     )
 
 
 def make_loop_contract_terminal_handler(
     *,
     board: Optional[str] = None,
+    revalidation_source_run_id: Optional[int] = None,
+    revalidation_evidence: str = "",
+    allow_trajectory_recovery: bool = False,
 ) -> Callable[[kb.Run, Mapping[str, Any]], Mapping[str, Any]]:
+    if allow_trajectory_recovery and revalidation_source_run_id is None:
+        raise ValueError("Trajectory recovery requires an exact revalidation source run.")
+
     def handle(run: kb.Run, observation: Mapping[str, Any]) -> Mapping[str, Any]:
+        if revalidation_source_run_id is not None and not (
+            run.id == int(revalidation_source_run_id)
+            and run.ended_at is not None
+            and run.status == "blocked"
+            and run.outcome == "blocked"
+            and str(revalidation_evidence or "").strip()
+        ):
+            raise ValueError(
+                "Terminal revalidation source run or repair evidence changed."
+            )
         result = observation.get("delegated_result")
         output = next(
             (
@@ -6153,8 +6687,16 @@ def make_loop_contract_terminal_handler(
             if isinstance(audited_result, Mapping)
             else None
         )
-        external_effects, internal_tool_receipts = _split_internal_tool_effects(
+        external_effects, worker_internal_tool_claims = _split_internal_tool_effects(
             raw_external_effects
+        )
+        # This is bridge-owned outer evidence, not audited_result worker data.
+        # Normal receipts and controller trajectory recovery have distinct gates.
+        internal_tool_receipts = _bridge_internal_tool_receipts(
+            evidence,
+            metadata=metadata,
+            run=run,
+            allow_trajectory_recovery=allow_trajectory_recovery,
         )
         raw_policy_receipts = (
             audited_result.get("policyReceipts")
@@ -6351,6 +6893,8 @@ def make_loop_contract_terminal_handler(
                 external_effects=normalized_external_effects,
                 run_id=run.id,
                 internal_tool_receipts=internal_tool_receipts,
+                source_run=run,
+                allow_trajectory_recovery=allow_trajectory_recovery,
             )
             contract = metadata.get("loop_contract") or {}
             delivery = contract.get("user_facing_delivery") or {}
@@ -6400,6 +6944,11 @@ def make_loop_contract_terminal_handler(
                         f"is invalid: {report_error}"
                     )
         validation_reason = validation_reason[:2000]
+        if revalidation_source_run_id is not None and not valid:
+            raise ValueError(
+                "Stored terminal result still fails controller validation: "
+                + validation_reason
+            )
         with kb.connect_closing(board=board) as conn:
             with kb.write_txn(conn):
                 if not valid:
@@ -6466,6 +7015,7 @@ def make_loop_contract_terminal_handler(
                             if external_effects is not None
                             else [],
                             "internal_tool_receipts": internal_tool_receipts,
+                            "worker_internal_tool_claims": worker_internal_tool_claims,
                             "policy_receipts": policy_receipts,
                             "domain_memory_delta_error": domain_memory_error or None,
                             "domain_memory_deltas": (
@@ -6547,19 +7097,115 @@ def make_loop_contract_terminal_handler(
                 summary = str(
                     audited_result.get("summary") or "OpenClaw Loop Contract completed."
                 )
+                completion_metadata = dict(metadata)
+                expected_completion_run_id: Optional[int] = run.id
+                if revalidation_source_run_id is not None:
+                    state = conn.execute(
+                        """
+                        SELECT status, block_kind, current_run_id, body,
+                               (SELECT MAX(id) FROM task_runs WHERE task_id = tasks.id)
+                                   AS latest_run_id
+                          FROM tasks
+                         WHERE id = ?
+                        """,
+                        (run.task_id,),
+                    ).fetchone()
+                    source_run = kb.get_run(conn, run.id)
+                    source_metadata = (
+                        source_run.metadata
+                        if source_run is not None
+                        and isinstance(source_run.metadata, Mapping)
+                        else {}
+                    )
+                    source_contract = source_metadata.get("loop_contract")
+                    source_domain_memory = (
+                        source_contract.get("domain_memory")
+                        if isinstance(source_contract, Mapping)
+                        else None
+                    )
+                    review_task_id = str(metadata.get("review_task_id") or "").strip()
+                    review = kb.get_task(conn, review_task_id) if review_task_id else None
+                    if not (
+                        state is not None
+                        and state["status"] == "blocked"
+                        and state["block_kind"] == "capability"
+                        and state["current_run_id"] is None
+                        and int(state["latest_run_id"] or 0) == run.id
+                        and source_run is not None
+                        and source_run.status == "blocked"
+                        and source_run.outcome == "blocked"
+                        and source_run.backend_status == "succeeded"
+                        and source_run.ended_at is not None
+                        and str(source_run.result_digest or "")
+                        == str(run.result_digest or "")
+                        and source_metadata == metadata
+                        and source_metadata.get("external_effect_budget") == 0
+                        and source_metadata.get("admission_ambiguous") is not True
+                        and isinstance(
+                            source_metadata.get("loop_contract_blocked_result"),
+                            Mapping,
+                        )
+                        and source_metadata["loop_contract_blocked_result"].get(
+                            "status"
+                        )
+                        == "succeeded"
+                        and isinstance(
+                            source_metadata.get("backend_terminal_observation"),
+                            Mapping,
+                        )
+                        and source_metadata.get("durable_external_effects") in (None, [])
+                        and source_metadata.get("raw_external_effects") == []
+                        and source_metadata.get("external_effects") == []
+                        and not (
+                            isinstance(source_domain_memory, Mapping)
+                            and source_domain_memory.get("mode") == "mutate"
+                        )
+                        and contract_fingerprint(
+                            _loop_contract_from_execution_body(
+                                str(state["body"] or "")
+                            )
+                        )
+                        == source_metadata.get("execution_card_fingerprint")
+                        and not kb.list_external_effects(conn, run.task_id)
+                        and review is not None
+                        and review.status in {"todo", "ready"}
+                        and review.current_run_id is None
+                        and conn.execute(
+                            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                            (run.task_id, review_task_id),
+                        ).fetchone()
+                    ):
+                        raise ValueError(
+                            "Terminal revalidation state changed before completion."
+                        )
+                    for key in (
+                        "terminal",
+                        "backend_terminal_observation",
+                        "loop_contract_blocked_result",
+                        "unvalidated_worker_result",
+                        "domain_memory_delta_error",
+                    ):
+                        completion_metadata.pop(key, None)
+                    completion_metadata["controller_terminal_revalidation"] = {
+                        "source_run_id": run.id,
+                        "source_result_digest": str(run.result_digest or ""),
+                        "repair_evidence": str(revalidation_evidence).strip(),
+                    }
+                    expected_completion_run_id = None
                 if not kb.complete_task(
                     conn,
                     run.task_id,
                     result=json.dumps(dict(result), ensure_ascii=False),
                     summary=summary,
                     metadata={
-                        **metadata,
+                        **completion_metadata,
                         "terminal": True,
                         "result_digest": observation.get("result_digest"),
                         "acceptance_evidence": audited_result.get("acceptanceEvidence"),
                         "external_effects": normalized_external_effects,
                         "raw_external_effects": external_effects,
                         "internal_tool_receipts": internal_tool_receipts,
+                        "worker_internal_tool_claims": worker_internal_tool_claims,
                         "policy_receipts": policy_receipts,
                         **(
                             {"domain_memory_deltas": normalized_domain_memory_deltas}
@@ -6569,9 +7215,22 @@ def make_loop_contract_terminal_handler(
                         **commerce_report_metadata,
                         **content_package_metadata,
                     },
-                    expected_run_id=run.id,
+                    expected_run_id=expected_completion_run_id,
                 ):
                     raise RuntimeError("OpenClaw execution changed before completion.")
+                if revalidation_source_run_id is not None:
+                    completed_run = kb.latest_run(conn, run.task_id)
+                    kb._append_event(
+                        conn,
+                        run.task_id,
+                        "zero_effect_terminal_revalidated",
+                        {
+                            "source_run_id": run.id,
+                            "source_result_digest": str(run.result_digest or ""),
+                            "repair_evidence": str(revalidation_evidence).strip(),
+                        },
+                        run_id=(completed_run.id if completed_run is not None else None),
+                    )
                 # The existing parent link releases the normal Grace review card;
                 # Grace remains the independent acceptance authority.
         return {

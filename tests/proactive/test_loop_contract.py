@@ -194,6 +194,42 @@ def test_facebook_group_publish_requires_canonical_url_per_group():
     assert facebook_group_publish_destination_ids(accepted) == {"897927458651235"}
 
 
+def test_facebook_group_publish_accepts_only_preflight_pinned_chooser_destinations():
+    contract = _contract()
+    contract["external_targets"] = ["group:897927458651235"]
+    contract["facebook_group_publish"] = {
+        "mode": "listing_bound_chooser",
+        "source_listing_id": "37276725125275496",
+        "destinations": [{
+            "group_id": "897927458651235",
+            "canonical_name": "二手家具 家電 買賣",
+            "canonical_url": "https://www.facebook.com/groups/897927458651235",
+        }],
+        "preflight_evidence": {
+            "execution_task_id": "t_1234abcd",
+            "execution_run_id": 11,
+            "review_task_id": "t_5678abcd",
+            "review_run_id": 12,
+            "list_in_more_places_available": True,
+            "side_effects_performed": False,
+            "eligible_destination_ids": ["897927458651235"],
+            "destination_identity": [{
+                "group_id": "897927458651235",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }],
+        },
+    }
+
+    accepted = validate_loop_contract(contract)
+    assert accepted["facebook_group_publish"]["mode"] == "listing_bound_chooser"
+
+    contract["facebook_group_publish"]["preflight_evidence"][
+        "eligible_destination_ids"
+    ] = []
+    with pytest.raises(LoopContractError, match="not selectable in the accepted preflight"):
+        validate_loop_contract(contract)
+
+
 def test_facebook_group_publish_rejects_chooser_only_or_mismatched_identity():
     contract = _contract()
     contract["external_targets"] = ["group:897927458651235"]
@@ -322,6 +358,8 @@ def test_review_body_explains_canonical_verdict_for_fail_closed_parent():
     assert "Do not set approved=false" in review
     assert "review_outcome=blocked" in review
     assert "parent_verdict" in review
+    assert "parent_execution_task_id=t_execution" in review
+    assert "parent_execution_run_id" in review
 
 
 def test_facebook_group_publish_body_forbids_chooser_identity():
@@ -345,6 +383,38 @@ def test_facebook_group_publish_body_forbids_chooser_identity():
     assert "canonical_url_per_group" in execution
     assert "Do not use Marketplace 'List in more places' chooser rows" in execution
     assert "canonical_url_per_group" in review
+
+
+def test_facebook_group_publish_body_uses_only_preflight_selected_chooser_route():
+    contract = _contract()
+    contract["external_targets"] = ["group:897927458651235"]
+    contract["facebook_group_publish"] = {
+        "mode": "listing_bound_chooser",
+        "source_listing_id": "37276725125275496",
+        "destinations": [{
+            "group_id": "897927458651235",
+            "canonical_name": "二手家具 家電 買賣",
+            "canonical_url": "https://www.facebook.com/groups/897927458651235",
+        }],
+        "preflight_evidence": {
+            "execution_task_id": "t_1234abcd",
+            "execution_run_id": 11,
+            "review_task_id": "t_5678abcd",
+            "review_run_id": 12,
+            "list_in_more_places_available": True,
+            "side_effects_performed": False,
+            "eligible_destination_ids": ["897927458651235"],
+            "destination_identity": [{
+                "group_id": "897927458651235",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }],
+        },
+    }
+
+    execution = render_execution_body(validate_loop_contract(contract))
+    assert "accepted read-only preflight selected" in execution
+    assert "not a relaxation of any general Facebook safety restriction" in execution
+    assert "Do not use Share to Group" in execution
 
 
 def test_text_only_review_body_does_not_require_page_hero_visual_review():
@@ -566,3 +636,52 @@ def test_grace_bodies_require_durable_external_effect_handoff():
     assert "metadata.external_effects" in execution
     assert "all cumulative evidence" in review
     assert "external-effect ledger" in review
+
+
+@pytest.mark.parametrize("route,version,valid", [
+    ("facebook_marketplace_readonly", "facebook_group_preflight/v1", True),
+    ("browser_publish", "facebook_group_preflight/v1", False),
+    ("facebook_marketplace_readonly", "facebook_group_preflight/v99", False),
+])
+def test_declared_preflight_schema_is_validated_before_dispatch(route, version, valid):
+    contract = _contract()
+    contract["routing"] = {"task_type": route}
+    contract["evidence_contract"] = version
+    if valid:
+        assert validate_loop_contract(contract)["evidence_contract"] == version
+    else:
+        with pytest.raises(LoopContractError, match="Unsupported evidence_contract"):
+            validate_loop_contract(contract)
+
+
+def test_legacy_preflight_schema_requires_structured_deliverables():
+    from hermes_cli.facebook_group_preflight import requested
+
+    contract = {
+        "routing": {"task_type": "facebook_marketplace_readonly"},
+        "goal": {
+            "objective": (
+                "Explain why sourceListing and coverageReconciliation are not requested"
+            ),
+            "deliverables": ["Generic read-only report"],
+        },
+    }
+
+    assert requested(contract) is False
+    contract["goal"]["deliverables"] = [
+        "sourceListing and coverageReconciliation evidence"
+    ]
+    assert requested(contract) is True
+    contract["goal"]["deliverables"] = [
+        "Do not return sourceListing and coverageReconciliation evidence"
+    ]
+    assert requested(contract) is False
+
+
+@pytest.mark.parametrize("routing", [None, [], True, "facebook_marketplace_readonly"])
+def test_declared_preflight_rejects_non_object_routing(routing):
+    contract = _contract()
+    contract["routing"] = routing
+    contract["evidence_contract"] = "facebook_group_preflight/v1"
+    with pytest.raises(LoopContractError, match="Unsupported evidence_contract"):
+        validate_loop_contract(contract)

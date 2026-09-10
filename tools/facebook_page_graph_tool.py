@@ -385,7 +385,17 @@ def bind_accepted_page_preflight_source(
     message = package.get("facebook_page_post") if isinstance(package, Mapping) else None
     if not isinstance(message, str) or not message.strip():
         raise ValueError("Accepted package lacks structured facebook_page_post text.")
-    images = [a for a in (review_run.metadata or {}).get("asset_review", [])
+    review_metadata = review_run.metadata or {}
+    raw_images = review_metadata.get("asset_review")
+    if not isinstance(raw_images, list):
+        page_hero = review_metadata.get("page_hero")
+        if isinstance(page_hero, Mapping):
+            canonical_page_hero = dict(page_hero)
+            canonical_page_hero.setdefault("accepted", True)
+            raw_images = [canonical_page_hero]
+        else:
+            raw_images = []
+    images = [a for a in raw_images
               if isinstance(a, Mapping) and a.get("asset_family") == "page_hero"
               and a.get("accepted") is True]
     if len(images) != 1:

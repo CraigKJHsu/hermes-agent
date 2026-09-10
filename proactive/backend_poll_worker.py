@@ -17,6 +17,22 @@ from proactive.execution_backends import (
 BackendPollAdapter = Callable[[kb.Run], Mapping[str, Any]]
 BackendTerminalHandler = Callable[[kb.Run, Mapping[str, Any]], Mapping[str, Any]]
 
+_TERMINAL_HANDLER_RETRY_LIMIT = 3
+_TRANSIENT_TERMINAL_ERROR_MARKERS = (
+    "temporarily overloaded",
+    "overloaded",
+    "please try again",
+    "try again in a moment",
+    "rate limit",
+    "rate_limited",
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection_failed",
+    "service unavailable",
+    "http_5",
+)
+
 
 def _read_poll_control(metadata: Mapping[str, Any], key: str) -> int:
     value = metadata.get(key)
@@ -31,6 +47,69 @@ def _read_poll_control(metadata: Mapping[str, Any], key: str) -> int:
     if parsed < 0 or str(value).strip() != str(parsed):
         raise ValueError(f"{key} must be a non-negative integer.")
     return parsed
+
+
+def _read_no_progress_error_limit(metadata: Mapping[str, Any]) -> int:
+    if "no_progress_error_limit" in metadata:
+        return _read_poll_control(metadata, "no_progress_error_limit")
+    stop_rules = (metadata.get("loop_contract") or {}).get("stop_rules") or {}
+    if isinstance(stop_rules, Mapping) and stop_rules.get("no_progress"):
+        return 2
+    return 0
+
+
+def _transient_terminal_error(observation: Mapping[str, Any]) -> str | None:
+    """Return a retryable backend error hidden inside a terminal observation."""
+    status = str(observation.get("status") or "").strip().lower()
+    if status not in {"failed", "blocked"}:
+        return None
+
+    snippets: list[str] = []
+
+    def collect(value: Any) -> None:
+        if len(snippets) >= 80:
+            return
+        if isinstance(value, str):
+            text = " ".join(value.split())
+            if text:
+                snippets.append(text)
+            return
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                key_text = str(key)
+                if (
+                    "error" in key_text.lower()
+                    or "reason" in key_text.lower()
+                    or "status" in key_text.lower()
+                    or "message" in key_text.lower()
+                ):
+                    collect(child)
+                elif isinstance(child, (Mapping, list, tuple)):
+                    collect(child)
+            return
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child)
+
+    collect(observation)
+    haystack = "\n".join(snippets).casefold()
+    if not haystack:
+        return None
+    if not any(marker in haystack for marker in _TRANSIENT_TERMINAL_ERROR_MARKERS):
+        return None
+    if (
+        "invalid_terminal_result" not in haystack
+        and "backendrunstatus error" not in haystack.replace(":", " ")
+        and "failovererror" not in haystack
+        and "runtime_block" not in haystack
+    ):
+        return None
+    matched = next(
+        snippet
+        for snippet in snippets
+        if any(marker in snippet.casefold() for marker in _TRANSIENT_TERMINAL_ERROR_MARKERS)
+    )
+    return matched[:300]
 
 
 @dataclass(frozen=True)
@@ -105,10 +184,7 @@ def poll_due_backend_runs(
                 metadata,
                 "max_poll_iterations",
             )
-            no_progress_limit = _read_poll_control(
-                metadata,
-                "no_progress_error_limit",
-            )
+            no_progress_limit = _read_no_progress_error_limit(metadata)
         except ValueError as exc:
             error = f"Invalid backend poll-control metadata: {exc}"
             with kb.connect_closing(board=board) as conn:
@@ -406,6 +482,120 @@ def poll_due_backend_runs(
             ).strip()
             if status in TERMINAL_BACKEND_STATUSES:
                 observation["circuit_generation"] = circuit_generation
+            transient_terminal_error = _transient_terminal_error(observation)
+            if transient_terminal_error is not None:
+                error = (
+                    "Transient backend terminal error; retrying without "
+                    f"closing Loop Contract: {transient_terminal_error}"
+                )
+                with kb.connect_closing(board=board) as conn:
+                    with kb.write_txn(conn):
+                        if not kb.renew_backend_poll_claim(
+                            conn,
+                            run_id=run.id,
+                            owner=poll_owner,
+                            lease_seconds=max(int(lease_seconds), 120),
+                        ):
+                            poll_lease_lost = True
+                            raise RuntimeError(
+                                f"Poll lease expired during backend I/O: "
+                                f"task={run.task_id} run={run.id}."
+                            )
+                        previous_error = str(
+                            metadata.get("last_poll_error") or ""
+                        )
+                        same_error_count = (
+                            int(metadata.get("same_poll_error_count") or 0) + 1
+                            if previous_error == error
+                            else 1
+                        )
+                        kb.merge_active_run_metadata(
+                            conn,
+                            run.task_id,
+                            expected_run_id=run.id,
+                            metadata={
+                                "last_poll_error": error,
+                                "same_poll_error_count": same_error_count,
+                                "last_transient_terminal_observation": observation,
+                            },
+                        )
+                        should_stop = (
+                            no_progress_limit > 0
+                            and same_error_count >= no_progress_limit
+                        )
+                        if should_stop:
+                            stop_error = (
+                                "Loop Contract no_progress rule reached after "
+                                f"{same_error_count} identical transient backend "
+                                f"terminal errors: {transient_terminal_error}"
+                            )
+                            if run.backend_run_id:
+                                kb.merge_active_run_metadata(
+                                    conn,
+                                    run.task_id,
+                                    expected_run_id=run.id,
+                                    metadata={
+                                        "stop_rule_cleanup_pending": True,
+                                        "stop_rule_reason": stop_error,
+                                        "cleanup_attempt_count": 0,
+                                        "cleanup_attempt_limit": 3,
+                                        "cleanup_deadline_at": (
+                                            int(kb.time.time())
+                                            + max(
+                                                90,
+                                                int(lease_seconds) * 3,
+                                            )
+                                        ),
+                                    },
+                                )
+                                released = kb.release_backend_poll_claim(
+                                    conn,
+                                    run_id=run.id,
+                                    owner=poll_owner,
+                                    retry_seconds=max(lease_seconds, 1),
+                                    error=stop_error,
+                                    increment_poll_count=False,
+                                    now=now,
+                                )
+                            else:
+                                kb.record_backend_circuit_outcome(
+                                    conn,
+                                    run.executor_backend,
+                                    succeeded=False,
+                                    error=error,
+                                    expected_generation=circuit_generation,
+                                )
+                                kb.block_task(
+                                    conn,
+                                    run.task_id,
+                                    reason=stop_error,
+                                    kind="capability",
+                                    expected_run_id=run.id,
+                                )
+                                released = False
+                        else:
+                            released = kb.release_backend_poll_claim(
+                                conn,
+                                run_id=run.id,
+                                owner=poll_owner,
+                                retry_seconds=next_poll_delay_seconds(
+                                    run.backend_poll_count + 1
+                                ),
+                                error=error,
+                                now=now,
+                            )
+                            if released:
+                                kb.record_backend_circuit_outcome(
+                                    conn,
+                                    run.executor_backend,
+                                    succeeded=False,
+                                    error=error,
+                                    expected_generation=circuit_generation,
+                                )
+                errors.append(error)
+                if released:
+                    retried += 1
+                continue
             with kb.connect_closing(board=board) as conn:
                 with kb.write_txn(conn):
                     if not kb.renew_backend_poll_claim(
@@ -542,16 +732,47 @@ def poll_due_backend_runs(
                 continue
             if terminal_observed:
                 with kb.connect_closing(board=board) as conn:
-                    kb.block_task(
-                        conn,
-                        run.task_id,
-                        reason=(
-                            "Backend terminated, but its terminal evidence "
-                            f"handler failed: {error}"
-                        ),
-                        kind="capability",
-                        expected_run_id=run.id,
-                    )
+                    with kb.write_txn(conn):
+                        current_run = kb.get_run(conn, run.id)
+                        current_metadata = (
+                            current_run.metadata if current_run is not None else {}
+                        ) or {}
+                        failure_count = (
+                            int(current_metadata.get("terminal_handler_error_count") or 0)
+                            + 1
+                        )
+                        kb.merge_active_run_metadata(
+                            conn,
+                            run.task_id,
+                            expected_run_id=run.id,
+                            metadata={
+                                "terminal_handler_error": error,
+                                "terminal_handler_error_count": failure_count,
+                            },
+                        )
+                        if failure_count < _TERMINAL_HANDLER_RETRY_LIMIT:
+                            released = kb.release_backend_poll_claim(
+                                conn,
+                                run_id=run.id,
+                                owner=poll_owner,
+                                retry_seconds=max(lease_seconds, 1),
+                                error=error,
+                                now=now,
+                            )
+                        else:
+                            kb.block_task(
+                                conn,
+                                run.task_id,
+                                reason=(
+                                    "Backend terminated, but its terminal evidence "
+                                    "handler failed repeatedly: " + error
+                                ),
+                                kind="capability",
+                                expected_run_id=run.id,
+                            )
+                            released = False
+                if released:
+                    retried += 1
             else:
                 with kb.connect_closing(board=board) as conn:
                     with kb.write_txn(conn):

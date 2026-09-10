@@ -451,6 +451,112 @@ def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
     assert seen[0]["allowed_tools"] == ["read", "web_search", "browser"]
 
 
+def test_zero_effect_internal_devops_loop_allows_local_write_without_capability():
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "Internal repair accepted.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll.",
+            "protocol_version": "2.0",
+            "delegation_id": task["delegation_id"],
+            "attempt_id": task["attempt_id"],
+            "contract_fingerprint": task["contract_fingerprint"],
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "run-internal-repair",
+            "backend_agent_id": "missioncrew-executor",
+            "backend_session_key": "agent:missioncrew-executor:subagent:test",
+        }
+
+    result = tools.delegate_to_openclaw(
+        {
+            "task_id": "task-internal-repair",
+            "objective": "Repair the internal control-plane adapter.",
+            "risk_level": "medium",
+            "allowed_tools": ["read", "write"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-internal-repair",
+            "attempt_id": "attempt-internal-repair",
+            "contract_fingerprint": "fingerprint-internal-repair",
+            "project": "ai_bizweek",
+            "topic_id": "4641",
+            "task_type": "devops",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-executor",
+            "approval_grant_id": "delegation-internal-repair",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "openclaw_task_id": "openclaw.agent.loop_contract_start",
+            "dry_run": False,
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert seen[0]["allowed_tools"] == ["read", "write"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"approval_grant_id": ""}, {"external_effect_budget": 1}],
+)
+def test_zero_effect_internal_devops_loop_does_not_widen_confirmation_boundary(overrides):
+    from plugins.openclaw_bridge import tools
+
+    args = {
+        "task_id": "task-internal-repair-boundary",
+        "objective": "Repair the internal control-plane adapter.",
+        "risk_level": "medium",
+        "allowed_tools": ["write"],
+        "requires_confirmation": False,
+        "protocol_version": "2.0",
+        "delegation_id": "delegation-boundary",
+        "attempt_id": "attempt-boundary",
+        "contract_fingerprint": "fingerprint-boundary",
+        "project": "ai_bizweek",
+        "topic_id": "4641",
+        "task_type": "devops",
+        "executor_backend": "openclaw",
+        "executor_profile": "loop-contract",
+        "backend_agent_id": "missioncrew-executor",
+        "approval_grant_id": "delegation-boundary",
+        "external_effect_budget": 0,
+        "workspace_policy": "dedicated",
+        "session_policy": "ephemeral",
+        "credential_refs": [],
+        "openclaw_task_id": "openclaw.agent.loop_contract_start",
+        "dry_run": False,
+    }
+    args.update(overrides)
+
+    result = tools.delegate_to_openclaw(args, transport=lambda task: pytest.fail("transport called"))
+
+    assert result["status"] == "blocked"
+    assert any(
+        marker in result["summary"]
+        for marker in (
+            "requires confirmation",
+            "requires the durable OpenClaw execution adapter",
+        )
+    )
+
+
 def test_zero_effect_facebook_page_preflight_needs_no_read_confirmation():
     from plugins.openclaw_bridge import tools
 

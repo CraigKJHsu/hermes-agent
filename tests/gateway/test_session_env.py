@@ -86,12 +86,14 @@ def test_queued_human_turn_clears_internal_callback_provenance():
     rebind_turn_vars(
         message_id="human-message-5071",
         message_text="核准 approval-token",
+        message_timestamp="1788912000",
         internal=False,
         owner_user_id="kj",
     )
 
     assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "human-message-5071"
     assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == "核准 approval-token"
+    assert get_session_env("HERMES_SESSION_MESSAGE_TIMESTAMP") == "1788912000"
     assert get_session_env("HERMES_SESSION_INTERNAL") == "false"
     assert get_session_env("HERMES_SESSION_OWNER_USER_ID") == "kj"
     assert get_session_env("HERMES_GRACE_CALLBACK_BOARD") == ""
@@ -122,7 +124,9 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
 
-    tokens = runner._set_session_env(context)
+    tokens = runner._set_session_env(
+        context, message_timestamp=1788912000.75,
+    )
 
     # Values should be readable via get_session_env (contextvar path)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
@@ -132,6 +136,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
+    assert get_session_env("HERMES_SESSION_MESSAGE_TIMESTAMP") == "1788912000"
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None

@@ -937,6 +937,26 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
     return message
 
 
+_CONTEXT_ONLY_INJECTION_BLOCK_RE = re.compile(
+    r"(?s)"
+    r"<recommended_plugins>.*?</recommended_plugins>"
+    r"|# AGENTS\.md instructions\s*<INSTRUCTIONS>.*?</INSTRUCTIONS>"
+    r"|<environment_context>.*?</environment_context>"
+)
+
+
+def _looks_like_context_only_injection(message: Any) -> bool:
+    """Return True when a gateway turn contains only injected runtime context."""
+
+    if not isinstance(message, str):
+        return False
+    text = message.strip()
+    if not text:
+        return False
+    stripped = _CONTEXT_ONLY_INJECTION_BLOCK_RE.sub("", text).strip()
+    return stripped == "" and stripped != text
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -10614,6 +10634,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             internal=bool(getattr(event, "internal", False)),
             owner_user_id=self._configured_external_action_owner(source),
             message_text=str(event.text or ""),
+            message_timestamp=getattr(event, "timestamp", None),
             grace_callback_board=str(
                 (
                     getattr(event, "internal_context", None) or {}
@@ -11387,7 +11408,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 reason = str(approval_result.get("reason") or "")
-                if (
+                if approval_result.get("approval_saved"):
+                    response = (
+                        "已保存你對這份契約的核准；目前委派尚未成功建立。"
+                        "系統會重試同一請求；持續故障時保留收據待修復，不需要重新核准。"
+                        "尚未有可計入的刊登成果。原因：" + reason
+                    )
+                elif (
                     approval_result.get("status") == "rejected"
                     and "expired" in reason.lower()
                 ):
@@ -14950,6 +14977,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         internal: bool = False,
         owner_user_id: str = "",
         message_text: str = "",
+        message_timestamp: Any = None,
         grace_callback_board: str = "",
         grace_callback_lease_owner: str = "",
         grace_callback_review_id: str = "",
@@ -14987,6 +15015,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             message_text=message_text,
+            message_timestamp=(
+                str(int(timestamp))
+                if (timestamp := _coerce_gateway_timestamp(message_timestamp))
+                is not None
+                else ""
+            ),
             internal=internal,
             owner_user_id=owner_user_id,
             grace_callback_board=grace_callback_board,
@@ -18666,10 +18700,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # no NEW user message to address, so tell the model to report
                 # recovery instead of the (nonexistent) "new message".
                 if message:
-                    _resume_guidance = (
-                        "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
-                    )
+                    if _looks_like_context_only_injection(message):
+                        _resume_guidance = (
+                            "The message below is runtime/environment context "
+                            "only, not a new user task. Recover the active "
+                            "unfinished work from the conversation history and "
+                            "continue or report that work."
+                        )
+                    else:
+                        _resume_guidance = (
+                            "Address the user's NEW message below FIRST and "
+                            "focus on what the user is asking now."
+                        )
                 else:
                     _resume_guidance = (
                         "Report to the user that the session was restored "
@@ -19745,9 +19787,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 from gateway.session_context import rebind_turn_vars
 
+                # Interrupt-text follow-ups may not carry a MessageEvent. Keep
+                # the authenticated source anchor in that case so delegated
+                # work can still derive its request_instance_id. A real
+                # pending event supplies its own fresh message identity above.
+                rebound_message_id = str(next_message_id or "").strip()
+                if not rebound_message_id and pending_event is None:
+                    rebound_message_id = str(
+                        getattr(next_source, "message_id", None) or ""
+                    ).strip()
                 rebind_turn_vars(
-                    message_id=str(next_message_id or ""),
+                    message_id=rebound_message_id,
                     message_text=str(next_message or ""),
+                    message_timestamp=(
+                        str(int(timestamp))
+                        if pending_event is not None
+                        and (
+                            timestamp := _coerce_gateway_timestamp(
+                                getattr(pending_event, "timestamp", None)
+                            )
+                        )
+                        is not None
+                        else ""
+                    ),
                     internal=bool(
                         getattr(pending_event, "internal", False)
                         if pending_event is not None

@@ -850,8 +850,10 @@ def test_registry_readonly_package_preserves_exact_source_in_card(source_kind):
             "kind": "content_package", "asset_filenames": ["newcase_page.png"],
         }
     safe = _worker_safe_contract(contract)
+    async_safe = _worker_safe_loop_contract(contract)
     if source_kind == "package":
         assert safe["original_request"].encode("utf-8") == original.encode("utf-8")
-        assert _worker_safe_loop_contract(safe)["original_request"] == original
+        assert async_safe["original_request"].encode("utf-8") == original.encode("utf-8")
     else:
         assert "original_request" not in safe
+        assert "original_request" not in async_safe

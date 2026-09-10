@@ -411,6 +411,7 @@ def _handle_show(args: dict, **kw) -> str:
                         "external_actions_performed",
                         "external_effects",
                         "domain_memory_deltas",
+                        "user_facing_report",
                     )
                     review_evidence = (
                         {
@@ -445,6 +446,7 @@ def _handle_show(args: dict, **kw) -> str:
                             else None
                         ),
                         "review_evidence": review_evidence,
+                        "user_facing_report": metadata.get("user_facing_report") if isinstance(metadata, dict) else None,
                         "attachments": attachments,
                         "backend_run_id": latest.backend_run_id if latest else None,
                         "run_id": latest.id if latest else None,

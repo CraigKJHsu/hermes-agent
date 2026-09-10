@@ -240,11 +240,14 @@ def canonical_marketplace_readonly_sections(
                 "Read the listing-bound List in more places candidate surface",
             ],
             "evidence_required": [
-                "Visible candidate names, statuses, and observation time",
+                "Visible candidate names, statuses, observation time, and any stable "
+                "numeric group ID/canonical URL exposed by each chooser row",
             ],
             "acceptance_criteria": [
                 "Every reported candidate is visibly read from the exact "
                 "listing and no external state changes occur",
+                "A candidate is eligible for later publishing only when its chooser "
+                "row exposes a stable numeric group ID and matching canonical URL",
             ],
         },
     }
@@ -253,13 +256,7 @@ def canonical_marketplace_readonly_sections(
 def facebook_group_publish_destination_ids(
     contract: Mapping[str, Any],
 ) -> set[str]:
-    """Return exact numeric group IDs from canonical per-group publish scope.
-
-    This scope is intentionally separate from Marketplace's ``List in more
-    places`` chooser.  The chooser can hide numeric IDs, so writable contracts
-    must bind every destination to a known canonical group URL before a worker
-    is allowed to navigate there or report an external effect.
-    """
+    """Return exact numeric group IDs from a verified group publish scope."""
     publish = contract.get("facebook_group_publish")
     if not isinstance(publish, Mapping):
         return set()
@@ -286,9 +283,10 @@ def _validate_facebook_group_publish_scope(
     if not isinstance(publish, Mapping):
         return ["facebook_group_publish must be an object"]
     mode = str(publish.get("mode") or "").strip()
-    if mode != "canonical_url_per_group":
+    if mode not in {"canonical_url_per_group", "listing_bound_chooser"}:
         errors.append(
-            "facebook_group_publish.mode must be canonical_url_per_group"
+            "facebook_group_publish.mode must be canonical_url_per_group or "
+            "listing_bound_chooser"
         )
     source_listing_id = str(publish.get("source_listing_id") or "").strip()
     if not re.fullmatch(r"[1-9][0-9]*", source_listing_id):
@@ -328,6 +326,61 @@ def _validate_facebook_group_publish_scope(
             )
         elif group_id and url_match.group(1) != group_id:
             errors.append(f"{prefix}.canonical_url must match group_id")
+    if mode == "listing_bound_chooser":
+        preflight = publish.get("preflight_evidence")
+        if not isinstance(preflight, Mapping):
+            errors.append(
+                "listing_bound_chooser requires compiler-bound preflight_evidence"
+            )
+        else:
+            eligible = preflight.get("eligible_destination_ids")
+            eligible_ids = {
+                str(item or "").strip()
+                for item in eligible
+            } if isinstance(eligible, list) else set()
+            identities = preflight.get("destination_identity")
+            identity_by_id = {
+                str(item.get("group_id") or "").strip(): str(
+                    item.get("canonical_url") or ""
+                ).rstrip("/")
+                for item in identities
+                if isinstance(item, Mapping)
+            } if isinstance(identities, list) else {}
+            if preflight.get("list_in_more_places_available") is not True:
+                errors.append(
+                    "listing_bound_chooser preflight must verify List in more places"
+                )
+            if preflight.get("side_effects_performed") is not False:
+                errors.append(
+                    "listing_bound_chooser preflight must have zero side effects"
+                )
+            for key in ("execution_task_id", "review_task_id"):
+                if not re.fullmatch(r"t_[0-9a-f]+", str(preflight.get(key) or "")):
+                    errors.append(
+                        f"listing_bound_chooser preflight_evidence.{key} is invalid"
+                    )
+            for key in ("execution_run_id", "review_run_id"):
+                if not isinstance(preflight.get(key), int) or preflight[key] < 1:
+                    errors.append(
+                        f"listing_bound_chooser preflight_evidence.{key} is invalid"
+                    )
+            missing_eligible = sorted(seen - eligible_ids)
+            if missing_eligible:
+                errors.append(
+                    "listing_bound_chooser destinations were not selectable in the "
+                    f"accepted preflight: {', '.join(missing_eligible)}"
+                )
+            for item in destinations:
+                if not isinstance(item, Mapping):
+                    continue
+                group_id = str(item.get("group_id") or "").strip()
+                if identity_by_id.get(group_id) != str(
+                    item.get("canonical_url") or ""
+                ).rstrip("/"):
+                    errors.append(
+                        "listing_bound_chooser preflight lacks stable chooser identity "
+                        f"for destination {group_id or '(missing)'}"
+                    )
     external_targets = value.get("external_targets")
     if isinstance(external_targets, list):
         target_ids = {
@@ -403,6 +456,13 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             "body_field": "domain_inventory_report",
         }
     errors: list[str] = []
+    if value.get("evidence_contract") is not None:
+        from hermes_cli.facebook_group_preflight import requested
+
+        try:
+            requested(value)
+        except ValueError as exc:
+            errors.append(str(exc))
 
     def required_text(path: str) -> None:
         cur: Any = value

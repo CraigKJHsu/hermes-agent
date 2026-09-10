@@ -1742,6 +1742,72 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     assert "validated_outcome=accepted" in review_event.text
 
 
+def test_callback_exposes_exact_stranded_reservation_for_reconcile(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "stranded-reservation-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    execution_id, review_id, event_id = _objective_blocked_execution_chain(
+        db_path, suffix="stranded-reservation"
+    )
+    with kb.connect_closing(db_path) as conn:
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id, session_key, session_id,
+                resolved_route, approval_required, objective_id, stage_key,
+                origin_review_task_id, origin_event_id, contract_snapshot,
+                state, created_at, updated_at
+            ) VALUES (?, ?, ?, 'telegram', 'chat-1', '2', ?, ?, '{}', 0,
+                      ?, ?, ?, ?, ?, 'authorized', ?, ?)
+            """,
+            (
+                "gd-stranded-reconcile",
+                "c" * 64,
+                "request-stranded-reconcile",
+                "agent:main:telegram:group:chat-1:2",
+                "grace-session-1",
+                "go_execution_blocker",
+                "prepare",
+                review_id,
+                event_id,
+                json.dumps({"contract_fingerprint": "c" * 64}),
+                now,
+                now,
+            ),
+        )
+
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    event = adapter.handled[0]
+    evidence_line = next(
+        line for line in event.text.splitlines()
+        if line.startswith("evidence_snapshot=")
+    )
+    evidence = json.loads(evidence_line.split("=", 1)[1])
+    assert evidence["stranded_delegations"] == [{
+        "delegation_id": "gd-stranded-reconcile",
+        "objective_id": "go_execution_blocker",
+        "stage_key": "prepare",
+        "state": "authorized",
+        "execution_task_id": None,
+        "review_task_id": None,
+        "contract_fingerprint": "c" * 64,
+        "snapshot_available": 1,
+    }]
+    assert "call grace_reconcile" in event.text
+    assert "invent a request_instance_id" in event.text
+
+
 def test_capability_blocker_is_not_mislabeled_as_needs_input(tmp_path, monkeypatch):
     db_path = tmp_path / "execution-capability-callback.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -1793,6 +1859,8 @@ def test_capability_blocker_is_not_mislabeled_as_needs_input(tmp_path, monkeypat
     assert "validated_outcome=capability" in event.text
     assert "validated_outcome=needs_input" not in event.text
     assert "do not ask KJ to re-authorize" in event.text
+    assert "preserve the originating contract's domain_memory" in event.text
+    assert "never add a domain_memory contract" in event.text
 
 
 def test_objective_execution_blocker_is_durably_blocked_without_successor(tmp_path, monkeypatch):
@@ -1806,6 +1874,7 @@ def test_objective_execution_blocker_is_durably_blocked_without_successor(tmp_pa
     asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
     assert len(adapter.handled) == 1
     assert "create one corrected successor for the same Objective" in adapter.handled[0].text
+    assert "If the list is empty, do not call grace_reconcile" in adapter.handled[0].text
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
         objective = kb.get_grace_objective(conn, "go_execution_blocker")
@@ -2039,8 +2108,9 @@ def test_objective_blocker_continuation_rejects_retained_approval_after_expiry(
     "agent:main:telegram:group:chat-1:2",
     "codex:thread:01a-test-callback",
 ])
+@pytest.mark.parametrize("historical_origin", [False, True])
 def test_objective_execution_blocker_correlates_same_objective_successor(
-    tmp_path, monkeypatch, callback_session_key,
+    tmp_path, monkeypatch, callback_session_key, historical_origin,
 ):
     db_path = tmp_path / "objective-execution-successor.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -2059,6 +2129,54 @@ def test_objective_execution_blocker_correlates_same_objective_successor(
         async def handle_message(self, event):
             await super().handle_message(event)
             with kb.connect_closing(db_path) as conn:
+                if historical_origin:
+                    conn.execute("DROP INDEX idx_grace_delegation_origin")
+                    old_execution = kb.create_task(conn, title="superseded execution")
+                    old_review = kb.create_task(
+                        conn,
+                        title="superseded review",
+                        parents=(old_execution,),
+                    )
+                    _bind_delegation(
+                        conn,
+                        old_execution,
+                        old_review,
+                        suffix="superseded-successor",
+                    )
+                    kb.ensure_grace_objective_stage(
+                        conn,
+                        objective_id="go_execution_blocker",
+                        stage_key="prepare_r1",
+                    )
+                    old_delegation_id = conn.execute(
+                        "SELECT delegation_id FROM grace_delegations "
+                        "WHERE execution_task_id=?",
+                        (old_execution,),
+                    ).fetchone()[0]
+                    conn.execute(
+                        "UPDATE grace_delegations SET state='superseded',"
+                        "origin_review_task_id=?,origin_event_id=?,objective_id=?,"
+                        "stage_key=? WHERE delegation_id=?",
+                        (
+                            review_id,
+                            event_id,
+                            "go_execution_blocker",
+                            "prepare_r1",
+                            old_delegation_id,
+                        ),
+                    )
+                    kb._bind_grace_objective_stage(
+                        conn,
+                        objective_id="go_execution_blocker",
+                        stage_key="prepare_r1",
+                        delegation_id=old_delegation_id,
+                    )
+                    conn.execute(
+                        "UPDATE grace_objective_stages SET status='done',"
+                        "outcome_kind='superseded_by_retry' "
+                        "WHERE objective_id=? AND stage_key='prepare_r1'",
+                        ("go_execution_blocker",),
+                    )
                 next_execution = kb.create_task(conn, title="corrected execution")
                 next_review = kb.create_task(conn, title="corrected review", parents=(next_execution,))
                 _bind_delegation(conn, next_execution, next_review, suffix="corrected-successor")

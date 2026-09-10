@@ -69,6 +69,9 @@ _INTERNAL_OPS_TOOLS = frozenset(
         "report_generate",
     }
 )
+_INTERNAL_DEVOPS_TOOLS = frozenset(
+    {"filesystem_read", "filesystem_write", "shell", "tests", "docs_read"}
+)
 def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
     """Select narrowly scoped, deterministic skills for a Loop Contract.
 
@@ -167,10 +170,21 @@ def contract_internal_hermes_runtime(
         and allowed_tools <= _INTERNAL_OPS_TOOLS
         and assignment.get("approval_required") is False
     )
+    internal_devops_route = bool(
+        allowed_tools
+        and allowed_tools <= _INTERNAL_DEVOPS_TOOLS
+        and assignment.get("approval_required") is False
+    )
     if (
         task_type == "ops"
         and runtime_profile == "clawops-ops"
         and internal_ops_route
+    ):
+        return runtime_profile
+    if (
+        task_type == "devops"
+        and runtime_profile == "clawops-dev"
+        and internal_devops_route
     ):
         return runtime_profile
     return ""
@@ -400,9 +414,44 @@ def _render_facebook_group_publish_guidance(contract: Mapping[str, Any]) -> list
     publish = contract.get("facebook_group_publish")
     if not isinstance(publish, Mapping):
         return []
-    if str(publish.get("mode") or "").strip() != "canonical_url_per_group":
-        return []
+    mode = str(publish.get("mode") or "").strip()
     group_count = len(facebook_group_publish_destination_ids(contract))
+    if mode == "listing_bound_chooser":
+        return [
+            "Facebook group publish routing: the accepted read-only preflight selected "
+            "the listing_bound_chooser route. This is a narrow task-specific permission, "
+            "not a relaxation of any general Facebook safety restriction.",
+            "Open the exact source listing, then More options → List in more places. "
+            "Before selecting anything, verify every contracted destination is still a "
+            "visible unchecked row whose live numeric group ID and canonical URL match the "
+            "preflight-pinned identity. A matching name alone is insufficient. Record absent, "
+            "ambiguous or contradicted destinations as gaps. If an unexpected row is already "
+            "selected, stop before writes. When the contract's stop rules permit partial "
+            "execution, continue only with the exact still-eligible subset; "
+            "never substitute destinations or count a gap as submitted.",
+            "Select only the exact still-eligible contracted rows and click the listing-bound "
+            "Post control once. If the submit result is uncertain, reconcile before any retry. "
+            "Do not use Share to Group, Sell Something, Create new listing, "
+            "suggested groups, or any replacement destination.",
+            "Every reported Facebook group external effect must use effect_key=group:<group_id>, "
+            "external_id=<group_id>, and details containing action=publish_existing_listing, "
+            "the preflight source task/run IDs, source_listing_id, canonical_url, canonical_name, "
+            "submit readback, and post-submit or pending-review readback.",
+            "Include a verified post_url when the destination post is actually visible. Pending "
+            "review is submitted but not published. Include publication_state=published, pending, "
+            "or unknown in each effect's details/readback; a pending permalink is not proof "
+            "of publication. Report per-destination gaps and preserve "
+            "the original expected count until published evidence satisfies it.",
+            "For a published result, post_submit_or_pending_readback must be an object "
+            "with status=published, visible=true, pending_review=false, exact group_id, "
+            "source_listing_id, matching post_url, and positive observed_at epoch seconds. "
+            "Populate it only from actual visible publication evidence. Pending/unknown "
+            "readback must keep its corresponding status; never relabel it as published.",
+            f"This approved contract covers at most {group_count} listing-bound destination(s); "
+            "do not broaden the set.",
+        ]
+    if mode != "canonical_url_per_group":
+        return []
     return [
         "Facebook group publish routing: this contract uses canonical_url_per_group. "
         "Do not use Marketplace 'List in more places' chooser rows to establish "
@@ -490,10 +539,12 @@ def _render_domain_memory_guidance(
             guidance.extend([
                 "Complete with metadata.acceptance_evidence.domain_inventory_report containing the "
                 "full readable inline answer and metadata.user_facing_report exactly shaped as "
-                "kind=content_package, delivery=inline_only, complete=true, "
+                "kind=content_package, delivery=inline_only, complete=<boolean>, "
                 "body_field=domain_inventory_report, body=<the same full answer>, assets=[]. Include "
                 "title and a plausible Unix-seconds observed_at. Do not invent another report kind "
-                "or require a Markdown attachment.",
+                "or require a Markdown attachment. complete means the originating user outcome "
+                "is complete; use false for an unfinished Objective even when this query "
+                "report is ready for review.",
             ])
     if mode == "mutate":
         guidance.append(
@@ -537,6 +588,18 @@ def _render_user_facing_delivery_guidance(
             "A complete=false report may be accepted only as a truthful fail-closed or "
             "intermediate phase outcome; never treat it as completion or close the "
             "originating objective."
+        )
+        detail += (
+            " Preserve contract-requested title, body_field, full body, assets=[], row canonical_url, "
+            "visible, pending_review, post_url, evidence_url, evidence_gaps, and coverage counts "
+            "(use explicit null for unverified counts). For a report-only reuse of accepted historical "
+            "evidence, use evidence_mode=historical_verified and evidence_source with exact integer "
+            "execution_run_id/review_run_id; the review must pin that execution's unchanged evidence. "
+            "Preserve every source destination, original source_task_id, observation time and structured "
+            "status/URL fields; label the body historical and current state unverified, keep complete=false. "
+            "This mode preserves the report without updating the current commerce ledger. Do not refresh "
+            "Facebook or timestamps to repair formatting. Review the parent's canonical user_facing_report "
+            "from kanban_get_task even when acceptance_evidence is absent."
         )
         if review:
             return [
@@ -645,6 +708,10 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "When accepting that a parent correctly stopped fail-closed, keep the Grace "
             "review verdict accepted and record the parent's stop/reject/block conclusion "
             "under parent_verdict or evidence instead.",
+            "For every accepted review, metadata.evidence must include "
+            f"parent_execution_task_id={execution_task_id} and the exact positive integer "
+            "parent_execution_run_id of the newest parent run actually reviewed. Never use "
+            "task timing as a substitute for this run-level binding.",
             *page_hero_guidance,
             *_render_policy_guidance(worker_contract, review=True),
             *_render_facebook_group_publish_guidance(worker_contract),
@@ -707,6 +774,8 @@ def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> 
     original = str(contract.get("original_request") or "")
     if original.lstrip().startswith("[SYSTEM: Grace Loop callback]"):
         return False
+    if "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT" in original:
+        return True
     for key in ("scope", "verification", "goal", "grace_interpretation"):
         value = contract.get(key)
         if isinstance(value, str):
@@ -745,27 +814,34 @@ def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> 
     )
 
 
-def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove raw wording unless the contract explicitly makes it source material."""
-    safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
-    original = str(safe.get("original_request", "") or "")
-    domain_memory = safe.get("domain_memory")
+def _should_expose_backend_original_request(contract: Mapping[str, Any]) -> bool:
+    domain_memory = contract.get("domain_memory")
     registry_query = (
         isinstance(domain_memory, Mapping)
         and domain_memory.get("mode") == "query"
     )
-    delivery = safe.get("user_facing_delivery")
+    delivery = contract.get("user_facing_delivery")
     source_package = (
         isinstance(delivery, Mapping)
         and delivery.get("kind") == "content_package"
-        and bool(delivery.get("asset_filenames"))
+        and (
+            bool(delivery.get("asset_filenames"))
+            or "facebook_page_source_text" in str(contract.get("original_request") or "")
+        )
     )
+    return (
+        (not registry_query or source_package)
+        and _contract_requires_backend_original_request(contract)
+    )
+
+
+def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove raw wording unless the contract explicitly makes it source material."""
+    safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
+    original = str(safe.get("original_request", "") or "")
     # Registry query means no registry mutation; an explicitly source-bound
     # production package still needs its original text in the execution card.
-    expose_original = (
-        (not registry_query or source_package)
-        and _contract_requires_backend_original_request(safe)
-    )
+    expose_original = _should_expose_backend_original_request(safe)
     if not expose_original:
         safe.pop("original_request", None)
     audit = safe.setdefault("audit", {})

@@ -81,6 +81,45 @@ def test_accepted_page_source_requires_exact_review_and_topic(accepted_page_pack
         assert resolved["message_sha256"] == hashlib.sha256(message.encode("utf-8")).hexdigest()
 
 
+def test_accepted_page_source_accepts_canonical_page_hero_review(accepted_page_package):
+    contract, message, _, review_id = accepted_page_package
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, review_id)
+        metadata = run.metadata
+        page_hero = metadata.pop("asset_review")[0]
+        page_hero.pop("accepted")
+        metadata["page_hero"] = page_hero
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), run.id),
+        )
+
+    resolved = tool.bind_accepted_page_preflight_source(contract)
+
+    assert resolved["message"] == message
+    assert resolved["image_path"] == page_hero["path"]
+    assert resolved["image_sha256"] == page_hero["sha256"]
+
+
+def test_accepted_page_source_rejects_explicitly_rejected_canonical_page_hero(
+    accepted_page_package,
+):
+    contract, _, _, review_id = accepted_page_package
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, review_id)
+        metadata = run.metadata
+        page_hero = metadata.pop("asset_review")[0]
+        page_hero["accepted"] = False
+        metadata["page_hero"] = page_hero
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), run.id),
+        )
+
+    with pytest.raises(ValueError, match="one reviewed Page Hero"):
+        tool.bind_accepted_page_preflight_source(contract)
+
+
 @pytest.mark.parametrize("fault", [None, "changed_pin", "changed_message", "wrong_image", "inactive"])
 def test_preflight_reads_accepted_bytes_through_active_capability(
     accepted_page_package, monkeypatch, fault,
