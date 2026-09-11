@@ -6941,3 +6941,39 @@ def test_control_plane_snapshot_size_guard_without_stage_tasks(tmp_path):
                     "identity": {"platform": "telegram", "chat_id": "chat", "thread_id": "2"}}
         with pytest.raises(ValueError, match="snapshot exceeds inline byte budget"):
             openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
+
+@pytest.mark.parametrize('fault', ['', 'owner', 'hash', 'time', 'duplicate', 'partial', 'duplicate-report'])
+def test_registry_recovery_attests_every_image_in_exact_run(tmp_path, monkeypatch, fault):
+    import hashlib
+    import sqlite3
+    from types import SimpleNamespace
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: tmp_path))
+    state = tmp_path / '.openclaw'
+    (state / 'state').mkdir(parents=True)
+    media = state / 'media/tool-image-generation'
+    media.mkdir(parents=True)
+    assets = {}
+    with sqlite3.connect(state / 'state/openclaw.sqlite') as conn:
+        conn.execute('CREATE TABLE task_runs(task_id,owner_key,requester_session_key,source_id,status,task_kind,ended_at,terminal_summary)')
+        for n in range(2):
+            path = media / f'asset{n}.png'
+            path.write_bytes(f'image{n}'.encode())
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            assets[str(path)] = digest
+            summary = f'Generated 1 image. Attachments: 1. type=image name="asset{n}.png" mimeType=image/png dimensions=1248x1248 sha256={digest} path={json.dumps(str(path))}'
+            row = (f'e782061b-3576-4616-9d49-618e474e345{n}', 'owner', 'owner', 'image_generate:openai', 'succeeded', 'image_generation', 150000, summary)
+            if n == 1 and fault == 'owner': row = (row[0], 'foreign', *row[2:])
+            if n == 1 and fault == 'time': row = (*row[:6], 90000, summary)
+            conn.execute('INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?)', row)
+            if n == 1 and fault == 'duplicate': conn.execute('INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?)', row)
+            if n == 1 and fault == 'hash': path.write_bytes(b'changed')
+    kwargs = dict(metadata={'backend_session_key': 'owner'}, run=SimpleNamespace(started_at=100, ended_at=200),
+        audited_result={'metadata': {'user_facing_report': {'assets': [{'path': p, 'sha256': h} for p,h in assets.items()]}}}, expected_assets=assets)
+    if fault == 'partial': kwargs['expected_assets'] = dict(list(assets.items())[:1])
+    if fault == 'duplicate-report': kwargs['audited_result']['metadata']['user_facing_report']['assets'].append({'path': next(iter(assets)), 'sha256': next(iter(assets.values()))})
+    if fault:
+        with pytest.raises(ValueError): openclaw_async_executor._registry_internal_image_receipts(**kwargs)
+    else:
+        receipts = openclaw_async_executor._registry_internal_image_receipts(**kwargs)
+        assert len(receipts) == 2
+        assert all(openclaw_async_executor._controller_attested_internal_image_receipt(r, metadata=kwargs['metadata'], run=kwargs['run']) for r in receipts)

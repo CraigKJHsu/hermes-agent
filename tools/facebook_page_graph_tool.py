@@ -351,13 +351,17 @@ def bind_accepted_page_preflight_source(
     execution_id, review_id = match.groups()
     identity = contract.get("identity") or {}
     with kb.connect_closing(board=board) as conn:
-        link = conn.execute(
-            "SELECT d.platform, d.chat_id, d.thread_id FROM grace_delegations d "
+        links = conn.execute(
+            "SELECT d.platform, d.chat_id, d.thread_id, d.contract_snapshot, "
+            "d.contract_fingerprint FROM grace_delegations d "
             "JOIN task_links l ON l.parent_id=d.execution_task_id AND l.child_id=d.review_task_id "
             "WHERE d.execution_task_id=? AND d.review_task_id=?",
             (execution_id, review_id),
-        ).fetchone()
-        if link is None or any(
+        ).fetchall()
+        if len(links) != 1:
+            raise ValueError("Accepted package requires one exact delegation and review link.")
+        link = links[0]
+        if any(
             not identity.get(key) or str(link[key]) != str(identity[key])
             for key in ("platform", "chat_id", "thread_id")
         ):
@@ -378,39 +382,96 @@ def bind_accepted_page_preflight_source(
             raise ValueError("Selected package has no completed review of its latest execution.")
     source_metadata = source_run.metadata or {}
     source_identity = (source_metadata.get("loop_contract") or {}).get("identity") or {}
+    # Native Hermes completion replaces run metadata; the sealed delegation
+    # remains the controller-owned authority for its original identity.
+    snapshot = link["contract_snapshot"]
+    if snapshot is not None:
+        if (not isinstance(snapshot, str)
+            or hashlib.sha256(snapshot.encode("utf-8")).hexdigest() != link["contract_fingerprint"]):
+            raise ValueError("Accepted package has an invalid sealed contract fingerprint.")
+        sealed_contract = json.loads(snapshot)
+        sealed_identity = sealed_contract.get("identity") or {}
+        for key in ("platform", "chat_id", "thread_id", "project"):
+            if (not sealed_identity.get(key) or str(sealed_identity[key]) != str(identity.get(key) or "")
+                or (key in source_identity and str(source_identity[key]) != str(sealed_identity[key]))):
+                raise ValueError("Accepted package sealed identity does not match this Topic/project.")
+        source_identity = sealed_identity
     if not identity.get("project") or source_identity.get("project") != identity["project"]:
         raise ValueError("Accepted package belongs to another project.")
     evidence = source_metadata.get("acceptance_evidence") or {}
     package = evidence.get("inline_content_package") or {}
-    message = package.get("facebook_page_post") if isinstance(package, Mapping) else None
-    if not isinstance(message, str) or not message.strip():
+    candidates = []
+    if isinstance(package, Mapping) and "facebook_page_post" in package:
+        candidates.append(("acceptance_evidence.inline_content_package.facebook_page_post", package["facebook_page_post"]))
+    for prefix, metadata in (("", source_metadata), ("acceptance_evidence.", evidence)):
+        page_post = metadata.get("facebook_page_post")
+        if isinstance(page_post, Mapping) and "text" in page_post:
+            candidates.append((prefix + "facebook_page_post.text", page_post["text"]))
+    if not candidates or any(not isinstance(text, str) or not text.strip() for _, text in candidates):
         raise ValueError("Accepted package lacks structured facebook_page_post text.")
+    source_field, message = candidates[0]
+    if any(text != message for _, text in candidates):
+        raise ValueError("Accepted package has conflicting structured facebook_page_post text.")
     review_metadata = review_run.metadata or {}
     raw_images = review_metadata.get("asset_review")
-    if not isinstance(raw_images, list):
-        page_hero = review_metadata.get("page_hero")
-        if isinstance(page_hero, Mapping):
-            canonical_page_hero = dict(page_hero)
-            canonical_page_hero.setdefault("accepted", True)
-            raw_images = [canonical_page_hero]
-        else:
-            raw_images = []
-    images = [a for a in raw_images
-              if isinstance(a, Mapping) and a.get("asset_family") == "page_hero"
-              and a.get("accepted") is True]
-    if len(images) != 1:
+    images = [dict(asset) for asset in raw_images
+              if isinstance(asset, Mapping) and asset.get("asset_family") == "page_hero"] if isinstance(raw_images, list) else []
+    if len(images) > 1:
         raise ValueError("Accepted package must have one reviewed Page Hero.")
+    review_evidence = review_metadata.get("evidence")
+    for native, page_hero in (
+        (False, review_metadata.get("page_hero")),
+        (True, (review_metadata.get("acceptance_evidence") or {}).get("page_hero")),
+        (True, review_evidence.get("page_hero") if isinstance(review_evidence, Mapping) else None),
+    ):
+        if page_hero is None:
+            continue
+        if not isinstance(page_hero, Mapping):
+            raise ValueError("Accepted package has malformed Page Hero review evidence.")
+        asset = dict(page_hero)
+        if native:
+            # Canonical Grace evidence uses explicit raw-file/reviewer names.
+            # Normalize only corroborating fields; never override disagreement.
+            for key, alias in (("sha256", "raw_file_sha256"),
+                               ("actual_image_inspected", "actual_image_inspected_by_review")):
+                if alias in asset:
+                    if key in asset and asset[key] != asset[alias]:
+                        raise ValueError("Accepted Page Hero has conflicting review evidence.")
+                    if key == "actual_image_inspected" and (asset[alias] is not True
+                        or (key in asset and asset[key] is not True)):
+                        raise ValueError("Accepted Page Hero requires actual image inspection.")
+                    asset[key] = asset[alias]
+            if asset.get("actual_image_inspected") is not True:
+                raise ValueError("Accepted Page Hero requires actual image inspection.")
+            dimensions = asset.get("pixel_dimensions")
+            if (not isinstance(dimensions, list) or len(dimensions) != 2
+                or any(type(value) is not int or value <= 0 for value in dimensions)):
+                raise ValueError("Accepted Page Hero lacks exact path/hash/dimensions.")
+            if any(key in asset and asset[key] != value
+                   for key, value in zip(("width", "height"), dimensions)):
+                raise ValueError("Accepted Page Hero has conflicting dimensions.")
+            asset.update(width=dimensions[0], height=dimensions[1])
+        asset.setdefault("accepted", True)
+        images.append(asset)
+    if not images or any(asset.get("asset_family") != "page_hero" or asset.get("accepted") is not True
+                         for asset in images):
+        raise ValueError("Accepted package must have one reviewed Page Hero.")
+    # Multiple representations may corroborate the same image, never hide a
+    # rejection or choose between different reviewed assets.
+    for asset in images:
+        if (not isinstance(asset.get("path"), str) or not asset["path"]
+            or not re.fullmatch(r"[0-9a-f]{64}", str(asset.get("sha256") or ""))
+            or type(asset.get("width")) is not int or type(asset.get("height")) is not int
+            or asset["width"] <= 0 or asset["height"] <= 0
+            or asset["width"] * 9 != asset["height"] * 16):
+            raise ValueError("Accepted Page Hero lacks exact path/hash/dimensions.")
+        if any(asset[key] != images[0][key] for key in ("path", "sha256", "width", "height")):
+            raise ValueError("Accepted package has conflicting Page Hero review evidence.")
     asset = images[0]
-    if (not isinstance(asset.get("path"), str) or not asset["path"]
-        or not re.fullmatch(r"[0-9a-f]{64}", str(asset.get("sha256") or ""))
-        or not isinstance(asset.get("width"), int) or not isinstance(asset.get("height"), int)
-        or asset["width"] <= 0 or asset["height"] <= 0
-        or asset["width"] * 9 != asset["height"] * 16):
-        raise ValueError("Accepted Page Hero lacks exact path/hash/dimensions.")
     return {
         "execution_task_id": execution_id, "execution_run_id": source_run.id,
         "review_task_id": review_id, "review_run_id": review_run.id,
-        "source_field": "acceptance_evidence.inline_content_package.facebook_page_post",
+        "source_field": source_field,
         "message": message,
         "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
         "message_utf8_bytes": len(message.encode("utf-8")),

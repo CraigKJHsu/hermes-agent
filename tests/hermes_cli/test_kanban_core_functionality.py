@@ -3030,6 +3030,8 @@ def test_worker_capability_probe_timeout_does_not_claim_tools_missing(
     assert result["missing_required_tools"] == []
     assert result["probe_attempts"] == 2
     assert result["probe_error"].startswith("TimeoutExpired:")
+    assert result["probe_timed_out"] is True
+    assert len(result["probe_error"]) < 150
 
 
 def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
@@ -5211,3 +5213,55 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_probe_timeout_retry(kanban_home, monkeypatch, recover):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: ["file"])
+    calls = []
+    spawned = []
+
+    def probe(**kwargs):
+        calls.append(kwargs)
+        if recover and len(calls) == 2:
+            return {"ok": True, "required_runtime_tools": [], "missing_required_tools": []}
+        return {"ok": False, "probe_timed_out": True, "probe_attempts": 2,
+                "probe_error": "TimeoutExpired: worker capability probe exceeded 60s per attempt (2 attempts)",
+                "required_runtime_tools": [], "missing_required_tools": []}
+
+    def popen(*args, **kwargs):
+        spawned.append(args)
+        return SimpleNamespace(pid=None)
+
+    monkeypatch.setattr(kb, "_probe_worker_capabilities", probe)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="New case infrastructure recovery",
+                             body=_grace_execution_body_with_tools("browser_upload_files"),
+                             assignee="clawops-browser")
+        first = kb.dispatch_once(conn, failure_limit=2)
+        assert not first.auto_blocked
+        assert kb.get_task(conn, tid).status == "ready"
+        assert spawned == []
+        run = kb.list_runs(conn, tid)[0]
+        assert run.outcome == "spawn_failed"
+        assert run.metadata["worker_spawn"]["probe_timed_out"] is True
+        second = kb.dispatch_once(conn, failure_limit=2)
+        if recover:
+            assert len(spawned) == 1
+            assert second.spawned[0][0] == tid
+            assert kb.get_task(conn, tid).status == "running"
+        else:
+            assert second.auto_blocked == [tid]
+            assert kb.get_task(conn, tid).status == "blocked"
+            third = kb.dispatch_once(conn, failure_limit=2)
+            assert not third.spawned
+            assert spawned == [] and len(calls) == 2
+        kinds = [row[0] for row in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert "blocked" not in kinds and "block_loop_detected" not in kinds
+    finally:
+        conn.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import time
 import tempfile
 import warnings
@@ -1312,6 +1313,22 @@ def _objective_durable_evidence_snapshot(
         "referenced_task_ids": referenced_task_ids,
     }
     _attach_requested_run_evidence(conn, snapshot, contract)
+    # Native Hermes and OpenClaw deliveries share the canonical sealed receipt
+    # reader. Legacy run metadata alone cannot establish native source identity.
+    from hermes_cli.delivery_readback import read_delivery_evidence
+    deliveries = []
+    for source_id in referenced_task_ids:
+        if not conn.execute(
+            "SELECT 1 FROM grace_delegations WHERE review_task_id=?", (source_id,)
+        ).fetchone():
+            continue
+        try:
+            deliveries.append(read_delivery_evidence(conn, dict(contract), source_id))
+        except ValueError as exc:
+            deliveries.append({"source_review_task_id": source_id,
+                               "success": False, "error": str(exc)})
+    if deliveries:
+        snapshot["accepted_source_deliveries"] = deliveries
     if objective_id:
         objective = kb.get_grace_objective(conn, objective_id)
         if objective is None:
@@ -4258,6 +4275,7 @@ def revalidate_zero_effect_loop_contract_after_controller_repair(
     runtime_trajectory_path: Optional[str] = None,
     expected_trajectory_sha256: Optional[str] = None,
     expected_asset_sha256: Optional[str] = None,
+    expected_registry_assets: Optional[Mapping[str, str]] = None,
     board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Revalidate one immutable successful backend result without re-execution."""
@@ -4341,6 +4359,13 @@ def revalidate_zero_effect_loop_contract_after_controller_repair(
         terminal_observation = deepcopy(dict(observation))
         terminal_observation["result_digest"] = expected_digest
         recovered_receipts: list[dict[str, Any]] = []
+        if expected_registry_assets is not None:
+            if runtime_trajectory_path:
+                raise ValueError("Choose one controller recovery evidence source.")
+            recovered_receipts = _registry_internal_image_receipts(
+                metadata=metadata, run=run, audited_result=blocked_result,
+                expected_assets=expected_registry_assets,
+            )
         if runtime_trajectory_path:
             if not (
                 re.fullmatch(
@@ -4365,6 +4390,7 @@ def revalidate_zero_effect_loop_contract_after_controller_repair(
                 expected_trajectory_sha256=str(expected_trajectory_sha256).lower(),
                 expected_asset_sha256=str(expected_asset_sha256).lower(),
             )
+        if recovered_receipts:
             delegated_result = terminal_observation.get("delegated_result")
             output = next(
                 (
@@ -5273,6 +5299,78 @@ def _bridge_internal_tool_receipts(
             return []
         receipts.append(dict(receipt))
     return receipts
+
+
+def _registry_internal_image_receipts(
+    *, metadata: Mapping[str, Any], run: kb.Run,
+    audited_result: Mapping[str, Any], expected_assets: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Operator recovery from canonical runtime records, without worker replay."""
+    session = str(metadata.get("backend_session_key") or "")
+    assets = {
+        str(Path(path).expanduser().resolve()): str(digest).lower()
+        for path, digest in expected_assets.items()
+    }
+    report = (audited_result.get("metadata") or {}).get("user_facing_report") or {}
+    reported = {
+        str(Path(str(asset.get("path") or "")).expanduser().resolve()): asset.get("sha256")
+        for asset in report.get("assets", []) if isinstance(asset, Mapping)
+    }
+    if (reported != assets or len(report.get("assets", [])) != len(reported)
+        or not session or not 0 < len(assets) <= 16 or any(
+        not re.fullmatch(r"[0-9a-f]{64}", digest) or reported.get(path) != digest
+        for path, digest in assets.items()
+    )):
+        raise ValueError("Registry recovery requires exact operator-pinned reported assets.")
+    state = Path.home() / ".openclaw"
+    conn = sqlite3.connect((state / "state/openclaw.sqlite").as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM task_runs WHERE owner_key = ? AND status = 'succeeded' "
+            "AND task_kind = 'image_generation'", (session,),
+        ).fetchall()
+    finally:
+        conn.close()
+    pattern = re.compile(
+        r'\d+\. type=image name=("(?:[^"\\]|\\.)*") '
+        r'mimeType=(image/[a-z0-9.+-]+) dimensions=(\d+x\d+) '
+        r'sha256=([0-9a-f]{64}) path=("(?:[^"\\]|\\.)*")', re.I,
+    )
+    receipts = {}
+    for row in rows:
+        if not (
+            row["requester_session_key"] == session
+            and str(row["source_id"] or "").startswith("image_generate:")
+            and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", row["task_id"], re.I)
+            and int(run.started_at or 0) * 1000 <= int(row["ended_at"] or 0)
+            <= int(run.ended_at or 0) * 1000 + 1000
+        ):
+            continue
+        for match in pattern.finditer(str(row["terminal_summary"] or "")):
+            path = Path(json.loads(match[5])).resolve()
+            digest = match[4].lower()
+            if str(path) not in assets:
+                continue
+            if (
+                str(path) in receipts or assets[str(path)] != digest
+                or not path.is_relative_to((state / "media/tool-image-generation").resolve())
+                or not path.is_file() or not 0 < path.stat().st_size <= 25 * 1024 * 1024
+                or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+            ):
+                raise ValueError("Registry asset is ambiguous, changed, or outside generated media.")
+            task_id = "image_generate:" + row["task_id"]
+            receipts[str(path)] = {
+                "target": "openclaw.image_generate.local_media", "effectKey": task_id,
+                "state": "verified", "readback": {
+                    "attestedBy": "openclaw_runtime_task_registry", "taskId": task_id,
+                    "ownerSessionKey": session, "path": str(path), "sha256": digest,
+                    "mimeType": match[2], "dimensions": match[3], "endedAt": row["ended_at"],
+                },
+            }
+    if set(receipts) != set(assets):
+        raise ValueError("Runtime registry does not attest every pinned asset from this exact run.")
+    return list(receipts.values())
 
 
 def _trajectory_internal_image_receipts(

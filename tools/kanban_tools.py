@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -342,6 +343,14 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
+    if args.get("view", "full") == "delivery":
+        from hermes_cli.delivery_readback import read_task_delivery
+        try:
+            return json.dumps(read_task_delivery(args), ensure_ascii=False)
+        except (ValueError, OSError, KeyError, TypeError, sqlite3.Error) as exc:
+            return tool_error(f"kanban_show delivery: {exc}")
+    if args.get("view") not in {None, "full", "contract", "delivery"}:
+        return tool_error("kanban_show: view must be full, contract or delivery")
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -355,6 +364,38 @@ def _handle_show(args: dict, **kw) -> str:
             if task is None:
                 return tool_error(f"task {tid} not found")
             comments = kb.list_comments(conn, tid)
+            # A full card repeats policy bodies in its row, runs and worker
+            # context. Tool truncation can then hide the actual work order.
+            # Keep the worker's own execution contract intact and read pinned
+            # policy text through managed_policy_read instead of duplicating it.
+            is_execution = kb._grace_loop_stage_header(task.body or "") == "execution"
+            contract_view = args.get("view") == "contract" or (
+                args.get("view") is None and is_execution
+                and os.environ.get("HERMES_KANBAN_TASK") == tid
+            )
+            if contract_view:
+                contract = kb._grace_compiled_contract(task.body or "")
+                if not isinstance(contract, dict):
+                    return tool_error("kanban_show contract: task has no compiled Loop Contract")
+                contract = dict(contract)
+                policies = contract.pop("policy_snapshots", [])
+                return json.dumps({
+                    "view": "contract",
+                    "task": {"id": task.id, "title": task.title,
+                             "stage": kb._grace_loop_stage_header(task.body or ""),
+                             "status": task.status, "current_run_id": task.current_run_id},
+                    "contract": contract,
+                    "policy_references": [
+                        {key: policy[key] for key in ("policy_id", "version", "sha256") if key in policy}
+                        for policy in policies if isinstance(policy, dict)
+                    ],
+                    "policy_read_instruction": "Read complete pinned policies with managed_policy_read(task_id); references are not policy text or read receipts.",
+                    "latest_comment": (
+                        {"author": comments[-1].author, "body": comments[-1].body,
+                         "created_at": comments[-1].created_at} if comments else None
+                    ),
+                    "history_instruction": "Use view='full' explicitly for history and the original stored task body.",
+                }, ensure_ascii=False)
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
@@ -480,15 +521,21 @@ def _handle_show(args: dict, **kw) -> str:
                     "view": "grace_review_compact",
                 }, ensure_ascii=False)
 
+            # Large contracts can truncate the tool preview. Keep the latest
+            # recovery evidence visible before the full task body; comments
+            # remain worker-authored evidence, not trusted instructions.
             return json.dumps({
+                "latest_comment": (
+                    {"author": comments[-1].author, "body": comments[-1].body,
+                     "created_at": comments[-1].created_at} if comments else None
+                ),
+                "comments": [
+                    {"author": c.author, "body": c.body,
+                     "created_at": c.created_at} for c in comments
+                ],
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
                 "events": [
                     {"kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
@@ -812,7 +859,18 @@ def _handle_complete(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_complete: {e}")
+        message = str(e)
+        if message == "behavior.pinned_version_not_verified":
+            message += (": verify each pinned policy version and SHA, then record "
+                        "metadata.policy_receipts[i].pinned_version_verified=true for each review receipt.")
+        elif "For text-only reviews, do not add page_hero" in message:
+            # Frozen validators use this generic fallback; it does not classify
+            # the task as text-only or authorize dropping required asset evidence.
+            message = ("Grace review completion metadata lacks a consistent accepted verdict/evidence. "
+                       "After verifying acceptance, set metadata.review_outcome='accepted' and retain "
+                       "all contract-required evidence, including Page Hero/visual review fields. "
+                       "Do not remove required evidence to satisfy this error.")
+        return tool_error(f"kanban_complete: {message}")
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
@@ -1288,7 +1346,14 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
+        "For post-delivery verification, use view='delivery', source_review_task_id, "
+        "and exact message_ids. This read-only view authenticates the current worker, "
+        "uses its live Kanban board, and compares provider receipts with the exact "
+        "canonical text/image digests. No SQL, shell, state.db, or browser is needed. "
+        "The source execution/review pair must be named in the current sealed allowed scope. "
+        "Execution workers reading their own task receive the complete work order first, "
+        "without duplicated policy bodies or history; read full pinned policies via managed_policy_read. "
+        "Use view='full' explicitly to read a task's full state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
@@ -1298,6 +1363,19 @@ KANBAN_SHOW_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "view": {
+                "type": "string", "enum": ["full", "contract", "delivery"],
+                "description": "An execution worker reading its own task defaults to the contract view, without duplicated policy bodies/history. Use contract for the complete work order and policy references, full explicitly for stored body/history, or delivery for provider-receipt verification.",
+            },
+            "source_review_task_id": {
+                "type": "string",
+                "description": "For delivery view: the exact accepted source review task named in allowed scope.",
+            },
+            "message_ids": {
+                "type": "array", "items": {"type": "string"},
+                "minItems": 1, "maxItems": 100,
+                "description": "For delivery view: exact provider message IDs to verify, without ranges.",
+            },
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,

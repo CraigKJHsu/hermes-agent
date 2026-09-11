@@ -609,3 +609,98 @@ def test_publish_preserves_reservation_after_transport_error(
     assert result["published"] is None
     assert result["retry_permitted"] is False
     assert [name for name, _ in calls] == ["reserve"]
+
+
+@pytest.mark.parametrize("source_format", ["acceptance_evidence", "evidence"])
+@pytest.mark.parametrize("topic", ["4641", "2"])  # Historical failure plus an unrelated Topic.
+@pytest.mark.parametrize("fault", [None, "fingerprint", "project", "metadata_identity", "text_conflict",
+                                    "report_only", "uninspected", "dimensions", "rejected", "hash_alias_conflict",
+                                    "inspection_alias_conflict", "inspection_alias_nonboolean",
+                                    "inspection_canonical_integer", "inspection_canonical_float"])
+def test_native_hermes_accepted_package_preserves_sealed_source(accepted_page_package, topic, fault, source_format):
+    contract, message, source_id, review_id = accepted_page_package
+    contract["identity"]["thread_id"] = topic
+    sealed = {"identity": dict(contract["identity"])}
+    if fault == "project":
+        sealed["identity"]["project"] = "another-project"
+    snapshot = json.dumps(sealed)
+    fingerprint = hashlib.sha256(snapshot.encode()).hexdigest()
+    if fault == "fingerprint":
+        fingerprint = "0" * 64
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE grace_delegations SET thread_id=?, contract_snapshot=?, contract_fingerprint=?",
+                     (topic, snapshot, fingerprint))
+        run = kb.latest_run(conn, source_id)
+        metadata = {"facebook_page_post": {"text": message}}
+        if fault == "metadata_identity":
+            metadata["loop_contract"] = {"identity": {"project": "another-project"}}
+        if fault == "text_conflict":
+            metadata["acceptance_evidence"] = {"inline_content_package": {"facebook_page_post": message.strip()}}
+        if fault == "report_only":
+            metadata = {"user_facing_report": {"body": message}}
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run.id))
+        review_run = kb.latest_run(conn, review_id)
+        review_metadata = review_run.metadata
+        hero = review_metadata.pop("asset_review")[0]
+        hero.pop("accepted")  # Canonical native verdict is on the independent review root.
+        hero["pixel_dimensions"] = [hero.pop("width"), hero.pop("height")]
+        hero["actual_image_inspected"] = fault != "uninspected"
+        if fault == "dimensions":
+            hero["pixel_dimensions"] = [True, 936]
+        if fault == "rejected":
+            hero["accepted"] = False
+        expected_image_hash = hero["sha256"]
+        if source_format == "evidence":
+            hero["raw_file_sha256"] = hero.pop("sha256")
+            hero["actual_image_inspected_by_review"] = hero.pop("actual_image_inspected")
+        if fault == "hash_alias_conflict":
+            hero.update(sha256=expected_image_hash, raw_file_sha256="0" * 64)
+        if fault == "inspection_alias_conflict":
+            hero.update(actual_image_inspected=False, actual_image_inspected_by_review=True)
+        if fault == "inspection_alias_nonboolean":
+            hero["actual_image_inspected_by_review"] = 1
+        if fault in ("inspection_canonical_integer", "inspection_canonical_float"):
+            hero.update(actual_image_inspected=1 if fault.endswith("integer") else 1.0,
+                        actual_image_inspected_by_review=True)
+        review_metadata[source_format] = {"page_hero": hero}
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(review_metadata), review_run.id))
+    if fault:
+        with pytest.raises(ValueError):
+            tool.bind_accepted_page_preflight_source(contract)
+    else:
+        resolved = tool.bind_accepted_page_preflight_source(contract)
+        assert resolved["message"].encode() == message.encode()
+        assert resolved["source_field"] == "facebook_page_post.text"
+        assert resolved["message_sha256"] == hashlib.sha256(message.encode()).hexdigest()
+        assert resolved["image_sha256"] == expected_image_hash
+        assert resolved["dimensions"] == "1664×936"
+
+
+def test_empty_sealed_snapshot_cannot_fall_back_to_legacy_identity(accepted_page_package):
+    contract, _, _, _ = accepted_page_package
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE grace_delegations SET contract_snapshot=''")
+    with pytest.raises(ValueError, match="sealed contract fingerprint"):
+        tool.bind_accepted_page_preflight_source(contract)
+
+
+@pytest.mark.parametrize("fault", [None, "rejected", "uninspected", "different_image"])
+def test_legacy_image_cannot_shadow_native_review(accepted_page_package, fault):
+    contract, _, _, review_id = accepted_page_package
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, review_id)
+        metadata = run.metadata
+        hero = dict(metadata["asset_review"][0])
+        hero["pixel_dimensions"] = [hero.pop("width"), hero.pop("height")]
+        hero["actual_image_inspected"] = fault != "uninspected"
+        if fault == "rejected":
+            hero["accepted"] = False
+        if fault == "different_image":
+            hero["sha256"] = "f" * 64
+        metadata["acceptance_evidence"] = {"page_hero": hero}
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run.id))
+    if fault:
+        with pytest.raises(ValueError):
+            tool.bind_accepted_page_preflight_source(contract)
+    else:
+        assert tool.bind_accepted_page_preflight_source(contract)["image_sha256"] == hero["sha256"]

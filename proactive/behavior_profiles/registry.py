@@ -457,7 +457,15 @@ def migrate_objective(conn, *, objective_id, platform, chat_id, thread_id,
             (objective_id,),
         ).fetchone():
             raise BehaviorProfileError("behavior.migration_inflight: finish or cancel the active work first")
-        if conn.execute("SELECT 1 FROM grace_loop_callbacks WHERE objective_id=? AND (state<>'delivered' OR lease_owner IS NOT NULL) LIMIT 1", (objective_id,)).fetchone():
+        # Superseded callbacks remain cancelled, never fabricated as delivered.
+        if conn.execute("""SELECT 1 FROM grace_loop_callbacks c WHERE c.objective_id=?
+            AND (c.lease_owner IS NOT NULL OR NOT (
+                c.state IN ('delivered','attention') OR (c.state='cancelled' AND EXISTS (
+                    SELECT 1 FROM grace_objective_stages s
+                    WHERE s.objective_id=c.objective_id AND s.stage_key=c.stage_key
+                    AND s.status='done' AND s.outcome_kind IN ('superseded_by_retry','cancelled','intermediate_blocked')
+                ))
+            )) LIMIT 1""", (objective_id,)).fetchone():
             raise BehaviorProfileError("behavior.migration_callback_pending")
         # Cover a partially built card before its saga has attached task IDs.
         for task in conn.execute("SELECT body FROM tasks WHERE status NOT IN ('done','blocked','archived') AND instr(body,'GRACE_BEHAVIOR_PIN: ')>0"):

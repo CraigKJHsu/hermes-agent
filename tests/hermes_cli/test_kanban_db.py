@@ -8843,3 +8843,63 @@ def test_grace_delegation_reservation_persists_contract_snapshot(tmp_path):
             compiled_contract=contract,
         )
         assert json.loads(row["contract_snapshot"]) == contract
+
+
+@pytest.mark.parametrize("body_source", ["acceptance_evidence", "user_facing_report"])
+def test_attachment_report_delivers_structured_body_without_markdown(tmp_path, body_source):
+    db_path = tmp_path / "structured-body.db"
+    kb.init_db(db_path)
+    image = tmp_path / "accepted.png"
+    Image.new("RGB", (32, 18), "blue").save(image)
+    body = "完整發布包\n\n正文與待確認內容。"
+    field = "inline_content_package" if body_source == "acceptance_evidence" else "body"
+    contract = {"user_facing_delivery": {
+        "required": True, "kind": "content_package",
+        "delivery": "inline_with_attachment", "body_field": field,
+        "asset_filenames": [image.name],
+    }}
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="Delivery",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n" + json.dumps(contract) + "\n```")
+        metadata = {"artifacts": [str(image)]}
+        if body_source == "acceptance_evidence":
+            metadata[body_source] = {field: body}
+        else:
+            metadata[body_source] = {
+                "kind": "content_package", "delivery": "inline_with_attachment",
+                "complete": True, "title": "Original title", "body": body,
+                "observed_at": int(time.time()), "assets": [{
+                    "filename": image.name, "label": image.name, "path": str(image),
+                    "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+                }],
+            }
+        assert kb.complete_task(conn, task_id, metadata=metadata)
+        report = kb.grace_inline_content_package_report(conn, task_id)
+        assert report is not None and report["body"] == body
+        from hermes_cli.user_facing_report import report_satisfies_user_facing_delivery
+        assert report_satisfies_user_facing_delivery(report, contract["user_facing_delivery"])
+        attachment = kb.list_attachments(conn, task_id)[0]
+        assert report["assets"][0]["path"] == str(Path(attachment.stored_path).resolve())
+        assert report["assets"][0]["sha256"] == hashlib.sha256(image.read_bytes()).hexdigest()
+        # A replaced image cannot be delivered using the earlier completion manifest.
+        Image.new("RGB", (32, 18), "red").save(attachment.stored_path)
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+
+
+@pytest.mark.parametrize("raw_body", [None, "", 123, {"text": "untyped"}, "x" * 81000])
+def test_attachment_report_rejects_missing_or_invalid_structured_body(tmp_path, raw_body):
+    db_path = tmp_path / "invalid-body.db"
+    kb.init_db(db_path)
+    image = tmp_path / "accepted.png"
+    Image.new("RGB", (32, 18)).save(image)
+    contract = {"user_facing_delivery": {
+        "required": True, "kind": "content_package", "delivery": "inline_with_attachment",
+        "body_field": "inline_content_package", "asset_filenames": [image.name],
+    }}
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(conn, title="Invalid delivery",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n" + json.dumps(contract) + "\n```")
+        assert kb.complete_task(conn, task_id, metadata={
+            "artifacts": [str(image)], "acceptance_evidence": {"inline_content_package": raw_body},
+        })
+        assert kb.grace_inline_content_package_report(conn, task_id) is None

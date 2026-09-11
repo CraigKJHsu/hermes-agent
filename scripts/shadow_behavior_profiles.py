@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline, zero-effect legacy/v1 replay with full outputs and semantic diffs."""
+"""Offline, zero-effect legacy/selected-profile replay with full outputs and semantic diffs."""
 import argparse
 import hashlib
 import json
@@ -25,6 +25,7 @@ def deny_external_effects(event, _args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--version", default="v3", help="Installed compatible behavior profile version")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -47,17 +48,17 @@ def main():
         with capture(lambda record: observations.write(json.dumps(record, ensure_ascii=False) + "\n")):
             for case in fixture["cases"]:
                 results = {}
-                for version in (None, "v1"):
+                for version in (None, args.version):
                     label = version or "legacy"
                     os.environ["HERMES_HOME"] = str(output / (case["id"] + "-" + label + "-home"))
                     result = replay_case(fixture, case, output / (case["id"] + "-" + label + ".db"), behavior_version=version)
                     (output / (case["id"] + "-" + label + ".json")).write_text(json.dumps(result, ensure_ascii=False, indent=2))
                     results[label] = result
                 differences = {key: {label: result.get(key) for label, result in results.items()}
-                               for key in SEMANTIC_FIELDS if results["legacy"].get(key) != results["v1"].get(key)}
+                               for key in SEMANTIC_FIELDS if results["legacy"].get(key) != results[args.version].get(key)}
                 report["cases"][case["id"]] = {"semantic_differences": differences,
-                    "compiler_bytes_changed": results["legacy"].get("execution_body") != results["v1"].get("execution_body"),
-                    "decision": results["v1"]["decision"], "review_outcome": results["v1"]["review_outcome"]}
+                    "compiler_bytes_changed": results["legacy"].get("execution_body") != results[args.version].get("execution_body"),
+                    "decision": results[args.version]["decision"], "review_outcome": results[args.version]["review_outcome"]}
     report["passed"] = not any(case["semantic_differences"] for case in report["cases"].values())
     (output / "comparison.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
     print(json.dumps(report, ensure_ascii=False, indent=2))

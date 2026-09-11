@@ -1068,7 +1068,23 @@ class GatewayKanbanWatchersMixin:
                         callback["execution_assignee"] = (
                             execution_task.assignee if execution_task else ""
                         )
+                        # Use the same sealed source as the continuation guard;
+                        # worker metadata cannot grant domain-memory authority.
+                        origin_rows = conn.execute(
+                            "SELECT contract_snapshot FROM grace_delegations "
+                            "WHERE execution_task_id=? AND review_task_id=?",
+                            (callback["execution_task_id"], callback["review_task_id"]),
+                        ).fetchall()
+                        try:
+                            origin_contract = json.loads(origin_rows[0][0] or "") if len(origin_rows) == 1 else None
+                        except (TypeError, ValueError):
+                            origin_contract = None
+                        continuation_authorization = {"snapshot_available": isinstance(origin_contract, dict)}
+                        if isinstance(origin_contract, dict):
+                            continuation_authorization["domain_memory"] = origin_contract.get("domain_memory")
                         callback["evidence_snapshot"] = {
+                            "continuation_authorization": continuation_authorization,
+                            "original_request": origin_contract.get("original_request") if isinstance(origin_contract, dict) else None,
                             "trigger_event": {
                                 "stage": callback.get("event_stage"),
                                 "kind": callback.get("event_kind"),
@@ -1539,10 +1555,26 @@ class GatewayKanbanWatchersMixin:
                     )
                 except (TypeError, ValueError):
                     processing_timeout = 600.0
-                processing_ok = await asyncio.wait_for(
-                    asyncio.shield(completion_future),
-                    timeout=max(0.05, min(processing_timeout, 1800.0)),
-                )
+                while True:
+                    try:
+                        processing_ok = await asyncio.wait_for(
+                            asyncio.shield(completion_future),
+                            timeout=max(0.05, min(processing_timeout, 1800.0)),
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        if completion_future.done():
+                            processing_ok = completion_future.result()
+                            break
+                        processing_task = internal_context.get("processing_task")
+                        if processing_task is None or processing_task.done():
+                            raise
+                        # The agent has its own execution limits. Keep renewing
+                        # this lease while the exact adapter turn is still live;
+                        # releasing it would let a second callback race that turn.
+                        # The sibling _heartbeat task renews the DB lease every
+                        # 30 seconds through the owner/event CAS below.
+                        logger.info("Grace callback %s still processing; retaining lease", review_id)
                 if processing_ok is False:
                     raise RuntimeError(
                         "Grace callback turn failed before successful delivery."
@@ -1881,7 +1913,7 @@ class GatewayKanbanWatchersMixin:
             "kind": str(trigger_event.get("kind") or event_kind),
             "payload_preview": _clip_text(
                 trigger_event.get("payload") or {},
-                4000,
+                3300,
             ),
         }
         trigger_event_json = json.dumps(
@@ -1934,6 +1966,8 @@ class GatewayKanbanWatchersMixin:
                     if loop_contract.get(key) is not None
                 }
             full_snapshot = {
+                "continuation_authorization": full_snapshot.get("continuation_authorization"),
+                "original_request": full_snapshot.get("original_request"),
                 "execution": {
                     "task_id": execution_evidence.get("task_id"),
                     "status": execution_evidence.get("status"),
@@ -1992,6 +2026,7 @@ class GatewayKanbanWatchersMixin:
                         "size": attachment.get("size"),
                     })
             bounded_snapshot = {
+                "continuation_authorization": full_snapshot.get("continuation_authorization"),
                 "execution": {
                     "task_id": execution_evidence.get("task_id"),
                     "status": execution_evidence.get("status"),
@@ -2042,6 +2077,7 @@ class GatewayKanbanWatchersMixin:
                     {
                         "execution_task_id": execution_id,
                         "review_task_id": review_id,
+                        "continuation_authorization": {"snapshot_available": False},
                         "stranded_delegations": list(
                             full_snapshot.get("stranded_delegations") or []
                         ),
@@ -2123,6 +2159,18 @@ class GatewayKanbanWatchersMixin:
                 "blocker is an unauthorized result field such as domainMemoryDeltas, "
                 "remove that field from the corrected worker output; never add a "
                 "domain_memory contract to authorize the rejected output. "
+                "Copy continuation_authorization.domain_memory verbatim (null: omit). "
+                "If snapshot_available is false, report missing source; never guess "
+                "from history. Retry objective_stage_key in the same Objective. "
+                "Before copying prerequisites from the failed contract, load the "
+                "task-pinned managed policies and compare them with the supplied "
+                "original_request. A failed worker contract is not new user "
+                "authorization. Remove prerequisites that conflict with those "
+                "policies or were added without the user's request; do not merely "
+                "switch tools to satisfy the same mistaken prerequisite. In "
+                "particular, when policy accepts the user's supplied source and "
+                "the user did not request external fact-checking, do not require "
+                "public-source research or a source-URL appendix for acceptance. "
                 "A normal prose reply "
                 "does not by itself make an Objective runnable. "
                 "When validated_outcome=capability, dependency, or transient, do not ask "

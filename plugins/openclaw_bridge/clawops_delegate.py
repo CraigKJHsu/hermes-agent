@@ -2323,6 +2323,24 @@ def _active_callback_reservation(
     return dict(rows[0]) if rows else None
 
 
+def _declared_root_source_origin(conn, objective_ref):
+    root_stage = kb._grace_objective_retry_root_stage_key(objective_ref["stage_key"])
+    if root_stage == objective_ref["stage_key"]:
+        return {}
+    roots = conn.execute(
+        "SELECT execution_task_id, review_task_id, "
+        "(SELECT MAX(id) FROM task_events WHERE "
+        "(task_id = execution_task_id AND kind = 'blocked') OR "
+        "(task_id = review_task_id AND kind = 'completed')) AS source_event_id "
+        "FROM grace_delegations WHERE objective_id = ? AND stage_key = ? "
+        "AND origin_event_id IS NULL",
+        (objective_ref["objective_id"], root_stage),
+    ).fetchall()
+    if len(roots) > 1:
+        raise ValueError("Objective stage has ambiguous authenticated source roots")
+    return dict(roots[0]) if roots else {}
+
+
 def _objective_source_handoff(
     conn: sqlite3.Connection,
     contract: dict[str, Any],
@@ -2371,6 +2389,7 @@ def _objective_source_handoff(
     lineage: list[tuple[str, list[sqlite3.Row]]] = []
     reviewed_source_run_ids: set[int] = set()
     seen: set[str] = set()
+    lineage_event_id: int | None = callback.get("source_event_id")
 
     def accepted_source_run(
         stage_callback: dict[str, Any],
@@ -2593,6 +2612,10 @@ def _objective_source_handoff(
                 "Objective source lineage has a callback from another Objective or Topic; "
                 "stop internal handoff."
             )
+        if lineage_event_id is not None:
+            # Parentage is sealed to an exact event, not the callback's mutable
+            # delivery cursor (which may be parked, retried, or advanced).
+            stage_callback = {**stage_callback, "lease_event_id": lineage_event_id}
         event_id = next(
             (
                 int(stage_callback.get(key) or 0)
@@ -2648,6 +2671,7 @@ def _objective_source_handoff(
                 "stop internal handoff."
             )
         execution_id = parent_execution_id
+        lineage_event_id = int(origin_event_id)
 
     trusted_lineage_runs = {
         (task_id, int(row["id"]))
@@ -2660,6 +2684,20 @@ def _objective_source_handoff(
         source_task_id = str(payload.get("execution_task_id") or "").strip()
         source_run_id = payload.get("run_id")
         digest = str(payload.get("utf8_sha256") or "").strip().lower()
+        if type(source_run_id) is not int:
+            raise ValueError("Objective source content package is malformed or outside its lineage.")
+        if (source_task_id, source_run_id) not in trusted_lineage_runs:
+            # A human continuation seals the declared root package rather than
+            # a callback parent. Re-verify that root, never trust its text alone.
+            origin = _declared_root_source_origin(conn, objective_ref)
+            if origin.get("execution_task_id") not in seen and origin:
+                canonical = _objective_source_handoff(conn, contract, origin)
+                root_payload = json.loads(canonical[0][len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX):])
+                fields = ("objective_id", "execution_task_id", "run_id", "original_request", "utf8_sha256")
+                if all(payload.get(key) == root_payload.get(key) for key in fields):
+                    trusted_lineage_runs.add((source_task_id, source_run_id))
+                    if root_payload.get("assets"):
+                        reviewed_source_run_ids.add(source_run_id)
         if (
             payload.get("objective_id") != objective_id
             or not isinstance(source_text, str)
@@ -2705,6 +2743,16 @@ def _objective_source_handoff(
             if source_run.id in reviewed_source_run_ids
             else []
         )
+        # The manuscript stays rooted; images may be the accepted correction
+        # from the nearest descendant review (for example, an episode change).
+        for _, runs in lineage:
+            nearest_assets = next((
+                _reviewed_source_asset_manifest(kb.get_run(conn, int(row["id"])).metadata or {})
+                for row in runs if int(row["id"]) in reviewed_source_run_ids
+            ), [])
+            if nearest_assets:
+                assets = nearest_assets
+                break
         if assets:
             verified["assets"] = assets
         return verified
@@ -2729,6 +2777,10 @@ def _objective_source_handoff(
                 isinstance(original, str)
                 and original
                 and not original.lstrip().startswith("[SYSTEM: Grace Loop callback]")
+                and not any(
+                    str(entry).startswith(_OBJECTIVE_SOURCE_PACKAGE_PREFIX)
+                    for entry in (source_contract.get("memory") or {}).get("working", [])
+                )
                 and _contract_requires_backend_original_request(source_contract)
             ):
                 return [
@@ -3533,6 +3585,26 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "stage_key": str(objective_ref.get("stage_key") or "").strip(),
             }
             with kb.connect_closing(board=board) as conn:
+                # Resolve the retry before sealing. Reservation must never move
+                # the database stage away from the compiled contract's stage.
+                if not args.get("_approval_compiled_contract"):
+                    prior = conn.execute(
+                        "SELECT stage_key FROM grace_delegations "
+                        "WHERE objective_id = ? AND request_instance_id = ? "
+                        "AND state IN ('authorized','building','queued') "
+                        "AND platform = ? AND chat_id = ? AND thread_id = ?",
+                        (clean_objective_ref["objective_id"], request_instance_id,
+                         platform, chat_id, thread_id),
+                    ).fetchall()
+                    if len(prior) > 1:
+                        raise ValueError("Objective request has ambiguous reserved stages")
+                    clean_objective_ref["stage_key"] = (
+                        prior[0]["stage_key"] if prior else
+                        kb.available_grace_objective_stage_key(
+                            conn, objective_id=clean_objective_ref["objective_id"],
+                            stage_key=clean_objective_ref["stage_key"],
+                        )
+                    )
                 contract["completion_mode"] = kb.grace_objective_stage_mode(
                     conn,
                     objective_id=clean_objective_ref["objective_id"],
@@ -3543,18 +3615,30 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     ensure_stage=False,
                 )
             contract["objective_ref"] = clean_objective_ref
-        if verified_origin and isinstance(contract.get("objective_ref"), dict):
+        source_origin = verified_origin
+        if (
+            not source_origin and not internal_turn
+            and isinstance(contract.get("objective_ref"), dict)
+            and _requires_objective_source_handoff(contract)
+        ):
+            # Human confirmations continue the declared stage family; they do
+            # not replace its sealed source manuscript with the short reply.
+            ref = contract["objective_ref"]
             with kb.connect_closing(board=board) as conn:
-                _guard_recoverable_callback_domain_memory(
-                    conn,
-                    contract,
-                    verified_origin,
-                    event_id=int(origin_event_id or 0),
-                )
+                source_origin = _declared_root_source_origin(conn, ref)
+        if source_origin and isinstance(contract.get("objective_ref"), dict):
+            with kb.connect_closing(board=board) as conn:
+                if verified_origin:
+                    _guard_recoverable_callback_domain_memory(
+                        conn,
+                        contract,
+                        verified_origin,
+                        event_id=int(origin_event_id or 0),
+                    )
                 source_handoff = _objective_source_handoff(
                     conn,
                     contract,
-                    verified_origin,
+                    source_origin,
                 )
             for entry in source_handoff:
                 _append_unique_text(contract["memory"]["working"], entry)

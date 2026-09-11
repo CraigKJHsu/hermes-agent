@@ -111,6 +111,31 @@ class TestBasePlatformTopicSessions:
         assert adapter.get_pending_message(build_session_key(pending_event.source)) == pending_event
 
     @pytest.mark.asyncio
+    async def test_callback_exposes_exact_processing_task_until_completion(self):
+        adapter = DummyTelegramAdapter()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(event):
+            assert event.internal_context["processing_task"] is asyncio.current_task()
+            entered.set()
+            await release.wait()
+            return "ack"
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        completion = asyncio.get_running_loop().create_future()
+        event.internal = True
+        event.internal_context = {"processing_completion_future": completion}
+        task = asyncio.create_task(adapter._process_message_background(event, build_session_key(event.source)))
+        await entered.wait()
+        assert event.internal_context["processing_task"] is task
+        assert not completion.done()
+        release.set()
+        await task
+        assert completion.result() is True
+
+    @pytest.mark.asyncio
     async def test_process_message_background_replies_in_same_topic(self):
         adapter = DummyTelegramAdapter()
         typing_calls = []

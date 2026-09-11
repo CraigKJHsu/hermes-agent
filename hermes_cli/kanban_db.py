@@ -100,6 +100,7 @@ from hermes_cli.grace_review_metadata import (
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from proactive.policy_registry import serialize_with_policy_registry
 from proactive.behavior_profiles.registry import guard_task as _guard_behavior_task
+from proactive.behavior_profiles.registry import BehaviorProfileError
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1356,8 +1357,29 @@ def grace_task_facebook_page_post_contract(
         compiled_fingerprint = contract_fingerprint(fingerprint_contract)
     except (ImportError, TypeError, ValueError):
         return None
+    source = provenance.get("source")
+    if source == "one_time_authenticated_owner_challenge":
+        source_valid = str(provenance.get("challenge_token_sha256") or "") == hashlib.sha256(
+            str(approval["challenge_token"] or "").encode("utf-8")
+        ).hexdigest()
+    elif source == "codex_local_operator":
+        requested_id = str(approval["requested_message_id"] or "")
+        authorization_id = requested_id.removeprefix("codex-request:")
+        identity = sealed_contract.get("identity") if isinstance(sealed_contract, Mapping) else None
+        source_valid = (
+            isinstance(identity, Mapping)
+            and identity.get("requested_by") == "codex_local_operator"
+            and requested_id.startswith("codex-request:")
+            and bool(authorization_id.strip())
+            and approval["approved_message_id"] == f"codex-approval:{authorization_id}"
+            and provenance.get("codex_authorization_id_sha256")
+            == hashlib.sha256(authorization_id.encode("utf-8")).hexdigest()
+            and bool(str(provenance.get("codex_thread_id") or "").strip())
+        )
+    else:
+        source_valid = False
     approval_valid = (
-        provenance.get("source") == "one_time_authenticated_owner_challenge"
+        source_valid
         and provenance.get("scope_binding") == "exact_loop_contract_fingerprint"
         and provenance.get("internal") is False
         and str(provenance.get("platform") or "")
@@ -1371,10 +1393,6 @@ def grace_task_facebook_page_post_contract(
         and str(provenance.get("contract_fingerprint") or "")
         == compiled_fingerprint
         == str(approval["contract_fingerprint"] or "")
-        and str(provenance.get("challenge_token_sha256") or "")
-        == hashlib.sha256(
-            str(approval["challenge_token"] or "").encode("utf-8")
-        ).hexdigest()
     )
     return normalized if approval_valid else None
 
@@ -14023,7 +14041,12 @@ def _probe_worker_capabilities(
                 # reporting every declared or abstract tool as missing.
                 "missing_required_tools": [],
                 "probe_attempts": probe_attempts,
-                "probe_error": f"{type(exc).__name__}: {exc}",
+                "probe_timed_out": True,
+                "probe_error": (
+                    f"TimeoutExpired: worker capability probe exceeded "
+                    f"{max(1.0, float(timeout)):g}s per attempt "
+                    f"({probe_attempts} attempts)"
+                ),
             }
         except Exception as exc:
             return {
@@ -14478,6 +14501,9 @@ def _default_spawn(
             )
             if capability.get("probe_error"):
                 detail += f" ({capability['probe_error']})"
+            if capability.get("probe_timed_out") is True and not missing:
+                # No schema verdict: retain the dispatcher's bounded startup retry.
+                raise TimeoutError(detail)
             raise WorkerCapabilityError(detail)
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
@@ -15345,6 +15371,7 @@ def create_grace_approval_challenge(
                       FROM grace_delegations
                      WHERE origin_review_task_id = ?
                        AND origin_event_id = ?
+                       AND (state NOT IN ('cancelled','superseded') OR approval_required <> 0)
                      LIMIT 1
                     """,
                     (clean_origin_review_id, clean_origin_event_id),
@@ -16213,10 +16240,19 @@ def _bind_grace_objective_stage(
                            last_error = ?
                      WHERE review_task_id = ?
                        AND state <> 'cancelled'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM grace_delegations d
+                            WHERE d.delegation_id = ?
+                              AND d.origin_review_task_id = grace_loop_callbacks.review_task_id
+                              AND d.origin_event_id = grace_loop_callbacks.lease_event_id
+                              AND grace_loop_callbacks.state = 'delivering'
+                              AND grace_loop_callbacks.lease_owner IS NOT NULL
+                       )
                     """,
                     (
                         f"Superseded by bound objective stage {stage_key}.",
                         review_task_id,
+                        delegation_id,
                     ),
                 )
     conn.execute(
@@ -16644,6 +16680,13 @@ def reserve_grace_delegation(
                 stage_key=clean_stage_key,
                 delegation_id=delegation_id,
             )
+            if compiled_contract is not None and compiled_contract.get("objective_ref") != {
+                "objective_id": clean_objective_id,
+                "stage_key": clean_stage_key,
+            }:
+                raise ValueError(
+                    "Objective stage changed before reservation; recompile the contract."
+                )
 
         conn.execute(
             """
@@ -18048,7 +18091,7 @@ def grace_inline_content_package_report(
     }
     images = list(image_by_name.values())
     if (
-        len(markdown) != 1
+        len(markdown) > 1
         or not images
         or {image.filename for image in images} != expected_assets
     ):
@@ -18064,12 +18107,28 @@ def grace_inline_content_package_report(
         conn, execution_task_id,
     ):
         return None
-    body_path = Path(markdown[0].stored_path)
-    if not body_path.is_file():
+    if markdown:
+        body_path = Path(markdown[0].stored_path)
+        if not body_path.is_file():
+            return None
+        raw_body = body_path.read_text(encoding="utf-8")
+    else:
+        # A structured inline payload does not need a duplicate Markdown file.
+        # Asset authority still comes exclusively from this task's attachments.
+        body_field = str(delivery.get("body_field") or "").strip()
+        acceptance = metadata.get("acceptance_evidence")
+        raw_body = acceptance.get(body_field) if isinstance(acceptance, Mapping) and body_field else None
+        if raw_body is None and body_field == "body":
+            stored = metadata.get("user_facing_report")
+            if isinstance(stored, Mapping) and stored.get("kind") == "content_package" and stored.get("delivery") == "inline_with_attachment":
+                raw_body = stored.get("body")
+        if raw_body is None:
+            return _grace_facebook_page_preflight_report(
+                conn, execution_task_id, delivery=delivery, task=task,
+            )
+    if not isinstance(raw_body, str) or not raw_body.strip():
         return None
-    body = body_path.read_text(encoding="utf-8").strip()
-    if not body:
-        return None
+    body = raw_body.strip()
     report_assets = []
     decoded_images: dict[str, tuple[str, tuple[int, int]]] = {}
     from PIL import Image
@@ -18159,15 +18218,19 @@ def grace_inline_content_package_report(
         except ValueError:
             return None
 
-    return canonical_objective_report(conn, execution_task_id, normalize_user_facing_report({
-        "kind": "content_package",
-        "delivery": "inline_with_attachment",
-        "complete": stored_complete,
-        "title": task.title if task is not None else "Content package",
-        "body": body,
-        "observed_at": max(attachment.created_at for attachment in attachments),
-        "assets": report_assets,
-    }))
+    try:
+        return canonical_objective_report(conn, execution_task_id, normalize_user_facing_report({
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "complete": stored_complete,
+            "title": (stored_report.get("title") if isinstance(stored_report, Mapping) and stored_report.get("body") == body else None)
+            or (task.title if task is not None else "Content package"),
+            "body": body,
+            "observed_at": max(attachment.created_at for attachment in attachments),
+            "assets": report_assets,
+        }))
+    except ValueError:
+        return None
 
 
 def accepted_full_publication_package(
@@ -18754,8 +18817,59 @@ def _apply_grace_objective_callback_outcome(
     stage_key = str(callback.get("stage_key") or "").strip()
     if not objective_id:
         return
-    _guard_behavior_task(conn, str(callback.get("execution_task_id") or ""))
-    _guard_behavior_task(conn, str(callback.get("review_task_id") or ""))
+    approval_successor = None
+    if kind == "approval_blocked":
+        from proactive.behavior_profiles import registry as behavior_registry
+        challenges = conn.execute(
+            "SELECT contract_fingerprint,delegation_args FROM grace_approval_challenges "
+            "WHERE origin_review_task_id=? AND origin_event_id=? AND state='pending' AND expires_at>?",
+            (callback.get("review_task_id"), callback.get("lease_event_id"), int(time.time())),
+        ).fetchall()
+        if len(challenges) == 1:
+            candidate = json.loads(challenges[0]["delegation_args"] or "{}")
+            candidate = candidate.get("_approval_compiled_contract")
+            if (isinstance(candidate, Mapping)
+                and behavior_registry.digest(candidate) == challenges[0]["contract_fingerprint"]
+                and (candidate.get("objective_ref") or {}).get("objective_id") == objective_id
+                and candidate.get("behavior_pin") == behavior_registry.get_pin(conn, objective_id)):
+                approval_successor = behavior_registry.bind_contract(conn, candidate)
+    for task_key in ("execution_task_id", "review_task_id"):
+        task_id = str(callback.get(task_key) or "")
+        try:
+            _guard_behavior_task(conn, task_id)
+        except BehaviorProfileError as exc:
+            # A migrated predecessor is historical evidence, never executable
+            # current work. Only correlation to a current successor may use it.
+            current_continuation = kind == "continued" and successor and successor.get("objective_id") == objective_id
+            current_approval = kind == "approval_blocked" and approval_successor is not None
+            if (str(exc) != "behavior.pin_mismatch: supplied pin differs from Objective"
+                    or not (current_continuation or current_approval)):
+                raise
+            task = get_task(conn, task_id)
+            contract = _grace_compiled_contract(task.body if task else "") or {}
+            pin = contract.get("behavior_pin")
+            if not pin or (contract.get("objective_ref") or {}).get("objective_id") != objective_id:
+                raise
+            from proactive.behavior_profiles import registry as behavior_registry
+            marker = json.loads(next(line[len("GRACE_BEHAVIOR_PIN: "):]
+                for line in task.body.splitlines() if line.startswith("GRACE_BEHAVIOR_PIN: ")))
+            if any(marker.get(key) != contract.get(key)
+                   for key in ("identity", "objective_ref", "behavior_pin")):
+                raise BehaviorProfileError("behavior.historical_marker_mismatch")
+            # Validate unchanged Topic/project/board identity without using the
+            # retired generation as executable or accepted evidence.
+            marker.pop("behavior_pin")
+            behavior_registry.bind_contract(conn, marker)
+            migrations = conn.execute(
+                "SELECT previous_pin FROM grace_behavior_migrations WHERE objective_id = ?",
+                (objective_id,),
+            ).fetchall()
+            if not any(row[0] and json.loads(row[0]) == pin for row in migrations):
+                raise
+            if current_continuation:
+                for successor_key in ("execution_task_id", "review_task_id"):
+                    if _guard_behavior_task(conn, str(successor.get(successor_key) or "")) is None:
+                        raise BehaviorProfileError("behavior.continuation_pin_missing")
     if not stage_key:
         raise ValueError("Objective-linked callback is missing its stage key")
     objective = get_grace_objective(conn, objective_id)
@@ -19459,13 +19573,19 @@ def record_grace_loop_callback_outcome(
             """,
             (review_task_id.strip(), int(event_id), int(time.time())),
         ).fetchall()
-        if kind == "closed" and (origin_delegations or origin_challenges):
+        if kind == "closed" and (origin_challenges or any(
+            row["state"] not in {"cancelled", "superseded"} or row["approval_required"]
+            for row in origin_delegations
+        )):
             raise ValueError(
                 "Closed callback outcome conflicts with a durable continuation "
                 "or pending approval challenge created by this callback."
             )
         if kind == "approval_blocked":
-            if len(origin_challenges) != 1 or origin_delegations:
+            if len(origin_challenges) != 1 or any(
+                row["state"] not in {"cancelled", "superseded"} or row["approval_required"]
+                for row in origin_delegations
+            ):
                 raise ValueError(
                     "Approval-blocked callback outcome requires exactly one "
                     "pending challenge and no queued continuation for this callback."

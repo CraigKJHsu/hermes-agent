@@ -1303,6 +1303,98 @@ def test_dropped_background_turn_times_out_and_releases_callback(
     assert "TimeoutError" in callback["last_error"]
 
 
+@pytest.mark.parametrize("thread_id", ["4641", "2"])
+def test_live_callback_keeps_lease_past_dispatch_timeout(tmp_path, monkeypatch, thread_id):
+    # Topic 4641 is the historical failure sample, not a routing exception.
+    db_path = tmp_path / "long-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_TURN_TIMEOUT_SECONDS", "0.05")
+    clock = [time.time()]
+    started_at = clock[0]
+    original_sleep = asyncio.sleep
+    ttl_crossed = asyncio.Event()
+
+    async def accelerated_heartbeat_sleep(seconds):
+        if seconds == 30:
+            await original_sleep(0.01)
+            clock[0] += 30
+            if clock[0] > started_at + 120:
+                ttl_crossed.set()
+        else:
+            await original_sleep(seconds)
+
+    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
+    monkeypatch.setattr(asyncio, "sleep", accelerated_heartbeat_sleep)
+    kb.init_db()
+    _, review_id, event_id = _objective_blocked_execution_chain(db_path)
+    session_key = f"agent:main:telegram:group:chat-1:{thread_id}"
+    with kb.connect_closing(db_path) as conn:
+        for table in ("grace_loop_callbacks", "grace_delegations", "grace_objectives"):
+            conn.execute(f"UPDATE {table} SET thread_id=?,session_key=?", (thread_id, session_key))
+
+    class LongCallbackAdapter(CallbackAdapter):
+        def __init__(self):
+            super().__init__(record_outcome=False)
+            self._session_tasks = {}
+
+        async def handle_message(self, event):
+            async def process():
+                context = event.internal_context
+                context["processing_task"] = asyncio.current_task()
+                try:
+                    await asyncio.sleep(0.06)
+                    await asyncio.wait_for(ttl_crossed.wait(), timeout=5)
+                    assert clock[0] > started_at + 120
+                    with kb.connect_closing(db_path) as conn:
+                        rebound = kb.rebind_active_grace_callback_session(
+                            conn, review_task_id=review_id, event_id=event_id,
+                            platform="telegram", chat_id="chat-1", thread_id=thread_id,
+                            session_id="compressed-session",
+                            lease_owner=context["grace_callback_lease_owner"],
+                        )
+                        assert rebound["state"] == "delivering"
+                    await CallbackAdapter.handle_message(self, event)
+                finally:
+                    context["processing_completion_future"].set_result(True)
+
+            self._session_tasks[session_key] = asyncio.create_task(process())
+
+    adapter = LongCallbackAdapter()
+    runner = _runner(adapter, session_key=session_key, session_id="grace-session-1", thread_id=thread_id)
+
+    async def deliver():
+        await runner._deliver_due_grace_loop_callbacks(kb)
+        await asyncio.gather(*adapter._session_tasks.values())
+
+    asyncio.run(deliver())
+    assert len(adapter.handled) == 1
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "delivered"
+    assert callback["session_id"] == "compressed-session"
+    assert callback["last_error"] is None
+
+
+@pytest.mark.parametrize("domain_memory", [{"domain_key": "solobizai", "mode": "query"}, None])
+def test_blocker_carries_sealed_memory_authorization(tmp_path, monkeypatch, domain_memory):
+    db_path = tmp_path / "sealed-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id, _ = _objective_blocked_execution_chain(db_path)
+    contract = {"domain_memory": domain_memory} if domain_memory is not None else {}
+    with kb.connect_closing(db_path) as conn:
+        conn.execute("UPDATE grace_delegations SET contract_snapshot=? WHERE review_task_id=?",
+                     (json.dumps(contract), review_id))
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(adapter, session_key="agent:main:telegram:group:chat-1:2", session_id="grace-session-1")
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+    evidence = json.loads(next(line.split("=", 1)[1] for line in adapter.handled[0].text.splitlines()
+                               if line.startswith("evidence_snapshot=")))
+    assert evidence["continuation_authorization"] == {
+        "snapshot_available": True, "domain_memory": domain_memory,
+    }
+
+
 def test_callback_delivery_is_supervised_without_blocking_notifier_polling():
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._background_tasks = set()
@@ -3443,3 +3535,32 @@ def test_approval_recovery_does_not_block_or_duplicate_notifier_work(monkeypatch
         await asyncio.sleep(0)
         assert not runner._background_tasks
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("state,approval_required,can_close", [
+    ("cancelled", 0, True), ("superseded", 0, True),
+    ("queued", 0, False), ("cancelled", 1, False), ("superseded", 1, False),
+])
+def test_closed_callback_ignores_only_withdrawn_internal_successors(tmp_path, monkeypatch, state, approval_required, can_close):
+    db_path = tmp_path / "withdrawn-successor.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id = _review_chain(db_path)
+    with kb.connect_closing(db_path) as conn:
+        event = kb.list_due_grace_loop_callbacks(conn)[0]
+        child = kb.create_task(conn, title="Redundant delivery repair")
+        assert kb.complete_task(conn, child, summary="Internal result")
+        child_review = kb.create_task(conn, title="Redundant repair review")
+        _bind_delegation(conn, child, child_review, suffix="withdrawn-repair")
+        assert kb.block_task(conn, child_review, reason="Redundant repair withdrawn")
+        conn.execute("UPDATE grace_delegations SET state=?,approval_required=?,origin_review_task_id=?,origin_event_id=? WHERE execution_task_id=?",
+                     (state, approval_required, review_id, event["event_id"], child))
+        conn.commit()
+        assert kb.claim_grace_loop_callback(conn, review_task_id=review_id, event_id=event["event_id"], lease_owner="delivery-test")
+        args = dict(review_task_id=review_id, event_id=event["event_id"], platform="telegram", chat_id="chat-1", thread_id="2",
+                    session_id="grace-session-1", lease_owner="delivery-test", outcome_kind="closed", payload={"summary":"Accepted result delivered"})
+        if can_close:
+            assert kb.record_grace_loop_callback_outcome(conn, **args)["outcome_kind"] == "closed"
+        else:
+            with pytest.raises(ValueError, match="durable continuation"):
+                kb.record_grace_loop_callback_outcome(conn, **args)

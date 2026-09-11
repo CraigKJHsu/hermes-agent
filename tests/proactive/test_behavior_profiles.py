@@ -30,7 +30,7 @@ def setup_objective(project="ai_bizweek", *, enabled=True, oid="go_profile", pro
         if enabled:
             br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"],
                              thread_id=identity["thread_id"], project=project_namespace, profile_id=project,
-                             version="v1", expected_revision=0, reason="Local canary")
+                             version="v6", expected_revision=0, reason="Local canary")
         kb.create_grace_objective(conn, objective_id=oid, platform="telegram", chat_id=identity["chat_id"],
                                   thread_id=identity["thread_id"], session_key="fixture", title="fixture",
                                   objective="fixture", original_request_sha256="a" * 64,
@@ -100,7 +100,7 @@ def test_migration_cas_and_rollback_keep_history_and_reject_old_task_generation(
         saved_body = kb.get_task(conn, task_id).body
         pin = br.get_pin(conn, "go_profile")
         spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"],
-                    thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1",
+                    thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6",
                     expected_revision=1, expected_pin_hash=br.digest(pin), reason="Explicit compatibility checkpoint")
         preview = br.migrate_objective(conn, **spec)
         assert preview["applied"] is False
@@ -123,11 +123,43 @@ def test_migration_cas_and_rollback_keep_history_and_reject_old_task_generation(
         assert conn.execute("SELECT count(*) FROM task_external_effects").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
+@pytest.mark.parametrize("old_version", ["v1", "v3"])
+def test_callback_kernel_release_retains_behavior_and_migrates_policy(project, old_version):
+    import json
+
+    old_manifest = br.profile(project, old_version)
+    new_manifest = br.profile(project, "v6")
+    compatibility_fields = {"version", "safety_kernel_version", "safety_kernel_hash"}
+    assert {k: v for k, v in old_manifest.items() if k not in compatibility_fields} == {
+        k: v for k, v in new_manifest.items() if k not in compatibility_fields
+    }
+    contract = setup_objective(project, enabled=False)
+    identity = contract["identity"]
+    policy = br._policy_snapshot("telegram", identity["chat_id"], identity["thread_id"])
+    old_pin = br._make_pin(project, old_version, policy)
+    with kb.connect_closing() as conn:
+        # Historical v1 Objective: migration, not rewriting its immutable pin.
+        conn.execute("INSERT INTO grace_objective_behavior_pins VALUES (?,?,?)",
+                     ("go_profile", json.dumps(old_pin), json.dumps(policy)))
+        with pytest.raises(br.BehaviorProfileError, match="kernel_migration_required"):
+            br.guard_objective(conn, "go_profile")
+        result = br.migrate_objective(
+            conn, objective_id="go_profile", platform="telegram", chat_id=identity["chat_id"],
+            thread_id=identity["thread_id"], profile_id=project, version="v6",
+            expected_revision=1, expected_pin_hash=br.digest(old_pin),
+            reason="Callback kernel compatibility release", apply=True,
+        )
+        assert br.guard_objective(conn, "go_profile") == result["next_pin"]
+        assert result["next_pin"]["policy_snapshot_hash"] == old_pin["policy_snapshot_hash"]
+        assert result["next_pin"]["generation"] == old_pin["generation"] + 1
+
+
 @pytest.mark.parametrize("case", load_cases()["cases"], ids=lambda case: case["id"])
 def test_profile_full_local_replay_preserves_decision_stage_and_package(tmp_path, case):
     fixture = load_cases()
     legacy = replay_case(fixture, case, tmp_path / "legacy.db")
-    pinned = replay_case(fixture, case, tmp_path / "pinned.db", behavior_version="v1")
+    pinned = replay_case(fixture, case, tmp_path / "pinned.db", behavior_version="v6")
     for key in ("decision", "review_outcome", "objective", "stages", "callback", "package",
                 "task_states", "external_effect_count", "successor_task_count", "approval_states"):
         assert pinned.get(key) == legacy.get(key), key
@@ -135,7 +167,7 @@ def test_profile_full_local_replay_preserves_decision_stage_and_package(tmp_path
         assert pinned["normalized_contract"]["behavior_pin"]["behavior_profile_id"] == case["project"]
 
 
-def test_secondhand_v2_route_change_does_not_change_ai_bizweek_replay(tmp_path, monkeypatch):
+def test_secondhand_route_change_does_not_change_ai_bizweek_replay(tmp_path, monkeypatch):
     import hashlib
     import json
     import shutil
@@ -143,30 +175,30 @@ def test_secondhand_v2_route_change_does_not_change_ai_bizweek_replay(tmp_path, 
 
     fixture = load_cases()
     case = fixture["cases"][0]
-    before = replay_case(fixture, case, tmp_path / "before.db", behavior_version="v1")
+    before = replay_case(fixture, case, tmp_path / "before.db", behavior_version="v6")
     catalog = tmp_path / "catalog"
     shutil.copytree(br.ROOT, catalog)
     monkeypatch.setattr(br, "ROOT", catalog)
-    manifest = json.loads((catalog / "secondhand_commerce@v1.json").read_text())
+    manifest = json.loads((catalog / "secondhand_commerce@v6.json").read_text())
     old_routes = manifest["route_snapshot"]
-    new_routes = "v2/secondhand_commerce"
+    new_routes = "v7/secondhand_commerce"
     shutil.copytree(catalog / old_routes, catalog / new_routes)
     route_path = catalog / new_routes / "routing-rules.yaml"
     rules = yaml.safe_load(route_path.read_text())
     rules["worker_routes"] = [r for r in rules["worker_routes"] if r.get("match", {}).get("task_type") != "facebook_marketplace_readonly"]
     route_path.write_text(yaml.safe_dump(rules, allow_unicode=True))
-    manifest.update(version="v2", route_snapshot=new_routes)
+    manifest.update(version="v7", route_snapshot=new_routes)
     for name in ("routing-rules.yaml", "agent-registry.yaml"):
         del manifest["files"][old_routes + "/" + name]
         manifest["files"][new_routes + "/" + name] = hashlib.sha256((catalog / new_routes / name).read_bytes()).hexdigest()
-    (catalog / "secondhand_commerce@v2.json").write_text(json.dumps(manifest))
+    (catalog / "secondhand_commerce@v7.json").write_text(json.dumps(manifest))
     contract = setup_objective("secondhand_commerce")
     normalized = validate_loop_contract(contract)
     routing = br.implementation(normalized, "routing")
     before_route = routing.route_clawops_objective("Read listing", task_type="facebook_marketplace_readonly", hub_ops_dir=br.route_directory(normalized))
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")
-        br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="secondhand_commerce", version="v2", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Test changed route", apply=True)
+        br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="secondhand_commerce", version="v7", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Test changed route", apply=True)
         contract.pop("behavior_pin")
         candidate = br.bind_contract(conn, contract)
     after_route = routing.route_clawops_objective("Read listing", task_type="facebook_marketplace_readonly", hub_ops_dir=br.route_directory(candidate))
@@ -174,7 +206,7 @@ def test_secondhand_v2_route_change_does_not_change_ai_bizweek_replay(tmp_path, 
     assert "Unsupported task_type" not in str(before_route)
     # Preserve the same input binding bytes; rebinding changes its timestamp hash.
     monkeypatch.setattr("proactive.policy_registry.bind_topic_policies", lambda *a, **k: None)
-    after = replay_case(fixture, case, tmp_path / "after.db", behavior_version="v1")
+    after = replay_case(fixture, case, tmp_path / "after.db", behavior_version="v6")
     assert after == before
 
 
@@ -184,7 +216,7 @@ def test_migration_refuses_unfinished_card_before_delegation_link():
         kb.create_task(conn, title="Pending pinned work", body=render_execution_body(validate_loop_contract(contract)))
         pin = br.get_pin(conn, "go_profile")
         with pytest.raises(br.BehaviorProfileError, match="migration_inflight"):
-            br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Cannot bypass unfinished work", apply=True)
+            br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Cannot bypass unfinished work", apply=True)
         assert br.get_pin(conn, "go_profile") == pin
         assert conn.execute("SELECT count(*) FROM grace_behavior_migrations").fetchone()[0] == 0
 
@@ -211,7 +243,7 @@ def test_real_ai_namespace_is_bound_separately_from_business_profile():
     saved_body = render_execution_body(normalized)
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")
-        result = br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Preserve actual project namespace", apply=True)
+        result = br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Preserve actual project namespace", apply=True)
         assert result["next_pin"]["project_namespace"] == namespace
     assert resolve_task_policy_snapshots(saved_body)["policies"][0]["content"] == "Original complete policy"
     wrong = deepcopy(contract)
@@ -229,7 +261,7 @@ def test_migration_cli_preview_is_read_only(tmp_path, monkeypatch, capsys):
     contract = setup_objective()
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")
-    spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Read-only CLI preview")
+    spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Read-only CLI preview")
     path = tmp_path / "migration.json"
     path.write_text(json.dumps(spec))
     monkeypatch.setattr(sys, "argv", ["behavior_profiles", "migrate", str(path)])
@@ -281,7 +313,7 @@ def test_legacy_migration_requires_explicit_current_policy_and_project():
     contract = setup_objective(enabled=False)
     with kb.connect_closing() as conn:
         original = kb.get_grace_objective(conn, "go_profile")
-        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(None), reason="Explicit legacy adoption")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(None), reason="Explicit legacy adoption")
         with pytest.raises(br.BehaviorProfileError, match="legacy_policy_unknown"):
             br.migrate_objective(conn, **spec, apply=True)
         with pytest.raises(br.BehaviorProfileError, match="migration_project_unknown"):
@@ -304,7 +336,7 @@ def test_idempotent_objective_reuse_never_rebinds(initially_pinned):
         before = kb.get_grace_objective(conn, "go_profile")
         pin = br.get_pin(conn, "go_profile")
         if not initially_pinned:
-            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], project="ai_bizweek", profile_id="ai_bizweek", version="v1", expected_revision=0, reason="Enable after this legacy Objective already exists")
+            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], project="ai_bizweek", profile_id="ai_bizweek", version="v6", expected_revision=0, reason="Enable after this legacy Objective already exists")
         reused = kb.create_grace_objective(conn, objective_id="go_profile", platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], session_key="fixture", title="fixture", objective="fixture", original_request_sha256="a" * 64, required_stage_keys=["prepare", "publish"], terminal_stage_key="publish", acceptance_criteria=["verified"], behavior_project="ai_bizweek")
         assert reused == before
         assert br.get_pin(conn, "go_profile") == pin
@@ -386,7 +418,7 @@ def test_preupgrade_migration_preview_needs_no_schema_write():
         conn.execute("DROP TABLE grace_objective_behavior_pins")
         conn.execute("DROP TABLE grace_behavior_migrations")
         conn.execute("DROP TABLE grace_behavior_selections")
-        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v1", expected_revision=1, expected_pin_hash=br.digest(None), reason="Preview legacy adoption", policy_mode="current", project_namespace="ai_bizweek")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(None), reason="Preview legacy adoption", policy_mode="current", project_namespace="ai_bizweek")
         conn.execute("PRAGMA query_only=ON")
         assert br.migrate_objective(conn, **spec)["applied"] is False
         with pytest.raises(br.BehaviorProfileError, match="rollback_target_unavailable"):
@@ -422,3 +454,111 @@ def test_catalog_install_requires_restart_then_preserves_pinned_review_auth(tmp_
         conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run.id))
         with pytest.raises(kb.WorkerAuthorizationError):
             kb.validate_kanban_worker_auth(conn, **auth)
+
+@pytest.mark.parametrize('project', ['ai_bizweek', 'secondhand_commerce'])
+def test_migrated_callback_correlates_successor_without_accepting_old_work(project):
+    contract = validate_loop_contract(setup_objective(project))
+    with kb.connect_closing() as conn:
+        old = [kb.create_task(conn, title='old', body=render_execution_body(contract)),
+               kb.create_task(conn, title='old review', body=render_review_body(contract, 'old'))]
+        for task_id in old:
+            kb.block_task(conn, task_id, reason='Migration checkpoint', kind='capability')
+        pin = br.get_pin(conn, 'go_profile')
+        br.migrate_objective(conn, objective_id='go_profile', platform='telegram',
+            chat_id=contract['identity']['chat_id'], thread_id=contract['identity']['thread_id'],
+            profile_id=project, version='v6', expected_revision=1, expected_pin_hash=br.digest(pin),
+            reason='Retire old callback generation', apply=True)
+        fresh = deepcopy(contract)
+        fresh.pop('behavior_pin')
+        fresh = validate_loop_contract(br.bind_contract(conn, fresh))
+        new = [kb.create_task(conn, title='new', body=render_execution_body(fresh)),
+               kb.create_task(conn, title='new review', body=render_review_body(fresh, 'new'))]
+        callback = dict(objective_id='go_profile', stage_key='prepare', execution_task_id=old[0], review_task_id=old[1])
+        successor = dict(objective_id='go_profile', stage_key='publish', execution_task_id=new[0], review_task_id=new[1])
+        def apply(kind='continued', **changes):
+            kb._apply_grace_objective_callback_outcome(conn, callback=callback, kind=kind,
+                payload={}, successor={**successor, **changes})
+        with pytest.raises(br.BehaviorProfileError):
+            apply('closed')
+        with pytest.raises(br.BehaviorProfileError):
+            apply(execution_task_id=old[0])
+        with pytest.raises(br.BehaviorProfileError, match='continuation_pin_missing'):
+            apply(execution_task_id='missing')
+        apply()
+        assert kb.get_grace_objective(conn, 'go_profile')['current_stage_key'] == 'publish'
+        with pytest.raises(br.BehaviorProfileError):
+            kb.claim_task(conn, old[0])
+        conn.execute('DELETE FROM grace_behavior_migrations WHERE objective_id=?', ('go_profile',))
+        with pytest.raises(br.BehaviorProfileError):
+            apply()
+
+
+@pytest.mark.parametrize("state,stage_status,outcome,owner,allowed", [
+    ("cancelled", "done", "superseded_by_retry", None, True),
+    ("cancelled", "done", "cancelled", None, True),
+    ("attention", "done", "continued", None, True),
+    ("attention", "done", "continued", "active-lease", False),
+    ("cancelled", "blocked", "superseded_by_retry", None, False),
+    ("cancelled", "done", "accepted", None, False),
+    ("cancelled", "done", "superseded_by_retry", "active-lease", False),
+    ("pending", "done", "superseded_by_retry", None, False),
+])
+def test_migration_preserves_superseded_cancelled_callback(state, stage_status, outcome, owner, allowed):
+    contract = setup_objective()
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE grace_objective_stages SET status=?,outcome_kind=? WHERE objective_id='go_profile' AND stage_key='prepare'", (stage_status, outcome))
+        conn.execute("""INSERT INTO grace_loop_callbacks
+            (review_task_id,execution_task_id,platform,chat_id,thread_id,contract_fingerprint,
+             state,created_at,objective_id,stage_key,lease_owner)
+            VALUES ('review','execution','telegram',?,?,'fingerprint',?,1,'go_profile','prepare',?)""",
+            (contract['identity']['chat_id'],contract['identity']['thread_id'],state,owner))
+        before = dict(conn.execute("SELECT * FROM grace_loop_callbacks WHERE review_task_id='review'").fetchone())
+        pin = br.get_pin(conn, 'go_profile')
+        args = dict(objective_id='go_profile',platform='telegram',chat_id=contract['identity']['chat_id'],
+            thread_id=contract['identity']['thread_id'],profile_id='ai_bizweek',version='v6',
+            expected_revision=1,expected_pin_hash=br.digest(pin),reason='Preserve cancelled history',apply=True)
+        if allowed:
+            result = br.migrate_objective(conn, **args)
+            assert result['next_pin']['generation'] == pin['generation'] + 1
+        else:
+            with pytest.raises(br.BehaviorProfileError, match='migration_callback_pending'):
+                br.migrate_objective(conn, **args)
+            assert br.get_pin(conn, 'go_profile') == pin
+        assert dict(conn.execute("SELECT * FROM grace_loop_callbacks WHERE review_task_id='review'").fetchone()) == before
+
+
+@pytest.mark.parametrize('project', ['ai_bizweek','secondhand_commerce'])
+@pytest.mark.parametrize('fault', [None,'missing_challenge','stale_pin','wrong_fingerprint'])
+def test_migrated_accepted_callback_needs_current_sealed_approval(project, fault):
+    import json
+    contract=setup_objective(project)
+    identity=contract['identity']
+    with kb.connect_closing() as conn:
+        execution=kb.create_task(conn,title='historical execution',body=render_execution_body(contract))
+        review=kb.create_task(conn,title='historical review',body=render_review_body(contract,execution))
+        conn.execute("UPDATE tasks SET status='done' WHERE id IN (?,?)",(execution,review))
+        previous=br.get_pin(conn,'go_profile')
+        br.migrate_objective(conn,objective_id='go_profile',platform='telegram',chat_id=identity['chat_id'],
+            thread_id=identity['thread_id'],profile_id=project,version='v6',expected_revision=1,
+            expected_pin_hash=br.digest(previous),reason='Idle compatibility repair',apply=True)
+        current=deepcopy(contract);current.pop('behavior_pin');current=br.bind_contract(conn,current)
+        selected=contract if fault=='stale_pin' else current
+        callback=dict(objective_id='go_profile',stage_key='prepare',execution_task_id=execution,
+                      review_task_id=review,lease_event_id=99)
+        if fault!='missing_challenge':
+            kb.create_grace_approval_challenge(conn,contract_fingerprint='0'*64 if fault=='wrong_fingerprint' else br.digest(selected),
+                request_instance_id='request',platform='telegram',chat_id=identity['chat_id'],thread_id=identity['thread_id'],
+                session_key='key',session_id='session',user_id_sha256='a'*64,requested_message_id='message',
+                action_summary='publish',approval_platform='Facebook',approval_scope='["exact bytes"]',
+                compiled_contract=selected,origin_review_task_id=review,origin_event_id=99)
+        args=dict(callback=callback,kind='approval_blocked',payload={'next_stage_key':'publish','action':'publish','exact_question':'pending approval'})
+        if fault:
+            with pytest.raises(br.BehaviorProfileError):
+                kb._apply_grace_objective_callback_outcome(conn,**args)
+            assert kb.get_grace_objective(conn,'go_profile')['status']=='active'
+        else:
+            kb._apply_grace_objective_callback_outcome(conn,**args)
+            obj=kb.get_grace_objective(conn,'go_profile')
+            assert obj['status']=='waiting_approval' and obj['current_stage_key']=='publish'
+        with pytest.raises(br.BehaviorProfileError):
+            kb.claim_task(conn,execution)

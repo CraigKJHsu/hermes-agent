@@ -2170,3 +2170,30 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+@pytest.mark.parametrize("failure", ["pinned", "verdict", "other"])
+def test_review_error_guidance_preserves_required_evidence(worker_env, monkeypatch, failure):
+    from copy import deepcopy
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.grace_review_metadata import grace_review_acceptance_error
+    from tools import kanban_tools as kt
+    message = ("behavior.pinned_version_not_verified" if failure == "pinned" else
+               grace_review_acceptance_error({}) if failure == "verdict" else "unrelated rejection")
+    args = {"summary": "review", "metadata": {"page_hero": {"required": True}}}
+    before = deepcopy(args)
+    def reject(*args, **kwargs):
+        raise ValueError(message)
+    monkeypatch.setattr(kb, "complete_task", reject)
+    result = json.loads(kt._handle_complete(args))
+    assert args == before
+    assert "error" in result and not result.get("ok")
+    if failure == "pinned":
+        assert "policy_receipts[i].pinned_version_verified" in result["error"]
+    elif failure == "verdict":
+        assert "do not add page_hero" not in result["error"]
+        assert "retain all contract-required evidence" in result["error"]
+    else:
+        assert result["error"] == "kanban_complete: unrelated rejection"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"

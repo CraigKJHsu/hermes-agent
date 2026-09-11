@@ -342,7 +342,7 @@ def _seed_root_source_blocker(
     identity = {
         "platform": "telegram",
         "chat_id": "chat-1",
-        "thread_id": "2",
+        "thread_id": values.get("HERMES_SESSION_THREAD_ID", "2"),
         "project": "secondhand_commerce",
         "requested_by": requested_by,
         "compiled_by": "Grace",
@@ -365,7 +365,7 @@ def _seed_root_source_blocker(
         objective_id=objective_id,
         platform="telegram",
         chat_id="chat-1",
-        thread_id="2",
+        thread_id=values.get("HERMES_SESSION_THREAD_ID", "2"),
         session_key=values["HERMES_SESSION_KEY"],
         title="Root source repair",
         objective=source_text,
@@ -381,7 +381,7 @@ def _seed_root_source_blocker(
         request_instance_id="root-source-request",
         platform="telegram",
         chat_id="chat-1",
-        thread_id="2",
+        thread_id=values.get("HERMES_SESSION_THREAD_ID", "2"),
         session_key=values["HERMES_SESSION_KEY"],
         session_id=values["HERMES_SESSION_ID"],
         resolved_route={"backend": "openclaw"},
@@ -433,7 +433,7 @@ def _seed_root_source_blocker(
         execution_task_id=execution_id,
         platform="telegram",
         chat_id="chat-1",
-        thread_id="2",
+        thread_id=values.get("HERMES_SESSION_THREAD_ID", "2"),
         session_key=values["HERMES_SESSION_KEY"],
         session_id=values["HERMES_SESSION_ID"],
         contract_fingerprint="c" * 64,
@@ -1527,8 +1527,9 @@ def test_objective_source_handoff_adds_only_hash_verified_reviewed_assets(
     ]
 
 
+@pytest.mark.parametrize("parent_cursor", ["original", "parked", "advanced"])
 def test_objective_source_handoff_skips_recoverable_blocker_to_accepted_ancestor(
-    tmp_path,
+    tmp_path, parent_cursor,
 ):
     values = {
         "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
@@ -1603,6 +1604,12 @@ def test_objective_source_handoff_skips_recoverable_blocker_to_accepted_ancestor
             event_id=callback["event_id"],
             lease_owner="recoverable-source-lease",
         )
+        if parent_cursor != "original":
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET state='attention', lease_event_id=NULL, "
+                "outcome_event_id=NULL, last_event_id=? WHERE review_task_id=?",
+                (0 if parent_cursor == "parked" else callback["event_id"], root_review_id),
+            )
 
         from plugins.openclaw_bridge.clawops_delegate import (
             _OBJECTIVE_SOURCE_PACKAGE_PREFIX,
@@ -1713,7 +1720,8 @@ def test_objective_source_handoff_uses_sealed_authenticated_root_without_assets(
     assert "assets" not in payload
 
 
-def test_objective_source_handoff_rejects_unreviewed_run_from_trusted_task(tmp_path):
+@pytest.mark.parametrize("invalid_run_id", ["unreviewed", [], {}, True])
+def test_objective_source_handoff_rejects_unreviewed_run_from_trusted_task(tmp_path, invalid_run_id):
     values = {
         "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
         "HERMES_SESSION_ID": "grace-session-1",
@@ -1751,7 +1759,7 @@ def test_objective_source_handoff_rejects_unreviewed_run_from_trusted_task(tmp_p
                 {
                     "objective_id": objective_id,
                     "execution_task_id": execution_id,
-                    "run_id": forged_run_id,
+                    "run_id": forged_run_id if invalid_run_id == "unreviewed" else invalid_run_id,
                     "original_request": forged_text,
                     "utf8_sha256": forged_digest,
                 },
@@ -5221,3 +5229,174 @@ def test_explicit_objective_handoff_never_silently_forks(tmp_path, monkeypatch, 
         assert resolved["stage_key"].startswith("prepare_")
     with kb.connect_closing() as conn:
         assert conn.execute("SELECT COUNT(*) FROM grace_objectives").fetchone()[0] == (0 if fault == "unknown" else 1)
+
+@pytest.mark.parametrize('topic', ['2', '4641'])
+def test_human_confirmation_keeps_source_and_seals_actual_retry(tmp_path, monkeypatch, topic):
+    # Historical SoloBizAi failure; the same rule applies to another Topic.
+    values = {
+        'HERMES_SESSION_PLATFORM': 'telegram', 'HERMES_SESSION_CHAT_ID': 'chat-1',
+        'HERMES_SESSION_THREAD_ID': topic, 'HERMES_SESSION_USER_ID': 'kj',
+        'HERMES_SESSION_OWNER_USER_ID': 'kj',
+        'HERMES_SESSION_KEY': f'agent:main:telegram:group:chat-1:{topic}',
+        'HERMES_SESSION_ID': 'grace-session-1', 'HERMES_SESSION_MESSAGE_ID': 'confirmation',
+        'HERMES_SESSION_MESSAGE_TEXT': '使用 EP08，依原稿接續。', 'HERMES_SESSION_INTERNAL': 'false',
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    registry = tmp_path / 'registry.yaml'
+    registry.write_text(registry.read_text().replace("thread_id: '2'", f"thread_id: '{topic}'").replace('topic:2/', f'topic:{topic}/'))
+    with kb.connect_closing(tmp_path / 'kanban.db') as conn:
+        objective_id, stage, _, _, _ = _seed_root_source_blocker(
+            conn, source_text='完整原稿，保留來源。', values=values,
+        )
+        root = conn.execute("SELECT contract_snapshot FROM grace_delegations WHERE objective_id=?", (objective_id,)).fetchone()
+        with pytest.raises(ValueError, match='stage changed before reservation'):
+            kb.reserve_grace_delegation(
+                conn, contract_fingerprint='d' * 64, request_instance_id='unsealed-retry',
+                platform='telegram', chat_id='chat-1', thread_id=topic,
+                session_key=values['HERMES_SESSION_KEY'], session_id='grace-session-1',
+                resolved_route={'backend': 'openclaw'}, approval_required=False,
+                objective_id=objective_id, stage_key=stage,
+                compiled_contract=json.loads(root['contract_snapshot']),
+            )
+        assert conn.execute("SELECT 1 FROM grace_objective_stages WHERE objective_id=? AND stage_key=?", (objective_id, stage + '_r2')).fetchone() is None
+    args = _nested_args()
+    args['task_type'] = 'content_draft'
+    args['original_request'] = values['HERMES_SESSION_MESSAGE_TEXT']
+    args['objective_ref'] = {'objective_id': objective_id, 'stage_key': stage}
+    args['user_facing_delivery'] = {'required': True, 'kind': 'content_package',
+        'delivery': 'inline_with_attachment', 'asset_filenames': ['source.png']}
+    args['goal']['objective'] = 'Prepare source-faithful content package'
+    args['scope']['allowed'] = ['Use original_request as SOURCE material']
+    args['verification']['checks'] = ['Compare against original source']
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate, _OBJECTIVE_SOURCE_PACKAGE_PREFIX
+    result = json.loads(handle_clawops_delegate(json.loads(json.dumps(args))))
+    assert result['status'] == 'queued', result
+    with kb.connect_closing(tmp_path / 'kanban.db') as conn:
+        row = kb.get_grace_delegation(conn, delegation_id=result['delegation_id'])
+        run = kb.latest_run(conn, result['execution_task_id'])
+    snapshot = json.loads(row['contract_snapshot'])
+    assert row['stage_key'] == stage + '_r2'
+    assert snapshot['objective_ref']['stage_key'] == row['stage_key']
+    assert run.metadata['loop_contract']['objective_ref'] == snapshot['objective_ref']
+    package = next(x for x in snapshot['memory']['working'] if x.startswith(_OBJECTIVE_SOURCE_PACKAGE_PREFIX))
+    assert json.loads(package[len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX):])['original_request'] == '完整原稿，保留來源。'
+    replay = json.loads(handle_clawops_delegate(json.loads(json.dumps(args))))
+    assert replay['status'] == 'queued', replay
+    assert replay['execution_task_id'] == result['execution_task_id']
+
+    # The next internal retry must keep the manuscript, not promote the short
+    # episode confirmation into the new source of truth.
+    with kb.connect_closing(tmp_path / 'kanban.db') as conn:
+        kb.block_task(conn, result['execution_task_id'], reason='Test source handoff', kind='capability', expected_run_id=run.id)
+        event_id = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='blocked'", (result['execution_task_id'],)).fetchone()[0]
+        from plugins.openclaw_bridge.clawops_delegate import _objective_source_handoff
+        following = _objective_source_handoff(conn, snapshot, {
+            'execution_task_id': result['execution_task_id'],
+            'review_task_id': row['review_task_id'], 'source_event_id': event_id,
+        })
+    assert json.loads(following[0][len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX):])['original_request'] == '完整原稿，保留來源。'
+
+
+@pytest.mark.parametrize('topic', ['2', '4641'])
+def test_active_callback_owns_lease_through_retry_reservation(tmp_path, monkeypatch, topic):
+    values = {
+        'HERMES_SESSION_PLATFORM': 'telegram', 'HERMES_SESSION_CHAT_ID': 'chat-1',
+        'HERMES_SESSION_THREAD_ID': topic, 'HERMES_SESSION_USER_ID': 'kj',
+        'HERMES_SESSION_KEY': f'agent:main:telegram:group:chat-1:{topic}',
+        'HERMES_SESSION_ID': 'grace-session-1', 'HERMES_SESSION_MESSAGE_ID': 'callback-retry',
+        'HERMES_SESSION_MESSAGE_TEXT': '[SYSTEM: Grace Loop callback]',
+        'HERMES_SESSION_INTERNAL': 'true',
+        'HERMES_GRACE_CALLBACK_LEASE_OWNER': 'root-source-lease',
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    registry = tmp_path / 'registry.yaml'
+    registry.write_text(registry.read_text().replace("thread_id: '2'", f"thread_id: '{topic}'").replace('topic:2/', f'topic:{topic}/'))
+    with kb.connect_closing(tmp_path / 'kanban.db') as conn:
+        objective_id, stage, _, _, review_id = _seed_root_source_blocker(
+            conn, source_text='完整原稿，保留來源。', values=values)
+        before = kb.get_grace_loop_callback(conn, review_id)
+    args = _nested_args()
+    args.update(original_request=values['HERMES_SESSION_MESSAGE_TEXT'], task_type='content_draft',
+        objective_ref={'objective_id': objective_id, 'stage_key': stage},
+        origin_callback_review_id=review_id, origin_callback_event_id=before['lease_event_id'],
+        origin_callback_board='default',
+        user_facing_delivery={'required': True, 'kind': 'content_package',
+            'delivery': 'inline_with_attachment', 'asset_filenames': ['source.png']})
+    args['goal']['objective'] = 'Prepare source-faithful content package'
+    args['scope']['allowed'] = ['Use original_request as SOURCE material']
+    args['verification']['checks'] = ['Compare against original source']
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+    result = json.loads(handle_clawops_delegate(args))
+    assert result['status'] == 'queued', result
+    with kb.connect_closing(tmp_path / 'kanban.db') as conn:
+        callback = kb.validate_active_grace_callback_origin(conn, review_task_id=review_id,
+            event_id=before['lease_event_id'],platform='telegram',chat_id='chat-1',thread_id=topic,
+            session_id='grace-session-1')
+        assert callback['lease_owner'] == 'root-source-lease'
+        assert callback['state'] == 'delivering'
+        row = kb.get_grace_delegation(conn, delegation_id=result['delegation_id'])
+        assert row['stage_key'] == stage + '_r2'
+        assert json.loads(row['contract_snapshot'])['objective_ref']['stage_key'] == row['stage_key']
+        assert row['state'] == 'queued'
+        recorded = kb.record_grace_loop_callback_outcome(conn, review_task_id=review_id,
+            event_id=before['lease_event_id'], platform='telegram', chat_id='chat-1', thread_id=topic,
+            session_id='grace-session-1',lease_owner='root-source-lease',outcome_kind='continued',
+            payload={'delegation_id': result['delegation_id'], 'execution_task_id': result['execution_task_id'],
+                'review_task_id': result['grace_review_task_id']})
+        assert recorded['outcome_kind'] == 'continued'
+
+
+@pytest.mark.parametrize('topic', ['4641', '2'])  # Historical failure and unrelated Topic.
+@pytest.mark.parametrize('successor_state,external_approval', [(s,False) for s in ['cancelled','superseded','queued','authorized','building']] + [('cancelled',True),('superseded',True)])
+@pytest.mark.parametrize('renew_first', [False, True])
+def test_approval_outcome_ignores_only_retired_successors(tmp_path, monkeypatch, topic, successor_state, external_approval, renew_first):
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'approval.db'))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        execution = kb.create_task(conn, title='accepted source')
+        _complete_with_run(conn, execution, summary='complete')
+        review = kb.create_task(conn, title='independent review', parents=(execution,))
+        _bind_callback_delegation(conn, execution_id=execution, review_id=review,
+                                  contract_fingerprint='a'*64, suffix='source')
+        conn.execute("UPDATE grace_delegations SET thread_id=? WHERE delegation_id='gd-source'", (topic,))
+        kb.add_grace_loop_callback(conn, review_task_id=review, execution_task_id=execution,
+            platform='telegram', chat_id='chat-1', thread_id=topic, session_key='session-key',
+            session_id='session-id', contract_fingerprint='a'*64)
+        _complete_with_run(conn, review, summary='accepted', metadata={'review_outcome':'accepted'})
+        event = kb.list_due_grace_loop_callbacks(conn)[0]['event_id']
+        assert kb.claim_grace_loop_callback(conn, review_task_id=review, event_id=event, lease_owner='owner')
+        challenge_args=dict(contract_fingerprint='b'*64,
+            request_instance_id='request', platform='telegram', chat_id='chat-1', thread_id=topic,
+            session_key='session-key', session_id='session-id', user_id_sha256='c'*64,
+            requested_message_id='message', action_summary='publish exact approved bytes',
+            approval_platform='Facebook', approval_scope='["exact artifact"]',
+            origin_review_task_id=review, origin_event_id=event, callback_lease_owner='owner')
+        challenge=kb.create_grace_approval_challenge(conn, **challenge_args)
+        _bind_callback_delegation(conn, execution_id='old-execution', review_id='old-review',
+                                  contract_fingerprint='d'*64, suffix='retired')
+        conn.execute("UPDATE grace_delegations SET state=?, origin_review_task_id=?, origin_event_id=?, thread_id=?, approval_required=? WHERE delegation_id='gd-retired'", (successor_state,review,event,topic,int(external_approval)))
+        before=dict(conn.execute("SELECT * FROM grace_delegations WHERE delegation_id='gd-retired'").fetchone())
+        allowed = successor_state in {'cancelled','superseded'} and not external_approval
+        if renew_first:
+            conn.execute('UPDATE grace_approval_challenges SET expires_at=0 WHERE token=?', (challenge['token'],))
+            if allowed:
+                renewed=kb.create_grace_approval_challenge(conn, **challenge_args)
+                assert renewed['token'] != challenge['token']
+                challenge=renewed
+            else:
+                with pytest.raises(ValueError, match='already authorized'):
+                    kb.create_grace_approval_challenge(conn, **challenge_args)
+                conn.execute('UPDATE grace_approval_challenges SET expires_at=? WHERE token=?', (int(time.time())+3600,challenge['token']))
+        args=dict(review_task_id=review,event_id=event,platform='telegram',chat_id='chat-1',thread_id=topic,
+            session_id='session-id',lease_owner='owner',outcome_kind='approval_blocked',payload={
+                'action':'publish exact approved bytes','platform':'Facebook','scope':['exact artifact'],
+                'exact_question':'核准 '+challenge['token']})
+        if allowed:
+            result=kb.record_grace_loop_callback_outcome(conn,**args)
+            assert result['outcome_kind']=='approval_blocked'
+            assert kb.finish_grace_loop_callback(conn, review_task_id=review,event_id=event,lease_owner='owner')
+        else:
+            with pytest.raises(ValueError, match='no queued continuation'):
+                kb.record_grace_loop_callback_outcome(conn,**args)
+        assert dict(conn.execute("SELECT * FROM grace_delegations WHERE delegation_id='gd-retired'").fetchone())==before
+        assert kb.get_grace_approval_challenge(conn,challenge['token'])['state']=='pending'
