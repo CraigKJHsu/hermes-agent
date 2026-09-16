@@ -190,6 +190,11 @@ def create_clawops_task(
         if normalized_contract is not None
         else ""
     )
+    if contract is None or not contract_fingerprint or not delegation_id.strip():
+        raise ValueError(
+            "Every ClawOps execution requires a validated Loop Contract and "
+            "reserved Grace delegation."
+        )
     hubops_envelope = _route_hubops_if_requested(
         clean_objective,
         enriched_source,
@@ -227,11 +232,6 @@ def create_clawops_task(
         else bool(hubops_envelope and route_requires_owner_approval(hubops_envelope))
     )
     delegation: Optional[dict[str, Any]] = None
-    if contract is None or not contract_fingerprint or not delegation_id.strip():
-        raise ValueError(
-            "Every ClawOps execution requires a validated Loop Contract and "
-            "reserved Grace delegation."
-        )
     with kb.connect_closing(board=board) as conn:
         delegation = kb.get_grace_delegation(
             conn, delegation_id=delegation_id,

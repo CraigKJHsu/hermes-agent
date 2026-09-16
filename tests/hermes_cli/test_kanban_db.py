@@ -26,6 +26,38 @@ from proactive.model_routing import (
 from proactive.policy_registry import create_policy_version
 
 
+def test_profile_capability_probe_uses_non_authorizing_marker(
+    tmp_path, monkeypatch,
+):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli: [hermes-cli]\nagent:\n  disabled_toolsets: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.normalize_profile_name", lambda value: value,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env", lambda _value: str(profile_home),
+    )
+    observed = {}
+
+    def probe(**kwargs):
+        observed.update(kwargs)
+        return {"ok": True, "available_tools": ["terminal"]}
+
+    monkeypatch.setattr(kb, "_probe_worker_capabilities", probe)
+
+    result = kb.probe_profile_callable_tools(
+        profile="clawops-dev", required_tools=["terminal"],
+    )
+
+    assert result["ok"] is True
+    assert observed["env"]["HERMES_KANBAN_TASK"] == "capability-probe"
+    assert observed["required_tools"] == ["terminal"]
+
+
 def _install_model_routing_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-policy"))
     source = (
@@ -153,6 +185,20 @@ def test_attachment_report_rebuild_preserves_explicit_incomplete_status(tmp_path
 
         assert report is not None
         assert report["complete"] is False
+        latest = kb.latest_run(conn, task_id)
+        malformed_metadata = dict(latest.metadata)
+        malformed_report = dict(malformed_metadata["user_facing_report"])
+        malformed_report["complete"] = "false"
+        malformed_metadata["user_facing_report"] = malformed_report
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(malformed_metadata), latest.id),
+        )
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(latest.metadata), latest.id),
+        )
         stored_image = next(
             attachment
             for attachment in kb.list_attachments(conn, task_id)
@@ -168,6 +214,163 @@ def test_attachment_report_rebuild_preserves_explicit_incomplete_status(tmp_path
             conn, task_id, filename=extra.name, stored_path=str(extra),
         )
         assert kb.grace_inline_content_package_report(conn, task_id) is None
+
+
+def test_attachment_report_rebuilds_declared_zip_and_image_package(tmp_path):
+    db_path = tmp_path / "mixed-attachment-report.db"
+    kb.init_db(db_path)
+    archive = tmp_path / "homepage.zip"
+    image = tmp_path / "homepage.png"
+    archive.write_bytes(b"verified homepage archive")
+    Image.new("RGB", (1200, 800), "green").save(image)
+    body = "完整首頁下載包與實際瀏覽器渲染圖。"
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "body_field": "delivery_summary",
+            "asset_filenames": [archive.name, image.name],
+        },
+    }
+    assets = [
+        {
+            "filename": path.name,
+            "label": path.name,
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in (archive, image)
+    ]
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Mixed attachment package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps(contract) + "\n```",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={
+                "artifacts": [str(archive), str(image)],
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": True,
+                    "title": "Verified homepage package",
+                    "body": body,
+                    "observed_at": int(time.time()),
+                    "assets": assets,
+                },
+            },
+        )
+
+        report = kb.grace_inline_content_package_report(conn, task_id)
+
+        assert report is not None
+        assert report["body"] == body
+        assert {asset["filename"] for asset in report["assets"]} == {
+            archive.name,
+            image.name,
+        }
+        stored_image = next(
+            attachment
+            for attachment in kb.list_attachments(conn, task_id)
+            if attachment.filename == image.name
+        )
+        opaque_image_path = Path(stored_image.stored_path).with_suffix(".blob")
+        Path(stored_image.stored_path).replace(opaque_image_path)
+        conn.execute(
+            "UPDATE task_attachments SET stored_path=? WHERE id=?",
+            (str(opaque_image_path), stored_image.id),
+        )
+        assert kb.grace_inline_content_package_report(conn, task_id) is not None
+        opaque_image_path.write_bytes(b"not-an-image")
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+        opaque_image_path.write_bytes(image.read_bytes())
+        assert kb.grace_inline_content_package_report(conn, task_id) is not None
+        stored_archive = next(
+            attachment
+            for attachment in kb.list_attachments(conn, task_id)
+            if attachment.filename == archive.name
+        )
+        Path(stored_archive.stored_path).write_bytes(b"changed after completion")
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+
+
+def test_legacy_attachment_report_rejects_non_utf8_markdown(tmp_path):
+    db_path = tmp_path / "legacy-invalid-markdown.db"
+    kb.init_db(db_path)
+    markdown = tmp_path / "package.md"
+    image = tmp_path / "hero.png"
+    markdown.write_bytes(b"\xff\xfe\x00")
+    Image.new("RGB", (1200, 800), "green").save(image)
+    contract = {
+        "routing": {"task_type": "content_draft"},
+        "external_targets": ["local://telegram-package"],
+    }
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Legacy package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps(contract)
+            + "\n```",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="legacy package",
+            metadata={"artifacts": [str(markdown), str(image)]},
+        )
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+
+
+def test_attachment_readback_rejects_oversized_image_dimensions(tmp_path):
+    db_path = tmp_path / "oversized-image-readback.db"
+    kb.init_db(db_path)
+    image = tmp_path / "too-wide.png"
+    Image.new("RGB", (kb._MAX_CONTENT_PACKAGE_IMAGE_EDGE + 1, 1), "green").save(image)
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "body_field": "acceptance_evidence.body",
+        "asset_filenames": [image.name],
+    }
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Oversized image",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps({"user_facing_delivery": delivery})
+            + "\n```",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={
+                "artifacts": [str(image)],
+                "acceptance_evidence": {"body": "body"},
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": True,
+                    "title": "Oversized image",
+                    "body": "body",
+                    "observed_at": int(time.time()),
+                    "assets": [{
+                        "filename": image.name,
+                        "label": "oversized",
+                        "path": str(image),
+                        "sha256": digest,
+                    }],
+                },
+            },
+        )
+        assert kb.grace_content_package_attachment_readback(conn, task_id) is None
 
 
 def test_kj_profile_historical_blocked_content_package_readback(tmp_path):
@@ -458,6 +661,46 @@ def _required_user_facing_report_body() -> str:
         '"subject_keys":["carimali","kolin","celestron"]}}',
         "```",
     ])
+
+
+def test_completion_preserves_controller_pinned_loop_contract(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Controller-pinned contract",
+            executor_backend="hermes",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="controller:test")
+        assert claimed is not None and claimed.current_run_id is not None
+        pinned = {
+            "identity": {"project": "ai_bizweek"},
+            "original_request": "exact source bytes",
+            "audit": {"original_request_sha256": "a" * 64},
+        }
+        assert kb.merge_active_run_metadata(
+            conn,
+            task_id,
+            expected_run_id=claimed.current_run_id,
+            metadata={"loop_contract": pinned},
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={
+                "loop_contract": {"original_request": "worker replacement"},
+                "worker_result": "accepted",
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+
+        completed = kb.latest_run(conn, task_id)
+        assert completed is not None
+        assert completed.metadata["loop_contract"] == pinned
+        assert completed.metadata["worker_result"] == "accepted"
 
 
 def test_delegation_token_rollup_combines_sessions_and_backend_usage(
@@ -773,6 +1016,240 @@ def test_callback_lease_renewal_and_outcome_are_owner_fenced(tmp_path):
             )
 
 
+def test_fully_delivered_accepted_callback_can_retry_after_control_plane_repair(
+    tmp_path,
+):
+    db_path = tmp_path / "callback-control-plane-retry.db"
+    error = (
+        "Grace callback delivery failed: BehaviorProfileError: "
+        "behavior.kernel_migration_required: hermes_cli/kanban_db.py"
+    )
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="control-plane-retry",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        event_id = int(callback["event_id"])
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway-a",
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET user_report_event_id=?,"
+            "user_report_delivered_at=?,user_report_chunk_count=4,"
+            "user_report_next_chunk=4,user_report_total_chunks=4 "
+            "WHERE review_task_id=?",
+            (event_id, int(time.time()), review_id),
+        )
+        assert kb.escalate_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway-a",
+            error=error,
+        )
+        with pytest.raises(ValueError, match="fully delivered"):
+            kb.retry_delivered_grace_loop_callback_after_control_plane_repair(
+                conn,
+                review_task_id=review_id,
+                event_id=event_id,
+                expected_error="different failure",
+            )
+        assert kb.retry_delivered_grace_loop_callback_after_control_plane_repair(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            expected_error=error,
+        )
+        recovered = kb.get_grace_loop_callback(conn, review_id)
+        events = kb.list_events(conn, review_id)
+
+    assert recovered["state"] == "pending"
+    assert recovered["attempts"] == 0
+    assert recovered["last_error"] is None
+    assert events[-1].kind == "callback_delivery_retry_requested"
+
+
+def test_authenticated_same_lane_reply_resumes_session_reset_callback(tmp_path):
+    db_path = tmp_path / "callback-session-reset-resume.db"
+    objective_id = "go_ext_1234567890abcdef12345678"
+    stage_key = "package_schema_relay_example_r39"
+    error = (
+        "origin session changed; handoff notice delivered, "
+        "continuation remains unverified"
+    )
+    with kb.connect_closing(db_path) as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id=objective_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            title="Publish",
+            objective="Prepare then preflight",
+            original_request_sha256="a" * 64,
+            required_stage_keys=[stage_key, "page_preflight"],
+            terminal_stage_key="page_preflight",
+            acceptance_criteria=["preflight verified"],
+            current_stage_key=stage_key,
+        )
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="session-reset-resume",
+        )
+        delegation_id = conn.execute(
+            "SELECT delegation_id FROM grace_delegations WHERE review_task_id=?",
+            (review_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key=? "
+            "WHERE delegation_id=?",
+            (objective_id, stage_key, delegation_id),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id=objective_id,
+            stage_key=stage_key,
+            delegation_id=delegation_id,
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="old-session",
+            contract_fingerprint="e" * 64,
+            completion_mode="intermediate",
+            objective_id=objective_id,
+            stage_key=stage_key,
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        event_id = int(callback["event_id"])
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway-a",
+        )
+        assert kb.record_grace_loop_delivery_attempt(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway-a",
+        ) == 1
+        assert kb.escalate_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway-a",
+            error=error,
+        )
+
+        with pytest.raises(ValueError, match="same authenticated user"):
+            kb.resume_session_reset_grace_loop_callback(
+                conn,
+                review_task_id=review_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                user_id="intruder",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id="new-session",
+            )
+        with pytest.raises(ValueError, match="another chat or topic"):
+            kb.resume_session_reset_grace_loop_callback(
+                conn,
+                review_task_id=review_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="other-topic",
+                user_id="kj",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id="new-session",
+            )
+        conn.execute("SAVEPOINT later_completion")
+        kb._append_event(
+            conn,
+            review_id,
+            "completed",
+            run_id=kb.latest_run(conn, review_id).id,
+        )
+        with pytest.raises(ValueError, match="no current accepted Grace review"):
+            kb.resume_session_reset_grace_loop_callback(
+                conn,
+                review_task_id=review_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                user_id="kj",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id="new-session",
+            )
+        conn.execute("ROLLBACK TO later_completion")
+        conn.execute("RELEASE later_completion")
+        resumed = kb.resume_session_reset_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="new-session",
+        )
+        stored = kb.get_grace_loop_callback(conn, review_id)
+        due = kb.list_due_grace_loop_callbacks(conn)
+        events = kb.list_events(conn, review_id)
+
+    assert resumed["objective_id"] == objective_id
+    assert resumed["stage_key"] == stage_key
+    assert resumed["event_id"] == event_id
+    assert stored["state"] == "pending"
+    assert stored["session_id"] == "new-session"
+    assert stored["last_error"] is None
+    assert [item["review_task_id"] for item in due] == [review_id]
+    assert events[-1].kind == "callback_session_resume_requested"
+
+
 def test_callback_uses_delegation_resolved_retry_stage(tmp_path):
     db_path = tmp_path / "callback-retry-stage.db"
     kb.init_db(db_path)
@@ -838,6 +1315,89 @@ def test_callback_uses_delegation_resolved_retry_stage(tmp_path):
         assert callback is not None
         assert callback["stage_key"] == "prepare_stage_r2"
         assert callback["completion_mode"] == "intermediate"
+
+
+def test_codex_local_callback_owner_is_default_and_self_heals_before_claim(tmp_path):
+    db_path = tmp_path / "codex-local-callback-owner.db"
+    callback_args = {
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "2",
+        "session_key": "codex:thread:01a093a0-fb45-76c0-ac50-65d451bd50c2",
+        "session_id": "codex-review-session",
+        "message_id": "codex-review-message",
+        "notifier_profile": "grace",
+        "contract_fingerprint": "e" * 64,
+    }
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(conn, title="review", parents=(execution_id,))
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            **callback_args,
+        )
+        assert kb.get_grace_loop_callback(conn, review_id)[
+            "notifier_profile"
+        ] == "default"
+
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET notifier_profile='grace' "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            **callback_args,
+        )
+        assert kb.get_grace_loop_callback(conn, review_id)[
+            "notifier_profile"
+        ] == "default"
+
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET notifier_profile='grace',attempts=1 "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            **callback_args,
+        )
+        assert kb.get_grace_loop_callback(conn, review_id)[
+            "notifier_profile"
+        ] == "grace"
+
+        second_review_id = kb.create_task(
+            conn, title="review without optional callback ids",
+            parents=(execution_id,),
+        )
+        optional_args = dict(callback_args)
+        optional_args.update(session_id="", message_id="")
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=second_review_id,
+            execution_task_id=execution_id,
+            **optional_args,
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET notifier_profile='grace' "
+            "WHERE review_task_id=?",
+            (second_review_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=second_review_id,
+            execution_task_id=execution_id,
+            **optional_args,
+        )
+        assert kb.get_grace_loop_callback(conn, second_review_id)[
+            "notifier_profile"
+        ] == "default"
 
 
 def test_callback_outcome_accepts_approved_review_metadata(tmp_path):
@@ -1003,6 +1563,17 @@ def test_policy_stale_review_block_does_not_reopen_completed_execution(tmp_path)
             suffix="policy-stale-review",
             claim_review=False,
         )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint=("policy-stale-review".encode().hex() + "0" * 64)[:64],
+        )
         review = kb.get_task(conn, review_id)
         assert review is not None
         assert review.status == "ready"
@@ -1020,7 +1591,7 @@ def test_policy_stale_review_block_does_not_reopen_completed_execution(tmp_path)
         assert execution.status == "done"
         assert execution.completed_at is not None
         assert review is not None
-        assert review.status == "todo"
+        assert review.status == "triage"
 
         event = conn.execute(
             "SELECT kind, payload FROM task_events "
@@ -1029,6 +1600,30 @@ def test_policy_stale_review_block_does_not_reopen_completed_execution(tmp_path)
         ).fetchone()
         assert event is not None
         assert json.loads(event["payload"])["mode"] == "policy_stale_review_snapshot"
+        terminal = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'block_loop_detected' ORDER BY id DESC LIMIT 1",
+            (review_id,),
+        ).fetchone()
+        assert terminal is not None
+        assert json.loads(terminal["payload"])["scope"] == "policy_stale_review_snapshot"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, review_id).status == "triage"
+        due = kb.list_due_grace_loop_callbacks(conn)
+        assert [row["event_id"] for row in due] == [terminal["id"]]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=terminal["id"],
+            lease_owner="policy-stale-delivery",
+        )
+        assert kb.finish_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=terminal["id"],
+            lease_owner="policy-stale-delivery",
+        )
+        assert kb.get_grace_loop_callback(conn, review_id)["state"] == "delivered"
 
 
 def test_callback_outcome_accepts_approved_review_evidence_metadata(tmp_path):
@@ -8527,21 +9122,105 @@ def test_write_txn_raises_on_truncated_file(tmp_path):
     conn = connect(db_path=db)
     # Get actual page size so we can fake a smaller file
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    original_getsize = os.path.getsize
+    original_fstat = os.fstat
 
-    def fake_getsize(path):
+    def fake_fstat(fd):
         # Return a size that implies at least 1 fewer page than header claims
-        real_size = original_getsize(path)
-        return max(0, real_size - page_size)
+        stat_result = original_fstat(fd)
+        return unittest.mock.Mock(
+            wraps=stat_result,
+            st_size=max(0, stat_result.st_size - page_size),
+        )
 
     with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
+        with unittest.mock.patch("hermes_cli.kanban_db.os.fstat", side_effect=fake_fstat):
             with write_txn(conn) as c:
                 c.execute(
                     "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
                     "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
                 )
+    assert conn.in_transaction is False
     conn.close()
+
+
+def test_file_length_check_accepts_concurrent_extend_between_header_and_size(tmp_path):
+    """A header/size pair from one concurrent extend must not look torn."""
+    from hermes_cli.kanban_db import _check_file_length_invariant
+
+    page_size = 4096
+    original_pages = 2
+    db = tmp_path / "growing.db"
+    contents = bytearray(original_pages * page_size)
+    contents[28:32] = original_pages.to_bytes(4, "big")
+    db.write_bytes(contents)
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class FakeConn:
+        in_transaction = False
+
+        def execute(self, sql):
+            if sql == "PRAGMA database_list":
+                return Result((0, "main", str(db)))
+            if sql == "PRAGMA page_size":
+                return Result((page_size,))
+            if sql == "BEGIN IMMEDIATE":
+                self.in_transaction = True
+                return Result(None)
+            if sql == "ROLLBACK":
+                self.in_transaction = False
+                return Result(None)
+            raise AssertionError(sql)
+
+    real_open = open
+    extended = False
+
+    class GrowingReader:
+        def __init__(self, file_obj):
+            self.file_obj = file_obj
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.file_obj.__exit__(*args)
+
+        def seek(self, *args):
+            return self.file_obj.seek(*args)
+
+        def read(self, size=-1):
+            nonlocal extended
+            if not extended and self.file_obj.tell() == 28:
+                extended = True
+                with real_open(db, "r+b") as writer:
+                    writer.seek(0, os.SEEK_END)
+                    writer.write(bytes(page_size))
+                    writer.seek(28)
+                    writer.write((original_pages + 1).to_bytes(4, "big"))
+                    writer.flush()
+            return self.file_obj.read(size)
+
+        def fileno(self):
+            return self.file_obj.fileno()
+
+    def growing_open(path, mode="r", *args, **kwargs):
+        file_obj = real_open(path, mode, *args, **kwargs)
+        if str(path) == str(db) and mode == "rb":
+            return GrowingReader(file_obj)
+        return file_obj
+
+    fake_conn = FakeConn()
+    with unittest.mock.patch("builtins.open", side_effect=growing_open):
+        _check_file_length_invariant(fake_conn)
+
+    assert extended is True
+    assert db.stat().st_size == (original_pages + 1) * page_size
+    assert fake_conn.in_transaction is False
 
 
 def test_write_txn_post_commit_check_fires_every_call(tmp_path):
@@ -8566,6 +9245,43 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
                     f"VALUES ('t_fire{i:02d}', 'task {i}', 'tester', 'todo', 0, 1234567890)"
                 )
     assert call_count == 3
+    conn.close()
+
+
+def test_post_commit_file_check_busy_does_not_report_committed_write_as_failed(
+    tmp_path,
+):
+    """A busy diagnostic reservation cannot turn commit success into failure."""
+    from hermes_cli.kanban_db import connect, write_txn
+    import hermes_cli.kanban_db as kanban_db_module
+
+    db = tmp_path / "busy-diagnostic.db"
+    conn = connect(db_path=db)
+    real_boundary = kanban_db_module._execute_boundary_with_retry
+    begin_calls = 0
+
+    def busy_after_commit(target, sql):
+        nonlocal begin_calls
+        if sql == "BEGIN IMMEDIATE":
+            begin_calls += 1
+            if begin_calls == 2:
+                raise sqlite3.OperationalError("database is locked")
+        return real_boundary(target, sql)
+
+    with unittest.mock.patch.object(
+        kanban_db_module,
+        "_execute_boundary_with_retry",
+        side_effect=busy_after_commit,
+    ):
+        with write_txn(conn) as c:
+            c.execute(
+                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                "VALUES ('t_busyok', 'committed', 'tester', 'todo', 0, 1234567890)"
+            )
+
+    assert conn.execute(
+        "SELECT title FROM tasks WHERE id='t_busyok'"
+    ).fetchone()["title"] == "committed"
     conn.close()
 
 
@@ -8845,14 +9561,21 @@ def test_grace_delegation_reservation_persists_contract_snapshot(tmp_path):
         assert json.loads(row["contract_snapshot"]) == contract
 
 
-@pytest.mark.parametrize("body_source", ["acceptance_evidence", "user_facing_report"])
+@pytest.mark.parametrize(
+    "body_source",
+    ["acceptance_evidence", "user_facing_report", "canonical_dotted_report"],
+)
 def test_attachment_report_delivers_structured_body_without_markdown(tmp_path, body_source):
     db_path = tmp_path / "structured-body.db"
     kb.init_db(db_path)
     image = tmp_path / "accepted.png"
     Image.new("RGB", (32, 18), "blue").save(image)
     body = "完整發布包\n\n正文與待確認內容。"
-    field = "inline_content_package" if body_source == "acceptance_evidence" else "body"
+    field = {
+        "acceptance_evidence": "inline_content_package",
+        "user_facing_report": "body",
+        "canonical_dotted_report": "metadata.user_facing_report.body",
+    }[body_source]
     contract = {"user_facing_delivery": {
         "required": True, "kind": "content_package",
         "delivery": "inline_with_attachment", "body_field": field,
@@ -8861,11 +9584,16 @@ def test_attachment_report_delivers_structured_body_without_markdown(tmp_path, b
     with kb.connect_closing(db_path) as conn:
         task_id = kb.create_task(conn, title="Delivery",
             body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n" + json.dumps(contract) + "\n```")
-        metadata = {"artifacts": [str(image)]}
+        artifacts = [str(image)]
+        if body_source == "canonical_dotted_report":
+            incidental_markdown = tmp_path / "incidental.md"
+            incidental_markdown.write_text("stale Markdown body")
+            artifacts.append(str(incidental_markdown))
+        metadata = {"artifacts": artifacts}
         if body_source == "acceptance_evidence":
             metadata[body_source] = {field: body}
         else:
-            metadata[body_source] = {
+            metadata["user_facing_report"] = {
                 "kind": "content_package", "delivery": "inline_with_attachment",
                 "complete": True, "title": "Original title", "body": body,
                 "observed_at": int(time.time()), "assets": [{
@@ -8886,6 +9614,230 @@ def test_attachment_report_delivers_structured_body_without_markdown(tmp_path, b
         assert kb.grace_inline_content_package_report(conn, task_id) is None
 
 
+def test_controller_page_relay_completion_owns_text_and_attachment(
+    kanban_home, monkeypatch,
+):
+    workspace = kanban_home / "relay-workspace"
+    handoff = workspace / ".hermes-controller-handoff"
+    handoff.mkdir(parents=True)
+    image = handoff / "page-hero.png"
+    Image.new("RGB", (160, 90), "blue").save(image)
+    message = "逐位元保留的 Page 正文。\n\n#案例"
+    message_bytes = message.encode("utf-8")
+    image_bytes = image.read_bytes()
+    bundle = {
+        "schema_version": "1.0",
+        "source_kind": "accepted_facebook_page_package",
+        "execution_task_id": "t_11111111",
+        "execution_run_id": 11,
+        "review_task_id": "t_22222222",
+        "review_run_id": 12,
+        "facebook_page_post": {
+            "text": message,
+            "sha256": hashlib.sha256(message_bytes).hexdigest(),
+            "utf8_bytes": len(message_bytes),
+            "source_field": "facebook_page_post.text",
+        },
+        "page_hero": {
+            "asset_family": "page_hero",
+            "filename": "original-hero.png",
+            "path": str(image),
+            "sha256": hashlib.sha256(image_bytes).hexdigest(),
+            "dimensions": "160×90",
+        },
+        "external_effects": [],
+    }
+    bundle_bytes = json.dumps(
+        bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    bundle_path = handoff / "accepted-page-source.json"
+    bundle_path.write_bytes(bundle_bytes)
+    receipt = {
+        "schema_version": "1.0",
+        "bundle_path": str(bundle_path),
+        "bundle_sha256": hashlib.sha256(bundle_bytes).hexdigest(),
+        "image_path": str(image),
+        "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "message_sha256": hashlib.sha256(message_bytes).hexdigest(),
+        "message_utf8_bytes": len(message_bytes),
+        "execution_task_id": "t_11111111",
+        "execution_run_id": 11,
+        "review_task_id": "t_22222222",
+        "review_run_id": 12,
+    }
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "body_field": "metadata.facebook_page_post.text",
+            "asset_filenames": ["page-hero.png"],
+        },
+    }
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+        + json.dumps(contract)
+        + "\n```"
+    )
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="Accepted Page relay", body=body)
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (
+                json.dumps({"worker_spawn": {"controller_source_handoff": receipt}}),
+                claimed.current_run_id,
+            ),
+        )
+        with pytest.raises(ValueError, match="artifacts conflict"):
+            kb._bind_controller_page_relay_completion(
+                conn,
+                task_id,
+                body,
+                {"artifacts": [str(workspace / "worker-selected.png")]},
+                claimed.current_run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.list_attachments(conn, task_id) == []
+
+        persist_verified = kb._persist_controller_completion_artifact_bytes
+
+        def replace_worker_file_before_persist(*args):
+            Image.new("RGB", (160, 90), "red").save(image)
+            return persist_verified(*args)
+
+        monkeypatch.setattr(
+            kb,
+            "_persist_controller_completion_artifact_bytes",
+            replace_worker_file_before_persist,
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="relay complete",
+            metadata={
+                "facebook_page_post": {
+                    "sha256": receipt["message_sha256"],
+                    "utf8_bytes": receipt["message_utf8_bytes"],
+                    "source_field": "facebook_page_post.text",
+                },
+                "page_hero": {
+                    "asset_family": "page_hero",
+                    "dimensions": "160x90",
+                    "sha256": receipt["image_sha256"],
+                },
+                "external_effects": [],
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+
+        run = kb.latest_run(conn, task_id)
+        attachments = kb.list_attachments(conn, task_id)
+        report = kb.grace_inline_content_package_report(conn, task_id)
+        readback = kb.grace_content_package_attachment_readback(conn, task_id)
+
+    assert run.metadata["facebook_page_post"]["text"] == message
+    assert run.metadata["controller_source_handoff_readback"]["message_utf8_bytes"] == len(message_bytes)
+    assert len(attachments) == 1 and attachments[0].filename == "page-hero.png"
+    assert Path(attachments[0].stored_path).read_bytes() == image_bytes
+    assert image.read_bytes() != image_bytes
+    assert run.metadata["attachment_manifest"] == [{
+        "filename": "page-hero.png",
+        "sha256": receipt["image_sha256"],
+        "size": len(image_bytes),
+    }]
+    assert report is not None and report["body"] == message
+    assert readback is not None and readback["canonical_asset_count"] == 1
+
+
+def test_full_package_readback_ignores_materialized_markdown_trailing_newline(tmp_path):
+    db_path = tmp_path / "full-package.db"
+    kb.init_db(db_path)
+    page = tmp_path / "page.png"
+    audio = tmp_path / "audio.png"
+    Image.new("RGB", (1600, 900), "blue").save(page)
+    Image.new("RGB", (1200, 1200), "green").save(audio)
+    sections = (
+        ("Facebook Page 貼文", "Page body"),
+        ("Facebook Group 討論附文", "Group body"),
+        ("Gemini Notebook Audio Generation Prompt", "Gemini body"),
+        ("Podcast Title", "Podcast title"),
+        ("Podcast Description", "Podcast description"),
+    )
+    body = "\n\n".join(
+        f"## {index}. {heading}\n\n{value}"
+        for index, (heading, value) in enumerate(sections, 1)
+    )
+    assets = [
+        (page, "page_hero", 1600, 900),
+        (audio, "audio_brief", 1200, 1200),
+    ]
+    report_assets = [{
+        "filename": path.name,
+        "label": family,
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    } for path, family, _, _ in assets]
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "body_field": "acceptance_evidence.inline_content_package",
+        "asset_filenames": [page.name, audio.name],
+    }
+    markdown = tmp_path / "package.md"
+    markdown.write_text(body + "\n", encoding="utf-8")
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Full package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps({"user_facing_delivery": delivery})
+            + "\n```",
+        )
+        assert kb.complete_task(conn, task_id, metadata={
+            "artifacts": [str(markdown), str(page), str(audio)],
+            "acceptance_evidence": {
+                "inline_content_package": body + "\n",
+                "asset_manifest": [{
+                    **report_asset,
+                    "asset_family": family,
+                    "width": width,
+                    "height": height,
+                } for report_asset, (_, family, width, height)
+                in zip(report_assets, assets)],
+            },
+            "user_facing_report": {
+                "kind": "content_package",
+                "delivery": "inline_with_attachment",
+                "complete": False,
+                "title": "Full package",
+                "body": body,
+                "observed_at": int(time.time()),
+                "assets": report_assets,
+            },
+            "policy_receipts": [{
+                "role": "execution",
+                "policy_id": "ai-bizweek-brand-channel",
+                "version": "1",
+                "sha256": "a" * 64,
+                "loaded": True,
+            }],
+            "external_effects": [],
+        })
+
+        rebuilt = kb.grace_inline_content_package_report(conn, task_id)
+
+    assert rebuilt["package_kind"] == "full_publication_package"
+    assert rebuilt["complete"] is True
+    assert rebuilt["body"] == body
+    assert [(asset["width"], asset["height"]) for asset in rebuilt["assets"]] == [
+        (1600, 900), (1200, 1200),
+    ]
+
+
 @pytest.mark.parametrize("raw_body", [None, "", 123, {"text": "untyped"}, "x" * 81000])
 def test_attachment_report_rejects_missing_or_invalid_structured_body(tmp_path, raw_body):
     db_path = tmp_path / "invalid-body.db"
@@ -8902,4 +9854,34 @@ def test_attachment_report_rejects_missing_or_invalid_structured_body(tmp_path, 
         assert kb.complete_task(conn, task_id, metadata={
             "artifacts": [str(image)], "acceptance_evidence": {"inline_content_package": raw_body},
         })
+        assert kb.grace_inline_content_package_report(conn, task_id) is None
+
+
+def test_attachment_report_does_not_fallback_when_canonical_dotted_body_is_missing(
+    tmp_path,
+):
+    db_path = tmp_path / "missing-canonical-body.db"
+    kb.init_db(db_path)
+    image = tmp_path / "accepted.png"
+    markdown = tmp_path / "stale.md"
+    Image.new("RGB", (32, 18), "blue").save(image)
+    markdown.write_text("stale Markdown body")
+    contract = {"user_facing_delivery": {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "body_field": "metadata.user_facing_report.body",
+        "asset_filenames": [image.name],
+    }}
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Missing canonical body",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+            + json.dumps(contract)
+            + "\n```",
+        )
+        assert kb.complete_task(
+            conn, task_id, metadata={"artifacts": [str(image), str(markdown)]},
+        )
         assert kb.grace_inline_content_package_report(conn, task_id) is None

@@ -140,7 +140,15 @@ def _external_listing_args():
     return args
 
 
-def _configure_secondhand_context(tmp_path, monkeypatch, values):
+def _configure_secondhand_context(
+    tmp_path,
+    monkeypatch,
+    values,
+    *,
+    topic_name="二手拍賣",
+    project="secondhand_commerce",
+    memory_namespace="topic:2/secondhand",
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-policy"))
     policy_source = (
         Path(__file__).resolve().parents[2]
@@ -160,8 +168,8 @@ def _configure_secondhand_context(tmp_path, monkeypatch, values):
     registry.write_text(
         "version: 1\ncontexts:\n"
         "  - platform: telegram\n    chat_id: chat-1\n    thread_id: '2'\n"
-        "    topic_name: 二手拍賣\n    project: secondhand_commerce\n"
-        "    memory_namespace: topic:2/secondhand\n",
+        f"    topic_name: {topic_name}\n    project: {project}\n"
+        f"    memory_namespace: {memory_namespace}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
@@ -336,6 +344,8 @@ def _seed_root_source_blocker(
     values,
     requested_by="authenticated_user",
     acceptance_asset=None,
+    user_facing_delivery=None,
+    project="secondhand_commerce",
 ):
     objective_id = "go_ext_" + "c" * 24
     stage_key = "repair_audio_brief_episode_07"
@@ -343,7 +353,7 @@ def _seed_root_source_blocker(
         "platform": "telegram",
         "chat_id": "chat-1",
         "thread_id": values.get("HERMES_SESSION_THREAD_ID", "2"),
-        "project": "secondhand_commerce",
+        "project": project,
         "requested_by": requested_by,
         "compiled_by": "Grace",
     }
@@ -355,11 +365,11 @@ def _seed_root_source_blocker(
         "verification": {"checks": ["Compare against the original source"]},
         "objective_ref": {"objective_id": objective_id, "stage_key": stage_key},
     }
-    digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
-    worker_contract = {
-        **snapshot,
-        "audit": {"original_request_sha256": digest},
-    }
+    if user_facing_delivery is not None:
+        snapshot["user_facing_delivery"] = dict(user_facing_delivery)
+    from proactive.grace_task_compiler import _worker_safe_contract
+
+    worker_contract = _worker_safe_contract(snapshot)
     kb.create_grace_objective(
         conn,
         objective_id=objective_id,
@@ -406,7 +416,7 @@ def _seed_root_source_blocker(
         title="root source execution",
         body=body,
         executor_backend="openclaw",
-        project_namespace="secondhand_commerce",
+        project_namespace=project,
     )
     assert kb.claim_task(conn, execution_id, claimer="root-source-worker") is not None
     source_run = kb.latest_run(conn, execution_id)
@@ -425,7 +435,7 @@ def _seed_root_source_blocker(
         title="root source review",
         body="GRACE_LOOP_CONTRACT_STAGE: review",
         parents=(execution_id,),
-        project_namespace="secondhand_commerce",
+        project_namespace=project,
     )
     kb.add_grace_loop_callback(
         conn,
@@ -1435,6 +1445,105 @@ def test_objective_source_handoff_fails_closed_on_broken_lineage(
             )
 
 
+def test_objective_source_handoff_recovers_legacy_controller_sealed_contract(
+    tmp_path,
+):
+    values = {
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_GRACE_CALLBACK_LEASE_OWNER": "legacy-source-lease",
+    }
+    source_text = "Exact source retained by the controller"
+    with kb.connect_closing(tmp_path / "legacy-source-lineage.db") as conn:
+        objective_id, execution_id, source_run_id, review_id, _callback = (
+            _seed_source_bound_callback(
+                conn,
+                source_text=source_text,
+                values=values,
+            )
+        )
+        source_run = kb.get_run(conn, source_run_id)
+        source_contract = dict(source_run.metadata["loop_contract"])
+        source_contract["identity"] = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "2",
+            "project": "secondhand_commerce",
+            "requested_by": "codex_local_operator",
+            "compiled_by": "Grace",
+        }
+        snapshot = {
+            key: value for key, value in source_contract.items() if key != "audit"
+        }
+        conn.execute(
+            "UPDATE tasks SET body=? WHERE id=?",
+            (
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+                + json.dumps(source_contract)
+                + "\n```",
+                execution_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET contract_snapshot=? "
+            "WHERE execution_task_id=?",
+            (json.dumps(snapshot), execution_id),
+        )
+        legacy_metadata = dict(source_run.metadata)
+        legacy_metadata.pop("loop_contract")
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(legacy_metadata), source_run_id),
+        )
+        review_run = kb.latest_run(conn, review_id)
+        review_metadata = dict(review_run.metadata)
+        review_metadata["workflow_review_source"][
+            "parent_execution_evidence_sha256"
+        ] = kb.workflow_review_evidence_hash(kb.get_run(conn, source_run_id))
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(review_metadata), review_run.id),
+        )
+
+        from plugins.openclaw_bridge.clawops_delegate import (
+            _OBJECTIVE_SOURCE_PACKAGE_PREFIX,
+            _objective_source_handoff,
+        )
+
+        package = _objective_source_handoff(
+            conn,
+            {
+                "identity": {
+                    "platform": "telegram",
+                    "chat_id": "chat-1",
+                    "thread_id": "2",
+                    "project": "secondhand_commerce",
+                },
+                "original_request": "[SYSTEM: Grace Loop callback] event",
+                "grace_interpretation": "Preserve the original source faithfully.",
+                "goal": {"objective": "Create a source-faithful package"},
+                "scope": {"allowed": ["Use original_request as SOURCE material"]},
+                "verification": {"checks": ["Compare against original source"]},
+                "memory": {"working": []},
+                "objective_ref": {
+                    "objective_id": objective_id,
+                    "stage_key": "prepare_source",
+                },
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "asset_filenames": ["source.png"],
+                },
+            },
+            {"execution_task_id": execution_id, "review_task_id": review_id},
+        )[0]
+
+    payload = json.loads(package[len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX) :])
+    assert payload["original_request"] == source_text
+    assert payload["run_id"] == source_run_id
+
+
 def test_objective_source_handoff_adds_only_hash_verified_reviewed_assets(
     tmp_path,
     monkeypatch,
@@ -1524,6 +1633,328 @@ def test_objective_source_handoff_adds_only_hash_verified_reviewed_assets(
     payload = json.loads(package[len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX) :])
     assert payload["assets"] == [
         {"path": str(asset.resolve()), "sha256": asset_sha}
+    ]
+
+
+def test_reviewed_source_assets_reject_distinct_same_name_identities():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _unique_reviewed_asset_source,
+    )
+
+    repeated = [
+        ("exec-a", "run-a", [{"path": "/controlled/accepted.png", "sha256": "a" * 64}]),
+        ("exec-b", "run-b", [{"path": "/controlled/accepted.png", "sha256": "a" * 64}]),
+    ]
+    assert _unique_reviewed_asset_source(repeated, {"accepted.png"}) == (
+        "exec-a",
+        "run-a",
+    )
+    with pytest.raises(ValueError, match="ambiguous accepted asset identities"):
+        _unique_reviewed_asset_source(
+            [
+                *repeated,
+                (
+                    "exec-c",
+                    "run-c",
+                    [{"path": "/controlled/accepted.png", "sha256": "b" * 64}],
+                ),
+            ],
+            {"accepted.png"},
+        )
+
+
+def test_reviewed_source_asset_manifest_combines_exact_names_across_stages():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _unique_reviewed_asset_manifest,
+    )
+
+    page = {"path": "/controlled/page.png", "sha256": "a" * 64}
+    audio = {"path": "/controlled/audio.png", "sha256": "b" * 64}
+    resolved = _unique_reviewed_asset_manifest(
+        [
+            ("exec-audio", {"id": 12}, [audio]),
+            ("exec-page", {"id": 11}, [page]),
+            ("exec-page-repeat", {"id": 10}, [page]),
+            ("exec-typo", {"id": 9}, [
+                {"path": "/controlled/page-typo.png", "sha256": "c" * 64}
+            ]),
+        ],
+        {"page.png", "audio.png"},
+    )
+
+    assert resolved == (
+        [audio, page],
+        [("exec-audio", {"id": 12}), ("exec-page", {"id": 11})],
+    )
+    with pytest.raises(ValueError, match="ambiguous accepted asset identities"):
+        _unique_reviewed_asset_manifest(
+            [
+                ("exec-page-a", {"id": 1}, [page]),
+                (
+                    "exec-page-b",
+                    {"id": 2},
+                    [{"path": "/other/page.png", "sha256": "d" * 64}],
+                ),
+            ],
+            {"page.png"},
+        )
+
+
+def test_reviewed_source_asset_manifest_maps_family_to_canonical_filename():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _unique_reviewed_asset_manifest,
+    )
+
+    page = {
+        "path": "/controlled/generated-page-uuid.png",
+        "sha256": "a" * 64,
+        "asset_family": "page_hero",
+    }
+    audio = {
+        "path": "/controlled/generated-audio-uuid.png",
+        "sha256": "b" * 64,
+        "asset_family": "audio_brief",
+    }
+
+    assert _unique_reviewed_asset_manifest(
+        [("exec", {"id": 1}, [page, audio])],
+        {
+            "DPR_Construction_EP09_Page_Hero_16x9.png",
+            "DPR_Construction_EP09_Audio_Brief_1x1.png",
+        },
+    ) == (
+        [
+            {"path": audio["path"], "sha256": audio["sha256"]},
+            {"path": page["path"], "sha256": page["sha256"]},
+        ],
+        [("exec", {"id": 1})],
+    )
+    assert _unique_reviewed_asset_manifest(
+        [
+            (
+                "exec",
+                {"id": 1},
+                [
+                    {
+                        "path": "/controlled/cover.png",
+                        "sha256": "c" * 64,
+                        "asset_family": "cover",
+                    },
+                    {
+                        "path": "/controlled/image-1.png",
+                        "sha256": "d" * 64,
+                        "asset_family": "image_1",
+                    },
+                ],
+            )
+        ],
+        {"discover.png", "image_10.png"},
+    ) is None
+
+
+def test_reviewed_source_asset_manifest_uses_readable_canonical_path(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _reviewed_source_asset_manifest,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    generated = tmp_path / ".openclaw" / "media" / "tool-image-generation"
+    generated.mkdir(parents=True)
+    canonical = generated / "accepted-page.png"
+    canonical.write_bytes(b"accepted page pixels")
+    digest = hashlib.sha256(canonical.read_bytes()).hexdigest()
+
+    assert _reviewed_source_asset_manifest(
+        {
+            "acceptance_evidence": {
+                "pageHero": {
+                    "path": str(generated / "stale-worker-path.png"),
+                    "canonicalPath": str(canonical),
+                    "sha256": digest,
+                }
+            }
+        }
+    ) == [{"path": str(canonical), "sha256": digest}]
+
+
+def test_callback_source_handoff_combines_reviewed_assets_across_stages(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_GRACE_CALLBACK_LEASE_OWNER": "split-asset-lease",
+    }
+    monkeypatch.setenv("HOME", str(tmp_path))
+    generated = (
+        tmp_path / ".openclaw" / "media" / "tool-image-generation"
+    )
+    generated.mkdir(parents=True)
+    page = generated / "page.png"
+    audio = generated / "audio.png"
+    page.write_bytes(b"accepted page")
+    audio.write_bytes(b"accepted audio")
+    page_sha = hashlib.sha256(page.read_bytes()).hexdigest()
+    audio_sha = hashlib.sha256(audio.read_bytes()).hexdigest()
+    source_text = "Exact manuscript with separately reviewed assets."
+
+    with kb.connect_closing(tmp_path / "split-assets.db") as conn:
+        objective_id, root_execution, root_run_id, root_review, root_callback = (
+            _seed_source_bound_callback(
+                conn,
+                source_text=source_text,
+                values=values,
+            )
+        )
+        root_run = kb.get_run(conn, root_run_id)
+        root_metadata = dict(root_run.metadata)
+        root_metadata["acceptance_evidence"] = {
+            "page": {"path": str(page), "sha256": page_sha}
+        }
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(root_metadata), root_run_id),
+        )
+        root_review_run = kb.latest_run(conn, root_review)
+        root_review_metadata = dict(root_review_run.metadata)
+        root_review_metadata["workflow_review_source"][
+            "parent_execution_evidence_sha256"
+        ] = kb.workflow_review_evidence_hash(kb.get_run(conn, root_run_id))
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(root_review_metadata), root_review_run.id),
+        )
+
+        correction_execution = kb.create_task(
+            conn,
+            title="audio-only correction",
+            project_namespace="secondhand_commerce",
+        )
+        correction_contract = {
+            "identity": {"project": "secondhand_commerce"},
+            "original_request": "[SYSTEM: Grace Loop callback] audio correction",
+            "audit": {
+                "original_request_sha256": hashlib.sha256(
+                    b"[SYSTEM: Grace Loop callback] audio correction"
+                ).hexdigest()
+            },
+        }
+        _complete_with_run(
+            conn,
+            correction_execution,
+            summary="audio corrected",
+            metadata={
+                "loop_contract": correction_contract,
+                "acceptance_evidence": {
+                    "audio": {"path": str(audio), "sha256": audio_sha}
+                },
+            },
+        )
+        correction_run = kb.latest_run(conn, correction_execution)
+        correction_review = kb.create_task(
+            conn,
+            title="audio correction review",
+            parents=(correction_execution,),
+            project_namespace="secondhand_commerce",
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=correction_execution,
+            review_id=correction_review,
+            contract_fingerprint="e" * 64,
+            suffix="split-asset-correction",
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key='deliver',"
+            "origin_review_task_id=?,origin_event_id=? "
+            "WHERE delegation_id='gd-split-asset-correction'",
+            (objective_id, root_review, root_callback["event_id"]),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=correction_review,
+            execution_task_id=correction_execution,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key=values["HERMES_SESSION_KEY"],
+            session_id=values["HERMES_SESSION_ID"],
+            contract_fingerprint="e" * 64,
+            objective_id=objective_id,
+            stage_key="deliver",
+        )
+        _complete_with_run(
+            conn,
+            correction_review,
+            summary="accepted",
+            metadata={
+                "review_outcome": "accepted",
+                "workflow_review_source": {
+                    "parent_execution_task_id": correction_execution,
+                    "parent_execution_run_id": correction_run.id,
+                    "parent_execution_evidence_sha256": (
+                        kb.workflow_review_evidence_hash(correction_run)
+                    ),
+                },
+            },
+        )
+        correction_callback = next(
+            row
+            for row in kb.list_due_grace_loop_callbacks(conn)
+            if row["review_task_id"] == correction_review
+        )
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=correction_review,
+            event_id=correction_callback["event_id"],
+            lease_owner="split-correction-lease",
+        )
+
+        from plugins.openclaw_bridge.clawops_delegate import (
+            _OBJECTIVE_SOURCE_PACKAGE_PREFIX,
+            _objective_source_handoff,
+        )
+
+        package = _objective_source_handoff(
+            conn,
+            {
+                "identity": {
+                    "platform": "telegram",
+                    "chat_id": "chat-1",
+                    "thread_id": "2",
+                    "project": "secondhand_commerce",
+                },
+                "grace_interpretation": "Preserve the reviewed source.",
+                "goal": {"objective": "Deliver the complete package"},
+                "scope": {"allowed": ["Use reviewed source assets"]},
+                "verification": {"checks": ["Verify both assets"]},
+                "memory": {"working": []},
+                "objective_ref": {
+                    "objective_id": objective_id,
+                    "stage_key": "deliver",
+                },
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "asset_filenames": ["page.png", "audio.png"],
+                },
+            },
+            {
+                "execution_task_id": correction_execution,
+                "review_task_id": correction_review,
+            },
+        )[0]
+
+    payload = json.loads(package[len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX) :])
+    assert payload["original_request"] == source_text
+    assert payload["assets"] == [
+        {"path": str(audio.resolve()), "sha256": audio_sha},
+        {"path": str(page.resolve()), "sha256": page_sha},
     ]
 
 
@@ -1720,6 +2151,546 @@ def test_objective_source_handoff_uses_sealed_authenticated_root_without_assets(
     assert "assets" not in payload
 
 
+@pytest.mark.parametrize(
+    "direct_requested_by",
+    ["authenticated_user", "codex_local_operator"],
+)
+def test_objective_source_handoff_recovers_authenticated_root_across_direct_stage(
+    tmp_path,
+    monkeypatch,
+    direct_requested_by,
+):
+    values = {
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+    }
+    source_text = "Exact Objective manuscript across a direct correction stage."
+    monkeypatch.setenv("HOME", str(tmp_path))
+    asset = (
+        tmp_path / ".openclaw" / "media" / "tool-image-generation" / "accepted.png"
+    )
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"accepted direct-stage image")
+    asset_sha = hashlib.sha256(asset.read_bytes()).hexdigest()
+    with kb.connect_closing(tmp_path / "direct-stage-source.db") as conn:
+        objective_id, _stage_key, root_execution, source_run_id, root_review = (
+            _seed_root_source_blocker(
+                conn,
+                source_text=source_text,
+                values=values,
+            )
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id,kind,created_at) "
+            "VALUES (?,'completed',999999)",
+            (root_review,),
+        )
+        execution_id = kb.create_task(
+            conn,
+            title="direct correction execution",
+            project_namespace="secondhand_commerce",
+        )
+        assert kb.claim_task(conn, execution_id, claimer="direct-worker") is not None
+        direct_run = kb.latest_run(conn, execution_id)
+        assert direct_run is not None
+        direct_contract = {
+            "identity": {"project": "secondhand_commerce"},
+            "original_request": "Continue the accepted visual correction.",
+            "audit": {
+                "original_request_sha256": hashlib.sha256(
+                    b"Continue the accepted visual correction."
+                ).hexdigest()
+            },
+        }
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            metadata={
+                "loop_contract": direct_contract,
+                "acceptance_evidence": {
+                    "accepted_asset": {
+                        "path": str(asset),
+                        "sha256": asset_sha,
+                    }
+                },
+            },
+            expected_run_id=direct_run.id,
+        )
+        completed_direct_run = kb.get_run(conn, direct_run.id)
+        review_id = kb.create_task(
+            conn,
+            title="direct correction review",
+            parents=(execution_id,),
+            project_namespace="secondhand_commerce",
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=execution_id,
+            review_id=review_id,
+            contract_fingerprint="e" * 64,
+            suffix="direct-source",
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key='deliver' "
+            "WHERE execution_task_id=?",
+            (objective_id, execution_id),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key=values["HERMES_SESSION_KEY"],
+            session_id=values["HERMES_SESSION_ID"],
+            contract_fingerprint="e" * 64,
+            objective_id=objective_id,
+            stage_key="deliver",
+        )
+        assert kb.claim_task(conn, review_id, claimer="direct-reviewer") is not None
+        assert kb.complete_task(
+            conn,
+            review_id,
+            metadata={
+                "review_outcome": "accepted",
+                "workflow_review_source": {
+                    "parent_execution_task_id": execution_id,
+                    "parent_execution_run_id": direct_run.id,
+                    "parent_execution_evidence_sha256": (
+                        kb.workflow_review_evidence_hash(completed_direct_run)
+                    ),
+                },
+            },
+        )
+        callback = next(
+            row
+            for row in kb.list_due_grace_loop_callbacks(conn)
+            if row["review_task_id"] == review_id
+        )
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="direct-source-lease",
+        )
+        from plugins.openclaw_bridge.clawops_delegate import (
+            _OBJECTIVE_SOURCE_PACKAGE_PREFIX,
+            _objective_source_handoff,
+        )
+
+        handoff_contract = {
+            "identity": {
+                "platform": "telegram",
+                "chat_id": "chat-1",
+                "thread_id": "2",
+                "project": "secondhand_commerce",
+            },
+            "grace_interpretation": "Preserve the original source faithfully.",
+            "goal": {"objective": "Create a source-faithful package"},
+            "scope": {"allowed": ["Use original_request as SOURCE material"]},
+            "verification": {"checks": ["Compare against original source"]},
+            "memory": {"working": []},
+            "objective_ref": {
+                "objective_id": objective_id,
+                "stage_key": "deliver",
+            },
+            "user_facing_delivery": {
+                "required": True,
+                "kind": "content_package",
+                "delivery": "inline_with_attachment",
+                "asset_filenames": ["accepted.png"],
+            },
+        }
+
+        from proactive.grace_task_compiler import _worker_safe_contract
+
+        def blocked_stage(
+            stage_key,
+            suffix,
+            original_request,
+            *,
+            requested_by,
+            origin_review_id="",
+            origin_event_id=None,
+            source_package="",
+            persist_runtime_contract=True,
+        ):
+            snapshot = {
+                "identity": {
+                    "platform": "telegram",
+                    "chat_id": "chat-1",
+                    "thread_id": "2",
+                    "project": "secondhand_commerce",
+                    "requested_by": requested_by,
+                    "compiled_by": "Grace",
+                },
+                "original_request": original_request,
+                "goal": {"objective": "Continue the approved correction"},
+                "scope": {"allowed": ["Continue the approved correction"]},
+                "verification": {"checks": ["Keep the Objective lineage intact"]},
+                "memory": {"working": [source_package] if source_package else []},
+                "objective_ref": {
+                    "objective_id": objective_id,
+                    "stage_key": stage_key,
+                },
+            }
+            if source_package:
+                snapshot["grace_interpretation"] = (
+                    "Preserve the original source faithfully."
+                )
+                snapshot["scope"] = {
+                    "allowed": ["Use original_request as SOURCE material"]
+                }
+                snapshot["user_facing_delivery"] = dict(
+                    handoff_contract["user_facing_delivery"]
+                )
+            worker_contract = _worker_safe_contract(snapshot)
+            blocked_execution = kb.create_task(
+                conn,
+                title=f"{stage_key} execution",
+                body=(
+                    "GRACE_LOOP_CONTRACT_STAGE: execution\n\n```json\n"
+                    + json.dumps(worker_contract, ensure_ascii=False, sort_keys=True)
+                    + "\n```"
+                ),
+                project_namespace="secondhand_commerce",
+            )
+            assert kb.claim_task(
+                conn, blocked_execution, claimer=f"{stage_key}-worker"
+            ) is not None
+            blocked_review = kb.create_task(
+                conn,
+                title=f"{stage_key} review",
+                parents=(blocked_execution,),
+                project_namespace="secondhand_commerce",
+            )
+            _bind_callback_delegation(
+                conn,
+                execution_id=blocked_execution,
+                review_id=blocked_review,
+                contract_fingerprint=suffix * 64,
+                suffix=suffix,
+            )
+            conn.execute(
+                "UPDATE grace_delegations SET objective_id=?,stage_key=?,"
+                "contract_snapshot=?,origin_review_task_id=?,origin_event_id=? "
+                "WHERE execution_task_id=?",
+                (
+                    objective_id,
+                    stage_key,
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    origin_review_id or None,
+                    origin_event_id,
+                    blocked_execution,
+                ),
+            )
+            kb.add_grace_loop_callback(
+                conn,
+                review_task_id=blocked_review,
+                execution_task_id=blocked_execution,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_key=values["HERMES_SESSION_KEY"],
+                session_id=values["HERMES_SESSION_ID"],
+                contract_fingerprint=suffix * 64,
+                objective_id=objective_id,
+                stage_key=stage_key,
+            )
+            blocked_run = kb.latest_run(conn, blocked_execution)
+            assert blocked_run is not None
+            blocked_metadata = dict(blocked_run.metadata)
+            if persist_runtime_contract:
+                blocked_metadata["loop_contract"] = worker_contract
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (
+                    json.dumps(
+                        blocked_metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    blocked_run.id,
+                ),
+            )
+            assert kb.block_task(
+                conn,
+                blocked_execution,
+                reason="source package dependency unavailable",
+                kind="capability",
+                expected_run_id=blocked_run.id,
+            )
+            event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND kind='blocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (blocked_execution,),
+            ).fetchone()
+            assert event is not None
+            callback = {
+                "execution_task_id": blocked_execution,
+                "review_task_id": blocked_review,
+                "source_event_id": int(event["id"]),
+            }
+            return blocked_execution, blocked_review, callback
+
+        root_source_package = (
+            _OBJECTIVE_SOURCE_PACKAGE_PREFIX
+            + json.dumps(
+                {
+                    "objective_id": objective_id,
+                    "execution_task_id": root_execution,
+                    "run_id": source_run_id,
+                    "original_request": source_text,
+                    "utf8_sha256": hashlib.sha256(
+                        source_text.encode("utf-8")
+                    ).hexdigest(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        correction_execution, correction_review, correction_callback = blocked_stage(
+            "repair_package_schema_r20",
+            "g",
+            "Use the accepted image and repair the package schema.",
+            requested_by=direct_requested_by,
+            source_package=root_source_package,
+            persist_runtime_contract=False,
+        )
+        if direct_requested_by == "codex_local_operator":
+            request_instance_id = "gri_" + "1" * 32
+            conn.execute(
+                "UPDATE grace_delegations SET session_key=?,request_instance_id=? "
+                "WHERE execution_task_id=?",
+                (
+                    "codex:thread:01a093a0-fb45-76c0-ac50-65d451bd50c2",
+                    request_instance_id,
+                    correction_execution,
+                ),
+            )
+            snapshot_row = conn.execute(
+                "SELECT contract_snapshot FROM grace_delegations "
+                "WHERE execution_task_id=?",
+                (correction_execution,),
+            ).fetchone()
+            correction_snapshot = json.loads(snapshot_row[0])
+            correction_snapshot["identity"]["request_instance_id"] = (
+                request_instance_id
+            )
+            correction_snapshot["identity"]["codex_thread_id"] = (
+                "01a093a0-fb45-76c0-ac50-65d451bd50c2"
+            )
+            correction_snapshot["scope"]["forbidden"] = [
+                "No login, upload, publish, approval, or external effect."
+            ]
+            correction_worker_contract = _worker_safe_contract(
+                correction_snapshot
+            )
+            conn.execute(
+                "UPDATE grace_delegations SET contract_snapshot=? "
+                "WHERE execution_task_id=?",
+                (
+                    json.dumps(
+                        correction_snapshot,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    correction_execution,
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET body=? WHERE id=?",
+                (
+                    "GRACE_LOOP_CONTRACT_STAGE: execution\n\n```json\n"
+                    + json.dumps(
+                        correction_worker_contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n```",
+                    correction_execution,
+                ),
+            )
+        correction_run = kb.latest_run(conn, correction_execution)
+        assert correction_run is not None
+        assert "loop_contract" not in (correction_run.metadata or {})
+        _retry_execution, _retry_review, retry_callback = blocked_stage(
+            "repair_package_schema_r21",
+            "h",
+            "[SYSTEM: Grace Loop callback] continue the blocked repair",
+            requested_by="Grace",
+            origin_review_id=correction_review,
+            origin_event_id=correction_callback["source_event_id"],
+        )
+        package = _objective_source_handoff(
+            conn,
+            handoff_contract,
+            retry_callback,
+        )[0]
+
+        if direct_requested_by == "codex_local_operator":
+            conn.execute(
+                "UPDATE grace_delegations SET session_key=? "
+                "WHERE execution_task_id=?",
+                (
+                    "codex:thread:02b193a0-fb45-76c0-ac50-65d451bd50c2",
+                    correction_execution,
+                ),
+            )
+            with pytest.raises(
+                ValueError, match="compiler-sealed authenticated root"
+            ):
+                _objective_source_handoff(conn, handoff_contract, retry_callback)
+            conn.execute(
+                "UPDATE grace_delegations SET session_key=? "
+                "WHERE execution_task_id=?",
+                (
+                    "codex:thread:01a093a0-fb45-76c0-ac50-65d451bd50c2",
+                    correction_execution,
+                ),
+            )
+            conn.execute(
+                "UPDATE grace_delegations SET request_instance_id=? "
+                "WHERE execution_task_id=?",
+                ("gri_" + "2" * 32, correction_execution),
+            )
+            with pytest.raises(
+                ValueError, match="compiler-sealed authenticated root"
+            ):
+                _objective_source_handoff(conn, handoff_contract, retry_callback)
+            conn.execute(
+                "UPDATE grace_delegations SET request_instance_id=? "
+                "WHERE execution_task_id=?",
+                (request_instance_id, correction_execution),
+            )
+            unbounded_snapshot = json.loads(
+                json.dumps(correction_snapshot)
+            )
+            unbounded_snapshot["scope"].pop("forbidden")
+            unbounded_worker_contract = _worker_safe_contract(
+                unbounded_snapshot
+            )
+            conn.execute(
+                "UPDATE grace_delegations SET contract_snapshot=? "
+                "WHERE execution_task_id=?",
+                (
+                    json.dumps(
+                        unbounded_snapshot,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    correction_execution,
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET body=? WHERE id=?",
+                (
+                    "GRACE_LOOP_CONTRACT_STAGE: execution\n\n```json\n"
+                    + json.dumps(
+                        unbounded_worker_contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n```",
+                    correction_execution,
+                ),
+            )
+            with pytest.raises(
+                ValueError, match="compiler-sealed authenticated root"
+            ):
+                _objective_source_handoff(conn, handoff_contract, retry_callback)
+            conn.execute(
+                "UPDATE grace_delegations SET contract_snapshot=? "
+                "WHERE execution_task_id=?",
+                (
+                    json.dumps(
+                        correction_snapshot,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    correction_execution,
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET body=? WHERE id=?",
+                (
+                    "GRACE_LOOP_CONTRACT_STAGE: execution\n\n```json\n"
+                    + json.dumps(
+                        correction_worker_contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n```",
+                    correction_execution,
+                ),
+            )
+
+        correction_body = conn.execute(
+            "SELECT body FROM tasks WHERE id=?", (correction_execution,)
+        ).fetchone()["body"]
+        conn.execute(
+            "UPDATE tasks SET body=replace(body, 'secondhand_commerce', "
+            "'another_project') WHERE id=?",
+            (correction_execution,),
+        )
+        with pytest.raises(ValueError, match="compiler-sealed authenticated root"):
+            _objective_source_handoff(conn, handoff_contract, retry_callback)
+        conn.execute(
+            "UPDATE tasks SET body=? WHERE id=?",
+            (correction_body, correction_execution),
+        )
+
+        root_snapshot = conn.execute(
+            "SELECT contract_snapshot FROM grace_delegations "
+            "WHERE execution_task_id=?",
+            (root_execution,),
+        ).fetchone()[0]
+        duplicate_execution = kb.create_task(
+            conn,
+            title="duplicate source execution",
+            project_namespace="secondhand_commerce",
+        )
+        duplicate_review = kb.create_task(
+            conn,
+            title="duplicate source review",
+            parents=(duplicate_execution,),
+            project_namespace="secondhand_commerce",
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=duplicate_execution,
+            review_id=duplicate_review,
+            contract_fingerprint="f" * 64,
+            suffix="duplicate-source",
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key='duplicate_source',"
+            "contract_snapshot=? WHERE delegation_id='gd-duplicate-source'",
+            (objective_id, root_snapshot),
+        )
+        conn.execute(
+            "INSERT INTO grace_objective_stages (objective_id,stage_key,position,"
+            "status,delegation_id,execution_task_id,review_task_id,created_at,updated_at) "
+            "VALUES (?,'duplicate_source',2,'planned','gd-duplicate-source',?,?,1,1)",
+            (objective_id, duplicate_execution, duplicate_review),
+        )
+        with pytest.raises(ValueError, match="ambiguous authenticated root"):
+            _objective_source_handoff(
+                conn,
+                handoff_contract,
+                {"execution_task_id": execution_id, "review_task_id": review_id},
+            )
+
+    payload = json.loads(package[len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX) :])
+    assert payload["original_request"] == source_text
+    assert payload["run_id"] == source_run_id
+    assert payload["assets"] == [
+        {"path": str(asset.resolve()), "sha256": asset_sha}
+    ]
+
+
 @pytest.mark.parametrize("invalid_run_id", ["unreviewed", [], {}, True])
 def test_objective_source_handoff_rejects_unreviewed_run_from_trusted_task(tmp_path, invalid_run_id):
     values = {
@@ -1855,10 +2826,30 @@ def test_active_callback_reservation_rejects_ambiguous_current_rows(tmp_path):
 
 
 @pytest.mark.parametrize("internal_turn", [True, False], ids=["delivered", "fresh"])
+@pytest.mark.parametrize(
+    ("topic_name", "project", "memory_namespace"),
+    [
+        pytest.param(
+            "AI 業務週報",
+            "ai_bizweek",
+            "topic:2/ai-bizweek",
+            id="historical-topic-4641",
+        ),
+        pytest.param(
+            "二手拍賣",
+            "secondhand_commerce",
+            "topic:2/secondhand",
+            id="non-failing-topic",
+        ),
+    ],
+)
 def test_root_repair_callback_retains_objective_and_source_without_lease(
     tmp_path,
     monkeypatch,
     internal_turn,
+    topic_name,
+    project,
+    memory_namespace,
 ):
     callback_envelope = "[SYSTEM: Grace Loop callback] root repair blocker"
     values = {
@@ -1875,8 +2866,21 @@ def test_root_repair_callback_retains_objective_and_source_without_lease(
         ),
         "HERMES_SESSION_INTERNAL": "true" if internal_turn else "false",
     }
-    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    _configure_secondhand_context(
+        tmp_path,
+        monkeypatch,
+        values,
+        topic_name=topic_name,
+        project=project,
+        memory_namespace=memory_namespace,
+    )
     source_text = "Audio Brief Cover is EP07, not EP06."
+    sealed_delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "asset_filenames": ["source.png"],
+    }
     foreign_objective_id = "go_ext_" + "d" * 24
     with kb.connect_closing(tmp_path / "kanban.db") as conn:
         objective_id, stage_key, execution_id, source_run_id, review_id = (
@@ -1884,6 +2888,8 @@ def test_root_repair_callback_retains_objective_and_source_without_lease(
                 conn,
                 source_text=source_text,
                 values=values,
+                user_facing_delivery=sealed_delivery,
+                project=project,
             )
         )
         conn.execute(
@@ -1991,6 +2997,28 @@ def test_root_repair_callback_retains_objective_and_source_without_lease(
         ).fetchone() is None
 
     args.pop("domain_memory")
+    args["user_facing_delivery"].update(
+        {"required": 1, "asset_filenames": ["source.png"]}
+    )
+    rejected = json.loads(handle_clawops_delegate(args))
+    assert rejected["status"] == "rejected"
+    assert "cannot change the originating content-package delivery contract" in (
+        rejected["reason"]
+    )
+
+    args["user_facing_delivery"].update(
+        {"required": True, "asset_filenames": ["corrected.png"]}
+    )
+    rejected = json.loads(handle_clawops_delegate(args))
+    assert rejected["status"] == "rejected"
+    assert "cannot change the originating content-package asset filenames" in rejected[
+        "reason"
+    ]
+
+    # Historical Topic 4641 failure sample: Grace's recoverable callback omitted
+    # the already compiler-sealed filenames. The shared guard restores them from
+    # the originating contract instead of deriving names from callback prose.
+    del args["user_facing_delivery"]["asset_filenames"]
     queued = json.loads(handle_clawops_delegate(args))
     assert queued["status"] == "queued", queued
     with kb.connect_closing(tmp_path / "kanban.db") as conn:
@@ -2001,6 +3029,10 @@ def test_root_repair_callback_retains_objective_and_source_without_lease(
         run = kb.latest_run(conn, queued["execution_task_id"])
     assert delegation["objective_id"] == objective_id
     assert delegation["stage_key"] == f"{stage_key}_r2"
+    assert json.loads(delegation["contract_snapshot"])["user_facing_delivery"] == (
+        sealed_delivery
+    )
+    assert run.metadata["loop_contract"]["user_facing_delivery"] == sealed_delivery
     source_package = next(
         item
         for item in run.metadata["loop_contract"]["memory"]["working"]
@@ -2230,6 +3262,37 @@ def test_objective_source_handoff_skips_true_inventory_query():
             },
         }
     )
+
+
+def test_direct_source_handoff_routes_empty_origin_to_authenticated_root(monkeypatch):
+    from plugins.openclaw_bridge import clawops_delegate as delegate
+
+    contract = {
+        "original_request": "Exact source manuscript",
+        "goal": {"objective": "Build the exact source-bound package"},
+        "scope": {"allowed": ["Preserve original source bytes"]},
+        "verification": {"checks": ["Compare output to source"]},
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "asset_filenames": ["page.png"],
+        },
+    }
+    calls = []
+    monkeypatch.setattr(
+        delegate,
+        "_objective_source_handoff",
+        lambda conn, value, origin: calls.append((conn, value, origin)) or ["source"],
+    )
+
+    assert delegate._source_handoff_for_request(
+        object(), contract, {}, internal_turn=False
+    ) == ["source"]
+    assert calls[0][2] == {}
+    assert delegate._source_handoff_for_request(
+        object(), contract, {}, internal_turn=True
+    ) == []
 
 
 def test_codex_local_operator_authorizes_external_action_without_telegram_spoof(
@@ -3343,6 +4406,165 @@ def test_delegate_fails_closed_for_route_with_controlled_external_capabilities(
     assert result["task_created"] is False
 
 
+@pytest.mark.parametrize(
+    ("project", "topic_name", "thread_id"),
+    [
+        ("ingrids_marketing", "ingrids.app", "270"),
+        ("ai_bizweek", "AI BizWeek", "4641"),
+    ],
+)
+def test_delegate_rejects_zip_build_on_content_only_worker(
+    tmp_path, monkeypatch, project, topic_name, thread_id,
+):
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.probe_profile_callable_tools",
+        lambda **_: {"ok": True, "available_tools": ["terminal"]},
+    )
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "version: 1\ncontexts:\n"
+        f"  - platform: telegram\n    chat_id: chat-1\n    thread_id: '{thread_id}'\n"
+        f"    topic_name: {topic_name}\n    project: {project}\n"
+        f"    memory_namespace: topic:{thread_id}/{project}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": thread_id,
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": f"agent:main:telegram:group:chat-1:{thread_id}",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-local-site-package",
+        "HERMES_SESSION_MESSAGE_TEXT": "建立本機網站下載包與渲染截圖，不部署",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    args = _nested_args()
+    args["task_type"] = "product_marketing"
+    args["goal"]["objective"] = "建立本機 one-page 網站與實際瀏覽器截圖"
+    args["user_facing_delivery"] = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "asset_filenames": ["homepage.zip", "homepage-mockup.png"],
+    }
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "rejected"
+    assert result["task_created"] is False
+    assert "task_type=devops" in result["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert kb.list_tasks(conn) == []
+
+    args["task_type"] = "devops"
+    routed = json.loads(handle_clawops_delegate(args))
+
+    assert routed["status"] == "queued"
+    assert routed["execution_backend"] == "hermes"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution = kb.get_task(conn, routed["execution_task_id"])
+    assert execution is not None
+    assert execution.assignee == "clawops-dev"
+
+
+@pytest.mark.parametrize("python_executable", ["python", "python3", "python3.12"])
+def test_objective_workflow_cli_rejects_kanban_only_ops_route(python_executable):
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _validate_objective_workflow_route,
+    )
+
+    goal = {
+        "deliverables": [
+            f"Run `{python_executable} -m hermes_cli.objective_workflow plan plan.json`."
+        ]
+    }
+    with pytest.raises(ValueError, match="task_type=devops"):
+        _validate_objective_workflow_route("ops", goal, {"allowed": []}, {})
+
+    _validate_objective_workflow_route("devops", goal, {"allowed": []}, {})
+
+
+def test_workspace_file_completion_handoff_rejects_kanban_only_ops_route():
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _validate_completion_handoff_route,
+    )
+
+    with pytest.raises(ValueError, match="task_type=devops"):
+        _validate_completion_handoff_route(
+            "ops", {"metadata_source": "workspace_file"}
+        )
+
+    _validate_completion_handoff_route(
+        "devops", {"metadata_source": "workspace_file"}
+    )
+    _validate_completion_handoff_route("ops", {"metadata_source": "inline"})
+    _validate_completion_handoff_route("ops", None)
+
+    with pytest.raises(ValueError, match="must be an object"):
+        _validate_completion_handoff_route("devops", "workspace_file")
+    with pytest.raises(ValueError, match="accepts only"):
+        _validate_completion_handoff_route(
+            "devops", {"metadata_source": "workspace_file", "path": "x.json"}
+        )
+    with pytest.raises(ValueError, match="inline or workspace_file"):
+        _validate_completion_handoff_route(
+            "devops", {"metadata_source": "filesystem"}
+        )
+
+
+def test_delegate_requires_devops_for_workspace_file_completion_handoff(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.probe_profile_callable_tools",
+        lambda **_: {"ok": True, "available_tools": ["terminal"]},
+    )
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-metadata-path",
+        "HERMES_SESSION_MESSAGE_TEXT": "重送既有本機完成資料，不做外部動作",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args["task_type"] = "ops"
+    args["completion_handoff"] = {"metadata_source": "workspace_file"}
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "rejected"
+    assert result["task_created"] is False
+    assert "task_type=devops" in result["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert kb.list_tasks(conn) == []
+
+    args["task_type"] = "devops"
+    routed = json.loads(handle_clawops_delegate(args))
+
+    assert routed["status"] == "queued"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        execution = kb.get_task(conn, routed["execution_task_id"])
+    assert execution is not None
+    assert execution.assignee == "clawops-dev"
+    assert '"metadata_source": "workspace_file"' in execution.body
+
+
 def test_marketplace_readonly_target_queues_without_external_approval(
     tmp_path,
     monkeypatch,
@@ -3879,6 +5101,11 @@ def test_model_visible_schema_exposes_required_nested_parameters():
         "secondhand_commerce_group_status",
     ]
     assert "user_facing_delivery" in CLAWOPS_DELEGATE_PARAMETERS["properties"]
+    assert "completion_handoff" in CLAWOPS_DELEGATE_PARAMETERS["properties"]
+    validate(
+        {"metadata_source": "workspace_file"},
+        CLAWOPS_DELEGATE_PARAMETERS["properties"]["completion_handoff"],
+    )
     assert "listing" not in CLAWOPS_DELEGATE_PARAMETERS["properties"]["task_type"]["enum"]
     validate(_nested_args(), CLAWOPS_DELEGATE_PARAMETERS)
 
@@ -5229,6 +6456,350 @@ def test_explicit_objective_handoff_never_silently_forks(tmp_path, monkeypatch, 
         assert resolved["stage_key"].startswith("prepare_")
     with kb.connect_closing() as conn:
         assert conn.execute("SELECT COUNT(*) FROM grace_objectives").fetchone()[0] == (0 if fault == "unknown" else 1)
+
+
+def test_supplied_short_objective_id_is_recovered_only_from_exact_same_lane_stage(
+    tmp_path, monkeypatch,
+):
+    from plugins.openclaw_bridge.clawops_delegate import (
+        _ensure_external_action_objective_ref,
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "continuation.db"))
+    objective_id = "go_ext_1234567890abcdef12345678"
+    origin_stage_key = "package_schema_relay_17f708691314_r39"
+    stage_key = "facebook_page_publish_preflight_17f708691314"
+    with kb.connect_closing() as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id=objective_id,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            title="Page preflight",
+            objective="Run the declared read-only Page preflight",
+            original_request_sha256="a" * 64,
+            required_stage_keys=[origin_stage_key, stage_key, "execute_external_action"],
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=["preflight accepted"],
+            current_stage_key=stage_key,
+        )
+
+    args = {
+        "original_request": (
+            "接納既有 callback，然後執行 "
+            f"{stage_key}；不得發布。"
+        ),
+        "objective_ref": {
+            "objective_id": "17f708691314",
+            "stage_key": stage_key,
+        },
+    }
+    result = _ensure_external_action_objective_ref(
+        args,
+        platform="telegram",
+        chat_id="chat",
+        thread_id="4641",
+        session_key="agent:main:telegram:group:chat:4641",
+        topic_name="Topic 4641",
+        goal={"objective": "Run the declared read-only Page preflight"},
+        scope={},
+        verification={},
+        internal_only_contract=True,
+        request_instance_id="resume-r39",
+    )
+    assert result is None
+    assert args["objective_ref"] == {
+        "objective_id": objective_id,
+        "stage_key": stage_key,
+    }
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE grace_objectives SET current_stage_key=? WHERE objective_id=?",
+            (origin_stage_key, objective_id),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='queued' "
+            "WHERE objective_id=? AND stage_key=?",
+            (objective_id, origin_stage_key),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='planned' "
+            "WHERE objective_id=? AND stage_key=?",
+            (objective_id, stage_key),
+        )
+
+    args["objective_ref"] = {
+        "objective_id": objective_id,
+        "stage_key": stage_key,
+    }
+    assert _ensure_external_action_objective_ref(
+        args,
+        platform="telegram",
+        chat_id="chat",
+        thread_id="4641",
+        session_key="agent:main:telegram:group:chat:4641",
+        topic_name="Topic 4641",
+        goal={"objective": "Run the declared read-only Page preflight"},
+        scope={},
+        verification={},
+        internal_only_contract=True,
+        request_instance_id="resume-r39-canonical-callback",
+        origin_objective_id=objective_id,
+        origin_stage_key=origin_stage_key,
+    ) is None
+
+    args["objective_ref"] = {
+        "objective_id": objective_id,
+        "stage_key": "execute_external_action",
+    }
+    with pytest.raises(ValueError, match="verified callback origin stage"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-canonical-skip-preflight",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+
+    args["objective_ref"] = {
+        "objective_id": "17f708691314",
+        "stage_key": stage_key,
+    }
+    result = _ensure_external_action_objective_ref(
+        args,
+        platform="telegram",
+        chat_id="chat",
+        thread_id="4641",
+        session_key="agent:main:telegram:group:chat:4641",
+        topic_name="Topic 4641",
+        goal={"objective": "Run the declared read-only Page preflight"},
+        scope={},
+        verification={},
+        internal_only_contract=True,
+        request_instance_id="resume-r39-callback",
+        origin_objective_id=objective_id,
+        origin_stage_key=origin_stage_key,
+    )
+
+    assert result is None
+    assert args["objective_ref"] == {
+        "objective_id": objective_id,
+        "stage_key": stage_key,
+    }
+
+    args["objective_ref"] = {
+        "objective_id": "17f708691314",
+        "stage_key": "wrong-stage",
+    }
+    with pytest.raises(ValueError, match="verified callback origin stage"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-wrong-stage",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+
+    args["objective_ref"] = {
+        "objective_id": "17f708691314",
+        "stage_key": "execute_external_action",
+    }
+    with pytest.raises(ValueError, match="verified callback origin stage"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-skip-preflight",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+
+    args["objective_ref"] = {
+        "objective_id": "go_ext_abcdefabcdefabcdefabcdef",
+        "stage_key": stage_key,
+    }
+    with pytest.raises(ValueError, match="verified callback origin"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-foreign-canonical",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done', completed_at=1 "
+            "WHERE objective_id=? AND stage_key=?",
+            (objective_id, origin_stage_key),
+        )
+    args["objective_ref"] = {
+        "objective_id": "17f708691314",
+        "stage_key": stage_key,
+    }
+    with pytest.raises(ValueError, match="verified callback origin stage"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-completed-origin",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+    args["objective_ref"] = {
+        "objective_id": objective_id,
+        "stage_key": stage_key,
+    }
+    with pytest.raises(ValueError, match="verified callback origin stage"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-canonical-completed-origin",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='queued', completed_at=NULL "
+            "WHERE objective_id=? AND stage_key=?",
+            (objective_id, origin_stage_key),
+        )
+        conn.execute(
+            "UPDATE grace_objectives SET current_stage_key=? WHERE objective_id=?",
+            (origin_stage_key, objective_id),
+        )
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE grace_objectives SET status='completed' WHERE objective_id=?",
+            (objective_id,),
+        )
+    args["objective_ref"] = {
+        "objective_id": objective_id,
+        "stage_key": stage_key,
+    }
+    with pytest.raises(ValueError, match="verified callback origin stage"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-canonical-inactive",
+            origin_objective_id=objective_id,
+            origin_stage_key=origin_stage_key,
+        )
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE grace_objectives SET status='active' WHERE objective_id=?",
+            (objective_id,),
+        )
+        conn.execute(
+            "UPDATE grace_objectives SET current_stage_key=? WHERE objective_id=?",
+            (stage_key, objective_id),
+        )
+
+    with kb.connect_closing() as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_ext_abcdefabcdefabcdefabcdef",
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            title="Ambiguous Page preflight",
+            objective="Another active objective with the same stage label",
+            original_request_sha256="b" * 64,
+            required_stage_keys=[stage_key, "execute_external_action"],
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=["preflight accepted"],
+            current_stage_key=stage_key,
+        )
+    args["objective_ref"]["objective_id"] = "17f708691314"
+    with pytest.raises(ValueError, match="ambiguous"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat:4641",
+            topic_name="Topic 4641",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-ambiguous",
+        )
+
+    args["objective_ref"]["objective_id"] = "17f708691314"
+    with pytest.raises(ValueError, match="same chat or topic"):
+        _ensure_external_action_objective_ref(
+            args,
+            platform="telegram",
+            chat_id="chat",
+            thread_id="other-topic",
+            session_key="agent:main:telegram:group:chat:other-topic",
+            topic_name="Other",
+            goal={"objective": "Run the declared read-only Page preflight"},
+            scope={},
+            verification={},
+            internal_only_contract=True,
+            request_instance_id="resume-r39-foreign",
+        )
 
 @pytest.mark.parametrize('topic', ['2', '4641'])
 def test_human_confirmation_keeps_source_and_seals_actual_retry(tmp_path, monkeypatch, topic):

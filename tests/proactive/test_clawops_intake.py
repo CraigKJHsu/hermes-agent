@@ -56,6 +56,7 @@ def test_hubops_routing_selects_dev_worker_from_yaml():
         project="hub_ops",
         task_type="devops",
         risk_level="low",
+        runtime_callable_tools={"clawops-dev": {"terminal"}},
     )
 
     assert envelope["status"] == "routed"
@@ -126,7 +127,7 @@ def test_hubops_routing_admits_worker_with_all_required_callable_tools():
         risk_level="medium",
         approved=True,
         runtime_callable_tools={
-            "clawops-ops": {
+            "missioncrew-facebook-page-operator": {
                 "facebook_page_graph_status",
                 "facebook_page_graph_publish",
             }
@@ -135,9 +136,34 @@ def test_hubops_routing_admits_worker_with_all_required_callable_tools():
 
     assert envelope["status"] == "routed"
     assert envelope["assignment"]["required_callable_tools"] == [
-        "facebook_page_graph_status",
         "facebook_page_graph_publish",
+        "facebook_page_graph_status",
     ]
+
+
+def test_devops_route_requires_and_seals_terminal_callable():
+    missing = route_clawops_objective(
+        "Run the supported Objective workflow CLI.",
+        project="hub_ops",
+        task_type="devops",
+        risk_level="low",
+        approved=False,
+        runtime_callable_tools={"clawops-dev": set()},
+    )
+    assert missing["status"] == "blocked"
+    assert "terminal" in missing["blocked_reason"]
+
+    routed = route_clawops_objective(
+        "Run the supported Objective workflow CLI.",
+        project="hub_ops",
+        task_type="devops",
+        risk_level="low",
+        approved=False,
+        runtime_callable_tools={"clawops-dev": {"terminal"}},
+    )
+    assert routed["status"] == "routed"
+    assert routed["assignment"]["runtime_profile"] == "clawops-dev"
+    assert routed["assignment"]["required_callable_tools"] == ["terminal"]
 
 
 def test_hubops_routing_normalizes_listing_aliases_to_browser_publish():

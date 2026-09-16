@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
+    _callback_successor_is_correlatable,
     _confirmed_grace_provider_message_id,
+    _grace_callback_resume_review_id,
     _grace_review_accepted,
 )
 from gateway.run import GatewayRunner
@@ -108,6 +110,245 @@ class CallbackAdapter:
             success=True,
             message_id=f"image-{len(self.sent_images)}",
         )
+
+
+def test_full_publication_package_delivery_parks_before_another_agent_turn(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "full-package-checkpoint.db"
+    page = tmp_path / "page.png"
+    audio = tmp_path / "audio.png"
+    Image.new("RGB", (1600, 900)).save(page)
+    Image.new("RGB", (1200, 1200)).save(audio)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    sections = {
+        "facebook_page_post": "完整 Facebook Page 內文",
+        "facebook_group_post": "完整 Facebook Group 討論附文",
+        "gemini_notebook_prompt": "完整 Gemini Notebook Prompt",
+        "podcast_title": "完整 Podcast 標題",
+        "podcast_description": "完整 Podcast 說明",
+    }
+    report = {
+        "kind": "content_package",
+        "package_kind": "full_publication_package",
+        "delivery": "inline_with_attachment",
+        "complete": False,
+        "title": "完整發布包",
+        "body": "\n\n".join(sections.values()),
+        "observed_at": int(time.time()),
+        "sections": sections,
+        "assets": [
+            {
+                "filename": page.name,
+                "label": "Page Hero",
+                "path": str(page),
+                "sha256": hashlib.sha256(page.read_bytes()).hexdigest(),
+                "asset_family": "page_hero",
+                "dimensions": "1600x900",
+            },
+            {
+                "filename": audio.name,
+                "label": "Audio Brief",
+                "path": str(audio),
+                "sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+                "asset_family": "audio_brief",
+                "dimensions": "1200x1200",
+            },
+        ],
+        "policy_receipts": [{
+            "role": "execution",
+            "policy_id": "brand",
+            "version": "1",
+            "sha256": "a" * 64,
+            "loaded": True,
+        }],
+        "external_effects": [],
+    }
+    with kb.connect_closing(db_path) as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_full_package_checkpoint",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            title="Publish",
+            objective="Prepare then publish",
+            original_request_sha256="b" * 64,
+            required_stage_keys=["prepare", "publish"],
+            terminal_stage_key="publish",
+            acceptance_criteria=["published"],
+            current_stage_key="prepare",
+        )
+        execution_id = kb.create_task(
+            conn,
+            title="prepare package",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+                '{"external_effect_budget":0}\n```'
+            ),
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            metadata={
+                "user_facing_report": report,
+                "facebook_page_post": {
+                    "text": sections["facebook_page_post"],
+                },
+                "external_effects": [],
+            },
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review package",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(conn, execution_id, review_id, suffix="full-checkpoint")
+        delegation_id = conn.execute(
+            "SELECT delegation_id FROM grace_delegations WHERE execution_task_id=?",
+            (execution_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key=? "
+            "WHERE delegation_id=?",
+            ("go_full_package_checkpoint", "prepare", delegation_id),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_full_package_checkpoint",
+            stage_key="prepare",
+            delegation_id=delegation_id,
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="c" * 64,
+            completion_mode="intermediate",
+            objective_id="go_full_package_checkpoint",
+            stage_key="prepare",
+        )
+        assert _complete_review(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+
+        due = kb.list_due_grace_loop_callbacks(conn)
+        assert len(due) == 1
+        event_id = int(due[0]["event_id"])
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="pre-delivery-check",
+        )
+        with pytest.raises(ValueError, match="delivery receipt"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=event_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="pre-delivery-check",
+                outcome_kind="approval_blocked",
+                payload={
+                    "action": "confirm_content_package",
+                    "platform": "internal",
+                    "scope": {
+                        "execution_task_id": execution_id,
+                        "review_task_id": review_id,
+                        "review_event_id": event_id,
+                    },
+                    "exact_question": (
+                        "完整發布包已交付並通過 Grace 審查。要繼續進行 "
+                        "Facebook Page 發布前檢查嗎？"
+                    ),
+                    "next_stage_key": "publish",
+                },
+            )
+        assert kb.release_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="pre-delivery-check",
+            error="expected pre-delivery rejection",
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert adapter.handled == []
+    assert adapter.sent[-1][1] == (
+        "完整發布包已交付並通過 Grace 審查。要繼續進行 "
+        "Facebook Page 發布前檢查嗎？"
+    )
+    assert adapter.sent[-1][2]["thread_id"] == "2"
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        objective = kb.get_grace_objective(conn, "go_full_package_checkpoint")
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "approval_blocked"
+    assert callback["user_report_delivered_at"] is not None
+    assert callback["user_report_chunk_count"] == (
+        len(adapter.sent) + len(adapter.sent_images)
+    )
+    assert objective["status"] == "waiting_approval"
+    assert objective["current_stage_key"] == "publish"
+
+    # Simulate a v28 crash after the structured outcome committed but before
+    # any visible delivery receipt existed. Replay must finish the report and
+    # checkpoint question instead of treating the outcome row as delivery.
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='pending',last_event_id=0,"
+            "lease_event_id=NULL,lease_owner=NULL,lease_expires=NULL,"
+            "user_report_event_id=NULL,user_report_digest=NULL,"
+            "user_report_delivered_at=NULL,user_report_chunk_count=NULL,"
+            "user_report_next_chunk=0,user_report_total_chunks=NULL "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        conn.execute(
+            "DELETE FROM grace_user_report_chunk_deliveries "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        conn.commit()
+
+    replay_adapter = CallbackAdapter()
+    replay_runner = _runner(
+        replay_adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(replay_runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert replay_adapter.handled == []
+    assert replay_adapter.sent[-1][1] == adapter.sent[-1][1]
+    with kb.connect_closing(db_path) as conn:
+        replayed = kb.get_grace_loop_callback(conn, review_id)
+    assert replayed["state"] == "delivered"
+    assert replayed["outcome_kind"] == "approval_blocked"
+    assert replayed["user_report_delivered_at"] is not None
 
 
 def test_legacy_telegram_content_package_is_delivered_before_callback_closes(
@@ -891,11 +1132,71 @@ def test_grace_review_rejects_page_hero_with_obstructive_disclosure():
     }) is False
 
 
+def test_grace_review_validates_nested_page_hero_evidence():
+    metadata = {
+        "review_outcome": "accepted",
+        "evidence": {
+            "asset_family": "page_hero",
+            "asset_declarations": {
+                "page_hero": {"dimensions": "1648x927"},
+            },
+            "visual_review": {
+                "all_required_text_readable": True,
+                "text_occlusion_free": True,
+                "disclosure_non_obstructive": True,
+                "defects_found": [],
+            },
+        },
+    }
+
+    assert _grace_review_accepted(metadata) is True
+    metadata["evidence"]["visual_review"]["text_occlusion_free"] = False
+    assert _grace_review_accepted(metadata) is False
+
+    metadata["evidence"]["visual_review"]["text_occlusion_free"] = True
+    metadata["evidence"]["asset_declarations"]["page_hero"]["filename"] = []
+    metadata["evidence"]["actual_controller_attachment_inspected"] = []
+    assert _grace_review_accepted(metadata) is False
+
+    metadata["evidence"]["asset_declarations"]["page_hero"].pop("filename")
+    metadata["evidence"]["actual_controller_attachment_inspected"] = False
+    assert _grace_review_accepted(metadata) is False
+    metadata["evidence"]["actual_controller_attachment_inspected"] = True
+    assert _grace_review_accepted(metadata) is True
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [None, {"width": -16, "height": -9}],
+)
+def test_grace_review_rejects_page_hero_without_positive_declaration(
+    declaration,
+):
+    evidence = {
+        "asset_family": "page_hero",
+        "visual_review": {
+            "all_required_text_readable": True,
+            "text_occlusion_free": True,
+            "disclosure_non_obstructive": True,
+            "defects_found": [],
+        },
+    }
+    if declaration is not None:
+        evidence["asset_declarations"] = {"page_hero": declaration}
+    assert _grace_review_accepted({
+        "review_outcome": "accepted",
+        "evidence": evidence,
+    }) is False
+
+
 def test_grace_review_canonical_acceptance_allows_non_rejecting_legacy_alias():
     assert _grace_review_accepted({
         "review_outcome": "accepted",
         "review_result": "pass",
         "asset_family": "page_hero",
+        "asset_declarations": {
+            "page_hero": {"dimensions": "1664x936"},
+        },
         "visual_review": {
             "all_required_text_readable": True,
             "text_occlusion_free": True,
@@ -907,6 +1208,9 @@ def test_grace_review_canonical_acceptance_allows_non_rejecting_legacy_alias():
         "review_outcome": "accepted",
         "review_verdict": "blocked",
         "asset_family": "page_hero",
+        "asset_declarations": {
+            "page_hero": {"dimensions": "1664x936"},
+        },
         "visual_review": {
             "all_required_text_readable": True,
             "text_occlusion_free": True,
@@ -1278,7 +1582,7 @@ def test_failed_background_turn_does_not_consume_blocker_callback(
     assert "turn failed" in callback["last_error"]
 
 
-def test_dropped_background_turn_times_out_and_releases_callback(
+def test_dropped_background_turn_without_task_is_quarantined(
     tmp_path,
     monkeypatch,
 ):
@@ -1297,34 +1601,172 @@ def test_dropped_background_turn_times_out_and_releases_callback(
 
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
-    assert callback["state"] == "pending"
+    assert callback["state"] == "attention"
     assert callback["last_event_id"] == 0
     assert callback["attempts"] == 1
+    assert "termination is unconfirmed" in callback["last_error"]
+
+
+def test_callback_cancellation_uses_independent_grace_period(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "slow-confirmed-cancellation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_TURN_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_CANCEL_TIMEOUT_SECONDS", "0.2")
+    kb.init_db()
+    _, review_id = _review_chain(db_path, event_kind="blocked")
+
+    class SlowConfirmedCancellationAdapter(CallbackAdapter):
+        def __init__(self):
+            super().__init__(record_outcome=False)
+            self._session_tasks = {}
+            self.cancelled = False
+
+        async def handle_message(self, event):
+            async def process():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+
+            task = asyncio.create_task(process())
+            event.internal_context["processing_task"] = task
+            self._session_tasks[
+                "agent:main:telegram:group:chat-1:2"
+            ] = task
+
+        async def cancel_session_processing(
+            self, session_key, *, release_guard=True,
+        ):
+            await asyncio.sleep(0.08)
+            task = self._session_tasks.pop(session_key)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    adapter = SlowConfirmedCancellationAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    assert adapter.cancelled is True
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "pending"
     assert "TimeoutError" in callback["last_error"]
 
 
+def test_unconfirmed_callback_cancellation_is_quarantined(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "unconfirmed-cancellation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_TURN_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_CANCEL_TIMEOUT_SECONDS", "0.1")
+    kb.init_db()
+    _, review_id = _review_chain(db_path, event_kind="blocked")
+
+    class UnconfirmedCancellationAdapter(CallbackAdapter):
+        def __init__(self):
+            super().__init__(record_outcome=False)
+            self._session_tasks = {}
+
+        async def handle_message(self, event):
+            task = asyncio.create_task(asyncio.sleep(5))
+            event.internal_context["processing_task"] = task
+            self._session_tasks[
+                "agent:main:telegram:group:chat-1:2"
+            ] = task
+
+        async def cancel_session_processing(
+            self, session_key, *, release_guard=True,
+        ):
+            await asyncio.sleep(5)
+
+    adapter = UnconfirmedCancellationAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    async def deliver_and_cleanup():
+        await runner._deliver_due_grace_loop_callbacks(kb)
+        for task in adapter._session_tasks.values():
+            task.cancel()
+        await asyncio.gather(
+            *adapter._session_tasks.values(), return_exceptions=True,
+        )
+
+    asyncio.run(deliver_and_cleanup())
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "attention"
+    assert callback["lease_owner"] is None
+    assert "could not be confirmed stopped" in callback["last_error"]
+
+
+def test_unconfirmed_fallback_cancellation_is_quarantined(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "unconfirmed-fallback-cancellation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_TURN_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setenv("HERMES_GRACE_CALLBACK_CANCEL_TIMEOUT_SECONDS", "0.1")
+    kb.init_db()
+    _, review_id = _review_chain(db_path, event_kind="blocked")
+
+    class StubbornFallbackAdapter(CallbackAdapter):
+        def __init__(self):
+            super().__init__(record_outcome=False)
+            self._session_tasks = {}
+
+        async def handle_message(self, event):
+            async def process():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.3)
+
+            task = asyncio.create_task(process())
+            event.internal_context["processing_task"] = task
+            self._session_tasks["callback"] = task
+
+    adapter = StubbornFallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+
+    async def deliver_and_finish_unwind():
+        await runner._deliver_due_grace_loop_callbacks(kb)
+        await asyncio.gather(
+            *adapter._session_tasks.values(), return_exceptions=True,
+        )
+
+    asyncio.run(deliver_and_finish_unwind())
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "attention"
+    assert "could not be confirmed stopped" in callback["last_error"]
+
+
 @pytest.mark.parametrize("thread_id", ["4641", "2"])
-def test_live_callback_keeps_lease_past_dispatch_timeout(tmp_path, monkeypatch, thread_id):
+def test_live_callback_has_absolute_dispatch_timeout(tmp_path, monkeypatch, thread_id):
     # Topic 4641 is the historical failure sample, not a routing exception.
     db_path = tmp_path / "long-callback.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_GRACE_CALLBACK_TURN_TIMEOUT_SECONDS", "0.05")
-    clock = [time.time()]
-    started_at = clock[0]
-    original_sleep = asyncio.sleep
-    ttl_crossed = asyncio.Event()
-
-    async def accelerated_heartbeat_sleep(seconds):
-        if seconds == 30:
-            await original_sleep(0.01)
-            clock[0] += 30
-            if clock[0] > started_at + 120:
-                ttl_crossed.set()
-        else:
-            await original_sleep(seconds)
-
-    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
-    monkeypatch.setattr(asyncio, "sleep", accelerated_heartbeat_sleep)
     kb.init_db()
     _, review_id, event_id = _objective_blocked_execution_chain(db_path)
     session_key = f"agent:main:telegram:group:chat-1:{thread_id}"
@@ -1336,26 +1778,20 @@ def test_live_callback_keeps_lease_past_dispatch_timeout(tmp_path, monkeypatch, 
         def __init__(self):
             super().__init__(record_outcome=False)
             self._session_tasks = {}
+            self.cancelled = False
 
         async def handle_message(self, event):
             async def process():
                 context = event.internal_context
                 context["processing_task"] = asyncio.current_task()
                 try:
-                    await asyncio.sleep(0.06)
-                    await asyncio.wait_for(ttl_crossed.wait(), timeout=5)
-                    assert clock[0] > started_at + 120
-                    with kb.connect_closing(db_path) as conn:
-                        rebound = kb.rebind_active_grace_callback_session(
-                            conn, review_task_id=review_id, event_id=event_id,
-                            platform="telegram", chat_id="chat-1", thread_id=thread_id,
-                            session_id="compressed-session",
-                            lease_owner=context["grace_callback_lease_owner"],
-                        )
-                        assert rebound["state"] == "delivering"
-                    await CallbackAdapter.handle_message(self, event)
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
                 finally:
-                    context["processing_completion_future"].set_result(True)
+                    if not context["processing_completion_future"].done():
+                        context["processing_completion_future"].set_result(True)
 
             self._session_tasks[session_key] = asyncio.create_task(process())
 
@@ -1364,15 +1800,18 @@ def test_live_callback_keeps_lease_past_dispatch_timeout(tmp_path, monkeypatch, 
 
     async def deliver():
         await runner._deliver_due_grace_loop_callbacks(kb)
-        await asyncio.gather(*adapter._session_tasks.values())
+        for task in adapter._session_tasks.values():
+            task.cancel()
+        await asyncio.gather(*adapter._session_tasks.values(), return_exceptions=True)
 
     asyncio.run(deliver())
-    assert len(adapter.handled) == 1
+    assert adapter.handled == []
+    assert adapter.cancelled is True
     with kb.connect_closing(db_path) as conn:
         callback = kb.get_grace_loop_callback(conn, review_id)
-    assert callback["state"] == "delivered"
-    assert callback["session_id"] == "compressed-session"
-    assert callback["last_error"] is None
+    assert callback["state"] == "pending"
+    assert callback["last_event_id"] == 0
+    assert "TimeoutError" in callback["last_error"]
 
 
 @pytest.mark.parametrize("domain_memory", [{"domain_key": "solobizai", "mode": "query"}, None])
@@ -1393,6 +1832,80 @@ def test_blocker_carries_sealed_memory_authorization(tmp_path, monkeypatch, doma
     assert evidence["continuation_authorization"] == {
         "snapshot_available": True, "domain_memory": domain_memory,
     }
+
+
+def test_blocker_callback_preserves_nested_canonical_report(tmp_path, monkeypatch):
+    db_path = tmp_path / "blocked-result-report.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    execution_id, review_id, _ = _objective_blocked_execution_chain(db_path)
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": False,
+        "title": "Controller-rejected draft",
+        "body": "完整草稿正文" * 1_200,
+        "assets": [],
+    }
+    blocked_result = {
+        "status": "succeeded",
+        "summary": "Backend completed but contract validation rejected the draft.",
+        "acceptanceEvidence": {"body_present": "x" * 10_000},
+        "externalEffects": [
+            {"target": f"internal-{index}", "detail": "x" * 2_000}
+            for index in range(20)
+        ],
+        "artifacts": [f"/tmp/{index}-" + "a" * 1_500 for index in range(20)],
+        "metadata": {"user_facing_report": report},
+    }
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE grace_delegations SET contract_snapshot=? "
+            "WHERE execution_task_id=?",
+            (json.dumps({"domain_memory": {"mode": "query"}}), execution_id),
+        )
+        run = kb.latest_run(conn, execution_id)
+        metadata = dict(run.metadata or {})
+        metadata["loop_contract_blocked_result"] = blocked_result
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), run.id),
+        )
+
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    evidence = json.loads(next(
+        line.split("=", 1)[1]
+        for line in adapter.handled[0].text.splitlines()
+        if line.startswith("evidence_snapshot=")
+    ))
+    assert evidence["execution"]["user_facing_report"] == report
+    assert evidence["execution"]["blocked_result"]["status"] == "succeeded"
+    artifacts = evidence["execution"]["blocked_result"]["artifacts"]
+    assert len(artifacts) == 8
+    assert all(artifact.endswith("...[truncated]") for artifact in artifacts)
+    assert evidence["execution"]["blocked_result"]["external_effects"].endswith(
+        "...[truncated]"
+    )
+    assert len(evidence["execution"]["blocked_result"]["external_effects"]) < 2_100
+    assert evidence["continuation_authorization"]["snapshot_available"] is True
+
+
+def test_already_blocked_exact_successor_remains_correlatable():
+    assert _callback_successor_is_correlatable({
+        "delegation_state": "queued",
+        "execution_task_id": "execution",
+        "review_task_id": "review",
+        "stage_status": "blocked",
+        "execution_status": "blocked",
+        "review_status": "todo",
+    })
 
 
 def test_callback_delivery_is_supervised_without_blocking_notifier_polling():
@@ -1518,7 +2031,7 @@ def test_missing_continuation_keeps_retained_approval_receipt_pending(
 
 @pytest.mark.parametrize(
     "successor_state",
-    [None, "ready", "done", "bound_live", "unrelated_bound_live", "exact_done_blocked", "exact_done_advanced", "later_blocked"],
+    [None, "ready", "done", "bound_live", "same_stage_bound_live", "unrelated_bound_live", "exact_done_blocked", "exact_done_advanced", "later_blocked"],
 )
 def test_intermediate_missing_continuation_blocks_only_without_live_successor(
     tmp_path, monkeypatch, successor_state,
@@ -1546,12 +2059,13 @@ def test_intermediate_missing_continuation_blocks_only_without_live_successor(
             _bind_delegation(conn, child_execution, child_review, suffix="fallback-successor")
             conn.execute("UPDATE grace_delegations SET origin_review_task_id=?, origin_event_id=? WHERE execution_task_id=?",
                          (review_id, event_id, child_execution))
-            if successor_state in {"bound_live", "unrelated_bound_live", "exact_done_blocked", "exact_done_advanced"}:
-                kb.ensure_grace_objective_stage(conn, objective_id="go_callback_continuity", stage_key="next")
+            if successor_state in {"bound_live", "same_stage_bound_live", "unrelated_bound_live", "exact_done_blocked", "exact_done_advanced"}:
+                successor_stage = "prepare" if successor_state == "same_stage_bound_live" else "next"
+                kb.ensure_grace_objective_stage(conn, objective_id="go_callback_continuity", stage_key=successor_stage)
                 conn.execute("UPDATE grace_delegations SET objective_id=?,stage_key=? WHERE execution_task_id=?",
-                             ("go_callback_continuity", "next", child_execution))
+                             ("go_callback_continuity", successor_stage, child_execution))
                 delegation_id = conn.execute("SELECT delegation_id FROM grace_delegations WHERE execution_task_id=?", (child_execution,)).fetchone()[0]
-                kb._bind_grace_objective_stage(conn, objective_id="go_callback_continuity", stage_key="next", delegation_id=delegation_id)
+                kb._bind_grace_objective_stage(conn, objective_id="go_callback_continuity", stage_key=successor_stage, delegation_id=delegation_id)
                 if successor_state == "unrelated_bound_live":
                     conn.execute(
                         "UPDATE grace_delegations SET origin_review_task_id=?,origin_event_id=? "
@@ -1612,10 +2126,12 @@ def test_intermediate_missing_continuation_blocks_only_without_live_successor(
         callback = kb.get_grace_loop_callback(conn, review_id)
         objective = kb.get_grace_objective(conn, "go_callback_continuity")
     assert len(adapter.handled) == 1
-    if successor_state in {"bound_live", "exact_done_blocked", "exact_done_advanced"}:
+    if successor_state in {"bound_live", "same_stage_bound_live", "exact_done_blocked", "exact_done_advanced"}:
         assert objective["status"] == ("blocked" if successor_state == "exact_done_blocked" else "active")
         assert objective["current_stage_key"] == (
             "later" if successor_state == "exact_done_advanced" else "next"
+            if successor_state != "same_stage_bound_live"
+            else "prepare"
         )
         assert callback["state"] == "delivered"
         assert callback["outcome_kind"] == "continued"
@@ -1979,6 +2495,115 @@ def test_objective_execution_blocker_is_durably_blocked_without_successor(tmp_pa
     assert objective["status"] == "blocked"
     assert objective["waiting_for"] == "worker policy forbids a required read-only click"
     assert (stage["status"], stage["outcome_kind"]) == ("done", "intermediate_blocked")
+
+
+def test_objective_execution_blocker_waits_for_formal_review_lane(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "objective-execution-review-race.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    execution_id, review_id, event_id = _objective_blocked_execution_chain(
+        db_path, suffix="execution-review-race",
+    )
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET executor_profile='grace-policy-review' WHERE id=?",
+            (review_id,),
+        )
+        assert kb.list_due_grace_loop_callbacks(conn) == []
+        assert not kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway",
+        )
+        assert kb.recompute_ready(conn) == 1
+        review = kb.claim_task(conn, review_id, claimer="grace-review")
+        assert review is not None and review.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            review_id,
+            reason="execution attachments are incomplete",
+            kind="dependency",
+            expected_run_id=review.current_run_id,
+        )
+        due = kb.list_due_grace_loop_callbacks(conn)
+        assert [row["event_id"] for row in due] == [event_id]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="gateway",
+        )
+
+
+def test_objective_execution_blocker_correlates_same_stage_successor(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "objective-same-stage-successor.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id, event_id = _objective_blocked_execution_chain(
+        db_path, suffix="same-stage-successor",
+    )
+
+    class SameStageSuccessorAdapter(CallbackAdapter):
+        async def handle_message(self, event):
+            await super().handle_message(event)
+            with kb.connect_closing(db_path) as conn:
+                next_execution = kb.create_task(conn, title="reconciled execution")
+                next_review = kb.create_task(
+                    conn, title="reconciled review", parents=(next_execution,),
+                )
+                _bind_delegation(
+                    conn, next_execution, next_review, suffix="same-stage-reconciled",
+                )
+                delegation_id = conn.execute(
+                    "SELECT delegation_id FROM grace_delegations "
+                    "WHERE execution_task_id=?",
+                    (next_execution,),
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE grace_delegations SET origin_review_task_id=?,"
+                    "origin_event_id=?,objective_id=?,stage_key=? "
+                    "WHERE delegation_id=?",
+                    (
+                        review_id, event_id, "go_execution_blocker", "prepare",
+                        delegation_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE grace_objective_stages SET delegation_id=?,"
+                    "execution_task_id=?,review_task_id=?,status='queued' "
+                    "WHERE objective_id=? AND stage_key='prepare'",
+                    (
+                        delegation_id, next_execution, next_review,
+                        "go_execution_blocker",
+                    ),
+                )
+
+    adapter = SameStageSuccessorAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        objective = kb.get_grace_objective(conn, "go_execution_blocker")
+        stage = conn.execute(
+            "SELECT status,delegation_id FROM grace_objective_stages "
+            "WHERE objective_id=? AND stage_key='prepare'",
+            ("go_execution_blocker",),
+        ).fetchone()
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "continued"
+    assert objective["status"] == "active"
+    assert objective["current_stage_key"] == "prepare"
+    assert stage["status"] == "queued"
 
 
 @pytest.mark.parametrize("event_stage", ["execution", "grace_review"])
@@ -2623,6 +3248,41 @@ def test_quota_blocked_execution_records_structured_callback_outcome(
     assert review is not None and review.status == "todo"
 
 
+def test_objective_quota_blocker_durably_blocks_current_stage(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "objective-quota-blocker.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _, review_id, event_id = _objective_blocked_execution_chain(
+        db_path, suffix="objective-quota",
+    )
+    usage_message = (
+        "codex_usage_limit: You've reached your Codex subscription usage limit."
+    )
+    with kb.connect_closing(db_path) as conn:
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps({"reason": usage_message}), event_id),
+        )
+
+    adapter = CallbackAdapter(record_outcome=False)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        objective = kb.get_grace_objective(conn, "go_execution_blocker")
+    assert callback["state"] == "delivered"
+    assert callback["outcome_kind"] == "intermediate_blocked"
+    assert objective["status"] == "blocked"
+    assert objective["waiting_for"] == usage_message
+
+
 def test_callback_bounds_worker_authored_trigger_payload(tmp_path, monkeypatch):
     db_path = tmp_path / "bounded-trigger.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -3135,6 +3795,71 @@ def test_session_reset_sends_safe_handoff_without_injecting_old_turn(tmp_path, m
     assert callback["state"] == "delivered"
     assert callback["outcome_kind"] == "closed"
     assert callback["outcome_event_id"] == callback["last_event_id"]
+
+
+def test_exact_authenticated_reply_rebinds_intermediate_callback(tmp_path, monkeypatch):
+    db_path = tmp_path / "reset-intermediate-callback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    objective_id = "go_ext_1234567890abcdef12345678"
+    execution_id, review_id = _review_chain(
+        db_path,
+        completion_mode="intermediate",
+        objective_id=objective_id,
+    )
+    with kb.connect_closing(db_path) as conn:
+        delegation_id = conn.execute(
+            "SELECT delegation_id FROM grace_delegations WHERE review_task_id=?",
+            (review_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id=?,stage_key='prepare' "
+            "WHERE delegation_id=?",
+            (objective_id, delegation_id),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id=objective_id,
+            stage_key="prepare",
+            delegation_id=delegation_id,
+        )
+
+    adapter = CallbackAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="new-session-after-reset",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        parked = kb.get_grace_loop_callback(conn, review_id)
+    assert parked["state"] == "attention"
+    assert parked["last_error"] == kb._GRACE_SESSION_RESET_HANDOFF_ERROR
+
+    source = next(iter(runner.session_store._entries.values())).origin
+    resumed = runner._resume_grace_callback_handoff(
+        text=f"接續 {review_id}",
+        source=source,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="new-session-after-reset",
+    )
+
+    with kb.connect_closing(db_path) as conn:
+        rebound = kb.get_grace_loop_callback(conn, review_id)
+        due = kb.list_due_grace_loop_callbacks(conn)
+    assert resumed["objective_id"] == objective_id
+    assert resumed["stage_key"] == "prepare"
+    assert rebound["state"] == "pending"
+    assert rebound["session_id"] == "new-session-after-reset"
+    assert [item["review_task_id"] for item in due] == [review_id]
+
+
+def test_grace_callback_resume_phrase_is_exact_control_syntax():
+    assert _grace_callback_resume_review_id("接續 t_e4cebdd9") == "t_e4cebdd9"
+    assert _grace_callback_resume_review_id("  接續   t_e4cebdd9。 ") == "t_e4cebdd9"
+    assert _grace_callback_resume_review_id("請接續 t_e4cebdd9") == ""
+    assert _grace_callback_resume_review_id("接續 t_e4cebdd9 再發布") == ""
 
 
 def test_compression_child_rebinds_and_delivers_callback(tmp_path, monkeypatch):

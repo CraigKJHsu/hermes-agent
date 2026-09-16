@@ -1,5 +1,11 @@
 # Topic execution compatibility: phase one
 
+> Historical phase-one record. The later versioned Behavior Profile registry,
+> Objective pin, safety-kernel generations and explicit migration workflow are
+> implemented and documented in `docs/versioned-behavior-profiles.md`. The
+> statements below describe the isolated observation baseline only and must not
+> be read as current capability status.
+
 This change adds observation and reproducible local replay. It does **not**
 implement Behavior Profile isolation, pin old executable behavior, migrate an
 Objective, change a policy resolution rule, or grant publication authority.

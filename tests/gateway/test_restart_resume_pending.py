@@ -998,12 +998,100 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True
+    assert event.internal_context["gateway_resume_reason"] == "restart_timeout"
     assert event.message_type == MessageType.TEXT
     assert event.source == source
     # Text is empty — the existing _is_resume_pending branch in
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_recovers_pending_review_retry_first(tmp_path):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._session_db = MagicMock(db_path=tmp_path / "state.db")
+    adapter.handle_message = AsyncMock()
+    recovered = {
+        "status": "queued",
+        "task_created": False,
+        "grace_review_task_id": "t_review",
+    }
+
+    with patch(
+        "hermes_cli.review_retry_recovery.recover_interrupted_review_retry",
+        return_value=recovered,
+    ) as recover:
+        assert runner._schedule_resume_pending_sessions() == 1
+        await asyncio.sleep(0)
+
+    recover.assert_called_once_with(
+        session_id="sid",
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        platform="telegram",
+        chat_id="resume-chat",
+        chat_type="group",
+        thread_id="topic-1",
+        user_id=str(source.user_id or ""),
+        owner_user_id=runner._configured_external_action_owner(source),
+        state_db_path=tmp_path / "state.db",
+        freshness_seconds=_auto_continue_freshness_window(),
+    )
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal_context["gateway_recovered_review_retry"] == recovered
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_waits_for_durable_review_retry_result(tmp_path):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._session_db = MagicMock(db_path=tmp_path / "state.db")
+    adapter.handle_message = AsyncMock()
+    pending = {
+        "status": "state_write_pending",
+        "task_created": False,
+        "grace_review_task_id": "t_review",
+        "tool_result_durable": False,
+    }
+
+    with patch(
+        "hermes_cli.review_retry_recovery.recover_interrupted_review_retry",
+        return_value=pending,
+    ):
+        assert runner._schedule_resume_pending_sessions() == 0
+        await asyncio.sleep(0)
+
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.session_key not in runner._running_agents
+    assert pending_entry.session_key not in runner._running_agents_ts
+    assert pending_entry.resume_pending is True
 
 
 @pytest.mark.asyncio
@@ -1066,6 +1154,47 @@ async def test_startup_auto_resume_skips_stale_entries():
 
     assert scheduled == 0
     adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_stale_session_can_finish_durable_review_receipt(tmp_path):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stale-receipt-chat")
+    stale_marker = datetime.now() - timedelta(
+        seconds=_auto_continue_freshness_window() + 60
+    )
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:stale-receipt-chat",
+        session_id="sid",
+        created_at=stale_marker,
+        updated_at=stale_marker,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=stale_marker,
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = MagicMock(db_path=tmp_path / "state.db")
+    adapter.handle_message = AsyncMock()
+    recovered = {
+        "status": "queued",
+        "grace_review_task_id": "t_review",
+    }
+
+    with patch(
+        "hermes_cli.review_retry_recovery.recover_interrupted_review_retry",
+        return_value=recovered,
+    ) as recover:
+        assert runner._schedule_resume_pending_sessions() == 0
+        await asyncio.sleep(0)
+
+    recover.assert_called_once()
+    adapter.handle_message.assert_not_called()
+    assert entry.session_key not in runner._running_agents
+    assert entry.session_key not in runner._running_agents_ts
+    assert entry.resume_pending is True
 
 
 @pytest.mark.asyncio

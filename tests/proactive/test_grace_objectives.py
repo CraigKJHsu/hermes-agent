@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -398,6 +399,348 @@ def test_later_retry_supersedes_open_retry_sibling_and_callback(tmp_path):
         assert callback["lease_event_id"] is None
         assert "prepare_asset_r3" in callback["last_error"]
         assert kb.list_due_grace_loop_callbacks(conn) == []
+
+
+def test_later_retry_supersedes_terminal_cancelled_sibling(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-cancelled-retry.db") as conn:
+        _create_objective(conn)
+        execution_id = kb.create_task(conn, title="cancelled execution")
+        review_id = kb.create_task(
+            conn, title="cancelled review", parents=(execution_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id IN (?,?)",
+            (execution_id, review_id),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            contract_fingerprint="f" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset",
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='cancelled',"
+            "outcome_kind='cancelled' WHERE review_task_id=?",
+            (review_id,),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',"
+            "outcome_kind='cancelled',evidence=?,execution_task_id=?,"
+            "review_task_id=?,completed_at=123 WHERE objective_id='go_test' "
+            "AND stage_key='prepare_asset'",
+            (json.dumps({"reason": "preserve this cancellation"}), execution_id, review_id),
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET stage_key='wrong_stage' "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        with pytest.raises(ValueError, match="not safe to supersede"):
+            kb._bind_grace_objective_stage(
+                conn,
+                objective_id="go_test",
+                stage_key="prepare_asset_r2",
+                delegation_id="gd-retry",
+            )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET stage_key='prepare_asset' "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET evidence='[]' "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        )
+        with pytest.raises(ValueError, match="not an object"):
+            kb._bind_grace_objective_stage(
+                conn,
+                objective_id="go_test",
+                stage_key="prepare_asset_r2",
+                delegation_id="gd-retry",
+            )
+        conn.execute(
+            "UPDATE grace_objective_stages SET evidence=? "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'",
+            (json.dumps({"reason": "preserve this cancellation"}),),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+            delegation_id="gd-retry",
+        )
+
+        stage = conn.execute(
+            "SELECT outcome_kind,evidence,completed_at FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        evidence = json.loads(stage["evidence"])
+        assert stage["outcome_kind"] == "superseded_by_retry"
+        assert stage["completed_at"] == 123
+        assert evidence["reason"] == "preserve this cancellation"
+        assert evidence["superseded_by_retry"]["next_stage_key"] == "prepare_asset_r2"
+        assert callback["state"] == "cancelled"
+        assert callback["outcome_kind"] == "superseded_by_retry"
+
+
+def test_historical_cancelled_stage_repair_requires_verified_successor(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-history-repair.db") as conn:
+        _create_objective(conn)
+        source_execution = kb.create_task(conn, title="source execution")
+        source_review = kb.create_task(
+            conn, title="source review", parents=(source_execution,),
+        )
+        successor_execution = kb.create_task(conn, title="successor execution")
+        successor_review = kb.create_task(
+            conn, title="successor review", parents=(successor_execution,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id IN (?,?,?,?)",
+            (source_execution, source_review, successor_execution, successor_review),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=source_review,
+            execution_task_id=source_execution,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-1",
+            contract_fingerprint="1" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset",
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=successor_review,
+            execution_task_id=successor_execution,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-2",
+            contract_fingerprint="2" * 64,
+            completion_mode="intermediate",
+            objective_id="go_test",
+            stage_key="prepare_asset_r2",
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='cancelled',"
+            "outcome_kind='cancelled',last_error='original callback cancellation' "
+            "WHERE review_task_id=?",
+            (source_review,),
+        )
+        kb._append_event(
+            conn, successor_review, "completed", {"summary": "accepted successor"},
+        )
+        successor_event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='pending',"
+            "outcome_kind='continued',outcome_event_id=? WHERE review_task_id=?",
+            (successor_event_id, successor_review),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',"
+            "outcome_kind='cancelled',evidence=?,execution_task_id=?,"
+            "review_task_id=? WHERE objective_id='go_test' "
+            "AND stage_key='prepare_asset'",
+            (json.dumps({"reason": "original cancellation"}), source_execution, source_review),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',"
+            "outcome_kind='continued',execution_task_id=?,review_task_id=? "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset_r2'",
+            (successor_execution, successor_review),
+        )
+        receipt = {
+            "authorization_id": "user-confirmation",
+            "reason": "repair history",
+            "objective_id": "go_test",
+            "stage_successors": {"prepare_asset": "prepare_asset_r2"},
+        }
+        with pytest.raises(ValueError, match="duplicate normalized stage keys"):
+            kb.repair_superseded_cancelled_grace_objective_stages(
+                conn,
+                objective_id="go_test",
+                stage_successors={
+                    "prepare_asset": "prepare_asset_r2",
+                    " prepare_asset ": "prepare_asset_r3",
+                },
+                repair_receipt=receipt,
+            )
+        with pytest.raises(ValueError, match="evidence changed"):
+            kb.repair_superseded_cancelled_grace_objective_stages(
+                conn,
+                objective_id="go_test",
+                stage_successors={"prepare_asset": "prepare_asset_r2"},
+                repair_receipt=receipt,
+            )
+        assert conn.execute(
+            "SELECT outcome_kind FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        ).fetchone()[0] == "cancelled"
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='cancelled' "
+            "WHERE review_task_id=?",
+            (successor_review,),
+        )
+        with pytest.raises(ValueError, match="evidence changed"):
+            kb.repair_superseded_cancelled_grace_objective_stages(
+                conn,
+                objective_id="go_test",
+                stage_successors={"prepare_asset": "prepare_asset_r2"},
+                repair_receipt=receipt,
+            )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='delivered' WHERE review_task_id=?",
+            (successor_review,),
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET stage_key='wrong_stage' "
+            "WHERE review_task_id=?",
+            (successor_review,),
+        )
+        with pytest.raises(ValueError, match="evidence changed"):
+            kb.repair_superseded_cancelled_grace_objective_stages(
+                conn,
+                objective_id="go_test",
+                stage_successors={"prepare_asset": "prepare_asset_r2"},
+                repair_receipt=receipt,
+            )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET stage_key='prepare_asset_r2' "
+            "WHERE review_task_id=?",
+            (successor_review,),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET evidence='[]' "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        )
+        with pytest.raises(ValueError, match="evidence is invalid"):
+            kb.repair_superseded_cancelled_grace_objective_stages(
+                conn,
+                objective_id="go_test",
+                stage_successors={"prepare_asset": "prepare_asset_r2"},
+                repair_receipt=receipt,
+            )
+        conn.execute(
+            "UPDATE grace_objective_stages SET evidence=? "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'",
+            (json.dumps({"reason": "original cancellation"}),),
+        )
+        result = kb.repair_superseded_cancelled_grace_objective_stages(
+            conn,
+            objective_id="go_test",
+            stage_successors={"prepare_asset": "prepare_asset_r2"},
+            repair_receipt=receipt,
+        )
+
+        stage = conn.execute(
+            "SELECT outcome_kind,evidence FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, source_review)
+        evidence = json.loads(stage["evidence"])
+        assert result["repaired_stages"][0]["successor_stage_key"] == "prepare_asset_r2"
+        assert stage["outcome_kind"] == "superseded_by_retry"
+        assert evidence["reason"] == "original cancellation"
+        assert evidence["superseded_by_retry"]["repair_receipt"] == receipt
+        assert callback["outcome_kind"] == "superseded_by_retry"
+        assert callback["last_error"] == "original callback cancellation"
+
+
+def test_historical_cancelled_stage_repair_rejects_active_lease(tmp_path):
+    path = tmp_path / "objective-history-repair-lease.db"
+    with kb.connect_closing(path) as conn:
+        _create_objective(conn)
+        execution_id = kb.create_task(conn, title="source execution")
+        review_id = kb.create_task(conn, title="source review", parents=(execution_id,))
+        successor_execution = kb.create_task(conn, title="successor execution")
+        successor_review = kb.create_task(
+            conn, title="successor review", parents=(successor_execution,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id IN (?,?,?,?)",
+            (execution_id, review_id, successor_execution, successor_review),
+        )
+        kb.add_grace_loop_callback(
+            conn, review_task_id=review_id, execution_task_id=execution_id,
+            platform="telegram", chat_id="chat-1", thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641", session_id="session-1",
+            contract_fingerprint="3" * 64, completion_mode="intermediate",
+            objective_id="go_test", stage_key="prepare_asset",
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go_test", stage_key="prepare_asset_r2",
+        )
+        kb.add_grace_loop_callback(
+            conn, review_task_id=successor_review,
+            execution_task_id=successor_execution, platform="telegram",
+            chat_id="chat-1", thread_id="4641",
+            session_key="agent:main:telegram:group:chat-1:4641",
+            session_id="session-2", contract_fingerprint="4" * 64,
+            completion_mode="intermediate", objective_id="go_test",
+            stage_key="prepare_asset_r2",
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='cancelled',outcome_kind='cancelled',"
+            "lease_owner='active-owner' WHERE review_task_id=?",
+            (review_id,),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',outcome_kind='cancelled',"
+            "execution_task_id=?,review_task_id=? WHERE objective_id='go_test' "
+            "AND stage_key='prepare_asset'",
+            (execution_id, review_id),
+        )
+        kb._append_event(
+            conn, successor_review, "completed", {"summary": "accepted successor"},
+        )
+        successor_event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='delivered',"
+            "outcome_kind='continued',outcome_event_id=? WHERE review_task_id=?",
+            (successor_event_id, successor_review),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',outcome_kind='continued',"
+            "execution_task_id=?,review_task_id=? WHERE objective_id='go_test' "
+            "AND stage_key='prepare_asset_r2'",
+            (successor_execution, successor_review),
+        )
+        with pytest.raises(ValueError, match="evidence changed"):
+            kb.repair_superseded_cancelled_grace_objective_stages(
+                conn,
+                objective_id="go_test",
+                stage_successors={"prepare_asset": "prepare_asset_r2"},
+                repair_receipt={
+                    "authorization_id": "confirmed",
+                    "reason": "repair",
+                    "objective_id": "go_test",
+                    "stage_successors": {"prepare_asset": "prepare_asset_r2"},
+                },
+            )
+        assert conn.execute(
+            "SELECT outcome_kind FROM grace_objective_stages "
+            "WHERE objective_id='go_test' AND stage_key='prepare_asset'"
+        ).fetchone()[0] == "cancelled"
 
 
 def test_reselecting_existing_retry_repairs_open_older_sibling(tmp_path):
@@ -1036,6 +1379,65 @@ def test_available_stage_key_skips_done_or_bound_retry_stage(tmp_path):
         ]
 
 
+def test_available_stage_key_reuses_exact_unbound_stage_with_retry_suffix(tmp_path):
+    with kb.connect_closing(tmp_path / "objective-exact-suffixed-stage.db") as conn:
+        _create_objective(conn)
+        stage_key = "package_schema_repair_case_r14"
+        kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key=stage_key,
+        )
+
+        assert kb.available_grace_objective_stage_key(
+            conn,
+            objective_id="go_test",
+            stage_key=stage_key,
+        ) == stage_key
+
+
+@pytest.mark.parametrize(
+    ("used_suffix", "next_suffix"),
+    (("r14", "r15"), ("r25", "r26"), ("r99", "r100")),
+)
+def test_bound_suffixed_stage_advances_declared_retry_family(
+    tmp_path,
+    used_suffix,
+    next_suffix,
+):
+    with kb.connect_closing(tmp_path / "objective-advance-suffixed-stage.db") as conn:
+        _create_objective(conn)
+        stage_key = f"package_schema_repair_case_{used_suffix}"
+        kb.ensure_grace_objective_stage(
+            conn,
+            objective_id="go_test",
+            stage_key=stage_key,
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages "
+            "SET status='done', delegation_id='gd-used' "
+            "WHERE objective_id='go_test' AND stage_key=?",
+            (stage_key,),
+        )
+
+        retry_stage_key = kb.available_grace_objective_stage_key(
+            conn,
+            objective_id="go_test",
+            stage_key=stage_key,
+        )
+
+        assert retry_stage_key == f"package_schema_repair_case_{next_suffix}"
+        assert kb.grace_objective_stage_mode(
+            conn,
+            objective_id="go_test",
+            stage_key=retry_stage_key,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+            ensure_stage=False,
+        ) == "intermediate"
+
+
 def test_retry_stage_key_uses_root_family_instead_of_nesting(tmp_path):
     with kb.connect_closing(tmp_path / "objective-root-retry-stage.db") as conn:
         _create_objective(conn)
@@ -1429,3 +1831,66 @@ def test_active_objective_is_injected_outside_compaction_history(tmp_path, monke
     assert "go_prompt" in prompt
     assert "not historical compaction text" in prompt
     assert '"current_stage_key": "prepare_asset"' in prompt
+
+
+def test_active_objective_prompt_isolates_stale_sibling_pin(tmp_path, monkeypatch):
+    from proactive.behavior_profiles.registry import BehaviorProfileError
+    from hermes_cli import objective_workflow
+
+    db_path = tmp_path / "objective-prompt-stale-sibling.db"
+    with kb.connect_closing(db_path) as conn:
+        _create_objective(conn, objective_id="go_current")
+        _create_objective(conn, objective_id="go_stale")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    def fake_progress(_conn, objective_id):
+        if objective_id == "go_stale":
+            raise BehaviorProfileError("behavior.manifest_mismatch")
+        return {"complete": False, "verified": True}
+
+    monkeypatch.setattr(objective_workflow, "progress", fake_progress)
+    prompt = active_objectives_prompt(
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="4641",
+    )
+    rendered = {
+        row["objective_id"]: row
+        for row in json.loads(prompt.rsplit("\n", 1)[1])
+    }
+
+    assert rendered["go_current"]["publication_progress"] == {
+        "complete": False,
+        "verified": True,
+    }
+    assert "control_plane_blocker" not in rendered["go_current"]
+    assert rendered["go_stale"]["publication_progress"] is None
+    assert rendered["go_stale"]["control_plane_blocker"] == {
+        "advance_allowed": False,
+        "code": "behavior.manifest_mismatch",
+        "operator_action_required": True,
+    }
+    assert "do not plan, delegate, approve, execute, or otherwise advance it" in prompt
+
+
+def test_active_objective_prompt_does_not_isolate_unclassified_failure(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import objective_workflow
+
+    db_path = tmp_path / "objective-prompt-unclassified-failure.db"
+    with kb.connect_closing(db_path) as conn:
+        _create_objective(conn, objective_id="go_broken")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        objective_workflow,
+        "progress",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("unexpected storage failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected storage failure"):
+        active_objectives_prompt(
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="4641",
+        )

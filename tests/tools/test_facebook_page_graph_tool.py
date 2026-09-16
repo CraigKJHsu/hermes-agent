@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import os
+from pathlib import Path
 import struct
 import pytest
 
@@ -99,6 +101,415 @@ def test_accepted_page_source_accepts_canonical_page_hero_review(accepted_page_p
     assert resolved["message"] == message
     assert resolved["image_path"] == page_hero["path"]
     assert resolved["image_sha256"] == page_hero["sha256"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [None, "changed_hash", "wrong_dimensions", "missing_byte_receipt", "ambiguous",
+     "malformed_visual", "malformed_hashes", "missing_visual_safety", "occluded",
+     "obstructive_disclosure", "visual_defect", "intermediate_package",
+     "incomplete_terminal_package"],
+)
+def test_accepted_page_source_accepts_controller_actual_pixel_review(
+    accepted_page_package, fault,
+):
+    """Historical Topic 4641 schema sample; behavior must remain project-agnostic."""
+    contract, message, source_id, review_id = accepted_page_package
+    with kb.connect_closing() as conn:
+        source_run = kb.latest_run(conn, source_id)
+        review_run = kb.latest_run(conn, review_id)
+        image_path = Path(review_run.metadata["asset_review"][0]["path"])
+        image_hash = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        kb.add_attachment(
+            conn,
+            source_id,
+            filename="hero.png",
+            stored_path=str(image_path),
+            content_type="image/png",
+            size=image_path.stat().st_size,
+            uploaded_by="kanban_complete",
+        )
+        if fault == "ambiguous":
+            kb.add_attachment(
+                conn,
+                source_id,
+                filename="duplicate.png",
+                stored_path=str(image_path),
+                content_type="image/png",
+                size=image_path.stat().st_size,
+                uploaded_by="kanban_complete",
+            )
+        review_metadata = {
+            "review_outcome": "accepted",
+            "asset_family": "page_hero",
+            "asset_declarations": {
+                "page_hero": {"dimensions": "1664x936"},
+            },
+            "visual_review": {
+                "all_required_text_readable": True,
+                "text_occlusion_free": True,
+                "disclosure_non_obstructive": True,
+                "defects_found": [],
+            },
+            "workflow_review_source": {
+                "parent_execution_task_id": source_id,
+                "parent_execution_run_id": source_run.id,
+                "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+                    source_run
+                ),
+            },
+            "evidence": {
+                "page_hero_actual_pixel_analysis": {
+                    "asset_family": "page_hero",
+                    "status": "passed",
+                    "dimensions": "1664x936"
+                    if fault != "wrong_dimensions"
+                    else "1600x900",
+                    "traditional_chinese_readable": True,
+                    "ai_disclosure_visible": True,
+                },
+                "hash_verification": {
+                    "page_hero_sha256": image_hash
+                    if fault != "changed_hash"
+                    else "f" * 64,
+                    "exact_attachment_bytes_verified": fault != "missing_byte_receipt",
+                },
+                "controller_content_package_readback": {
+                    "package_complete": fault not in {
+                        "intermediate_package", "incomplete_terminal_package",
+                    },
+                    "task_attachment_row_count": 2 if fault == "ambiguous" else 1,
+                },
+            },
+        }
+        if fault == "malformed_visual":
+            review_metadata["evidence"]["page_hero_actual_pixel_analysis"] = ["invalid"]
+        elif fault == "malformed_hashes":
+            review_metadata["evidence"]["hash_verification"] = "invalid"
+        elif fault == "missing_visual_safety":
+            review_metadata.pop("visual_review")
+        elif fault == "occluded":
+            review_metadata["visual_review"]["text_occlusion_free"] = False
+        elif fault == "obstructive_disclosure":
+            review_metadata["visual_review"]["disclosure_non_obstructive"] = False
+        elif fault == "visual_defect":
+            review_metadata["visual_review"]["defects_found"] = ["overlay obstructs text"]
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(review_metadata), review_run.id),
+        )
+        if fault in {"intermediate_package", "incomplete_terminal_package"}:
+            sealed_contract = {
+                "identity": dict(contract["identity"]),
+                "completion_mode": (
+                    "intermediate"
+                    if fault == "intermediate_package"
+                    else "terminal"
+                ),
+            }
+            snapshot = json.dumps(sealed_contract, ensure_ascii=False)
+            conn.execute(
+                "UPDATE grace_delegations SET contract_snapshot=?, "
+                "contract_fingerprint=? WHERE execution_task_id=?",
+                (
+                    snapshot,
+                    hashlib.sha256(snapshot.encode("utf-8")).hexdigest(),
+                    source_id,
+                ),
+            )
+
+    if fault and fault != "intermediate_package":
+        with pytest.raises(ValueError):
+            tool.bind_accepted_page_preflight_source(contract)
+    else:
+        resolved = tool.bind_accepted_page_preflight_source(contract)
+        assert resolved["message"] == message
+        assert resolved["execution_run_id"] == source_run.id
+        assert resolved["review_run_id"] == review_run.id
+        assert resolved["image_path"] == str(image_path)
+        assert resolved["image_sha256"] == image_hash
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [None, "normalized_representation", "unsafe_visual", "wrong_dimensions", "wrong_hash", "wrong_attachment", "wrong_message", "conflict", "incomplete_current_with_legacy", "uninspected_current_with_legacy"],
+)
+def test_accepted_page_source_accepts_current_controller_review(
+    accepted_page_package, fault,
+):
+    contract, message, source_id, review_id = accepted_page_package
+    with kb.connect_closing() as conn:
+        review_run = kb.latest_run(conn, review_id)
+        legacy = review_run.metadata["asset_review"][0]
+        image_path = Path(legacy["path"])
+        image_bytes = image_path.read_bytes()
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        attachment_id = kb.add_attachment(
+            conn,
+            source_id,
+            filename="page-hero.png",
+            stored_path=str(image_path),
+            content_type="image/png",
+            size=len(image_bytes),
+            uploaded_by="kanban_complete",
+        )
+        declaration = {
+            "asset_family": "page_hero",
+            "filename": "page-hero.png",
+            "dimensions": "1664x936",
+            "width": 1664,
+            "height": 936,
+            "ratio": "16:9",
+            "sha256": image_hash,
+            "bytes": len(image_bytes),
+        }
+        evidence = {
+            "actual_controller_attachment_inspected": True,
+            "asset_family": "page_hero",
+            "asset_declarations": {"page_hero": declaration},
+            "controller_attachment": {
+                "attachment_id": attachment_id,
+                "filename": "page-hero.png",
+                "stored_path": str(image_path),
+                "bytes": len(image_bytes),
+                "sha256": image_hash,
+                "width": 1664,
+                "height": 936,
+                "byte_for_byte_equal": True,
+            },
+            "facebook_page_post_readback": {
+                "utf8_bytes": len(message.encode("utf-8")),
+                "sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "byte_preserving": True,
+            },
+            "visual_review": {
+                "all_required_text_readable": True,
+                "text_occlusion_free": True,
+                "disclosure_non_obstructive": True,
+                "defects_found": [],
+            },
+        }
+        if fault == "unsafe_visual":
+            evidence["visual_review"]["text_occlusion_free"] = False
+        elif fault == "normalized_representation":
+            declaration.pop("width")
+            declaration.pop("height")
+            declaration["sha256"] = image_hash.upper()
+            evidence["controller_attachment"]["sha256"] = image_hash.upper()
+            evidence["facebook_page_post_readback"]["sha256"] = (
+                evidence["facebook_page_post_readback"]["sha256"].upper()
+            )
+        elif fault == "wrong_dimensions":
+            declaration["width"] = 1600
+            declaration["height"] = 900
+        elif fault == "wrong_hash":
+            evidence["controller_attachment"]["sha256"] = "f" * 64
+        elif fault == "wrong_attachment":
+            evidence["controller_attachment"]["attachment_id"] += 1
+        elif fault == "wrong_message":
+            evidence["facebook_page_post_readback"]["sha256"] = "f" * 64
+        elif fault in {
+            "incomplete_current_with_legacy",
+            "uninspected_current_with_legacy",
+        }:
+            evidence.pop("controller_attachment")
+            evidence.pop("facebook_page_post_readback")
+            if fault == "incomplete_current_with_legacy":
+                evidence.pop("actual_controller_attachment_inspected")
+            else:
+                evidence["actual_controller_attachment_inspected"] = False
+        review_metadata = {
+            "review_outcome": "accepted",
+            "evidence": evidence,
+        }
+        if fault in {
+            "incomplete_current_with_legacy",
+            "uninspected_current_with_legacy",
+        }:
+            review_metadata["asset_review"] = [legacy]
+        if fault == "conflict":
+            review_metadata["asset_declarations"] = {
+                "page_hero": {**declaration, "sha256": "f" * 64},
+            }
+            review_metadata["visual_review"] = dict(evidence["visual_review"])
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(review_metadata), review_run.id),
+        )
+
+    if fault and fault != "normalized_representation":
+        with pytest.raises(ValueError):
+            tool.bind_accepted_page_preflight_source(contract)
+    else:
+        resolved = tool.bind_accepted_page_preflight_source(contract)
+        assert resolved["message"] == message
+        assert resolved["image_path"] == str(image_path)
+        assert resolved["image_sha256"] == image_hash
+
+
+@pytest.mark.parametrize("source_filename", ["hero.png", "accepted-page-source.json"])
+def test_historical_accepted_page_is_controller_materialized_for_fresh_relay(
+    accepted_page_package, tmp_path, source_filename,
+):
+    contract, message, source_id, review_id = accepted_page_package
+    with kb.connect_closing() as conn:
+        source_run = kb.latest_run(conn, source_id)
+        review_run = kb.latest_run(conn, review_id)
+        legacy = review_run.metadata["asset_review"][0]
+        image_path = Path(legacy["path"])
+        image_hash = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        kb.add_attachment(
+            conn,
+            source_id,
+            filename=source_filename,
+            stored_path=str(image_path),
+            content_type="image/png",
+            size=image_path.stat().st_size,
+            uploaded_by="kanban_complete",
+        )
+        review_metadata = {
+            "review_outcome": "accepted",
+            "workflow_review_source": {
+                "parent_execution_task_id": source_id,
+                "parent_execution_run_id": source_run.id,
+                "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+                    source_run
+                ),
+            },
+            "evidence": {
+                "page_hero_actual_pixel_analysis": {
+                    "asset_family": "page_hero",
+                    "status": "passed",
+                    "dimensions": "1664x936",
+                    "traditional_chinese_readable": True,
+                    "ai_disclosure_visible": True,
+                },
+                "hash_verification": {
+                    "page_hero_sha256": image_hash,
+                    "exact_attachment_bytes_verified": True,
+                },
+                "controller_content_package_readback": {
+                    "package_complete": True,
+                    "task_attachment_row_count": 1,
+                },
+            },
+        }
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(review_metadata), review_run.id),
+        )
+
+    # Historical evidence is a source for a new review, never direct preflight.
+    with pytest.raises(ValueError, match="current structured Page Hero safety"):
+        tool.bind_accepted_page_preflight_source(contract)
+
+    contract.update(
+        completion_handoff={"metadata_source": "workspace_file"},
+        routing={"resolved": {"task_type": "devops"}},
+        user_facing_delivery={
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "body_field": "metadata.facebook_page_post.text",
+            "asset_filenames": ["page-hero.png"],
+        },
+    )
+    workspace = tmp_path / "relay-workspace"
+    workspace.mkdir()
+    receipt = tool.materialize_accepted_page_relay_handoff(
+        contract, str(workspace)
+    )
+    bundle_path = Path(receipt["bundle_path"])
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["facebook_page_post"]["text"].encode("utf-8") == message.encode(
+        "utf-8"
+    )
+    assert bundle["facebook_page_post"]["sha256"] == hashlib.sha256(
+        message.encode("utf-8")
+    ).hexdigest()
+    assert bundle["facebook_page_post"]["utf8_bytes"] == len(
+        message.encode("utf-8")
+    )
+    copied_image = Path(bundle["page_hero"]["path"])
+    assert copied_image.is_relative_to(workspace)
+    assert copied_image.name == "page-hero.png"
+    assert bundle["page_hero"]["filename"] == source_filename
+    assert copied_image != bundle_path
+    assert copied_image.read_bytes() == image_path.read_bytes()
+    assert bundle["external_effects"] == []
+    readback = tool.read_materialized_accepted_page_relay_handoff(receipt)
+    assert readback["message"].encode("utf-8") == message.encode("utf-8")
+    assert readback["image_path"] == str(copied_image)
+    assert readback["image_data"] == copied_image.read_bytes()
+
+    copied_image.unlink()
+    os.mkfifo(copied_image)
+    with pytest.raises(ValueError, match="file is invalid"):
+        tool.read_materialized_accepted_page_relay_handoff(receipt)
+
+    bundle_path.write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match accepted bytes"):
+        tool.materialize_accepted_page_relay_handoff(contract, str(workspace))
+
+
+def test_accepted_page_relay_rejects_wrong_delivery_contract(
+    accepted_page_package, tmp_path,
+):
+    contract, _, _, _ = accepted_page_package
+    contract.update(
+        completion_handoff={"metadata_source": "workspace_file"},
+        routing={"resolved": {"task_type": "devops"}},
+        user_facing_delivery={
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "domain_inventory_report",
+        },
+    )
+    workspace = tmp_path / "wrong-delivery"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="inline_with_attachment"):
+        tool.materialize_accepted_page_relay_handoff(contract, str(workspace))
+
+
+def test_controller_relay_handoff_ignores_ordinary_workspace_tasks(tmp_path):
+    workspace = tmp_path / "ordinary"
+    workspace.mkdir()
+    assert tool.materialize_accepted_page_relay_handoff(
+        {
+            "completion_handoff": {"metadata_source": "inline"},
+            "routing": {"resolved": {"task_type": "devops"}},
+        },
+        str(workspace),
+    ) is None
+    assert list(workspace.iterdir()) == []
+
+
+def test_accepted_page_source_remains_valid_in_another_topic(
+    accepted_page_package,
+):
+    contract, message, source_id, _ = accepted_page_package
+    contract["identity"].update(thread_id="other-topic", project="other-project")
+    with kb.connect_closing() as conn:
+        source_run = kb.latest_run(conn, source_id)
+        metadata = source_run.metadata
+        metadata["loop_contract"]["identity"].update(
+            thread_id="other-topic", project="other-project"
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), source_run.id),
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET thread_id='other-topic' "
+            "WHERE execution_task_id=?",
+            (source_id,),
+        )
+
+    resolved = tool.bind_accepted_page_preflight_source(contract)
+
+    assert resolved["message"] == message
 
 
 def test_accepted_page_source_rejects_explicitly_rejected_canonical_page_hero(

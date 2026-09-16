@@ -84,6 +84,63 @@ def get_pin(conn, objective_id):
     return json.loads(row[0]) if row else None
 
 
+def closure_recovery_migration_matches(
+    conn, *, objective_id, review_task_id, review_event_id, historical_pin,
+):
+    """Verify the durable receipt for one accepted terminal-closure re-pin."""
+    current = get_pin(conn, objective_id)
+    if current is None:
+        return False
+    row = conn.execute(
+        "SELECT previous_pin,next_pin,reason FROM grace_behavior_migrations "
+        "WHERE objective_id=? AND generation=?",
+        (objective_id, current["generation"]),
+    ).fetchone()
+    try:
+        previous = json.loads(row["previous_pin"]) if row else None
+        next_pin = json.loads(row["next_pin"]) if row else None
+        receipt = json.loads(row["reason"]) if row else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        previous == historical_pin
+        and next_pin == current
+        and isinstance(receipt, dict)
+        and receipt.get("kind") == "terminal_closure_recovery"
+        and receipt.get("review_task_id") == review_task_id
+        and type(review_event_id) is int
+        and review_event_id > 0
+        and receipt.get("review_event_id") == review_event_id
+        and receipt.get("previous_pin_hash") == digest(historical_pin)
+        and receipt.get("next_generation") == current["generation"]
+        and isinstance(receipt.get("reason"), str)
+        and receipt["reason"].strip()
+    )
+
+
+def _terminal_closure_recovery_recorded(
+    conn, *, objective_id, review_task_id, review_event_id,
+):
+    """Return whether this exact parked callback event was already re-pinned."""
+    rows = conn.execute(
+        "SELECT reason FROM grace_behavior_migrations WHERE objective_id=?",
+        (objective_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            receipt = json.loads(row["reason"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("kind") == "terminal_closure_recovery"
+            and receipt.get("review_task_id") == review_task_id
+            and receipt.get("review_event_id") == review_event_id
+        ):
+            return True
+    return False
+
+
 @contextmanager
 def _read_board(identity):
     from hermes_cli import kanban_db as kb
@@ -205,6 +262,215 @@ def guard_task(conn, task_id):
         raise BehaviorProfileError("behavior.task_pin_mismatch")
     verify_pin(pin)
     return pin
+
+
+def validate_timeout_review_historical_contract(
+    conn, *, review_task_id, execution_task_id, historical_contract,
+):
+    """Admit one sealed predecessor after an exact same-version timeout re-pin.
+
+    The predecessor remains historical input: this only proves that its sealed
+    contract is the one bridged by the authenticated retry receipt.  It never
+    makes the retired pin executable or current again.
+    """
+    from hermes_cli import kanban_db as kb
+
+    review = conn.execute(
+        "SELECT body,status,current_run_id,max_runtime_seconds,max_retries "
+        "FROM tasks WHERE id=?",
+        (review_task_id,),
+    ).fetchone()
+    if review is None or review["status"] != "running" or review["current_run_id"] is None:
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+    current_pin = guard_task(conn, review_task_id)
+    current_contract = kb._grace_compiled_contract(review["body"] or "")
+    historical_pin = (
+        historical_contract.get("behavior_pin")
+        if isinstance(historical_contract, dict)
+        else None
+    )
+    if not all(isinstance(value, dict) for value in (
+        current_pin, current_contract, historical_pin,
+    )):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+    if current_contract.get("behavior_pin") != historical_pin:
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+
+    stable_fields = (
+        "behavior_profile_id", "behavior_profile_version",
+        "project_namespace", "contract_schema_version",
+        "validator_set_hash", "policy_snapshot_hash", "safety_kernel_version",
+    )
+    if (
+        any(current_pin.get(key) != historical_pin.get(key) for key in stable_fields)
+        or type(current_pin.get("generation")) is not int
+        or type(historical_pin.get("generation")) is not int
+        or current_pin["generation"] != historical_pin["generation"] + 1
+    ):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+
+    current_marker = next((
+        json.loads(line[len("GRACE_BEHAVIOR_PIN: "):])
+        for line in str(review["body"] or "").splitlines()
+        if line.startswith("GRACE_BEHAVIOR_PIN: ")
+    ), None)
+    objective_ref = current_contract.get("objective_ref") or {}
+    identity = current_contract.get("identity") or {}
+    if (
+        not isinstance(current_marker, dict)
+        or current_marker.get("behavior_pin") != current_pin
+        or (current_marker.get("objective_ref") or {}) != objective_ref
+        or (current_marker.get("identity") or {}) != identity
+        or (historical_contract.get("objective_ref") or {}) != objective_ref
+        or (historical_contract.get("identity") or {}) != identity
+    ):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+
+    objective_id = str(objective_ref.get("objective_id") or "")
+    stage_key = str(objective_ref.get("stage_key") or "")
+    lineage = conn.execute(
+        "SELECT d.objective_id,d.stage_key,o.status,o.current_stage_key,o.revision,"
+        "s.status stage_status "
+        "FROM grace_delegations d "
+        "JOIN grace_objectives o ON o.objective_id=d.objective_id "
+        "JOIN grace_objective_stages s ON s.objective_id=d.objective_id "
+        "AND s.stage_key=d.stage_key "
+        "WHERE d.execution_task_id=? AND d.review_task_id=?",
+        (execution_task_id, review_task_id),
+    ).fetchall()
+    if not (
+        len(lineage) == 1
+        and lineage[0]["objective_id"] == objective_id
+        and lineage[0]["stage_key"] == stage_key
+        and lineage[0]["status"] == "active"
+        and lineage[0]["current_stage_key"] == stage_key
+        and lineage[0]["stage_status"] == "queued"
+    ):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+
+    migrations = conn.execute(
+        "SELECT previous_pin,next_pin,reason FROM grace_behavior_migrations "
+        "WHERE objective_id=? AND generation=?",
+        (objective_id, current_pin["generation"]),
+    ).fetchall()
+    if not (
+        len(migrations) == 1
+        and migrations[0]["previous_pin"]
+        and migrations[0]["next_pin"]
+        and json.loads(migrations[0]["previous_pin"]) == historical_pin
+        and json.loads(migrations[0]["next_pin"]) == current_pin
+        and migrations[0]["reason"]
+        == "Authenticated same-card recovery after exactly two formal-review cold-start timeouts."
+    ):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+
+    receipts = conn.execute(
+        "SELECT id,payload FROM task_events WHERE task_id=? "
+        "AND kind='grace_review_retry_authorized' ORDER BY id DESC LIMIT 1",
+        (review_task_id,),
+    ).fetchall()
+    try:
+        receipt = json.loads(receipts[0]["payload"] or "{}") if len(receipts) == 1 else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        receipt = {}
+    receipt_event_id = int(receipts[0]["id"]) if len(receipts) == 1 else 0
+    timeout_run_ids = receipt.get("timeout_run_ids")
+    previous_runtime = receipt.get("previous_max_runtime_seconds")
+    repaired_runtime = receipt.get("max_runtime_seconds")
+    gave_up_event_id = receipt.get("gave_up_event_id")
+    timeout_runs = conn.execute(
+        "SELECT id,status,outcome,max_runtime_seconds,error FROM task_runs "
+        "WHERE task_id=? AND outcome='timed_out' ORDER BY id",
+        (review_task_id,),
+    ).fetchall()
+    gave_up_event = (
+        conn.execute(
+            "SELECT id,payload FROM task_events WHERE id=? AND task_id=? "
+            "AND kind='gave_up' AND id<?",
+            (gave_up_event_id, review_task_id, receipt_event_id),
+        ).fetchone()
+        if type(gave_up_event_id) is int
+        else None
+    )
+    try:
+        gave_up = json.loads(gave_up_event["payload"] or "{}") if gave_up_event else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        gave_up = {}
+    if not isinstance(gave_up, dict):
+        gave_up = {}
+    claimed = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='claimed' "
+        "AND run_id=? AND id>? LIMIT 1",
+        (review_task_id, review["current_run_id"], receipt_event_id),
+    ).fetchone()
+    if not (
+        receipt.get("repaired_fault") == "formal_review_cold_start_budget"
+        and receipt.get("review_task_id") == review_task_id
+        and receipt.get("execution_task_id") == execution_task_id
+        and receipt.get("behavior_repin_previous_sha256") == digest(historical_pin)
+        and receipt.get("behavior_repin_next_sha256") == digest(current_pin)
+        and type(receipt.get("behavior_repin_previous_generation")) is int
+        and receipt.get("behavior_repin_previous_generation")
+        == historical_pin["generation"]
+        and type(receipt.get("behavior_repin_generation")) is int
+        and receipt.get("behavior_repin_generation") == current_pin["generation"]
+        and type(receipt.get("behavior_repin_objective_revision")) is int
+        and receipt.get("behavior_repin_objective_revision")
+        == lineage[0]["revision"]
+        and type(previous_runtime) is int
+        and type(repaired_runtime) is int
+        and previous_runtime > 0
+        and repaired_runtime > previous_runtime
+        and repaired_runtime == review["max_runtime_seconds"]
+        and type(receipt.get("max_retries")) is int
+        and receipt.get("max_retries") == review["max_retries"] == 1
+        and isinstance(timeout_run_ids, list)
+        and len(timeout_run_ids) == 2
+        and all(type(run_id) is int for run_id in timeout_run_ids)
+        and timeout_run_ids == [int(run["id"]) for run in timeout_runs]
+        and all(
+            run["status"] == "timed_out"
+            and run["outcome"] == "timed_out"
+            and run["max_runtime_seconds"] == previous_runtime
+            and _timeout_error_matches(run["error"], previous_runtime)
+            for run in timeout_runs
+        )
+        and gave_up_event is not None
+        and gave_up.get("trigger_outcome") == "timed_out"
+        and type(gave_up.get("failures")) is int
+        and gave_up.get("failures") == 2
+        and type(gave_up.get("effective_limit")) is int
+        and gave_up.get("effective_limit") == 2
+        and conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=? "
+            "AND kind='gave_up' AND id<?",
+            (review_task_id, receipt_event_id),
+        ).fetchone()[0] == gave_up_event_id
+        and claimed is not None
+    ):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+
+    run_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=? AND task_id=? AND ended_at IS NULL",
+        (review["current_run_id"], review_task_id),
+    ).fetchone()
+    try:
+        run_metadata = json.loads(run_row["metadata"] or "{}") if run_row else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        run_metadata = {}
+    review_source = run_metadata.get("workflow_review_source")
+    if (
+        not isinstance(review_source, dict)
+        or review_source.get("behavior_pin") != current_pin
+        or review_source != kb._workflow_review_source(conn, review_task_id)
+    ):
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+    if conn.execute(
+        "SELECT 1 FROM task_external_effects WHERE task_id IN (?,?) LIMIT 1",
+        (execution_task_id, review_task_id),
+    ).fetchone():
+        raise BehaviorProfileError("behavior.timeout_recovery_history_invalid")
+    return current_pin
 
 
 def pin_new_objective(conn, objective, project):
@@ -430,11 +696,237 @@ def _read_transaction(conn):
         conn.rollback()
 
 
+def _timeout_error_matches(error, expected_limit):
+    if type(expected_limit) is not int or expected_limit <= 0:
+        return False
+    match = re.fullmatch(
+        r"elapsed (\d+)s > limit (\d+)s", str(error or ""),
+    )
+    if match is None:
+        return False
+    elapsed, limit = (int(value) for value in match.groups())
+    return elapsed > limit and limit == expected_limit
+
+
+def _exact_timeout_review_repin_allowed(
+    conn, *, objective, callback, review_task_id, previous_pin,
+):
+    """Admit only the parked review that motivated a same-version re-pin."""
+    from hermes_cli import kanban_db as kb
+
+    if callback["review_task_id"] != review_task_id:
+        return False
+    row = conn.execute(
+        """
+        SELECT d.state delegation_state,d.contract_fingerprint,
+               e.status execution_status,r.status review_status,
+               r.current_run_id,r.consecutive_failures,r.block_kind,r.body,
+               s.status stage_status,s.review_task_id stage_review_task_id
+          FROM grace_delegations d
+          JOIN tasks e ON e.id=d.execution_task_id
+          JOIN tasks r ON r.id=d.review_task_id
+          JOIN grace_objective_stages s
+            ON s.objective_id=d.objective_id AND s.stage_key=d.stage_key
+         WHERE d.objective_id=? AND d.review_task_id=?
+           AND d.execution_task_id=? AND d.stage_key=?
+        """,
+        (
+            objective["objective_id"], review_task_id,
+            callback["execution_task_id"], callback["stage_key"],
+        ),
+    ).fetchone()
+    latest = conn.execute(
+        "SELECT id,kind,payload FROM task_events WHERE task_id=? "
+        "AND kind IN ('completed','blocked','gave_up','cancelled') "
+        "ORDER BY id DESC LIMIT 1",
+        (review_task_id,),
+    ).fetchone()
+    try:
+        gave_up = json.loads(latest["payload"] or "{}") if latest else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        gave_up = {}
+    if not isinstance(gave_up, dict):
+        gave_up = {}
+    runs = conn.execute(
+        "SELECT id,status,outcome,max_runtime_seconds,error FROM task_runs "
+        "WHERE task_id=? ORDER BY id",
+        (review_task_id,),
+    ).fetchall()
+    timeout_run_ids = [
+        int(event["run_id"] or 0)
+        for event in conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id=? AND kind='timed_out' "
+            "ORDER BY id",
+            (review_task_id,),
+        )
+    ]
+    markers = [
+        line[len("GRACE_BEHAVIOR_PIN: "):]
+        for line in str(row["body"] if row else "").splitlines()
+        if line.startswith("GRACE_BEHAVIOR_PIN: ")
+    ]
+    try:
+        marker = json.loads(markers[0]) if len(markers) == 1 else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        marker = None
+    compiled = kb._grace_compiled_contract(str(row["body"] if row else ""))
+    now = int(time.time())
+    previous_runtime = int(runs[0]["max_runtime_seconds"] or 0) if runs else 0
+    return bool(
+        row is not None
+        and row["delegation_state"] == "queued"
+        and row["contract_fingerprint"] == callback["contract_fingerprint"]
+        and row["execution_status"] == "done"
+        and row["review_status"] == "blocked"
+        and row["current_run_id"] is None
+        and row["consecutive_failures"] == 2
+        and row["block_kind"] in {None, ""}
+        and row["stage_status"] == "queued"
+        and row["stage_review_task_id"] == review_task_id
+        and objective["status"] == "active"
+        and objective["current_stage_key"] == callback["stage_key"]
+        and callback["state"] in {"pending", "delivering"}
+        and callback["outcome_event_id"] is None
+        and callback["outcome_kind"] is None
+        and callback["outcome_payload"] is None
+        and (
+            callback["lease_expires"] is None
+            or int(callback["lease_expires"]) <= now
+        )
+        and latest is not None
+        and latest["kind"] == "gave_up"
+        and int(callback["last_event_id"] or 0) < int(latest["id"])
+        and gave_up.get("trigger_outcome") == "timed_out"
+        and type(gave_up.get("failures")) is int
+        and gave_up.get("failures") == 2
+        and type(gave_up.get("effective_limit")) is int
+        and gave_up.get("effective_limit") == 2
+        and len(runs) == 2
+        and timeout_run_ids == [int(run["id"]) for run in runs]
+        and all(
+            run["status"] == "timed_out"
+            and run["outcome"] == "timed_out"
+            and int(run["max_runtime_seconds"] or 0) == previous_runtime
+            and _timeout_error_matches(run["error"], previous_runtime)
+            for run in runs
+        )
+        and isinstance(marker, dict)
+        and marker.get("behavior_pin") == previous_pin
+        and isinstance(compiled, dict)
+        and compiled.get("behavior_pin") == previous_pin
+        and (marker.get("objective_ref") or {}).get("objective_id")
+        == objective["objective_id"]
+        and (marker.get("objective_ref") or {}).get("stage_key")
+        == callback["stage_key"]
+        and not conn.execute(
+            "SELECT 1 FROM task_external_effects WHERE task_id IN (?,?) LIMIT 1",
+            (callback["execution_task_id"], review_task_id),
+        ).fetchone()
+    )
+
+
+def _exact_terminal_closure_repin_allowed(
+    conn, *, objective, callback, review_task_id,
+):
+    """Admit one accepted terminal review parked by the closure invariant."""
+    from hermes_cli import kanban_db as kb
+
+    row = conn.execute(
+        """
+        SELECT d.state delegation_state,e.status execution_status,
+               r.status review_status,s.status stage_status,
+               s.execution_task_id,s.review_task_id
+          FROM grace_delegations d
+          JOIN tasks e ON e.id=d.execution_task_id
+          JOIN tasks r ON r.id=d.review_task_id
+          JOIN grace_objective_stages s
+            ON s.objective_id=d.objective_id AND s.stage_key=d.stage_key
+         WHERE d.objective_id=? AND d.review_task_id=?
+           AND d.execution_task_id=? AND d.stage_key=?
+        """,
+        (
+            objective["objective_id"], review_task_id,
+            callback["execution_task_id"], callback["stage_key"],
+        ),
+    ).fetchone()
+    event = conn.execute(
+        "SELECT id,run_id FROM task_events WHERE task_id=? AND kind='completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (review_task_id,),
+    ).fetchone()
+    review_run = (
+        kb.get_run(conn, int(event["run_id"]))
+        if event is not None and event["run_id"] is not None
+        else None
+    )
+    incomplete_predecessor = conn.execute(
+        "SELECT 1 FROM grace_objective_stages WHERE objective_id=? "
+        "AND stage_key<>? AND (status<>'done' OR outcome_kind='cancelled') "
+        "LIMIT 1",
+        (objective["objective_id"], callback["stage_key"]),
+    ).fetchone()
+    return bool(
+        callback["review_task_id"] == review_task_id
+        and objective["status"] == "active"
+        and objective["current_stage_key"] == callback["stage_key"]
+        and objective["terminal_stage_key"] == callback["stage_key"]
+        and str(callback["completion_mode"] or "terminal") == "terminal"
+        and callback["state"] == "pending"
+        and callback["lease_event_id"] is None
+        and callback["lease_owner"] is None
+        and callback["lease_expires"] is None
+        and callback["outcome_event_id"] is None
+        and callback["outcome_kind"] is None
+        and callback["outcome_payload"] is None
+        and event is not None
+        and int(callback["attempt_event_id"] or 0) == int(event["id"])
+        and int(callback["attempts"] or 0) > 0
+        and "cannot close before required stages complete"
+        in str(callback["last_error"] or "")
+        and row is not None
+        and row["delegation_state"] == "queued"
+        and row["execution_status"] == "done"
+        and row["review_status"] == "done"
+        and row["stage_status"] != "done"
+        and row["execution_task_id"] == callback["execution_task_id"]
+        and row["review_task_id"] == review_task_id
+        and review_run is not None
+        and review_run.task_id == review_task_id
+        and review_run.outcome == "completed"
+        and kb.grace_review_accepted(review_run.metadata)
+        and incomplete_predecessor is None
+    )
+
+
+def _replace_behavior_marker(body, *, previous_pin, next_pin):
+    lines = str(body or "").splitlines()
+    indexes = [
+        index for index, line in enumerate(lines)
+        if line.startswith("GRACE_BEHAVIOR_PIN: ")
+    ]
+    if len(indexes) != 1:
+        raise BehaviorProfileError("behavior.migration_review_marker")
+    index = indexes[0]
+    try:
+        marker = json.loads(lines[index][len("GRACE_BEHAVIOR_PIN: "):])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BehaviorProfileError("behavior.migration_review_marker") from exc
+    if not isinstance(marker, dict) or marker.get("behavior_pin") != previous_pin:
+        raise BehaviorProfileError("behavior.migration_review_marker")
+    marker["behavior_pin"] = next_pin
+    lines[index] = "GRACE_BEHAVIOR_PIN: " + json.dumps(
+        marker, ensure_ascii=False, sort_keys=True,
+    )
+    return "\n".join(lines) + ("\n" if str(body or "").endswith("\n") else "")
+
+
 def migrate_objective(conn, *, objective_id, platform, chat_id, thread_id,
                       profile_id, version, expected_revision, expected_pin_hash,
                       reason, policy_mode="retain", rollback_generation=None,
-                      project_namespace=None, apply=False):
-    """Explicit idle-boundary migration; never rewrites tasks, evidence or effects."""
+                      project_namespace=None, apply=False,
+                      recovery_review_task_id=None,
+                      closure_review_task_id=None):
+    """Explicit idle migration, plus one exact parked-review re-pin boundary."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.objective_workflow import has_in_flight_delegation
     if not isinstance(reason, str) or not reason.strip():
@@ -452,27 +944,209 @@ def migrate_objective(conn, *, objective_id, platform, chat_id, thread_id,
             raise BehaviorProfileError("behavior.migration_cas: inspect the current Objective")
         if previous and previous["behavior_profile_id"] != profile_id:
             raise BehaviorProfileError("behavior.migration_project_mismatch")
+        recovery_review_id = str(recovery_review_task_id or "").strip()
+        closure_review_id = str(closure_review_task_id or "").strip()
+        if recovery_review_task_id is not None and (
+            not recovery_review_id
+            or recovery_review_id != recovery_review_task_id
+            or previous is None
+            or policy_mode != "retain"
+            or rollback_generation is not None
+            or previous["behavior_profile_id"] != profile_id
+            or previous["behavior_profile_version"] != version
+        ):
+            raise BehaviorProfileError("behavior.migration_timeout_recovery_invalid")
+        if closure_review_task_id is not None and (
+            not closure_review_id
+            or closure_review_id != closure_review_task_id
+            or recovery_review_id
+            or previous is None
+            or policy_mode != "retain"
+            or rollback_generation is not None
+            or previous["behavior_profile_id"] != profile_id
+            or previous["behavior_profile_version"] != version
+        ):
+            raise BehaviorProfileError("behavior.migration_closure_recovery_invalid")
         if has_in_flight_delegation(conn, objective_id) or conn.execute(
             "SELECT 1 FROM grace_delegations d JOIN task_runs r ON r.task_id IN (d.execution_task_id,d.review_task_id) WHERE d.objective_id=? AND r.ended_at IS NULL LIMIT 1",
             (objective_id,),
         ).fetchone():
             raise BehaviorProfileError("behavior.migration_inflight: finish or cancel the active work first")
-        # Superseded callbacks remain cancelled, never fabricated as delivered.
-        if conn.execute("""SELECT 1 FROM grace_loop_callbacks c WHERE c.objective_id=?
-            AND (c.lease_owner IS NOT NULL OR NOT (
-                c.state IN ('delivered','attention') OR (c.state='cancelled' AND EXISTS (
-                    SELECT 1 FROM grace_objective_stages s
-                    WHERE s.objective_id=c.objective_id AND s.stage_key=c.stage_key
-                    AND s.status='done' AND s.outcome_kind IN ('superseded_by_retry','cancelled','intermediate_blocked')
-                ))
-            )) LIMIT 1""", (objective_id,)).fetchone():
+        # Every terminal callback must agree with its exact completed stage.
+        # The sole unfinished exception is an accepted intermediate callback
+        # parked by the controller's authenticated session-reset handoff.
+        callbacks = conn.execute(
+            "SELECT * FROM grace_loop_callbacks WHERE objective_id=?",
+            (objective_id,),
+        ).fetchall()
+        timeout_recovery_admitted = False
+        closure_recovery_admitted = False
+        closure_recovery_event_id = None
+        for callback in callbacks:
+            stage = conn.execute(
+                "SELECT status,outcome_kind,delegation_id "
+                "FROM grace_objective_stages WHERE objective_id=? AND stage_key=?",
+                (objective_id, callback["stage_key"]),
+            ).fetchone()
+            settled = bool(
+                callback["lease_owner"] is None
+                and stage is not None
+                and stage["status"] == "done"
+                and stage["outcome_kind"] == callback["outcome_kind"]
+                and (
+                    callback["state"] in {"delivered", "attention"}
+                    or (
+                        callback["state"] == "cancelled"
+                        and stage["outcome_kind"] in {
+                            "superseded_by_retry", "cancelled",
+                            "intermediate_blocked",
+                        }
+                    )
+                )
+            )
+            if settled:
+                continue
+            if (
+                recovery_review_id
+                and _exact_timeout_review_repin_allowed(
+                    conn,
+                    objective=objective,
+                    callback=callback,
+                    review_task_id=recovery_review_id,
+                    previous_pin=previous,
+                )
+            ):
+                timeout_recovery_admitted = True
+                continue
+            if (
+                closure_review_id
+                and _exact_terminal_closure_repin_allowed(
+                    conn,
+                    objective=objective,
+                    callback=callback,
+                    review_task_id=closure_review_id,
+                )
+            ):
+                closure_recovery_admitted = True
+                closure_recovery_event_id = int(callback["attempt_event_id"])
+                continue
+            exact_reset_handoff = bool(
+                callback["state"] == "attention"
+                and callback["last_error"] == kb._GRACE_SESSION_RESET_HANDOFF_ERROR
+                and str(callback["completion_mode"] or "terminal") == "intermediate"
+                and callback["lease_event_id"] is None
+                and callback["lease_owner"] is None
+                and callback["outcome_event_id"] is None
+                and callback["outcome_kind"] is None
+                and callback["user_report_delivered_at"] is None
+                and stage is not None
+                and stage["status"] != "done"
+                and stage["outcome_kind"] is None
+                and objective["current_stage_key"] == callback["stage_key"]
+                and tuple(callback[key] for key in (
+                    "platform", "chat_id", "thread_id",
+                )) == (platform, chat_id, thread_id)
+            )
+            delegation = None
+            event = None
+            review_run = None
+            if exact_reset_handoff:
+                delegations = conn.execute(
+                    "SELECT d.state,e.status execution_status,r.status review_status "
+                    "FROM grace_delegations d "
+                    "JOIN tasks e ON e.id=d.execution_task_id "
+                    "JOIN tasks r ON r.id=d.review_task_id "
+                    "WHERE d.execution_task_id=? AND d.review_task_id=? "
+                    "AND d.objective_id=? AND d.stage_key=? "
+                    "AND d.delegation_id=?",
+                    (
+                        callback["execution_task_id"], callback["review_task_id"],
+                        objective_id, callback["stage_key"], stage["delegation_id"],
+                    ),
+                ).fetchall()
+                delegation = delegations[0] if len(delegations) == 1 else None
+                event = conn.execute(
+                    """SELECT e.id,e.run_id FROM task_events e
+                         WHERE e.task_id=? AND e.id>? AND e.kind='completed'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_events later
+                                WHERE later.task_id=e.task_id AND later.id>e.id
+                                  AND later.kind IN (
+                                      'unblocked','promoted','claimed','spawned',
+                                      'completed','backend_retry_scheduled'
+                                  )
+                           )
+                         ORDER BY e.id DESC LIMIT 1""",
+                    (callback["review_task_id"], int(callback["last_event_id"] or 0)),
+                ).fetchone()
+                review_run = (
+                    kb.get_run(conn, int(event["run_id"]))
+                    if event is not None and event["run_id"] is not None
+                    else None
+                )
+            if (
+                exact_reset_handoff
+                and delegation is not None
+                and delegation["state"] == "queued"
+                and delegation["execution_status"] == "done"
+                and delegation["review_status"] == "done"
+                and review_run is not None
+                and review_run.task_id == callback["review_task_id"]
+                and review_run.outcome == "completed"
+                and kb.grace_review_accepted(review_run.metadata)
+                and not conn.execute(
+                    "SELECT 1 FROM task_external_effects "
+                    "WHERE task_id IN (?,?) LIMIT 1",
+                    (callback["execution_task_id"], callback["review_task_id"]),
+                ).fetchone()
+            ):
+                continue
             raise BehaviorProfileError("behavior.migration_callback_pending")
+        if recovery_review_id and not timeout_recovery_admitted:
+            raise BehaviorProfileError("behavior.migration_timeout_recovery_invalid")
+        if closure_review_id and not closure_recovery_admitted:
+            raise BehaviorProfileError("behavior.migration_closure_recovery_invalid")
+        if closure_review_id and _terminal_closure_recovery_recorded(
+            conn,
+            objective_id=objective_id,
+            review_task_id=closure_review_id,
+            review_event_id=closure_recovery_event_id,
+        ):
+            raise BehaviorProfileError(
+                "behavior.migration_closure_recovery_already_applied"
+            )
         # Cover a partially built card before its saga has attached task IDs.
-        for task in conn.execute("SELECT body FROM tasks WHERE status NOT IN ('done','blocked','archived') AND instr(body,'GRACE_BEHAVIOR_PIN: ')>0"):
-            for line in task[0].splitlines():
+        for task in conn.execute("SELECT id,body,status,current_run_id FROM tasks WHERE status NOT IN ('done','blocked','archived') AND instr(body,'GRACE_BEHAVIOR_PIN: ')>0"):
+            for line in task["body"].splitlines():
                 if line.startswith("GRACE_BEHAVIOR_PIN: "):
                     marker = json.loads(line[len("GRACE_BEHAVIOR_PIN: "):])
                     if (marker.get("objective_ref") or {}).get("objective_id") == objective_id:
+                        dependency_finished = (
+                            task["status"] == "todo"
+                            and task["current_run_id"] is None
+                            and conn.execute(
+                                """SELECT 1 FROM grace_objective_stages s
+                                   WHERE s.objective_id=? AND s.review_task_id=?
+                                     AND s.status='done'
+                                     AND s.outcome_kind IN (
+                                         'continued','intermediate_blocked',
+                                         'terminal_blocked',
+                                         'superseded_by_retry','cancelled'
+                                     )
+                                     AND EXISTS (
+                                         SELECT 1 FROM grace_loop_callbacks c
+                                          WHERE c.review_task_id=s.review_task_id
+                                            AND c.objective_id=s.objective_id
+                                            AND c.stage_key=s.stage_key
+                                            AND c.state IN ('delivered','attention','cancelled')
+                                            AND c.outcome_kind=s.outcome_kind
+                                            AND c.lease_owner IS NULL
+                                     )""",
+                                (objective_id, task["id"]),
+                            ).fetchone()
+                        )
+                        if dependency_finished:
+                            break
                         raise BehaviorProfileError("behavior.migration_inflight: unfinished versioned card")
         row = conn.execute("SELECT policy FROM grace_objective_behavior_pins WHERE objective_id=?", (objective_id,)).fetchone() if previous else None
         previous_policy = json.loads(row[0]) if row else None
@@ -512,10 +1186,57 @@ def migrate_objective(conn, *, objective_id, platform, chat_id, thread_id,
                   "next_pin": candidate, "expected_revision": expected_revision,
                   "next_revision": expected_revision + 1, "applied": bool(apply)}
         if apply:
+            if recovery_review_id:
+                review = conn.execute(
+                    "SELECT body FROM tasks WHERE id=? AND status='blocked' "
+                    "AND current_run_id IS NULL",
+                    (recovery_review_id,),
+                ).fetchone()
+                if review is None:
+                    raise BehaviorProfileError("behavior.migration_review_marker")
+                body = _replace_behavior_marker(
+                    review["body"], previous_pin=previous, next_pin=candidate,
+                )
+                cur = conn.execute(
+                    "UPDATE tasks SET body=? WHERE id=? AND status='blocked' "
+                    "AND current_run_id IS NULL AND body=?",
+                    (body, recovery_review_id, review["body"]),
+                )
+                if cur.rowcount != 1:
+                    raise BehaviorProfileError("behavior.migration_review_marker")
+            migration_reason = reason
+            if closure_review_id:
+                closure_callback = conn.execute(
+                    "SELECT attempt_event_id FROM grace_loop_callbacks "
+                    "WHERE review_task_id=? AND objective_id=?",
+                    (closure_review_id, objective_id),
+                ).fetchone()
+                if (
+                    closure_callback is None
+                    or closure_callback["attempt_event_id"] is None
+                ):
+                    raise BehaviorProfileError(
+                        "behavior.migration_closure_recovery_invalid"
+                    )
+                migration_reason = json.dumps(
+                    {
+                        "kind": "terminal_closure_recovery",
+                        "review_task_id": closure_review_id,
+                        "review_event_id": int(
+                            closure_callback["attempt_event_id"]
+                        ),
+                        "previous_pin_hash": digest(previous),
+                        "next_generation": candidate["generation"],
+                        "reason": reason,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             conn.execute("INSERT INTO grace_behavior_migrations VALUES (?,?,?,?,?,?,?)",
                          (objective_id, generation, json.dumps(previous) if previous else None,
                           json.dumps(previous_policy, ensure_ascii=False) if previous_policy else None,
-                          json.dumps(candidate), reason, int(time.time())))
+                          json.dumps(candidate), migration_reason, int(time.time())))
             conn.execute("INSERT INTO grace_objective_behavior_pins VALUES (?,?,?) ON CONFLICT(objective_id) DO UPDATE SET pin=excluded.pin,policy=excluded.policy",
                          (objective_id, json.dumps(candidate), json.dumps(policy, ensure_ascii=False)))
             conn.execute("UPDATE grace_objectives SET revision=revision+1,updated_at=? WHERE objective_id=? AND revision=?",

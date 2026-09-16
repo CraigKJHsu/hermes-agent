@@ -1,5 +1,7 @@
 # Versioned behavior profiles
 
+Status: Current operator contract. Volatile selections and accepted canaries are recorded in the MissionCrew G-03 deployment status.
+
 ## Contract
 
 Grace owns business understanding, delegation, review and delivery. This change
@@ -7,25 +9,43 @@ belongs to the shared control plane. It adds no publishing authorization.
 
 An exact `(platform, chat_id, thread_id, project)` selection applies only when a
 new Objective is inserted. The Objective transaction durably stores a profile
-pin and the complete verified Topic policy bytes. Existing Objectives remain
-legacy/unresolved until explicitly migrated. Disabling a selection affects only
-future Objectives.
+pin and the complete verified Topic policy bytes. Objectives created before the
+behavior-pin rollout remain legacy/unresolved until explicitly migrated;
+Objectives that already have a durable pin are not legacy. Disabling a selection
+affects only future Objectives.
 
-Installed `ai_bizweek@v1` and `secondhand_commerce@v1` manifests pin a code bundle,
-separate routing snapshots, schema, validator hash and safety compatibility hash.
+Multiple immutable manifest versions may coexist; the exact installed
+profile/version/kernel inventory is point-in-time evidence recorded in G-03.
+Each version pins a code bundle, separate routing snapshots, schema, validator
+hash and safety compatibility hash. Different manifest versions may share one
+immutable bundle; manifest version and code-directory name are different
+compatibility identities and must not be inferred from each other.
 The pin stores the actual `project_namespace` separately from the business profile
 name. An operator may map an exact generated project namespace to `ai_bizweek`;
 existing policy/memory namespaces are never renamed.
-The v1 bundle contains contract validation, compiler, domain normalization,
+The pinned bundle contains contract validation, compiler, domain normalization,
 review, preflight, workflow, routing and prompt code. Compiler output carries a
 pin marker through execution/review cards. Admission, claims, completion,
 callbacks and workflow operations validate the authoritative Objective pin.
 Worker-supplied metadata cannot select another version.
 
-The full Topic policy snapshot survives later `latest_active` changes. Completion
-receipts must match the pinned version/hash; reviewers attest
-`pinned_version_verified=true`. Historical policy reads after migration resolve
-the immutable migration history, while old generations cannot resume execution.
+The full Topic policy snapshot survives ordinary later `latest_active` and
+Topic-binding changes. For a behavior-pinned Objective, current completion
+validates that immutable snapshot; it does not reinterpret the pin from active
+policy. Unpinned legacy tasks continue to revalidate `latest_active` and the
+Topic binding at review and fail closed with `policy_stale` after a change.
+
+The required deny-only revocation overlay for already pinned work is not yet
+source/runtime verified. Until it is implemented and accepted, operators must
+cancel every affected Objective and apply the relevant runtime/tool/credential
+hard ceiling before activating a revocation; policy activation alone must not be
+assumed to stop existing pins. A future overlay may only narrow or block
+admission, claim, and completion, never reinterpret the pinned bundle or rewrite
+its policy history. Changing the pin or policy snapshot still requires an
+explicit idle-boundary migration. Completion receipts must match the pinned
+version/hash and reviewers attest `pinned_version_verified=true`. Historical
+policy reads after migration resolve immutable migration history, while old
+generations cannot resume execution.
 
 ## Safety boundary and limits
 
@@ -36,7 +56,8 @@ attestation rejects a process whose loaded source snapshot is stale. Pinned
 review receipts bind the selected bundle and kernel separately from the physical
 process inventory. Adding a profile requires a runtime restart; after restart,
 existing pinned reviews and accepted packages keep their selected provenance.
-Starting a worker still verifies its own loaded runtime against disk.
+Starting a worker still verifies its own loaded runtime against disk. Current
+Topic selections do not upgrade existing Objective pins.
 
 This is a transitional extraction: residual shared business decisions in the
 controller/DB/executor are fenced by the kernel manifest. Editing a fenced file
@@ -44,18 +65,21 @@ blocks pinned work with `behavior.kernel_migration_required`; it must not silent
 reinterpret old work. This conservative fence also means some otherwise harmless
 shared-source edits require an explicit compatibility release. The hash is a
 local integrity/compatibility check, not a signature against a malicious host
-administrator. Installed v1 files must never be regenerated after release.
+administrator. Any released bundle or kernel file must never be regenerated in
+place; publish a new manifest/kernel generation instead.
 
 ## Shadow
 
-Run in the candidate checkout with its Python dependencies:
+From the `hermes-agent` repository root, run in the candidate checkout with the
+supported Python environment:
 
 ```sh
-python scripts/shadow_behavior_profiles.py --output /absolute/new/output-directory
+.venv312/bin/python scripts/shadow_behavior_profiles.py --output /absolute/new/output-directory
 ```
 
-Each of four representative fixtures runs through actual contract/compiler,
-SQLite tasks, review, Objective stages and callback handling under legacy and v1.
+Each representative fixture runs through actual contract/compiler, SQLite
+tasks, review, Objective stages and callback handling under legacy and the
+selected profile version.
 A CPython audit hook denies socket APIs (including UDP/DNS) and process APIs
 (including direct forks). This is a guard for the trusted Python replay, not an
 OS sandbox for hostile native code. Compare decisions, review
@@ -66,14 +90,18 @@ business acceptance or external publication.
 
 ## New-Objective canary
 
-Use `python -m hermes_cli.behavior_profiles select selection.json`. Example:
+Use `.venv312/bin/python -m hermes_cli.behavior_profiles select selection.json`.
+Example shape:
 
 ```json
-{"platform":"telegram","chat_id":"EXACT_CHAT","thread_id":"EXACT_TOPIC","project":"ai_bizweek","profile_id":"ai_bizweek","version":"v1","expected_revision":0,"reason":"Reviewed new-Objective canary"}
+{"platform":"telegram","chat_id":"EXACT_CHAT","thread_id":"EXACT_TOPIC","project":"EXACT_PROJECT_NAMESPACE","profile_id":"ai_bizweek","version":"EXACT_INSTALLED_VERSION","expected_revision":0,"reason":"Reviewed new-Objective canary"}
 ```
 
-The Topic must already have its managed policy binding. Use a second exact
-selection for `secondhand_commerce`; there is no wildcard. First verify source
+Replace `EXACT_*` and `expected_revision` with the exact installed version and
+current selection revision read from the CLI and G-03 before applying; the
+example is not directly executable. The Topic must already have its
+managed policy binding. Use a second exact selection for
+`secondhand_commerce`; there is no wildcard. First verify source
 hashes, restart the affected runtime under the normal deployment procedure, and
 verify loaded runtime attestation before enabling selection. Exercise a new
 zero-external-effect Objective through Grace delegation, execution, independent
@@ -86,14 +114,14 @@ selection revision. Existing pinned work stays pinned; never delete its history.
 
 ## Explicit Objective migration
 
-`python -m hermes_cli.behavior_profiles show OBJECTIVE_ID` reports the pin and
+`.venv312/bin/python -m hermes_cli.behavior_profiles show OBJECTIVE_ID` reports the pin and
 its CAS hash. Construct a migration JSON with exact Objective/Topic identity,
 `profile_id`, `version`, `expected_revision`, `expected_pin_hash`, `reason`, and
 `policy_mode` (`retain` by default, or explicitly `current`). Run:
 
 ```sh
-python -m hermes_cli.behavior_profiles migrate migration.json
-python -m hermes_cli.behavior_profiles migrate migration.json --apply
+.venv312/bin/python -m hermes_cli.behavior_profiles migrate migration.json
+.venv312/bin/python -m hermes_cli.behavior_profiles migrate migration.json --apply
 ```
 
 The first command is a dry run. Apply rechecks inside a write transaction. Active

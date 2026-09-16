@@ -1432,6 +1432,238 @@ def test_domain_mutation_loop_contract_sends_terminal_result_contract(kanban_hom
     )
 
 
+def _seed_page_recovery_registry(conn, *, objective_id: str) -> None:
+    now = 1_789_486_000
+    conn.execute(
+        """
+        INSERT INTO domain_entities (
+            domain_key, entity_type, entity_id, label, status, attributes,
+            schema_id, source_task_id, source_run_id,
+            accepted_review_task_id, accepted_review_run_id,
+            observed_at, created_at, updated_at
+        ) VALUES ('solobizai','SoloBizAiCase','dpr-construction',
+                  'DPR Construction','planned',?, 'solobizai.case.v1',
+                  't_seed',99,'t_seed_review',100,?,?,?)
+        """,
+        (json.dumps({"episode_number": "EP09"}), now, now, now),
+    )
+    rows = [
+        (
+            "audio_brief", "internal", "audio-brief", "reserved", None, None,
+            {"episode_number": "EP09"}, None,
+            "domain_episode_reservation:der_11111111111111111111111111111111",
+        ),
+        (
+            "facebook_page_post", "facebook", "facebook-page-post", "draft",
+            None, None, {}, None, "",
+        ),
+        (
+            "podcast_episode", "podcast", "podcast-episode", "planned",
+            None, None, {"episode_number": "EP09"}, None, "",
+        ),
+    ]
+    for artifact_type, platform, key, status, url, external_id, attrs, verified_at, ref in rows:
+        conn.execute(
+            """
+            INSERT INTO domain_artifacts (
+                domain_key, entity_type, entity_id, artifact_type, platform,
+                artifact_key, status, public_url, external_id, attributes,
+                verified_at, source_task_id, source_run_id,
+                accepted_review_task_id, accepted_review_run_id,
+                observed_at, created_at, updated_at, evidence_ref
+            ) VALUES ('solobizai','SoloBizAiCase','dpr-construction',?,?,?,?,
+                      ?,?,?,?, 't_seed',99,'t_seed_review',100,?,?,?,?)
+            """,
+            (
+                artifact_type, platform, key, status, url, external_id,
+                json.dumps(attrs), verified_at, now, now, now, ref,
+            ),
+        )
+    conn.execute(
+        """
+        INSERT INTO domain_episode_reservations (
+            reservation_id, receipt_version, domain_key, schema_id,
+            entity_type, artifact_type, episode_number, episode_label,
+            subject_entity_id, subject_label, objective_id,
+            source_task_id, source_run_id, authorization_fingerprint,
+            evidence, status, created_at, updated_at
+        ) VALUES ('der_11111111111111111111111111111111','v2','solobizai',
+                  'solobizai.case.v1','SoloBizAiCase','audio_brief',9,'EP09',
+                  'dpr-construction','DPR Construction',?,'t_seed',99,?,
+                  '{}','consumed',?,?)
+        """,
+        (objective_id, "a" * 64, now, now),
+    )
+
+
+@pytest.mark.parametrize(
+    ("effect_state", "conflicting_post"),
+    [("verified", False), ("existing", False), ("verified", True)],
+)
+def test_page_terminal_recovers_verified_effect_domain_snapshot(
+    kanban_home,
+    effect_state,
+    conflicting_post,
+):
+    objective_id = "go_page_domain_recovery"
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = (
+        f"page-domain-recovery-{effect_state}-{int(conflicting_post)}"
+    )
+    contract["identity"].update(
+        project="SoloBizAi",
+        platform="telegram",
+        chat_id="chat-page-recovery",
+        thread_id="4641",
+    )
+    contract["objective_ref"] = {
+        "objective_id": objective_id,
+        "stage_key": "execute_external_action",
+    }
+    contract["routing"] = {"task_type": "facebook_page_api_publish"}
+    contract["domain_memory"] = {
+        "schema_id": "solobizai.case.v1",
+        "mode": "mutate",
+        "expected_total": 1,
+    }
+    contract["external_targets"] = ["Facebook Page ID 531289396730654"]
+    with kb.connect() as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id=objective_id,
+            platform="telegram",
+            chat_id="chat-page-recovery",
+            thread_id="4641",
+            session_key="agent:main:telegram:chat-page-recovery:topic:4641",
+            title="Publish DPR Page",
+            objective="Publish and reconcile the DPR Page post.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=("execute_external_action",),
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=("Verified Page post and domain projection.",),
+        )
+        _seed_page_recovery_registry(conn, objective_id=objective_id)
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_page_api_publish",
+        risk_level="medium",
+        approved=True,
+        delegation_id=(
+            f"delegation-page-domain-recovery-{effect_state}-"
+            f"{int(conflicting_post)}"
+        ),
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        effect = {
+            "platform": "facebook",
+            "effect_key": "create",
+            "state": effect_state,
+            "external_id": "531289396730654_122182697174694189",
+            "details": {
+                "verified": True,
+                "published": True,
+                "post_id": "531289396730654_122182697174694189",
+                "photo_id": "122182697156694189",
+                "permalink_url": (
+                    "https://www.facebook.com/122180328530694189/"
+                    "posts/122182697174694189"
+                ),
+                "created_time": "2026-09-15T15:31:44+0000",
+                "message_sha256": "d" * 64,
+                "image_sha256": "b" * 64,
+            },
+        }
+        reported_effect = {
+            **effect,
+            "details": {
+                "target": "https://www.facebook.com/solobizai",
+                "readback": {
+                    **effect["details"],
+                    "success": True,
+                    "retry_permitted": False,
+                },
+            },
+        }
+        kb.record_external_effect(
+            conn,
+            run.task_id,
+            expected_run_id=run.id,
+            **effect,
+        )
+
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["externalEffectBudget"] = run.metadata[
+        "external_effect_budget"
+    ]
+    output["result"]["externalEffects"] = [reported_effect]
+    output["result"]["domainMemoryDeltas"] = [{
+        "operation": "upsert",
+        "entity_id": "dpr-construction",
+        "label": "DPR Construction／EP09",
+        "status": "published",
+        "artifacts": [{
+            "artifact_type": "facebook_page_post",
+            "platform": "facebook",
+            "status": "published",
+            "external_id": (
+                "different-post"
+                if conflicting_post
+                else effect["external_id"]
+            ),
+            "public_url": effect["details"]["permalink_url"],
+            "evidence_ref": "task_external_effect:facebook:create",
+        }],
+        "evidence_refs": ["task_external_effect:facebook:create"],
+    }]
+
+    handled = make_loop_contract_terminal_handler()(run, {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": f"page-domain-recovery-{int(conflicting_post)}",
+    })
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, run.task_id)
+        completed_run = kb.latest_run(conn, run.task_id)
+        durable_effect = kb.list_external_effects(conn, run.task_id)[0]
+        reservation = conn.execute(
+            "SELECT status FROM domain_episode_reservations"
+        ).fetchone()
+    assert task is not None
+    assert completed_run is not None
+    assert reservation["status"] == "consumed"
+    if conflicting_post:
+        assert handled["accepted"] is False
+        assert task.status == "blocked"
+        assert "external_id conflicts" in completed_run.metadata[
+            "domain_memory_delta_error"
+        ]
+        return
+    assert handled["accepted"] is True
+    assert task.status == "done"
+    assert completed_run.metadata["controller_domain_reconciliation"]["read_only"] is True
+    assert completed_run.metadata["external_effects"] == [effect]
+    assert durable_effect["details"] == effect["details"]
+    assert {
+        item["artifact_type"]
+        for item in completed_run.metadata["domain_memory_deltas"][0]["artifacts"]
+    } == {"facebook_page_post", "audio_brief", "podcast_episode"}
+
+
 @pytest.mark.parametrize("blocked_without_write", [False, True])
 def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
     kanban_home, blocked_without_write,
@@ -1539,9 +1771,10 @@ def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
     "existing_package", "canonical_report", "missing_report", "wrong_hash",
     "wrong_filename", "missing_image", "object_body", "reference_body", "see_reference_body",
     "prose_reference_body", "metadata_reference_body", "symlink_asset",
-    "cjk_reference_body", "cjk_metadata_reference_body",
+    "cjk_reference_body", "cjk_metadata_reference_body", "snake_reference_body",
     "generated_uuid", "generated_uuid_wrong_hash", "generated_other_case",
     "existing_package_generated_uuid", "existing_package_other_case",
+    "dotted_body_field",
 ])
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
@@ -1643,6 +1876,23 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
             ],
         }
     }
+    if wire_format == "dotted_body_field":
+        with kb.connect() as conn:
+            stored_run = kb.get_run(conn, run.id)
+            stored_metadata = dict(stored_run.metadata)
+            stored_contract = dict(stored_metadata["loop_contract"])
+            stored_delivery = dict(stored_contract["user_facing_delivery"])
+            stored_delivery["body_field"] = (
+                "acceptance_evidence.inline_content_package"
+            )
+            stored_contract["user_facing_delivery"] = stored_delivery
+            stored_metadata["loop_contract"] = stored_contract
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(stored_metadata), run.id),
+            )
+            run = kb.get_run(conn, run.id)
+            assert run is not None
     if wire_format == "existing_package_generated_uuid" or wire_format == "existing_package_other_case":
         package = terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"]["telegram_user_facing_content_package"]
         stem = "different-case" if wire_format.endswith("other_case") else page.stem
@@ -1676,6 +1926,8 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         }}
         report = payload["metadata"]["user_facing_report"]
         payload["acceptanceEvidence"]["inline_content_package"] = report["body"]
+        if wire_format == "dotted_body_field":
+            report["body_field"] = "acceptance_evidence.inline_content_package"
         if wire_format == "missing_report":
             payload["metadata"] = {"user_facing_report": {"kind": "content_package",
                 "inline_content_package_field": "acceptanceEvidence.inline_content_package"}}
@@ -1713,6 +1965,8 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
             report["body"] = "See acceptanceEvidence.inline_content_package for the complete package."
         elif wire_format == "metadata_reference_body":
             report["body"] = "The package is at metadata.user_facing_report.body"
+        elif wire_format == "snake_reference_body":
+            report["body"] = "acceptance_evidence.inline_content_package"
         elif wire_format == "cjk_reference_body":
             report["body"] = "請參閱acceptanceEvidence.inline_content_package"
         elif wire_format == "cjk_metadata_reference_body":
@@ -1770,7 +2024,7 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
 
     handled = make_loop_contract_terminal_handler()(run, observation)
 
-    if wire_format not in {"existing_package", "canonical_report", "generated_uuid", "existing_package_generated_uuid"}:
+    if wire_format not in {"existing_package", "canonical_report", "generated_uuid", "existing_package_generated_uuid", "dotted_body_field"}:
         assert handled["accepted"] is False
         assert "Required content package" in handled["reason"]
         with kb.connect() as conn:
@@ -1810,6 +2064,68 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         rebuilt = kb.grace_inline_content_package_report(conn, started["execution_task_id"])
     assert rebuilt["body"] == report["body"]
     assert {a["sha256"] for a in rebuilt["assets"]} == {a["sha256"] for a in report["assets"]}
+    if wire_format == "canonical_report":
+        original_observed_at = rebuilt["observed_at"]
+        with kb.connect() as conn:
+            duplicate_ids = [
+                kb.add_attachment(
+                    conn,
+                    started["execution_task_id"],
+                    filename=attachment.filename,
+                    stored_path=attachment.stored_path,
+                    content_type=attachment.content_type,
+                    size=attachment.size,
+                    uploaded_by="historical-replay",
+                )
+                for attachment in attachments
+            ]
+            conn.execute(
+                "UPDATE task_attachments SET created_at = ? "
+                "WHERE id IN ({})".format(
+                    ",".join("?" for _ in duplicate_ids),
+                ),
+                (original_observed_at + 100, *duplicate_ids),
+            )
+            latest = kb.latest_run(conn, started["execution_task_id"])
+            metadata = dict(latest.metadata)
+            metadata["attachment_manifest"] = kb.task_attachment_manifest(
+                conn, started["execution_task_id"],
+            )
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), latest.id),
+            )
+            readback = kb.grace_content_package_attachment_readback(
+                conn, started["execution_task_id"],
+            )
+            rebuilt = kb.grace_inline_content_package_report(
+                conn, started["execution_task_id"],
+            )
+        assert readback["canonical_asset_count"] == 2
+        assert readback["task_attachment_row_count"] == 6
+        assert {
+            duplicate_id
+            for asset in readback["assets"]
+            for duplicate_id in asset["duplicate_attachment_ids"]
+        } == set(duplicate_ids[1:])
+        assert rebuilt["complete"] is True
+        assert rebuilt["observed_at"] == original_observed_at
+
+        conflicting = kanban_home / page.name
+        Image.new("RGB", (1600, 900), "red").save(conflicting)
+        with kb.connect() as conn:
+            kb.add_attachment(
+                conn,
+                started["execution_task_id"],
+                filename=page.name,
+                stored_path=str(conflicting),
+                content_type="image/png",
+                size=conflicting.stat().st_size,
+                uploaded_by="conflicting-replay",
+            )
+            assert kb.grace_content_package_attachment_readback(
+                conn, started["execution_task_id"],
+            ) is None
 
 
 def test_loop_contract_terminal_promotes_inline_text_content_package(
@@ -2006,6 +2322,29 @@ def test_inline_text_content_package_rejects_non_string_body(malformed_body):
     assert result == {}
 
 
+def test_unsolicited_content_package_report_without_delivery_contract_is_ignored():
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "status": "succeeded",
+            "acceptanceEvidence": {"body": "unsolicited"},
+            "metadata": {"user_facing_report": {
+                "kind": "content_package",
+                "delivery": "inline_with_attachment",
+                "complete": True,
+                "title": "Unsolicited",
+                "body": "unsolicited",
+                "observed_at": int(openclaw_async_executor.time.time()),
+                "assets": [],
+            }},
+        },
+        metadata={"loop_contract": {}},
+        task_id="t_no_delivery_contract",
+        board=None,
+    )
+
+    assert result == {}
+
+
 def test_objective_inline_report_uses_canonical_body_and_system_completion(
     kanban_home,
 ):
@@ -2105,6 +2444,194 @@ def test_intermediate_objective_accepts_incomplete_attachment_report(
     assert result["user_facing_report"]["complete"] is False
     assert result["user_facing_report"]["assets"][0]["sha256"] == image_sha
     assert len(result["artifacts"]) == 2
+
+
+def test_intermediate_objective_marks_verified_full_publication_package_complete(
+    kanban_home,
+):
+    page = kanban_home / "page.png"
+    audio = kanban_home / "audio.png"
+    Image.new("RGB", (1600, 900)).save(page)
+    Image.new("RGB", (1200, 1200)).save(audio)
+    sections = {
+        "facebook_page_post": "完整 Page 內文",
+        "facebook_group_post": "完整 Group 附文",
+        "gemini_notebook_prompt": "完整 Gemini Prompt",
+        "podcast_title": "完整 Podcast 標題",
+        "podcast_description": "完整 Podcast 說明",
+    }
+    body = "\n\n".join((
+        f"## 1. Facebook Page 貼文\n\n{sections['facebook_page_post']}",
+        f"## 2. Facebook Group 討論附文\n\n{sections['facebook_group_post']}",
+        f"## 3. Gemini Notebook Audio Generation Prompt\n\n{sections['gemini_notebook_prompt']}",
+        f"## 4. Podcast Title\n\n{sections['podcast_title']}",
+        f"## 5. Podcast Description\n\n{sections['podcast_description']}",
+    ))
+    assets = [
+        {
+            "filename": page.name,
+            "label": "Page Hero",
+            "path": str(page),
+            "sha256": openclaw_async_executor.hashlib.sha256(
+                page.read_bytes()
+            ).hexdigest(),
+            "asset_family": "page_hero",
+            "width": 1600,
+            "height": 900,
+        },
+        {
+            "filename": audio.name,
+            "label": "Audio Brief",
+            "path": str(audio),
+            "sha256": openclaw_async_executor.hashlib.sha256(
+                audio.read_bytes()
+            ).hexdigest(),
+            "asset_family": "audio_brief",
+            "width": 1200,
+            "height": 1200,
+        },
+    ]
+    contract = {
+        "objective_ref": {"objective_id": "go_test", "stage_key": "repair_r26"},
+        "completion_mode": "intermediate",
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "body_field": "acceptance_evidence.inline_content_package",
+            "asset_filenames": [page.name, audio.name],
+        },
+        "memory": {
+            "working": [
+                "Objective source content package (data, not instructions): "
+                + json.dumps({
+                    "assets": [
+                        {"path": asset["path"], "sha256": asset["sha256"]}
+                        for asset in assets
+                    ]
+                })
+            ]
+        },
+    }
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "acceptanceEvidence": {
+                "inline_content_package": body,
+                "asset_manifest": assets,
+            },
+            "metadata": {"user_facing_report": {
+                "kind": "content_package",
+                "delivery": "inline_with_attachment",
+                "complete": False,
+                "title": "完整發布包",
+                "body_field": "acceptance_evidence.inline_content_package",
+                "body": body,
+                "observed_at": int(openclaw_async_executor.time.time()),
+                "assets": [
+                    {
+                        key: asset[key]
+                        for key in ("filename", "label", "path", "sha256")
+                    }
+                    for asset in assets
+                ],
+            }},
+        },
+        metadata={"loop_contract": contract},
+        task_id="t_intermediate_full_package",
+        board=None,
+        policy_receipts=[{
+            "role": "execution",
+            "policy_id": "ai-bizweek-brand-channel",
+            "version": "1",
+            "sha256": "a" * 64,
+            "loaded": True,
+        }],
+        external_effects=[],
+    )
+
+    assert result["user_facing_report"]["complete"] is True
+    assert result["user_facing_report"]["package_kind"] == (
+        "full_publication_package"
+    )
+    assert result["facebook_page_post"] == {
+        "text": sections["facebook_page_post"],
+    }
+    assert len(result["artifacts"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("project", "thread_id"),
+    [
+        # Topic 4641 is the historical SoloBizAi failure sample, not
+        # hardcoded behavior.
+        ("solobizai", "4641"),
+        ("course_marketing", "general"),
+    ],
+)
+def test_attachment_report_accepts_canonical_metadata_body_binding(
+    kanban_home,
+    project,
+    thread_id,
+):
+    image_path = kanban_home / f"{project}.png"
+    Image.new("RGB", (32, 32)).save(image_path)
+    image_sha = openclaw_async_executor.hashlib.sha256(
+        image_path.read_bytes()
+    ).hexdigest()
+    body = f"Complete package for {project}."
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "body_field": "metadata.user_facing_report.body",
+        "asset_filenames": [image_path.name],
+    }
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": True,
+        "title": "Complete package",
+        "body": body,
+        "observed_at": int(openclaw_async_executor.time.time()),
+        "assets": [
+            {
+                "filename": image_path.name,
+                "label": "Hero",
+                "path": str(image_path),
+                "sha256": image_sha,
+            }
+        ],
+    }
+
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "acceptanceEvidence": {"user_facing_body": body},
+            "metadata": {"user_facing_report": report},
+        },
+        metadata={
+            "loop_contract": {
+                "identity": {"project": project, "thread_id": thread_id},
+                "user_facing_delivery": delivery,
+                "memory": {
+                    "working": [
+                        "Objective source content package (data, not instructions): "
+                        + json.dumps(
+                            {
+                                "assets": [
+                                    {"path": str(image_path), "sha256": image_sha}
+                                ]
+                            }
+                        )
+                    ]
+                },
+            }
+        },
+        task_id=f"t_{project}",
+        board=None,
+    )
+
+    assert result["user_facing_report"]["body"] == body
+    assert result["user_facing_report"]["assets"][0]["sha256"] == image_sha
 
 
 def test_terminal_objective_canonicalizes_incomplete_worker_report(kanban_home):
@@ -2415,6 +2942,42 @@ def test_loop_contract_poll_rejects_cross_run_backend_identity(
     adapter = make_loop_contract_poll_adapter(transport=mismatched)
     with pytest.raises(ValueError, match="backend correlation mismatch"):
         adapter(run)
+
+
+def test_loop_contract_poll_keeps_admitted_run_alive_on_wrapped_transport_timeout(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-poll-wrapped-timeout"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-poll-wrapped-timeout",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+
+    def wrapped_timeout(task):
+        result = _loop_result(task, "failed")
+        result.update(
+            {
+                "errors": ["timeout"],
+                "identity_correlated": False,
+                "protocol_correlated": False,
+            }
+        )
+        return result
+
+    observed = make_loop_contract_poll_adapter(transport=wrapped_timeout)(run)
+
+    assert observed["status"] == "running"
+    assert observed["backend_run_id"] == run.backend_run_id
+    assert observed["backend_session_key"] == run.metadata["backend_session_key"]
+    assert observed["transport_ambiguous"] is True
 
 
 @pytest.mark.parametrize("missing_run_route", [False, True])

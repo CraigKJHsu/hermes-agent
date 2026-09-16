@@ -11,11 +11,12 @@ def test_preview_recovery(worker_env):
         conn.commit()
         kb.add_comment(conn, worker_env, "worker", "old blocker " * 2000)
         kb.add_comment(conn, worker_env, "operator", "Readback source: task-scoped live Kanban DB")
-    output = kt._handle_show({})
+    output = kt._handle_show({"view": "full"})
     assert "Readback source: task-scoped live Kanban DB" in output[:1500]
     shown = json.loads(output)
-    assert shown["task"]["body"] == body
+    assert shown["task"]["body"].startswith("large-contract ")
+    assert "<truncated chars=" in shown["task"]["body"]
     assert len(shown["comments"]) == 2
-    assert shown["comments"][0]["body"] == ("old blocker " * 2000).strip()
+    assert "<truncated chars=" in shown["comments"][0]["body"]
     assert "worker_context" in shown and "runs" in shown
     assert shown["latest_comment"] == shown["comments"][-1]

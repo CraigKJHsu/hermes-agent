@@ -44,6 +44,16 @@ _CALLBACK_QUOTA_PATTERNS = (
     "rate-limit",
 )
 
+_GRACE_CALLBACK_RESUME_RE = re.compile(
+    r"\s*接續\s+(t_[0-9a-f]{8})\s*[。.!！]?\s*"
+)
+
+
+def _grace_callback_resume_review_id(text: Any) -> str:
+    """Return the exact review id only for the advertised control phrase."""
+    match = _GRACE_CALLBACK_RESUME_RE.fullmatch(str(text or ""))
+    return match.group(1) if match else ""
+
 
 def _quota_blocker_message(value: Any) -> str:
     if isinstance(value, dict):
@@ -112,7 +122,7 @@ def _callback_successor_is_correlatable(successor: sqlite3.Row) -> bool:
         successor["delegation_state"] == "queued"
         and successor["execution_task_id"]
         and successor["review_task_id"]
-        and successor["stage_status"] in {"queued", "done"}
+        and successor["stage_status"] in {"queued", "blocked", "done"}
         and successor["execution_status"] in task_states
         and successor["review_status"] in task_states
     )
@@ -369,6 +379,36 @@ def _release_singleton_lock(handle) -> None:
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    def _resume_grace_callback_handoff(
+        self,
+        *,
+        text: str,
+        source: Any,
+        session_key: str,
+        session_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Consume one authenticated session-reset callback handoff command."""
+        review_id = _grace_callback_resume_review_id(text)
+        if not review_id:
+            return None
+        from hermes_cli import kanban_db as kb_module
+
+        platform = getattr(source, "platform", "")
+        platform_name = (
+            platform.value if hasattr(platform, "value") else str(platform or "")
+        )
+        with kb_module.connect_closing() as conn:
+            return kb_module.resume_session_reset_grace_loop_callback(
+                conn,
+                review_task_id=review_id,
+                platform=platform_name,
+                chat_id=str(getattr(source, "chat_id", "") or ""),
+                thread_id=str(getattr(source, "thread_id", "") or ""),
+                user_id=str(getattr(source, "user_id", "") or ""),
+                session_key=session_key,
+                session_id=session_id,
+            )
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver progress and terminal events.
@@ -1174,6 +1214,9 @@ class GatewayKanbanWatchersMixin:
         *,
         lease_owner: str,
     ) -> None:
+        class _CallbackTurnTerminationUnconfirmed(RuntimeError):
+            """The callback turn may still be mutating its Objective."""
+
         review_id = str(callback["review_task_id"])
         execution_id = str(callback["execution_task_id"])
         event_id = int(callback["event_id"])
@@ -1291,7 +1334,7 @@ class GatewayKanbanWatchersMixin:
                 with kb_module.connect_closing(board=board) as conn, kb_module.write_txn(conn):
                     objective_id = str(callback.get("objective_id") or "")
                     objective = kb_module.get_grace_objective(conn, objective_id) if objective_id else None
-                    if objective and objective["current_stage_key"] != callback.get("stage_key"):
+                    if objective:
                         successors = _active_exact_origin_successors(
                             conn,
                             objective_id=objective_id,
@@ -1304,7 +1347,11 @@ class GatewayKanbanWatchersMixin:
                                 "reconcile continuation identity"
                             )
                         successor = successors[0] if successors else None
-                        if successor is None and objective["status"] != "blocked":
+                        if (
+                            successor is None
+                            and objective["current_stage_key"] != callback.get("stage_key")
+                            and objective["status"] != "blocked"
+                        ):
                             raise RuntimeError("The objective has advanced; its current stage still needs continuation correlation")
                         if successor is not None:
                             if not _callback_successor_is_correlatable(successor):
@@ -1434,13 +1481,12 @@ class GatewayKanbanWatchersMixin:
                     objective = kb_module.get_grace_objective(conn, objective_id)
                     if objective and objective.get("status") in {"completed", "cancelled"}:
                         return
-                    if objective and objective["current_stage_key"] != callback.get("stage_key"):
+                    if objective:
                         successors = _active_exact_origin_successors(
                             conn,
                             objective_id=objective_id,
                             review_task_id=review_id,
                             event_id=event_id,
-                            excluded_stage_key=str(callback.get("stage_key") or ""),
                         )
                         if len(successors) > 1:
                             raise RuntimeError(
@@ -1555,26 +1601,93 @@ class GatewayKanbanWatchersMixin:
                     )
                 except (TypeError, ValueError):
                     processing_timeout = 600.0
-                while True:
+                bounded_timeout = max(
+                    0.05, min(processing_timeout, 1800.0),
+                )
+                try:
+                    processing_ok = await asyncio.wait_for(
+                        asyncio.shield(completion_future),
+                        timeout=bounded_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # Do not release the durable callback lease while the
+                    # timed-out adapter turn can still mutate the Objective.
                     try:
-                        processing_ok = await asyncio.wait_for(
-                            asyncio.shield(completion_future),
-                            timeout=max(0.05, min(processing_timeout, 1800.0)),
+                        cancellation_timeout = float(os.getenv(
+                            "HERMES_GRACE_CALLBACK_CANCEL_TIMEOUT_SECONDS",
+                            "5.5",
+                        ))
+                    except (TypeError, ValueError):
+                        cancellation_timeout = 5.5
+                    cancellation_timeout = max(
+                        0.1, min(cancellation_timeout, 30.0),
+                    )
+                    if hasattr(adapter, "cancel_session_processing"):
+                        processing_task = internal_context.get(
+                            "processing_task"
                         )
-                        break
-                    except asyncio.TimeoutError:
-                        if completion_future.done():
-                            processing_ok = completion_future.result()
-                            break
+                        if processing_task is None:
+                            processing_task = (
+                                getattr(adapter, "_session_tasks", {}) or {}
+                            ).get(delivery_session_key)
+                        session_guard = (
+                            getattr(adapter, "_active_sessions", {}) or {}
+                        ).get(delivery_session_key)
+                        try:
+                            await asyncio.wait_for(
+                                adapter.cancel_session_processing(
+                                    delivery_session_key,
+                                    release_guard=False,
+                                ),
+                                timeout=cancellation_timeout,
+                            )
+                        except Exception as exc:
+                            raise _CallbackTurnTerminationUnconfirmed(
+                                "Timed-out Grace callback turn could not be "
+                                "confirmed stopped; callback quarantined and "
+                                "its session guard remains held."
+                            ) from exc
+                        if (
+                            processing_task is None
+                            or not processing_task.done()
+                        ):
+                            raise _CallbackTurnTerminationUnconfirmed(
+                                "Timed-out Grace callback turn could not be "
+                                "confirmed stopped; callback quarantined and "
+                                "its session guard remains held."
+                            )
+                        if (
+                            session_guard is not None
+                            and hasattr(adapter, "_release_session_guard")
+                        ):
+                            adapter._release_session_guard(
+                                delivery_session_key,
+                                guard=session_guard,
+                            )
+                    else:
                         processing_task = internal_context.get("processing_task")
-                        if processing_task is None or processing_task.done():
-                            raise
-                        # The agent has its own execution limits. Keep renewing
-                        # this lease while the exact adapter turn is still live;
-                        # releasing it would let a second callback race that turn.
-                        # The sibling _heartbeat task renews the DB lease every
-                        # 30 seconds through the owner/event CAS below.
-                        logger.info("Grace callback %s still processing; retaining lease", review_id)
+                        if processing_task is None:
+                            raise _CallbackTurnTerminationUnconfirmed(
+                                "Timed-out Grace callback turn did not expose "
+                                "an authoritative processing task; callback "
+                                "quarantined because termination is unconfirmed."
+                            )
+                        if not processing_task.done():
+                            processing_task.cancel()
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(processing_task),
+                                    timeout=cancellation_timeout,
+                                )
+                            except asyncio.CancelledError:
+                                pass
+                            except asyncio.TimeoutError as exc:
+                                raise _CallbackTurnTerminationUnconfirmed(
+                                    "Timed-out Grace callback turn could not be "
+                                    "confirmed stopped; callback quarantined and "
+                                    "its session guard remains held."
+                                ) from exc
+                    raise
                 if processing_ok is False:
                     raise RuntimeError(
                         "Grace callback turn failed before successful delivery."
@@ -1662,6 +1775,7 @@ class GatewayKanbanWatchersMixin:
             "capability",
             "transient",
             "dependency",
+            "quota_blocked",
         }
         is_blocker_callback = (
             event_stage == "execution"
@@ -1669,10 +1783,24 @@ class GatewayKanbanWatchersMixin:
             or event_kind == "block_loop_detected"
         )
 
-        # An outcome may have committed just before a process crash. Its native
-        # validator already verified the successor/grant/closure. Replay only the
-        # delivery acknowledgement, never a second model turn or external action.
-        if await _has_structured_outcome():
+        # A structured outcome may have committed just before a process crash.
+        # Ordinary outcomes were validated after their required delivery and
+        # can finalize immediately. The v28 system package checkpoint is the
+        # one legacy shape that could commit before its visible receipts.
+        had_structured_outcome = await _has_structured_outcome()
+        stored_outcome_payload: Any = callback.get("outcome_payload")
+        try:
+            stored_outcome_payload = json.loads(stored_outcome_payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stored_outcome_payload = None
+        needs_checkpoint_recovery = bool(
+            had_structured_outcome
+            and callback.get("outcome_kind") == "approval_blocked"
+            and isinstance(stored_outcome_payload, dict)
+            and stored_outcome_payload.get("action")
+            == "confirm_content_package"
+        )
+        if had_structured_outcome and not needs_checkpoint_recovery:
             await _finish()
             return
 
@@ -1864,7 +1992,7 @@ class GatewayKanbanWatchersMixin:
                     await _finish()
                 elif outcome == "accepted":
                     await _escalate(
-                        "origin session changed; handoff notice delivered, continuation remains unverified"
+                        kb_module._GRACE_SESSION_RESET_HANDOFF_ERROR
                     )
                 elif (
                     str(callback.get("objective_id") or "").strip()
@@ -1927,6 +2055,21 @@ class GatewayKanbanWatchersMixin:
             if isinstance(execution_metadata, dict)
             else None
         )
+        blocked_result = (
+            execution_metadata.get("loop_contract_blocked_result")
+            if is_blocker_callback and isinstance(execution_metadata, dict)
+            else None
+        )
+        blocked_result_metadata = (
+            blocked_result.get("metadata")
+            if isinstance(blocked_result, dict)
+            and isinstance(blocked_result.get("metadata"), dict)
+            else {}
+        )
+        if user_facing_report is None:
+            candidate_report = blocked_result_metadata.get("user_facing_report")
+            if isinstance(candidate_report, dict):
+                user_facing_report = candidate_report
         if outcome == "accepted":
             with kb_module.connect_closing(board=board) as conn:
                 delivery_contract = (
@@ -1949,6 +2092,7 @@ class GatewayKanbanWatchersMixin:
                 execution_metadata["user_facing_report"] = user_facing_report
                 execution_evidence["metadata"] = execution_metadata
                 full_snapshot["execution"] = execution_evidence
+        blocked_result_evidence = None
         if is_blocker_callback:
             stranded_delegations = list(
                 full_snapshot.get("stranded_delegations") or []
@@ -1965,6 +2109,22 @@ class GatewayKanbanWatchersMixin:
                     for key in ("scope", "routing", "stop_rules")
                     if loop_contract.get(key) is not None
                 }
+            if isinstance(blocked_result, dict):
+                bounded_artifacts = [
+                    _clip_text(artifact, 800)
+                    for artifact in list(blocked_result.get("artifacts") or [])[:8]
+                ]
+                blocked_result_evidence = {
+                    "status": blocked_result.get("status"),
+                    "summary": _clip_text(blocked_result.get("summary"), 1200),
+                    "acceptance_evidence": _clip_text(
+                        blocked_result.get("acceptanceEvidence"), 4000,
+                    ),
+                    "external_effects": _clip_text(
+                        blocked_result.get("externalEffects"), 2000,
+                    ),
+                    "artifacts": bounded_artifacts,
+                }
             full_snapshot = {
                 "continuation_authorization": full_snapshot.get("continuation_authorization"),
                 "original_request": full_snapshot.get("original_request"),
@@ -1973,6 +2133,8 @@ class GatewayKanbanWatchersMixin:
                     "status": execution_evidence.get("status"),
                     "summary": _clip_text(execution_evidence.get("summary"), 1200),
                     "contract_boundary": contract_boundary,
+                    "blocked_result": blocked_result_evidence,
+                    "user_facing_report": user_facing_report,
                     "attachment_count": len(
                         execution_evidence.get("attachments") or []
                     ),
@@ -2035,6 +2197,7 @@ class GatewayKanbanWatchersMixin:
                         metadata_without_report, 1000,
                     ),
                     "user_facing_report": user_facing_report,
+                    "blocked_result": blocked_result_evidence,
                     "approval_context": approval_context,
                     "attachments": bounded_attachments,
                     "attachment_count": len(
@@ -2063,8 +2226,12 @@ class GatewayKanbanWatchersMixin:
                         "execution": {
                             "task_id": execution_id,
                             "user_facing_report": user_facing_report,
+                            "blocked_result": blocked_result_evidence,
                         },
                         "review_task_id": review_id,
+                        "continuation_authorization": full_snapshot.get(
+                            "continuation_authorization"
+                        ),
                         "stranded_delegations": list(
                             full_snapshot.get("stranded_delegations") or []
                         ),
@@ -2077,7 +2244,10 @@ class GatewayKanbanWatchersMixin:
                     {
                         "execution_task_id": execution_id,
                         "review_task_id": review_id,
-                        "continuation_authorization": {"snapshot_available": False},
+                        "continuation_authorization": full_snapshot.get(
+                            "continuation_authorization"
+                        ),
+                        "blocked_result": blocked_result_evidence,
                         "stranded_delegations": list(
                             full_snapshot.get("stranded_delegations") or []
                         ),
@@ -2204,6 +2374,13 @@ class GatewayKanbanWatchersMixin:
                 "approval question, or outcome_kind=terminal_blocked when verified "
                 "terminal evidence proves the originating outcome is not complete and "
                 "no scoped continuation can legally proceed. If completion_mode=intermediate and the next stage "
+                "is an already-declared local, preparatory, or read-only stage within "
+                "the originating scope, call clawops_delegate now with approved=false, "
+                "the exact declared objective_id/stage_key and accepted source selector, "
+                f"origin_callback_review_id={review_id}, "
+                f"origin_callback_event_id={event_id}, and "
+                f"origin_callback_board={str(board or 'default')}; then record "
+                "outcome_kind=continued with the returned exact task IDs. If the next stage "
                 "changes external state, call clawops_delegate now with the complete "
                 "successor contract, approved=false, explicit external_targets, "
                 f"origin_callback_review_id={review_id}, "
@@ -2284,14 +2461,57 @@ class GatewayKanbanWatchersMixin:
             "this callback turn; internal delegation of an already-authorized safe "
             "continuation is allowed."
             )
-        async def _ensure_inline_report_delivery() -> None:
-            if outcome != "accepted" or user_facing_report is None:
-                return
-            if kb_module.grace_user_facing_report_delivery_matches(
-                callback,
-                event_id=event_id,
-                report=user_facing_report,
+        def _full_publication_checkpoint_payload() -> Optional[dict[str, Any]]:
+            if not (
+                outcome == "accepted"
+                and str(callback.get("objective_id") or "").strip()
+                and isinstance(user_facing_report, dict)
+                and user_facing_report.get("package_kind")
+                == "full_publication_package"
             ):
+                return None
+            payload: dict[str, Any] = {
+                "action": "confirm_content_package",
+                "platform": "internal",
+                "scope": {
+                    "execution_task_id": execution_id,
+                    "review_task_id": review_id,
+                    "review_event_id": int(event_id),
+                },
+                "exact_question": (
+                    "完整發布包已交付並通過 Grace 審查。要繼續進行 "
+                    "Facebook Page 發布前檢查嗎？"
+                ),
+            }
+            with kb_module.connect_closing(board=board) as conn:
+                stage = conn.execute(
+                    "SELECT position FROM grace_objective_stages "
+                    "WHERE objective_id=? AND stage_key=?",
+                    (
+                        str(callback["objective_id"]),
+                        str(callback.get("stage_key") or ""),
+                    ),
+                ).fetchone()
+                next_stage = conn.execute(
+                    "SELECT stage_key FROM grace_objective_stages "
+                    "WHERE objective_id=? AND position>? ORDER BY position LIMIT 1",
+                    (
+                        str(callback["objective_id"]),
+                        int(stage["position"]) if stage else -1,
+                    ),
+                ).fetchone()
+            # A full package at an Objective's terminal stage is the final
+            # deliverable, not an implicit request to invent another stage.
+            # Let the ordinary terminal close validator handle it.
+            if next_stage is None:
+                return None
+            payload["next_stage_key"] = str(next_stage["stage_key"])
+            return payload
+
+        async def _ensure_inline_report_delivery(
+            checkpoint: Optional[dict[str, Any]],
+        ) -> None:
+            if outcome != "accepted" or user_facing_report is None:
                 return
             from hermes_cli.user_facing_report import (
                 delivery_contract_from_report,
@@ -2329,6 +2549,15 @@ class GatewayKanbanWatchersMixin:
                     ("asset", asset)
                     for asset in user_facing_report.get("assets") or []
                 )
+            if checkpoint is not None:
+                delivery_items.append(("checkpoint", checkpoint["exact_question"]))
+            if kb_module.grace_user_facing_report_delivery_matches(
+                callback,
+                event_id=event_id,
+                report=user_facing_report,
+                chunk_count=len(delivery_items),
+            ):
+                return
             report_digest = user_facing_report_digest(user_facing_report)
             next_chunk = kb_module.grace_user_facing_report_next_chunk(
                 callback,
@@ -2386,7 +2615,7 @@ class GatewayKanbanWatchersMixin:
                         "ambiguous prior inline chunk delivery requires reconciliation"
                     )
                 if reservation["state"] != "sent":
-                    if item_kind == "text":
+                    if item_kind in {"text", "checkpoint"}:
                         send_result = await adapter.send(
                             str(callback["chat_id"]),
                             str(item_payload),
@@ -2447,6 +2676,27 @@ class GatewayKanbanWatchersMixin:
                     )
                 callback.update(receipt)
 
+        async def _park_full_publication_package(
+            payload: Optional[dict[str, Any]],
+        ) -> bool:
+            if payload is None:
+                return False
+            with kb_module.connect_closing(board=board) as conn:
+                recorded = kb_module.record_grace_loop_callback_outcome(
+                    conn,
+                    review_task_id=review_id,
+                    event_id=event_id,
+                    platform=platform_name,
+                    chat_id=callback_chat_id,
+                    thread_id=callback_thread_id,
+                    session_id=str(callback.get("session_id") or ""),
+                    lease_owner=lease_owner,
+                    outcome_kind="approval_blocked",
+                    payload=payload,
+                )
+            callback.update(recorded)
+            return True
+
         try:
             from gateway.platforms.base import MessageEvent, MessageType
             event = MessageEvent(
@@ -2476,7 +2726,19 @@ class GatewayKanbanWatchersMixin:
                 message_id=str(callback.get("message_id") or "") or None,
             )
             callback["attempts"] = await _record_attempt()
-            await _ensure_inline_report_delivery()
+            checkpoint = _full_publication_checkpoint_payload()
+            await _ensure_inline_report_delivery(checkpoint)
+            if had_structured_outcome:
+                if (
+                    callback.get("outcome_kind") == "approval_blocked"
+                    and stored_outcome_payload == checkpoint
+                ):
+                    await _park_full_publication_package(checkpoint)
+                await _finish()
+                return
+            if await _park_full_publication_package(checkpoint):
+                await _finish()
+                return
             await _handle_with_lease_heartbeat(event)
             if quota_blocker_message and not str(
                 callback.get("objective_id") or ""
@@ -2533,6 +2795,9 @@ class GatewayKanbanWatchersMixin:
         except Exception as exc:
             error = f"Grace callback delivery failed: {type(exc).__name__}: {exc}"
             logger.warning("%s", error)
+            if isinstance(exc, _CallbackTurnTerminationUnconfirmed):
+                await _escalate(error)
+                return
             if int(callback.get("attempts") or 1) >= 3:
                 send_meta = {}
                 if callback.get("thread_id"):

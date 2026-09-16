@@ -1,5 +1,8 @@
 """Version pins exercise real SQLite, policy files, validator and compiler paths."""
 from copy import deepcopy
+import hashlib
+import json
+import time
 
 import pytest
 
@@ -14,7 +17,38 @@ from proactive.policy_registry import (
 from scripts.replay_behavior_observation import load_cases, make_contract, replay_case
 
 
-def setup_objective(project="ai_bizweek", *, enabled=True, oid="go_profile", project_namespace=None):
+CURRENT_VERSION = "v47"
+
+
+@pytest.mark.parametrize("relative_path", [
+    "gateway/kanban_watchers.py",
+    "gateway/run.py",
+    "hermes_cli/kanban_db.py",
+    "plugins/openclaw_bridge/clawops_delegate.py",
+    "tools/facebook_page_graph_tool.py",
+])
+def test_current_kernel_seals_callback_resume_and_page_source_authority(
+    relative_path,
+):
+    kernel = json.loads((br.ROOT / "kernel-v47.json").read_text())
+    source = br.CODE_ROOT / relative_path
+    assert kernel[relative_path] == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+
+
+def test_current_ai_bizweek_review_uses_controller_package_authority():
+    contract = setup_objective("ai_bizweek")
+
+    body = render_review_body(contract, "t_execution")
+
+    assert "Controller content-package readback is authoritative" in body
+    assert "Markdown body artifact increases the total attachment-row count" in body
+    assert "resized thumbnail is an optional inspection aid" in body
+    assert "`Controller state conflict:`" in body
+
+
+def setup_objective(project="ai_bizweek", *, enabled=True, oid="go_profile", project_namespace=None, version=CURRENT_VERSION):
     case = load_cases()["cases"][0 if project == "ai_bizweek" else 2]
     contract = make_contract(load_cases(), case)
     contract["objective_ref"]["objective_id"] = oid
@@ -30,7 +64,7 @@ def setup_objective(project="ai_bizweek", *, enabled=True, oid="go_profile", pro
         if enabled:
             br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"],
                              thread_id=identity["thread_id"], project=project_namespace, profile_id=project,
-                             version="v6", expected_revision=0, reason="Local canary")
+                             version=version, expected_revision=0, reason="Local canary")
         kb.create_grace_objective(conn, objective_id=oid, platform="telegram", chat_id=identity["chat_id"],
                                   thread_id=identity["thread_id"], session_key="fixture", title="fixture",
                                   objective="fixture", original_request_sha256="a" * 64,
@@ -53,7 +87,7 @@ def test_pin_survives_policy_activation_and_uses_actual_versioned_compiler(proje
     receipt = {**{k: loaded["policies"][0][k] for k in ("policy_id", "version", "sha256")},
                "role": "review", "loaded": True, "pinned_version_verified": True}
     validate_policy_completion(render_review_body(normalized, "t_parent"), {"policy_receipts": [receipt]}, role="review")
-    assert br.implementation(normalized, "compiler").__name__.endswith(".v1.compiler")
+    assert br.implementation(normalized, "compiler").__name__.endswith(".v47.compiler")
 
 
 def test_contract_cannot_remove_or_replace_pin_or_change_topic():
@@ -100,7 +134,7 @@ def test_migration_cas_and_rollback_keep_history_and_reject_old_task_generation(
         saved_body = kb.get_task(conn, task_id).body
         pin = br.get_pin(conn, "go_profile")
         spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"],
-                    thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6",
+                    thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version=CURRENT_VERSION,
                     expected_revision=1, expected_pin_hash=br.digest(pin), reason="Explicit compatibility checkpoint")
         preview = br.migrate_objective(conn, **spec)
         assert preview["applied"] is False
@@ -123,17 +157,180 @@ def test_migration_cas_and_rollback_keep_history_and_reject_old_task_generation(
         assert conn.execute("SELECT count(*) FROM task_external_effects").fetchone()[0] == 0
 
 
+def test_migration_treats_terminal_callback_review_as_idle():
+    contract = setup_objective(version=CURRENT_VERSION)
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn,
+            title="finished dependency review",
+            body=render_review_body(contract, "t_execution"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at) "
+            "VALUES(?,?,?,?,?)",
+            (review_id, "blocked", "blocked", 1_789_183_400, 1_789_183_500),
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',outcome_kind='continued',"
+            "review_task_id=? WHERE objective_id='go_profile' AND stage_key='prepare'",
+            (review_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='todo',block_kind='dependency' WHERE id=?",
+            (review_id,),
+        )
+        conn.execute(
+            """INSERT INTO grace_loop_callbacks
+                (review_task_id,execution_task_id,platform,chat_id,thread_id,
+                 contract_fingerprint,state,created_at,objective_id,stage_key,
+                 outcome_kind)
+                VALUES (?,'t_execution','telegram',?,?,'fingerprint','delivered',1,
+                        'go_profile','prepare','continued')""",
+            (
+                review_id, contract["identity"]["chat_id"],
+                contract["identity"]["thread_id"],
+            ),
+        )
+        pin = br.get_pin(conn, "go_profile")
+
+        result = br.migrate_objective(
+            conn,
+            objective_id="go_profile",
+            platform="telegram",
+            chat_id=contract["identity"]["chat_id"],
+            thread_id=contract["identity"]["thread_id"],
+            profile_id="ai_bizweek",
+            version=CURRENT_VERSION,
+            expected_revision=1,
+            expected_pin_hash=br.digest(pin),
+            reason="Finished dependency review is not in flight",
+            apply=True,
+        )
+
+        assert result["next_pin"]["generation"] == 2
+
+
+def test_migrated_system_checkpoint_can_replay_historical_tasks():
+    contract = setup_objective(version=CURRENT_VERSION)
+    payload = {
+        "action": "confirm_content_package",
+        "platform": "internal",
+        "scope": {},
+        "exact_question": "Confirm the already delivered package.",
+        "next_stage_key": "publish",
+    }
+    with kb.connect_closing() as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="historical checkpoint execution",
+            body=render_execution_body(contract),
+        )
+        review_id = kb.create_task(
+            conn,
+            title="historical checkpoint review",
+            body=render_review_body(contract, execution_id),
+            parents=(execution_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id IN (?,?)",
+            (execution_id, review_id),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id=contract["identity"]["chat_id"],
+            thread_id=contract["identity"]["thread_id"],
+            contract_fingerprint="c" * 64,
+            objective_id="go_profile",
+            stage_key="prepare",
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',"
+            "outcome_kind='approval_blocked' "
+            "WHERE objective_id='go_profile' AND stage_key='prepare'"
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='waiting_approval' "
+            "WHERE objective_id='go_profile' AND stage_key='publish'"
+        )
+        conn.execute(
+            "UPDATE grace_objectives SET status='waiting_approval',"
+            "current_stage_key='publish' WHERE objective_id='go_profile'"
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='attention',"
+            "outcome_kind='approval_blocked',outcome_payload=? "
+            "WHERE review_task_id=?",
+            ("{}", review_id),
+        )
+        pin = br.get_pin(conn, "go_profile")
+        objective = kb.get_grace_objective(conn, "go_profile")
+        br.migrate_objective(
+            conn,
+            objective_id="go_profile",
+            platform="telegram",
+            chat_id=contract["identity"]["chat_id"],
+            thread_id=contract["identity"]["thread_id"],
+            profile_id="ai_bizweek",
+            version=CURRENT_VERSION,
+            expected_revision=objective["revision"],
+            expected_pin_hash=br.digest(pin),
+            reason="Replay a durable system checkpoint after migration",
+            apply=True,
+        )
+        callback = dict(conn.execute(
+            "SELECT * FROM grace_loop_callbacks WHERE review_task_id=?",
+            (review_id,),
+        ).fetchone())
+
+        with pytest.raises(br.BehaviorProfileError, match="pin_mismatch"):
+            kb._apply_grace_objective_callback_outcome(
+                conn,
+                callback=callback,
+                kind="approval_blocked",
+                payload=payload,
+            )
+        kb._apply_grace_objective_callback_outcome(
+            conn,
+            callback=callback,
+            kind="approval_blocked",
+            payload=payload,
+            system_checkpoint_authorized=True,
+        )
+        assert kb.get_grace_objective(conn, "go_profile")["status"] == (
+            "waiting_approval"
+        )
+
+
 @pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
 @pytest.mark.parametrize("old_version", ["v1", "v3"])
-def test_callback_kernel_release_retains_behavior_and_migrates_policy(project, old_version):
+def test_callback_kernel_release_retains_behavior_and_migrates_policy(
+    project, old_version,
+):
     import json
 
     old_manifest = br.profile(project, old_version)
-    new_manifest = br.profile(project, "v6")
-    compatibility_fields = {"version", "safety_kernel_version", "safety_kernel_hash"}
-    assert {k: v for k, v in old_manifest.items() if k not in compatibility_fields} == {
-        k: v for k, v in new_manifest.items() if k not in compatibility_fields
-    }
+    new_manifest = br.profile(project, CURRENT_VERSION)
+    for field in (
+        "profile_id", "route_snapshot", "contract_schema_version",
+        "validator_set_hash",
+    ):
+        assert new_manifest[field] == old_manifest[field]
+    assert new_manifest["bundle"] == "v47"
+    for component in (
+        "contract", "domain", "preflight", "prompt", "review", "workflow",
+    ):
+        assert new_manifest["files"][f"v47/{component}.py"] == old_manifest["files"][
+            f"v1/{component}.py"
+        ]
+    assert new_manifest["files"]["v47/compiler.py"] != old_manifest["files"][
+        "v1/compiler.py"
+    ]
+    assert new_manifest["files"]["v47/routing.py"] != old_manifest["files"][
+        "v1/routing.py"
+    ]
     contract = setup_objective(project, enabled=False)
     identity = contract["identity"]
     policy = br._policy_snapshot("telegram", identity["chat_id"], identity["thread_id"])
@@ -146,7 +343,7 @@ def test_callback_kernel_release_retains_behavior_and_migrates_policy(project, o
             br.guard_objective(conn, "go_profile")
         result = br.migrate_objective(
             conn, objective_id="go_profile", platform="telegram", chat_id=identity["chat_id"],
-            thread_id=identity["thread_id"], profile_id=project, version="v6",
+            thread_id=identity["thread_id"], profile_id=project, version=CURRENT_VERSION,
             expected_revision=1, expected_pin_hash=br.digest(old_pin),
             reason="Callback kernel compatibility release", apply=True,
         )
@@ -159,7 +356,9 @@ def test_callback_kernel_release_retains_behavior_and_migrates_policy(project, o
 def test_profile_full_local_replay_preserves_decision_stage_and_package(tmp_path, case):
     fixture = load_cases()
     legacy = replay_case(fixture, case, tmp_path / "legacy.db")
-    pinned = replay_case(fixture, case, tmp_path / "pinned.db", behavior_version="v6")
+    pinned = replay_case(
+        fixture, case, tmp_path / "pinned-current.db", behavior_version=CURRENT_VERSION,
+    )
     for key in ("decision", "review_outcome", "objective", "stages", "callback", "package",
                 "task_states", "external_effect_count", "successor_task_count", "approval_states"):
         assert pinned.get(key) == legacy.get(key), key
@@ -175,30 +374,30 @@ def test_secondhand_route_change_does_not_change_ai_bizweek_replay(tmp_path, mon
 
     fixture = load_cases()
     case = fixture["cases"][0]
-    before = replay_case(fixture, case, tmp_path / "before.db", behavior_version="v6")
+    before = replay_case(fixture, case, tmp_path / "before.db", behavior_version=CURRENT_VERSION)
     catalog = tmp_path / "catalog"
     shutil.copytree(br.ROOT, catalog)
     monkeypatch.setattr(br, "ROOT", catalog)
-    manifest = json.loads((catalog / "secondhand_commerce@v6.json").read_text())
+    manifest = json.loads((catalog / f"secondhand_commerce@{CURRENT_VERSION}.json").read_text())
     old_routes = manifest["route_snapshot"]
-    new_routes = "v7/secondhand_commerce"
+    new_routes = "v23/secondhand_commerce"
     shutil.copytree(catalog / old_routes, catalog / new_routes)
     route_path = catalog / new_routes / "routing-rules.yaml"
     rules = yaml.safe_load(route_path.read_text())
     rules["worker_routes"] = [r for r in rules["worker_routes"] if r.get("match", {}).get("task_type") != "facebook_marketplace_readonly"]
     route_path.write_text(yaml.safe_dump(rules, allow_unicode=True))
-    manifest.update(version="v7", route_snapshot=new_routes)
+    manifest.update(version="v23", route_snapshot=new_routes)
     for name in ("routing-rules.yaml", "agent-registry.yaml"):
         del manifest["files"][old_routes + "/" + name]
         manifest["files"][new_routes + "/" + name] = hashlib.sha256((catalog / new_routes / name).read_bytes()).hexdigest()
-    (catalog / "secondhand_commerce@v7.json").write_text(json.dumps(manifest))
+    (catalog / "secondhand_commerce@v23.json").write_text(json.dumps(manifest))
     contract = setup_objective("secondhand_commerce")
     normalized = validate_loop_contract(contract)
     routing = br.implementation(normalized, "routing")
     before_route = routing.route_clawops_objective("Read listing", task_type="facebook_marketplace_readonly", hub_ops_dir=br.route_directory(normalized))
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")
-        br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="secondhand_commerce", version="v7", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Test changed route", apply=True)
+        br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="secondhand_commerce", version="v23", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Test changed route", apply=True)
         contract.pop("behavior_pin")
         candidate = br.bind_contract(conn, contract)
     after_route = routing.route_clawops_objective("Read listing", task_type="facebook_marketplace_readonly", hub_ops_dir=br.route_directory(candidate))
@@ -206,7 +405,7 @@ def test_secondhand_route_change_does_not_change_ai_bizweek_replay(tmp_path, mon
     assert "Unsupported task_type" not in str(before_route)
     # Preserve the same input binding bytes; rebinding changes its timestamp hash.
     monkeypatch.setattr("proactive.policy_registry.bind_topic_policies", lambda *a, **k: None)
-    after = replay_case(fixture, case, tmp_path / "after.db", behavior_version="v6")
+    after = replay_case(fixture, case, tmp_path / "after.db", behavior_version=CURRENT_VERSION)
     assert after == before
 
 
@@ -216,9 +415,59 @@ def test_migration_refuses_unfinished_card_before_delegation_link():
         kb.create_task(conn, title="Pending pinned work", body=render_execution_body(validate_loop_contract(contract)))
         pin = br.get_pin(conn, "go_profile")
         with pytest.raises(br.BehaviorProfileError, match="migration_inflight"):
-            br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Cannot bypass unfinished work", apply=True)
+            br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=1, expected_pin_hash=br.digest(pin), reason="Cannot bypass unfinished work", apply=True)
         assert br.get_pin(conn, "go_profile") == pin
         assert conn.execute("SELECT count(*) FROM grace_behavior_migrations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "settled_outcome",
+    ["intermediate_blocked", "terminal_blocked"],
+)
+def test_migration_accepts_resolved_callback_with_unstarted_review_card(
+    settled_outcome,
+):
+    contract = setup_objective()
+    with kb.connect_closing() as conn:
+        execution = kb.create_task(
+            conn, title="Blocked execution", body=render_execution_body(contract),
+        )
+        review = kb.create_task(
+            conn, title="Unstarted review", body=render_review_body(contract, execution),
+            parents=(execution,),
+        )
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (execution,))
+        conn.execute(
+            """UPDATE grace_objective_stages
+                  SET status='done', execution_task_id=?, review_task_id=?,
+                      outcome_kind=?
+                WHERE objective_id='go_profile' AND stage_key='prepare'""",
+            (execution, review, settled_outcome),
+        )
+        conn.execute(
+            """INSERT INTO grace_loop_callbacks
+                (review_task_id,execution_task_id,platform,chat_id,thread_id,
+                 contract_fingerprint,state,created_at,objective_id,stage_key,
+                 outcome_kind)
+                VALUES (?,?,?,?,?,'fingerprint','delivered',1,'go_profile',
+                        'prepare',?)""",
+            (
+                review, execution, "telegram", contract["identity"]["chat_id"],
+                contract["identity"]["thread_id"],
+                settled_outcome,
+            ),
+        )
+        pin = br.get_pin(conn, "go_profile")
+        result = br.migrate_objective(
+            conn, objective_id="go_profile", platform="telegram",
+            chat_id=contract["identity"]["chat_id"],
+            thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek",
+            version=CURRENT_VERSION, expected_revision=1,
+            expected_pin_hash=br.digest(pin), reason="Resolved callback is idle",
+            apply=True,
+        )
+        assert result["next_pin"]["generation"] == pin["generation"] + 1
+        assert kb.get_task(conn, review).status == "todo"
 
 
 def test_changed_profile_bytes_block_existing_pin(tmp_path, monkeypatch):
@@ -227,7 +476,7 @@ def test_changed_profile_bytes_block_existing_pin(tmp_path, monkeypatch):
     catalog = tmp_path / "catalog"
     shutil.copytree(br.ROOT, catalog)
     monkeypatch.setattr(br, "ROOT", catalog)
-    (catalog / "v1" / "contract.py").write_text("# incompatible replacement\n")
+    (catalog / "v47" / "contract.py").write_text("# incompatible replacement\n")
     with pytest.raises(br.BehaviorProfileError, match="bundle_changed"):
         validate_loop_contract(contract)
 
@@ -239,11 +488,11 @@ def test_real_ai_namespace_is_bound_separately_from_business_profile():
     assert normalized["identity"]["project"] == namespace
     assert normalized["behavior_pin"]["behavior_profile_id"] == "ai_bizweek"
     assert normalized["behavior_pin"]["project_namespace"] == namespace
-    assert br.implementation(normalized, "compiler").__name__.endswith(".v1.compiler")
+    assert br.implementation(normalized, "compiler").__name__.endswith(".v47.compiler")
     saved_body = render_execution_body(normalized)
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")
-        result = br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Preserve actual project namespace", apply=True)
+        result = br.migrate_objective(conn, objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=1, expected_pin_hash=br.digest(pin), reason="Preserve actual project namespace", apply=True)
         assert result["next_pin"]["project_namespace"] == namespace
     assert resolve_task_policy_snapshots(saved_body)["policies"][0]["content"] == "Original complete policy"
     wrong = deepcopy(contract)
@@ -261,7 +510,7 @@ def test_migration_cli_preview_is_read_only(tmp_path, monkeypatch, capsys):
     contract = setup_objective()
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")
-    spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(pin), reason="Read-only CLI preview")
+    spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=1, expected_pin_hash=br.digest(pin), reason="Read-only CLI preview")
     path = tmp_path / "migration.json"
     path.write_text(json.dumps(spec))
     monkeypatch.setattr(sys, "argv", ["behavior_profiles", "migrate", str(path)])
@@ -313,7 +562,7 @@ def test_legacy_migration_requires_explicit_current_policy_and_project():
     contract = setup_objective(enabled=False)
     with kb.connect_closing() as conn:
         original = kb.get_grace_objective(conn, "go_profile")
-        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(None), reason="Explicit legacy adoption")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=1, expected_pin_hash=br.digest(None), reason="Explicit legacy adoption")
         with pytest.raises(br.BehaviorProfileError, match="legacy_policy_unknown"):
             br.migrate_objective(conn, **spec, apply=True)
         with pytest.raises(br.BehaviorProfileError, match="migration_project_unknown"):
@@ -336,7 +585,7 @@ def test_idempotent_objective_reuse_never_rebinds(initially_pinned):
         before = kb.get_grace_objective(conn, "go_profile")
         pin = br.get_pin(conn, "go_profile")
         if not initially_pinned:
-            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], project="ai_bizweek", profile_id="ai_bizweek", version="v6", expected_revision=0, reason="Enable after this legacy Objective already exists")
+            br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], project="ai_bizweek", profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=0, reason="Enable after this legacy Objective already exists")
         reused = kb.create_grace_objective(conn, objective_id="go_profile", platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], session_key="fixture", title="fixture", objective="fixture", original_request_sha256="a" * 64, required_stage_keys=["prepare", "publish"], terminal_stage_key="publish", acceptance_criteria=["verified"], behavior_project="ai_bizweek")
         assert reused == before
         assert br.get_pin(conn, "go_profile") == pin
@@ -418,7 +667,7 @@ def test_preupgrade_migration_preview_needs_no_schema_write():
         conn.execute("DROP TABLE grace_objective_behavior_pins")
         conn.execute("DROP TABLE grace_behavior_migrations")
         conn.execute("DROP TABLE grace_behavior_selections")
-        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version="v6", expected_revision=1, expected_pin_hash=br.digest(None), reason="Preview legacy adoption", policy_mode="current", project_namespace="ai_bizweek")
+        spec = dict(objective_id="go_profile", platform="telegram", chat_id=contract["identity"]["chat_id"], thread_id=contract["identity"]["thread_id"], profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=1, expected_pin_hash=br.digest(None), reason="Preview legacy adoption", policy_mode="current", project_namespace="ai_bizweek")
         conn.execute("PRAGMA query_only=ON")
         assert br.migrate_objective(conn, **spec)["applied"] is False
         with pytest.raises(br.BehaviorProfileError, match="rollback_target_unavailable"):
@@ -466,7 +715,7 @@ def test_migrated_callback_correlates_successor_without_accepting_old_work(proje
         pin = br.get_pin(conn, 'go_profile')
         br.migrate_objective(conn, objective_id='go_profile', platform='telegram',
             chat_id=contract['identity']['chat_id'], thread_id=contract['identity']['thread_id'],
-            profile_id=project, version='v6', expected_revision=1, expected_pin_hash=br.digest(pin),
+            profile_id=project, version=CURRENT_VERSION, expected_revision=1, expected_pin_hash=br.digest(pin),
             reason='Retire old callback generation', apply=True)
         fresh = deepcopy(contract)
         fresh.pop('behavior_pin')
@@ -493,29 +742,38 @@ def test_migrated_callback_correlates_successor_without_accepting_old_work(proje
             apply()
 
 
-@pytest.mark.parametrize("state,stage_status,outcome,owner,allowed", [
-    ("cancelled", "done", "superseded_by_retry", None, True),
-    ("cancelled", "done", "cancelled", None, True),
-    ("attention", "done", "continued", None, True),
-    ("attention", "done", "continued", "active-lease", False),
-    ("cancelled", "blocked", "superseded_by_retry", None, False),
-    ("cancelled", "done", "accepted", None, False),
-    ("cancelled", "done", "superseded_by_retry", "active-lease", False),
-    ("pending", "done", "superseded_by_retry", None, False),
+@pytest.mark.parametrize("state,stage_status,outcome,callback_outcome,owner,allowed", [
+    ("cancelled", "done", "superseded_by_retry", "superseded_by_retry", None, True),
+    ("cancelled", "done", "cancelled", "cancelled", None, True),
+    ("attention", "done", "continued", "continued", None, True),
+    ("delivered", "done", "continued", "continued", None, True),
+    ("attention", "done", "continued", "continued", "active-lease", False),
+    ("delivered", "planned", "continued", "continued", None, False),
+    ("delivered", "done", "continued", "intermediate_blocked", None, False),
+    ("cancelled", "blocked", "superseded_by_retry", "superseded_by_retry", None, False),
+    ("cancelled", "done", "accepted", "accepted", None, False),
+    ("cancelled", "done", "superseded_by_retry", "superseded_by_retry", "active-lease", False),
+    ("pending", "done", "superseded_by_retry", "superseded_by_retry", None, False),
 ])
-def test_migration_preserves_superseded_cancelled_callback(state, stage_status, outcome, owner, allowed):
+def test_migration_preserves_superseded_cancelled_callback(
+    state, stage_status, outcome, callback_outcome, owner, allowed,
+):
     contract = setup_objective()
     with kb.connect_closing() as conn:
         conn.execute("UPDATE grace_objective_stages SET status=?,outcome_kind=? WHERE objective_id='go_profile' AND stage_key='prepare'", (stage_status, outcome))
         conn.execute("""INSERT INTO grace_loop_callbacks
             (review_task_id,execution_task_id,platform,chat_id,thread_id,contract_fingerprint,
-             state,created_at,objective_id,stage_key,lease_owner)
-            VALUES ('review','execution','telegram',?,?,'fingerprint',?,1,'go_profile','prepare',?)""",
-            (contract['identity']['chat_id'],contract['identity']['thread_id'],state,owner))
+             state,created_at,objective_id,stage_key,lease_owner,outcome_kind)
+            VALUES ('review','execution','telegram',?,?,'fingerprint',?,1,
+                    'go_profile','prepare',?,?)""",
+            (
+                contract['identity']['chat_id'], contract['identity']['thread_id'],
+                state, owner, callback_outcome,
+            ))
         before = dict(conn.execute("SELECT * FROM grace_loop_callbacks WHERE review_task_id='review'").fetchone())
         pin = br.get_pin(conn, 'go_profile')
         args = dict(objective_id='go_profile',platform='telegram',chat_id=contract['identity']['chat_id'],
-            thread_id=contract['identity']['thread_id'],profile_id='ai_bizweek',version='v6',
+            thread_id=contract['identity']['thread_id'],profile_id='ai_bizweek',version=CURRENT_VERSION,
             expected_revision=1,expected_pin_hash=br.digest(pin),reason='Preserve cancelled history',apply=True)
         if allowed:
             result = br.migrate_objective(conn, **args)
@@ -525,6 +783,375 @@ def test_migration_preserves_superseded_cancelled_callback(state, stage_status, 
                 br.migrate_objective(conn, **args)
             assert br.get_pin(conn, 'go_profile') == pin
         assert dict(conn.execute("SELECT * FROM grace_loop_callbacks WHERE review_task_id='review'").fetchone()) == before
+
+
+@pytest.mark.parametrize("fault", [
+    None,
+    "wrong_error",
+    "pending",
+    "lease",
+    "rejected_review",
+    "stage_mismatch",
+    "external_effect",
+    "lane_mismatch",
+])
+def test_migration_allows_only_exact_accepted_session_reset_handoff(fault):
+    contract = setup_objective(version=CURRENT_VERSION)
+    identity = contract["identity"]
+    with kb.connect_closing() as conn:
+        execution = kb.create_task(
+            conn,
+            title="accepted execution",
+            body=render_execution_body(contract),
+        )
+        assert kb.complete_task(conn, execution, summary="done")
+        review = kb.create_task(
+            conn,
+            title="accepted review",
+            body=render_review_body(contract, execution),
+            parents=(execution,),
+        )
+        now = 1
+        conn.execute(
+            """INSERT INTO grace_delegations (
+                delegation_id,contract_fingerprint,request_instance_id,
+                platform,chat_id,thread_id,session_key,session_id,
+                resolved_route,approval_required,state,execution_task_id,
+                review_task_id,objective_id,stage_key,created_at,updated_at
+            ) VALUES (
+                'gd-reset','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                'request-reset','telegram',?,?,'session','old-session','{}',0,
+                'queued',?,?,'go_profile','prepare',?,?
+            )""",
+            (
+                identity["chat_id"], identity["thread_id"], execution, review,
+                now, now,
+            ),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_profile",
+            stage_key="prepare",
+            delegation_id="gd-reset",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review,
+            execution_task_id=execution,
+            platform="telegram",
+            chat_id=identity["chat_id"],
+            thread_id=identity["thread_id"],
+            user_id="kj",
+            session_key="session",
+            session_id="old-session",
+            contract_fingerprint="f" * 64,
+            completion_mode="intermediate",
+            objective_id="go_profile",
+            stage_key="prepare",
+        )
+        review_run = kb._synthesize_ended_run(
+            conn,
+            review,
+            outcome="completed",
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (review,))
+        kb._append_event(
+            conn,
+            review,
+            "completed",
+            {"summary": "accepted"},
+            run_id=review_run,
+        )
+        due = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review,
+            event_id=due["event_id"],
+            lease_owner="gateway",
+        )
+        assert kb.escalate_grace_loop_callback(
+            conn,
+            review_task_id=review,
+            event_id=due["event_id"],
+            lease_owner="gateway",
+            error=kb._GRACE_SESSION_RESET_HANDOFF_ERROR,
+        )
+        if fault == "wrong_error":
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET last_error='other' "
+                "WHERE review_task_id=?", (review,),
+            )
+        elif fault == "pending":
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET state='pending' "
+                "WHERE review_task_id=?", (review,),
+            )
+        elif fault == "lease":
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET lease_owner='gateway' "
+                "WHERE review_task_id=?", (review,),
+            )
+        elif fault == "rejected_review":
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps({"review_outcome": "rejected"}), due["event_run_id"]),
+            )
+        elif fault == "stage_mismatch":
+            conn.execute(
+                "UPDATE grace_objectives SET current_stage_key='publish' "
+                "WHERE objective_id='go_profile'"
+            )
+        elif fault == "external_effect":
+            kb._upsert_external_effect(
+                conn,
+                task_id=execution,
+                platform="facebook",
+                state="absent_verified",
+                external_id=None,
+                details=None,
+                run_id=kb.latest_run(conn, execution).id,
+                now=now,
+            )
+        elif fault == "lane_mismatch":
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET thread_id='other' "
+                "WHERE review_task_id=?", (review,),
+            )
+        before = dict(kb.get_grace_loop_callback(conn, review))
+        pin = br.get_pin(conn, "go_profile")
+        migrate = dict(
+            objective_id="go_profile",
+            platform="telegram",
+            chat_id=identity["chat_id"],
+            thread_id=identity["thread_id"],
+            profile_id="ai_bizweek",
+            version=CURRENT_VERSION,
+            expected_revision=1,
+            expected_pin_hash=br.digest(pin),
+            reason="Resume an exact accepted session-reset handoff",
+            apply=True,
+        )
+        if fault is None:
+            result = br.migrate_objective(conn, **migrate)
+            assert result["next_pin"]["generation"] == 2
+        else:
+            with pytest.raises(
+                br.BehaviorProfileError,
+                match="migration_callback_pending",
+            ):
+                br.migrate_objective(conn, **migrate)
+            assert br.get_pin(conn, "go_profile") == pin
+        assert dict(kb.get_grace_loop_callback(conn, review)) == before
+
+
+@pytest.mark.parametrize(
+    "fault", [
+        None,
+        "active_lease",
+        "unrepaired_predecessor",
+        "missing_receipt",
+        "event_mismatch",
+        "repeated_migration",
+    ],
+)
+def test_migration_allows_exact_terminal_closure_repair(fault):
+    contract = setup_objective(version=CURRENT_VERSION)
+    identity = contract["identity"]
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done',"
+            "outcome_kind='continued' WHERE objective_id='go_profile' "
+            "AND stage_key='prepare'"
+        )
+        execution = kb.create_task(
+            conn, title="terminal execution", body=render_execution_body(contract),
+        )
+        execution_run = kb.claim_task(conn, execution, claimer="worker")
+        assert execution_run is not None
+        assert kb.complete_task(
+            conn, execution, summary="done",
+            expected_run_id=execution_run.current_run_id,
+        )
+        review = kb.create_task(
+            conn,
+            title="terminal review",
+            body=render_review_body(contract, execution),
+            parents=(execution,),
+        )
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO grace_delegations (
+                delegation_id,contract_fingerprint,request_instance_id,
+                platform,chat_id,thread_id,session_key,session_id,
+                resolved_route,approval_required,state,execution_task_id,
+                review_task_id,objective_id,stage_key,created_at,updated_at
+            ) VALUES (
+                'gd-closure','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                'request-closure','telegram',?,?,'session','session-id','{}',0,
+                'queued',?,?,'go_profile','publish',?,?
+            )""",
+            (identity["chat_id"], identity["thread_id"], execution, review, now, now),
+        )
+        kb._bind_grace_objective_stage(
+            conn,
+            objective_id="go_profile",
+            stage_key="publish",
+            delegation_id="gd-closure",
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET execution_task_id=?,review_task_id=? "
+            "WHERE objective_id='go_profile' AND stage_key='publish'",
+            (execution, review),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review,
+            execution_task_id=execution,
+            platform="telegram",
+            chat_id=identity["chat_id"],
+            thread_id=identity["thread_id"],
+            user_id="kj",
+            session_key="session",
+            session_id="session-id",
+            contract_fingerprint="f" * 64,
+            completion_mode="terminal",
+            objective_id="go_profile",
+            stage_key="publish",
+        )
+        review_run_id = kb._synthesize_ended_run(
+            conn,
+            review,
+            outcome="completed",
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (review,))
+        kb._append_event(
+            conn,
+            review,
+            "completed",
+            {"summary": "accepted"},
+            run_id=review_run_id,
+        )
+        due = kb.list_due_grace_loop_callbacks(conn)[0]
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET attempts=1,attempt_event_id=?,"
+            "last_error=? WHERE review_task_id=?",
+            (
+                due["event_id"],
+                "Grace objective cannot close before required stages complete: old",
+                review,
+            ),
+        )
+        if fault == "active_lease":
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET lease_owner='other' "
+                "WHERE review_task_id=?",
+                (review,),
+            )
+        elif fault == "unrepaired_predecessor":
+            conn.execute(
+                "UPDATE grace_objective_stages SET outcome_kind='cancelled' "
+                "WHERE objective_id='go_profile' AND stage_key='prepare'"
+            )
+        execution_body_before = kb.get_task(conn, execution).body
+        review_body_before = kb.get_task(conn, review).body
+        callback_before = dict(kb.get_grace_loop_callback(conn, review))
+        pin = br.get_pin(conn, "go_profile")
+        migrate = dict(
+            conn=conn,
+            objective_id="go_profile",
+            platform="telegram",
+            chat_id=identity["chat_id"],
+            thread_id=identity["thread_id"],
+            profile_id="ai_bizweek",
+            version=CURRENT_VERSION,
+            expected_revision=1,
+            expected_pin_hash=br.digest(pin),
+            reason="Install the reviewed closure lifecycle repair",
+            closure_review_task_id=review,
+            apply=True,
+        )
+        if fault in {"active_lease", "unrepaired_predecessor"}:
+            with pytest.raises(
+                br.BehaviorProfileError, match="migration_callback_pending",
+            ):
+                br.migrate_objective(**migrate)
+            assert br.get_pin(conn, "go_profile") == pin
+            return
+        result = br.migrate_objective(**migrate)
+        assert result["next_pin"]["generation"] == pin["generation"] + 1
+        assert kb.get_task(conn, execution).body == execution_body_before
+        assert kb.get_task(conn, review).body == review_body_before
+        assert dict(kb.get_grace_loop_callback(conn, review)) == callback_before
+        claim_event_id = due["event_id"]
+        if fault == "repeated_migration":
+            current = br.get_pin(conn, "go_profile")
+            with pytest.raises(
+                br.BehaviorProfileError,
+                match="migration_closure_recovery_already_applied",
+            ):
+                br.migrate_objective(
+                    **{
+                        **migrate,
+                        "expected_revision": 2,
+                        "expected_pin_hash": br.digest(current),
+                    }
+                )
+            assert br.get_pin(conn, "go_profile") == current
+            return
+        if fault == "event_mismatch":
+            kb._append_event(
+                conn,
+                review,
+                "completed",
+                {"summary": "different completed event"},
+                run_id=review_run_id,
+            )
+            replacement_event_id = conn.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET attempt_event_id=? "
+                "WHERE review_task_id=?",
+                (replacement_event_id, review),
+            )
+            claim_event_id = replacement_event_id
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review,
+            event_id=claim_event_id,
+            lease_owner="gateway",
+        )
+        callback = kb.get_grace_loop_callback(conn, review)
+        if fault in {"missing_receipt", "event_mismatch"}:
+            if fault == "missing_receipt":
+                conn.execute(
+                    "UPDATE grace_behavior_migrations SET reason='{}' "
+                    "WHERE objective_id='go_profile' AND generation=?",
+                    (result["next_pin"]["generation"],),
+                )
+            with pytest.raises(
+                br.BehaviorProfileError,
+                match="closure_recovery_receipt_missing",
+            ):
+                kb._apply_grace_objective_callback_outcome(
+                    conn,
+                    callback=callback,
+                    kind="closed",
+                    payload={"summary": "accepted terminal result"},
+                )
+            assert kb.get_grace_objective(conn, "go_profile")["status"] == "active"
+            return
+        kb._apply_grace_objective_callback_outcome(
+            conn,
+            callback=callback,
+            kind="closed",
+            payload={"summary": "accepted terminal result"},
+        )
+        assert kb.get_grace_objective(conn, "go_profile")["status"] == "completed"
 
 
 @pytest.mark.parametrize('project', ['ai_bizweek','secondhand_commerce'])
@@ -539,7 +1166,7 @@ def test_migrated_accepted_callback_needs_current_sealed_approval(project, fault
         conn.execute("UPDATE tasks SET status='done' WHERE id IN (?,?)",(execution,review))
         previous=br.get_pin(conn,'go_profile')
         br.migrate_objective(conn,objective_id='go_profile',platform='telegram',chat_id=identity['chat_id'],
-            thread_id=identity['thread_id'],profile_id=project,version='v6',expected_revision=1,
+            thread_id=identity['thread_id'],profile_id=project,version=CURRENT_VERSION,expected_revision=1,
             expected_pin_hash=br.digest(previous),reason='Idle compatibility repair',apply=True)
         current=deepcopy(contract);current.pop('behavior_pin');current=br.bind_contract(conn,current)
         selected=contract if fault=='stale_pin' else current

@@ -1,11 +1,14 @@
 """Real SQLite workflow boundaries, including restart/readback and rollback."""
 import hashlib
 import json
+import time
 
 import pytest
+from PIL import Image
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import objective_workflow as wf
+from proactive.grace_task_compiler import render_execution_body
 
 
 @pytest.fixture
@@ -269,6 +272,123 @@ def test_blocked_workflow_parent_evidence_is_visible_only_to_its_reviewer(db):
     assert "not-for-review" not in context and "omit-me" not in context
     other = kb.create_task(db, title="ordinary dependent", parents=[execution])
     assert "actual chooser readback" not in kb.build_worker_context(db, other)
+
+
+def test_workflow_review_context_counts_only_canonical_package_assets(db, tmp_path):
+    _plan(db)
+    execution, review, run_id, review_run_id = _pair(db, objective_id="go_test")
+    body = tmp_path / "package.md"
+    page = tmp_path / "page.png"
+    audio = tmp_path / "audio.png"
+    sections = {
+        "facebook_page_post": "Page 內文",
+        "facebook_group_post": "Group 附文",
+        "gemini_notebook_prompt": "Gemini prompt",
+        "podcast_title": "Podcast title",
+        "podcast_description": "Podcast description",
+    }
+    package_body = "\n\n".join(sections.values())
+    body.write_text(package_body + "\n", encoding="utf-8")
+    Image.new("RGB", (1600, 900)).save(page)
+    Image.new("RGB", (1200, 1200)).save(audio)
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "asset_filenames": [page.name, audio.name],
+        "body_field": "acceptance_evidence.inline_content_package",
+    }
+    for path in (body, page, audio):
+        for _ in range(2):
+            kb.add_attachment(
+                db,
+                execution,
+                filename=path.name,
+                stored_path=str(path),
+                content_type=("text/markdown" if path == body else "image/png"),
+                size=path.stat().st_size,
+                uploaded_by="historical-replay",
+            )
+    run = kb.get_run(db, run_id)
+    metadata = dict(run.metadata)
+    metadata["loop_contract"] = {
+        **metadata["loop_contract"],
+        "user_facing_delivery": delivery,
+    }
+    db.execute(
+        "UPDATE tasks SET body=? WHERE id=?",
+        (render_execution_body(metadata["loop_contract"]), execution),
+    )
+    metadata["user_facing_report"] = {
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": True,
+        "title": "完整發布包",
+        "body": package_body,
+        "observed_at": int(time.time()),
+        "assets": [
+            {
+                "filename": path.name,
+                "label": path.stem,
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in (page, audio)
+        ],
+    }
+    metadata["acceptance_evidence"].update({
+        "inline_content_package": package_body,
+        "sections": sections,
+        "asset_manifest": [
+            {
+                "filename": page.name,
+                "asset_family": "page_hero",
+                "path": str(page),
+                "sha256": hashlib.sha256(page.read_bytes()).hexdigest(),
+                "width": 1600,
+                "height": 900,
+            },
+            {
+                "filename": audio.name,
+                "asset_family": "audio_brief",
+                "path": str(audio),
+                "sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+                "width": 1200,
+                "height": 1200,
+            },
+        ],
+    })
+    metadata["policy_receipts"] = []
+    metadata["external_effects"] = []
+    metadata["attachment_manifest"] = kb.task_attachment_manifest(db, execution)
+    db.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps(metadata), run_id),
+    )
+    source = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": run_id,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, run_id)
+        ),
+    }
+    db.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps({"workflow_review_source": source}), review_run_id),
+    )
+
+    report = kb.grace_inline_content_package_report(db, execution)
+    assert report is not None
+    assert report["package_kind"] == "full_publication_package"
+    assert report["complete"] is True
+    assert report["body"] == package_body
+    context = kb.build_worker_context(db, review)
+
+    assert "## Controller content-package readback" in context
+    assert '"canonical_asset_count": 2' in context
+    assert '"task_attachment_row_count": 6' in context
+    assert '"package_complete": true' in context
+    assert "Markdown body artifact is separate" in context
 
 
 def test_cancelled_workflow_stage_finishes_lifecycle_without_acceptance(db):
@@ -1617,6 +1737,21 @@ def test_content_report_and_gateway_rebuild_do_not_claim_objective_success(db, m
     rebuilt = kb.grace_inline_content_package_report(db, execution)
     assert rebuilt["complete"] is False
     assert rebuilt["body"] == report["body"]
+    assert wf.progress(db, "go_test")["complete"] is False
+
+
+def test_intermediate_full_publication_package_is_complete_without_closing_objective(db):
+    _plan(db)
+    execution, _, _, _ = _pair(db, objective_id="go_test")
+    report = {
+        "kind": "content_package",
+        "package_kind": "full_publication_package",
+        "complete": True,
+    }
+
+    canonical = kb.canonical_objective_report(db, execution, report)
+
+    assert canonical["complete"] is True
     assert wf.progress(db, "go_test")["complete"] is False
 
 

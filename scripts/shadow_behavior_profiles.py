@@ -25,7 +25,11 @@ def deny_external_effects(event, _args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--version", default="v3", help="Installed compatible behavior profile version")
+    parser.add_argument(
+        "--version",
+        default="v13",
+        help="Installed compatible behavior profile version (default: current v13)",
+    )
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)

@@ -1,37 +1,51 @@
 # Objective workflow recovery
 
-Use `python -m hermes_cli.objective_workflow show OBJECTIVE_ID` to read the
+From the `hermes-agent` repository root, use
+`.venv312/bin/python -m hermes_cli.objective_workflow show OBJECTIVE_ID` to read the
 authoritative stage order, revision and publication progress. This operator CLI
 uses the configured Hermes home/board. Grace should delegate internal planning
 to the ops worker; it does not need browser credentials or registry SQL.
 
-Use `python -m hermes_cli.objective_workflow plan plan.json` to submit a forward
+Use `.venv312/bin/python -m hermes_cli.objective_workflow plan plan.json` to submit a forward
 stage plan. Required JSON fields: `objective_id`, `expected_revision`,
 `platform`, `chat_id`, `thread_id`, `required_stage_keys`, `current_stage_key`,
 and `reason`. Optional fields: `title`, `acceptance_criteria`, `next_action`,
-and `workflow`. An example workflow is:
-
-An ops card already bound to the Objective must use `request-plan` instead of
-`plan`, and include `origin_execution_task_id` in the JSON. The request is
-bound to that card's active execution run, delegation, stage, Topic, and
-Objective revision. It does not change the spine. The gateway applies it only
-after that exact run completes and its paired Grace review accepts it, then the
-accepted callback can bind the newly declared current stage. Set
-`current_stage_key` to that new successor stage. A blocked or rejected run,
-stale revision, mismatched review receipt, or unrelated in-flight delegation
-leaves the request unapplied.
+and `workflow`. The following is a complete `plan.json` document:
 
 ```json
 {
-  "project": "secondhand_commerce",
-  "source_listing_id": "12345",
-  "expected_destinations": 20,
-  "excluded_destination_ids": ["111"],
-  "historical_evidence": [
-    {"execution_task_id": "t_1234", "review_task_id": "t_5678"}
-  ]
+  "objective_id": "go_EXACT_OBJECTIVE_ID",
+  "expected_revision": 1,
+  "platform": "telegram",
+  "chat_id": "EXACT_CHAT_ID",
+  "thread_id": "EXACT_THREAD_ID",
+  "required_stage_keys": ["prepare", "preflight", "publish", "terminal"],
+  "current_stage_key": "preflight",
+  "reason": "Add the reviewed secondhand publication workflow",
+  "workflow": {
+    "project": "EXACT_PROJECT_NAMESPACE",
+    "source_listing_id": "12345",
+    "expected_destinations": 20,
+    "excluded_destination_ids": ["111"],
+    "historical_evidence": []
+  }
 }
 ```
+
+Replace every `EXACT_*` value, `expected_revision`, and the stage keys with the
+values returned by `show`; the final stage key must remain the Objective's
+declared terminal stage. The workflow project must match the Objective's exact
+project namespace. Do not reuse the example IDs.
+
+An ops card already bound to the Objective must use `request-plan` instead of
+`plan`, and include `origin_execution_task_id` in this same top-level JSON
+document. The request is bound to that card's active execution run, delegation,
+stage, Topic, and Objective revision. It does not change the spine. The gateway
+applies it only after that exact run completes and its paired Grace review
+accepts it, then the accepted callback can bind the newly declared current
+stage. Set `current_stage_key` to that new successor stage. A blocked or rejected
+run, stale revision, mismatched review receipt, or unrelated in-flight
+delegation leaves the request unapplied.
 
 Listing IDs and excluded group IDs must be strings of ASCII digits, even in
 JSON. `excluded_destination_names` may additionally preserve historical names
@@ -99,7 +113,14 @@ allowed only when the exact contract permits it; otherwise stop and narrow the
 next contract. Never substitute another group or use Create new listing to
 repost an existing listing. Reconcile an uncertain submit before retrying.
 
-Validation: run `scripts/run_tests.sh tests/proactive/test_objective_workflow.py`
-with the repository test environment. It exercises the real SQLite APIs and
-CLI in isolated Hermes homes, including rollback, revision conflict, retained
-history, exact review binding, restart readback and closure/replay gates.
+Validation from the `hermes-agent` repository root:
+
+```sh
+HERMES_TEST_VENV="$PWD/.venv312" \
+  scripts/run_tests.sh tests/proactive/test_objective_workflow.py
+```
+
+This selects the current Python 3.12 test environment and exercises the real
+SQLite APIs and CLI in isolated Hermes homes, including rollback, revision
+conflict, retained history, exact review binding, restart readback and
+closure/replay gates.

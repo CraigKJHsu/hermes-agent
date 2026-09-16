@@ -28,11 +28,15 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
-from typing import Any, Optional
+import stat
+from pathlib import Path
+from typing import Any, Mapping, Optional
 
 from agent.redact import redact_sensitive_text
 from tools.registry import registry, tool_error
@@ -47,6 +51,38 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+KANBAN_SHOW_STRING_LIMIT = 2_000
+KANBAN_SHOW_LIST_LIMIT = 20
+KANBAN_COMPLETE_METADATA_MAX_BYTES = 1_000_000
+
+
+def _bound_show_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound diagnostic history while keeping JSON valid and self-describing."""
+    if isinstance(value, str):
+        if len(value) <= KANBAN_SHOW_STRING_LIMIT:
+            return value
+        omitted = len(value) - KANBAN_SHOW_STRING_LIMIT
+        return value[:KANBAN_SHOW_STRING_LIMIT] + f"<truncated chars={omitted}>"
+    if depth >= 10:
+        return "<truncated depth>"
+    if isinstance(value, dict):
+        items = list(value.items())
+        bounded = {
+            str(key): _bound_show_value(item, depth=depth + 1)
+            for key, item in items[:50]
+        }
+        if len(items) > 50:
+            bounded["_truncated_keys"] = len(items) - 50
+        return bounded
+    if isinstance(value, (list, tuple)):
+        bounded = [
+            _bound_show_value(item, depth=depth + 1)
+            for item in value[:KANBAN_SHOW_LIST_LIMIT]
+        ]
+        if len(value) > KANBAN_SHOW_LIST_LIMIT:
+            bounded.append({"_truncated_items": len(value) - KANBAN_SHOW_LIST_LIMIT})
+        return bounded
+    return value
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -130,6 +166,198 @@ def _stamp_worker_session_metadata(
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
     return stamped
+
+
+def _load_worker_completion_metadata(path_value: Any) -> dict:
+    """Load a completion metadata object from this worker's workspace.
+
+    Large structured handoffs should not have to be re-serialized into a
+    model tool call after the worker has already written and validated them.
+    The dispatcher-provided workspace is the trust boundary: resolving both
+    paths rejects traversal and symlink escapes before any bytes are read.
+    """
+    workspace_raw = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    if not workspace_raw:
+        raise ValueError(
+            "metadata_path requires a dispatcher-provided worker workspace"
+        )
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError("metadata_path must be a non-empty file path")
+
+    try:
+        workspace_spelling = Path(workspace_raw).expanduser().absolute()
+        workspace = workspace_spelling.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("dispatcher-provided worker workspace is invalid") from exc
+    candidate = Path(path_value)
+    if candidate.is_absolute():
+        relative = None
+        for allowed_root in (workspace_spelling, workspace):
+            try:
+                relative = candidate.relative_to(allowed_root)
+                break
+            except ValueError:
+                continue
+        if relative is None:
+            raise ValueError(
+                "metadata_path must stay inside the current task workspace"
+            )
+    else:
+        relative = candidate
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("metadata_path must stay inside the current task workspace")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    opened: list[int] = []
+    try:
+        current_fd = os.open(workspace, directory_flags)
+        opened.append(current_fd)
+        for part in parts[:-1]:
+            current_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            opened.append(current_fd)
+        file_fd = os.open(parts[-1], file_flags, dir_fd=current_fd)
+        opened.append(file_fd)
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            raise ValueError("metadata_path must name an existing regular file")
+        if file_stat.st_size > KANBAN_COMPLETE_METADATA_MAX_BYTES:
+            raise ValueError(
+                "metadata_path exceeds the 1000000-byte completion metadata limit"
+            )
+        chunks: list[bytes] = []
+        remaining = KANBAN_COMPLETE_METADATA_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(file_fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > KANBAN_COMPLETE_METADATA_MAX_BYTES:
+            raise ValueError(
+                "metadata_path exceeds the 1000000-byte completion metadata limit"
+            )
+        text = raw.decode("utf-8")
+    except OSError as exc:
+        raise ValueError(
+            "metadata_path must stay inside the current task workspace and "
+            "name an existing regular file"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError("metadata_path must contain UTF-8 JSON") from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+    def _finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite JSON number")
+        return parsed
+
+    def _reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        loaded = json.loads(
+            text,
+            parse_float=_finite_float,
+            parse_constant=_reject_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ValueError("metadata_path must contain valid JSON") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError("metadata_path JSON must be an object/dict")
+    return loaded
+
+
+def _validate_workspace_file_completion_contract(task_id: str) -> None:
+    """Require a sealed devops route before accepting ``metadata_path``.
+
+    ``metadata_path`` is a structured execution capability, so its authority
+    comes from the compiled contract rather than from natural-language intent.
+    The task row and fenced contract are both controller-written state.
+    """
+    run_id = _worker_run_id(task_id)
+    if run_id is None:
+        raise ValueError(
+            "metadata_path requires an active dispatcher run with a compiled "
+            "completion_handoff"
+        )
+    kb, conn = _connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        contract = (
+            kb._grace_compiled_contract(task.body or "")
+            if task is not None
+            and kb._grace_loop_stage_header(task.body or "") == "execution"
+            else None
+        )
+    finally:
+        conn.close()
+    if (
+        task is None
+        or run is None
+        or task.current_run_id != run_id
+        or run.task_id != task_id
+        or run.ended_at is not None
+    ):
+        raise ValueError(
+            "metadata_path requires the worker's current active dispatcher run"
+        )
+    handoff = (
+        contract.get("completion_handoff")
+        if isinstance(contract, Mapping)
+        else None
+    )
+    resolved = (
+        ((contract.get("routing") or {}).get("resolved") or {})
+        if isinstance(contract, Mapping)
+        else {}
+    )
+    assignment = (
+        resolved.get("assignment")
+        if isinstance(resolved, Mapping)
+        else None
+    )
+    spawn = (
+        run.metadata.get("worker_spawn")
+        if isinstance(run.metadata, dict)
+        else None
+    )
+    required_tools = {
+        str(name or "").strip()
+        for name in (
+            assignment.get("required_callable_tools") or []
+            if isinstance(assignment, Mapping)
+            else []
+        )
+        if str(name or "").strip()
+    }
+    if not (
+        isinstance(handoff, Mapping)
+        and handoff.get("metadata_source") == "workspace_file"
+        and resolved.get("task_type") == "devops"
+        and isinstance(assignment, Mapping)
+        and assignment.get("runtime_profile") == "clawops-dev"
+        and task.assignee == "clawops-dev"
+        and task.executor_profile == "clawops-dev"
+        and run.profile == "clawops-dev"
+        and "terminal" in required_tools
+        and isinstance(spawn, dict)
+        and spawn.get("ok") is True
+        and spawn.get("profile") == "clawops-dev"
+        and "terminal" in set(spawn.get("required_runtime_tools") or [])
+        and not list(spawn.get("missing_required_tools") or [])
+    ):
+        raise ValueError(
+            "metadata_path requires a compiled completion_handoff with "
+            "metadata_source=workspace_file on the sealed devops/clawops-dev "
+            "route and a successful terminal capability attestation"
+        )
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -343,14 +571,14 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
-    if args.get("view", "full") == "delivery":
+    if args.get("view", "summary") == "delivery":
         from hermes_cli.delivery_readback import read_task_delivery
         try:
             return json.dumps(read_task_delivery(args), ensure_ascii=False)
         except (ValueError, OSError, KeyError, TypeError, sqlite3.Error) as exc:
             return tool_error(f"kanban_show delivery: {exc}")
-    if args.get("view") not in {None, "full", "contract", "delivery"}:
-        return tool_error("kanban_show: view must be full, contract or delivery")
+    if args.get("view") not in {None, "summary", "full", "contract", "delivery"}:
+        return tool_error("kanban_show: view must be summary, full, contract or delivery")
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -378,28 +606,125 @@ def _handle_show(args: dict, **kw) -> str:
                 if not isinstance(contract, dict):
                     return tool_error("kanban_show contract: task has no compiled Loop Contract")
                 contract = dict(contract)
-                policies = contract.pop("policy_snapshots", [])
-                return json.dumps({
+                policies = contract.get("policy_snapshots", [])
+                policy_references = [
+                    {
+                        key: policy[key]
+                        for key in ("policy_id", "version", "sha256")
+                        if key in policy
+                    }
+                    for policy in policies
+                    if isinstance(policy, dict)
+                ]
+                contract_json = json.dumps(
+                    contract,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                try:
+                    offset = int(args.get("offset", 0))
+                    limit = int(args.get("limit", 12_000))
+                except (TypeError, ValueError):
+                    return tool_error(
+                        "kanban_show contract: offset and limit must be integers"
+                    )
+                if offset < 0 or limit < 1 or limit > 12_000:
+                    return tool_error(
+                        "kanban_show contract: offset must be non-negative and "
+                        "limit must be between 1 and 12000"
+                    )
+                if offset > len(contract_json):
+                    return tool_error(
+                        "kanban_show contract: offset exceeds contract length"
+                    )
+                common = _bound_show_value({
                     "view": "contract",
                     "task": {"id": task.id, "title": task.title,
                              "stage": kb._grace_loop_stage_header(task.body or ""),
                              "status": task.status, "current_run_id": task.current_run_id},
-                    "contract": contract,
-                    "policy_references": [
-                        {key: policy[key] for key in ("policy_id", "version", "sha256") if key in policy}
-                        for policy in policies if isinstance(policy, dict)
-                    ],
-                    "policy_read_instruction": "Read complete pinned policies with managed_policy_read(task_id); references are not policy text or read receipts.",
+                    "policy_references": policy_references,
+                    "policy_read_instruction": "The canonical contract pages include complete pinned policy snapshots; managed_policy_read may provide independent task-scoped read receipts when available.",
                     "latest_comment": (
                         {"author": comments[-1].author, "body": comments[-1].body,
                          "created_at": comments[-1].created_at} if comments else None
                     ),
                     "history_instruction": "Use view='full' explicitly for history and the original stored task body.",
-                }, ensure_ascii=False)
+                })
+                if offset == 0 and len(contract_json) <= limit:
+                    common["contract"] = contract
+                    return json.dumps(common, ensure_ascii=False)
+
+                end = min(len(contract_json), offset + limit)
+                while True:
+                    response = dict(common)
+                    response.update({
+                        "view": "contract_chunk",
+                        "contract_json_chunk": contract_json[offset:end],
+                        "offset": offset,
+                        "next_offset": end,
+                        "total_chars": len(contract_json),
+                        "complete": end == len(contract_json),
+                        "contract_json_sha256": hashlib.sha256(
+                            contract_json.encode("utf-8")
+                        ).hexdigest(),
+                        "pagination_instruction": (
+                            "Concatenate contract_json_chunk values in offset order; "
+                            "call view='contract' with offset=next_offset until complete."
+                        ),
+                    })
+                    output = json.dumps(response, ensure_ascii=False)
+                    if len(output) <= 18_000 or end <= offset + 1:
+                        return output
+                    end = offset + max(1, (end - offset) // 2)
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+
+            if args.get("view") in {None, "summary"} and not str(
+                task.body or ""
+            ).startswith(
+                (
+                    "GRACE_LOOP_CONTRACT_STAGE: review",
+                    "GRACE_LOOP_CONTRACT_STAGE: grace_review",
+                )
+            ):
+                latest_run = runs[-1] if runs else None
+                return json.dumps(_bound_show_value({
+                    "view": "summary",
+                    "task": {
+                        "id": task.id,
+                        "title": task.title,
+                        "status": task.status,
+                        "assignee": task.assignee,
+                        "current_run_id": task.current_run_id,
+                    },
+                    "parent_count": len(parents),
+                    "child_count": len(children),
+                    "comment_count": len(comments),
+                    "event_count": len(events),
+                    "run_count": len(runs),
+                    "latest_comment": (
+                        {
+                            "author": comments[-1].author,
+                            "body": comments[-1].body,
+                            "created_at": comments[-1].created_at,
+                        }
+                        if comments else None
+                    ),
+                    "latest_run": (
+                        {
+                            "id": latest_run.id,
+                            "status": latest_run.status,
+                            "outcome": latest_run.outcome,
+                            "summary": latest_run.summary,
+                            "error": latest_run.error,
+                        }
+                        if latest_run else None
+                    ),
+                    "instruction": "Use view='full' for bounded history or view='contract' for a compiled work order.",
+                }), ensure_ascii=False)
 
             def _task_dict(t):
                 return {
@@ -431,17 +756,106 @@ def _handle_show(args: dict, **kw) -> str:
                     "GRACE_LOOP_CONTRACT_STAGE: grace_review",
                 )
             ):
+                review_run = (
+                    kb.get_run(conn, task.current_run_id)
+                    if task.current_run_id is not None
+                    else kb.latest_run(conn, tid)
+                )
+                review_source = (
+                    (review_run.metadata or {}).get("workflow_review_source")
+                    if review_run is not None
+                    else None
+                )
+                sealed_contract = kb._grace_compiled_contract(task.body or "")
+                sealed_contract_json = None
+                review_contract = None
+                policy_references = []
+                review_contract_json = None
+                if isinstance(sealed_contract, dict):
+                    sealed_contract_json = json.dumps(
+                        sealed_contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    review_contract = json.loads(sealed_contract_json)
+                    for policy in review_contract.get("policy_snapshots", []):
+                        if not isinstance(policy, dict):
+                            continue
+                        policy.pop("content", None)
+                        policy_references.append(dict(policy))
+                    review_contract_json = json.dumps(
+                        review_contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
                 parent_evidence = []
                 for parent_id in parents:
                     parent = kb.get_task(conn, parent_id)
-                    completed_runs = [
+                    candidate_runs = [
                         run
                         for run in kb.list_runs(conn, parent_id)
                         if run.outcome == "completed"
+                        or (
+                            run.outcome == "blocked"
+                            and isinstance(run.metadata, dict)
+                            and isinstance(
+                                run.metadata.get("loop_contract_blocked_result"),
+                                dict,
+                            )
+                        )
                     ]
-                    completed_runs.sort(key=lambda run: run.id, reverse=True)
-                    latest = completed_runs[0] if completed_runs else None
+                    candidate_runs.sort(key=lambda run: run.id, reverse=True)
+                    latest = candidate_runs[0] if candidate_runs else None
+                    if (
+                        isinstance(review_source, dict)
+                        and review_source.get("parent_execution_task_id") == parent_id
+                    ):
+                        latest = kb.reviewed_execution_run(conn, review_run, parent_id)
                     metadata = latest.metadata if latest and latest.metadata else {}
+                    blocked_result = (
+                        metadata.get("loop_contract_blocked_result")
+                        if latest and latest.outcome == "blocked"
+                        else None
+                    )
+                    blocked_metadata = (
+                        blocked_result.get("metadata")
+                        if isinstance(blocked_result, dict)
+                        and isinstance(blocked_result.get("metadata"), dict)
+                        else {}
+                    )
+                    blocked_top_level = (
+                        blocked_result if isinstance(blocked_result, dict) else {}
+                    )
+                    evidence_metadata = {
+                        **metadata,
+                        **blocked_top_level,
+                        **blocked_metadata,
+                    }
+                    controller_report = kb.grace_inline_content_package_report(
+                        conn, parent_id, execution_run=latest,
+                    )
+                    controller_attachment_readback = (
+                        kb.grace_content_package_attachment_readback(
+                            conn, parent_id, execution_run=latest,
+                        )
+                    )
+                    controller_content_package_readback = None
+                    if isinstance(controller_report, dict):
+                        body = controller_report.get("body")
+                        controller_content_package_readback = {
+                            "package_kind": controller_report.get("package_kind"),
+                            "package_complete": controller_report.get("complete"),
+                            "delivery_receipt_phase": "post_review",
+                            "delivery_receipt_required_before_review": False,
+                            "body_sha256": (
+                                hashlib.sha256(body.encode("utf-8")).hexdigest()
+                                if isinstance(body, str)
+                                else None
+                            ),
+                            "attachment_readback": controller_attachment_readback,
+                        }
                     review_evidence_keys = (
                         "artifacts",
                         "deliverables_completed",
@@ -453,16 +867,21 @@ def _handle_show(args: dict, **kw) -> str:
                         "external_effects",
                         "domain_memory_deltas",
                         "user_facing_report",
+                        "objective_plan_request",
                     )
                     review_evidence = (
                         {
-                            key: metadata[key]
+                            key: evidence_metadata[key]
                             for key in review_evidence_keys
-                            if key in metadata
+                            if key in evidence_metadata
                         }
-                        if isinstance(metadata, dict)
+                        if isinstance(evidence_metadata, dict)
                         else {}
                     )
+                    if controller_content_package_readback is not None:
+                        review_evidence["controller_content_package_readback"] = (
+                            controller_content_package_readback
+                        )
                     attachments = [
                         {
                             "filename": attachment.filename,
@@ -472,27 +891,83 @@ def _handle_show(args: dict, **kw) -> str:
                         }
                         for attachment in kb.list_attachments(conn, parent_id)
                     ]
+                    objective_readback = None
+                    plan_request = metadata.get("objective_plan_request")
+                    if isinstance(plan_request, dict) and latest is not None:
+                        request = conn.execute(
+                            "SELECT objective_id FROM grace_objective_plan_requests "
+                            "WHERE request_id=? AND execution_task_id=? AND execution_run_id=?",
+                            (plan_request.get("request_id"), parent_id, latest.id),
+                        ).fetchone()
+                        objective = (
+                            kb.get_grace_objective(conn, request["objective_id"])
+                            if request is not None
+                            else None
+                        )
+                        if objective is not None:
+                            objective_readback = {
+                                "objective": {
+                                    key: objective[key]
+                                    for key in (
+                                        "objective_id", "status", "current_stage_key",
+                                        "terminal_stage_key", "required_stage_keys", "revision",
+                                    )
+                                },
+                                "stages": [dict(row) for row in conn.execute(
+                                    "SELECT stage_key,position,status,delegation_id,"
+                                    "execution_task_id,review_task_id,outcome_kind "
+                                    "FROM grace_objective_stages WHERE objective_id=? "
+                                    "ORDER BY position",
+                                    (request["objective_id"],),
+                                )],
+                            }
                     parent_evidence.append({
                         "task_id": parent_id,
                         "status": parent.status if parent else "missing",
-                        "summary": latest.summary if latest else None,
+                        "summary": (
+                            blocked_result.get("summary")
+                            if isinstance(blocked_result, dict)
+                            else latest.summary if latest else None
+                        ),
+                        "evidence_mode": (
+                            "blocked_draft"
+                            if isinstance(blocked_result, dict)
+                            else "completed"
+                        ),
                         "acceptance_evidence": (
-                            metadata.get("acceptance_evidence")
+                            blocked_result.get("acceptanceEvidence")
+                            if isinstance(blocked_result, dict)
+                            else metadata.get("acceptance_evidence")
                             if isinstance(metadata, dict)
                             else None
                         ),
                         "external_effects": (
-                            metadata.get("external_effects")
+                            blocked_result.get("externalEffects")
+                            if isinstance(blocked_result, dict)
+                            else metadata.get("external_effects")
                             if isinstance(metadata, dict)
                             else None
                         ),
                         "review_evidence": review_evidence,
-                        "user_facing_report": metadata.get("user_facing_report") if isinstance(metadata, dict) else None,
+                        "objective_readback": objective_readback,
+                        "user_facing_report": (
+                            controller_report
+                            if isinstance(controller_report, dict)
+                            else evidence_metadata.get("user_facing_report")
+                        ),
+                        "controller_content_package_readback": (
+                            controller_content_package_readback
+                        ),
+                        "declared_artifacts": (
+                            blocked_result.get("artifacts")
+                            if isinstance(blocked_result, dict)
+                            else None
+                        ),
                         "attachments": attachments,
                         "backend_run_id": latest.backend_run_id if latest else None,
                         "run_id": latest.id if latest else None,
                     })
-                return json.dumps({
+                review_payload = {
                     "task": {
                         "id": task.id,
                         "title": task.title,
@@ -500,6 +975,20 @@ def _handle_show(args: dict, **kw) -> str:
                         "current_run_id": task.current_run_id,
                     },
                     "parent_evidence": parent_evidence,
+                    "review_contract": review_contract,
+                    "review_contract_sha256": (
+                        hashlib.sha256(review_contract_json.encode("utf-8")).hexdigest()
+                        if review_contract_json is not None else None
+                    ),
+                    "sealed_contract_sha256": (
+                        hashlib.sha256(sealed_contract_json.encode("utf-8")).hexdigest()
+                        if sealed_contract_json is not None else None
+                    ),
+                    "policy_references": policy_references,
+                    "policy_read_instruction": (
+                        "Read every pinned policy independently with managed_policy_read; "
+                        "policy content is intentionally omitted from this compact payload."
+                    ),
                     "comments": [
                         {
                             "author": comment.author,
@@ -519,12 +1008,63 @@ def _handle_show(args: dict, **kw) -> str:
                     ],
                     "runs": [_run_dict(run) for run in runs[-5:]],
                     "view": "grace_review_compact",
-                }, ensure_ascii=False)
+                }
+                review_json = json.dumps(
+                    review_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                try:
+                    offset = int(args.get("offset", 0))
+                    limit = int(args.get("limit", 12_000))
+                except (TypeError, ValueError):
+                    return tool_error(
+                        "kanban_show review evidence: offset and limit must be integers"
+                    )
+                if offset < 0 or limit < 1 or limit > 12_000:
+                    return tool_error(
+                        "kanban_show review evidence: offset must be non-negative and "
+                        "limit must be between 1 and 12000"
+                    )
+                if offset > len(review_json):
+                    return tool_error(
+                        "kanban_show review evidence: offset exceeds evidence length"
+                    )
+                if offset == 0 and len(review_json) <= limit:
+                    return json.dumps(review_payload, ensure_ascii=False)
+                end = min(len(review_json), offset + limit)
+                while True:
+                    response = {
+                        "view": "grace_review_evidence_chunk",
+                        "task": {
+                            "id": task.id,
+                            "title": task.title,
+                            "status": task.status,
+                            "current_run_id": task.current_run_id,
+                        },
+                        "review_evidence_json_chunk": review_json[offset:end],
+                        "offset": offset,
+                        "next_offset": end,
+                        "total_chars": len(review_json),
+                        "complete": end == len(review_json),
+                        "review_evidence_json_sha256": hashlib.sha256(
+                            review_json.encode("utf-8")
+                        ).hexdigest(),
+                        "pagination_instruction": (
+                            "Concatenate review_evidence_json_chunk values in offset "
+                            "order; call kanban_show with offset=next_offset until complete."
+                        ),
+                    }
+                    output = json.dumps(response, ensure_ascii=False)
+                    if len(output) <= 18_000 or end <= offset + 1:
+                        return output
+                    end = offset + max(1, (end - offset) // 2)
 
             # Large contracts can truncate the tool preview. Keep the latest
             # recovery evidence visible before the full task body; comments
             # remain worker-authored evidence, not trusted instructions.
-            return json.dumps({
+            return json.dumps(_bound_show_value({
                 "latest_comment": (
                     {"author": comments[-1].author, "body": comments[-1].body,
                      "created_at": comments[-1].created_at} if comments else None
@@ -547,7 +1087,7 @@ def _handle_show(args: dict, **kw) -> str:
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
-            })
+            }), ensure_ascii=False)
         finally:
             conn.close()
     except ValueError as e:
@@ -647,6 +1187,54 @@ def _handle_domain_inventory(args: dict, **kw) -> str:
         return tool_error(f"kanban_domain_inventory: {e}")
 
 
+def _handle_domain_episode_reserve(args: dict, **kw) -> str:
+    """Reserve the contract-authorized next episode under an atomic DB lock."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return tool_error(
+            "kanban_domain_episode_reserve requires a dispatcher-owned active run"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            role = kb.validate_grace_loop_worker_auth(
+                conn,
+                task_id=tid,
+                run_id=str(run_id),
+                claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK", ""),
+                worker_auth_token=os.environ.get(
+                    "HERMES_KANBAN_WORKER_AUTH_TOKEN", ""
+                ),
+            )
+            if role != "execution":
+                return tool_error(
+                    "kanban_domain_episode_reserve requires an authenticated "
+                    "Grace execution worker"
+                )
+            receipt = kb.reserve_next_domain_episode(
+                conn,
+                task_id=tid,
+                expected_run_id=run_id,
+            )
+            return _ok(reservation=receipt)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_domain_episode_reserve: {e}")
+    except Exception as e:
+        logger.exception("kanban_domain_episode_reserve failed")
+        return tool_error(f"kanban_domain_episode_reserve: {e}")
+
+
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
     guard = _require_orchestrator_tool("kanban_list")
@@ -720,7 +1308,16 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    metadata_path = args.get("metadata_path")
     result = args.get("result")
+    if metadata is not None and metadata_path is not None:
+        return tool_error("provide only one of: metadata, metadata_path")
+    if metadata_path is not None:
+        try:
+            _validate_workspace_file_completion_contract(tid)
+            metadata = _load_worker_completion_metadata(metadata_path)
+        except ValueError as exc:
+            return tool_error(f"kanban_complete: {exc}")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -863,6 +1460,17 @@ def _handle_complete(args: dict, **kw) -> str:
         if message == "behavior.pinned_version_not_verified":
             message += (": verify each pinned policy version and SHA, then record "
                         "metadata.policy_receipts[i].pinned_version_verified=true for each review receipt.")
+        elif (
+            "domain mutation requires at least one domain_memory_delta" in message
+            or "domain mutation requires structured metadata.domain_memory_deltas" in message
+        ):
+            message += (
+                ": pass metadata.domain_memory_deltas as a non-empty list (plural key). "
+                "Each delta must explicitly include every contract artifact slot. "
+                "For a reserved episode artifact, put the exact "
+                "domain_episode_reservation:<reservation_id> value in both the "
+                "artifact.evidence_ref and its enclosing delta.evidence_refs list."
+            )
         elif "For text-only reviews, do not add page_hero" in message:
             # Frozen validators use this generic fallback; it does not classify
             # the task as text-only or authorize dropping required asset evidence.
@@ -1351,9 +1959,10 @@ KANBAN_SHOW_SCHEMA = {
         "uses its live Kanban board, and compares provider receipts with the exact "
         "canonical text/image digests. No SQL, shell, state.db, or browser is needed. "
         "The source execution/review pair must be named in the current sealed allowed scope. "
-        "Execution workers reading their own task receive the complete work order first, "
-        "without duplicated policy bodies or history; read full pinned policies via managed_policy_read. "
-        "Use view='full' explicitly to read a task's full state — title, body, assignee, parent task "
+        "Execution workers reading their own task receive a lossless, paginated canonical "
+        "work order including pinned policy snapshots but without task history. "
+        "Grace review cards return lossless canonical parent evidence, paginated when needed. "
+        "Other summary views are bounded. Use view='full' explicitly to read bounded task state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
@@ -1364,8 +1973,8 @@ KANBAN_SHOW_SCHEMA = {
         "type": "object",
         "properties": {
             "view": {
-                "type": "string", "enum": ["full", "contract", "delivery"],
-                "description": "An execution worker reading its own task defaults to the contract view, without duplicated policy bodies/history. Use contract for the complete work order and policy references, full explicitly for stored body/history, or delivery for provider-receipt verification.",
+                "type": "string", "enum": ["summary", "full", "contract", "delivery"],
+                "description": "An execution worker reading its own task defaults to the contract view; other reads default to summary. Use contract for the complete paginated work order including policy snapshots, full explicitly for bounded stored body/history, or delivery for provider-receipt verification.",
             },
             "source_review_task_id": {
                 "type": "string",
@@ -1379,6 +1988,14 @@ KANBAN_SHOW_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "offset": {
+                "type": "integer", "minimum": 0,
+                "description": "For contract or Grace-review evidence: zero-based offset into the complete canonical JSON.",
+            },
+            "limit": {
+                "type": "integer", "minimum": 1, "maximum": 12000,
+                "description": "For contract or Grace-review evidence: maximum canonical JSON characters requested per page.",
             },
             "board": _board_schema_prop(),
         },
@@ -1423,6 +2040,32 @@ KANBAN_DOMAIN_INVENTORY_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["domain_key", "entity_type"],
+        "additionalProperties": False,
+    },
+}
+
+KANBAN_DOMAIN_EPISODE_RESERVE_SCHEMA = {
+    "name": "kanban_domain_episode_reserve",
+    "description": (
+        "Atomically reserve the next internal episode number authorized by the "
+        "current sealed Grace Loop Contract. The worker never supplies or chooses "
+        "the number: the controller verifies pinned accepted occupancy evidence, "
+        "the certified Domain Registry and prior reservations, requires a contiguous "
+        "sequence, then returns the durable reservation and immediate readback. "
+        "Use this before generating any episode-labelled asset when the contract "
+        "contains HERMES_DOMAIN_EPISODE_RESERVATION_V2. This performs no external "
+        "platform action and grants no publication authority."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
         "additionalProperties": False,
     },
 }
@@ -1479,7 +2122,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
+        "tests_run, decisions, findings, etc), or use ``metadata_path`` "
+        "for a large JSON object already written inside the current task "
+        "workspace only when the compiled contract declares "
+        "completion_handoff.metadata_source=workspace_file. At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
@@ -1512,7 +2158,27 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. For an execution contract "
+                    "whose domain_memory mode is mutate, include a non-empty "
+                    "metadata.domain_memory_deltas list (plural key). Each delta "
+                    "must explicitly represent every artifact slot declared by "
+                    "the contract. A reserved episode artifact must use the exact "
+                    "domain_episode_reservation:<reservation_id> string in both "
+                    "artifact.evidence_ref and the enclosing delta.evidence_refs list."
+                ),
+            },
+            "metadata_path": {
+                "type": "string",
+                "description": (
+                    "Optional path to a UTF-8 JSON object already written "
+                    "inside the current task workspace. This is accepted only "
+                    "when the compiled contract declares "
+                    "completion_handoff.metadata_source=workspace_file on a "
+                    "devops/clawops-dev route with terminal capability. Use this "
+                    "instead of metadata for large structured handoffs; traversal, "
+                    "symlink escapes, non-object JSON, and files over "
+                    "1,000,000 bytes are rejected. Do not pass both metadata "
+                    "and metadata_path."
                 ),
             },
             "result": {
@@ -1948,6 +2614,7 @@ registry.register(
     handler=_handle_show,
     check_fn=_check_kanban_mode,
     emoji="📋",
+    max_result_size_chars=20_000,
 )
 
 registry.register(
@@ -1957,6 +2624,15 @@ registry.register(
     handler=_handle_domain_inventory,
     check_fn=_check_kanban_mode,
     emoji="🗂️",
+)
+
+registry.register(
+    name="kanban_domain_episode_reserve",
+    toolset="kanban",
+    schema=KANBAN_DOMAIN_EPISODE_RESERVE_SCHEMA,
+    handler=_handle_domain_episode_reserve,
+    check_fn=_check_kanban_mode,
+    emoji="🔒",
 )
 
 registry.register(

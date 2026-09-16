@@ -15192,7 +15192,19 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                     expected_run_id=int(task.current_run_id),
                     metadata=metadata,
                 )
-            _kb.block_task(c, task_id, reason=reason)
+            blocker = metadata.get("goal_loop_blocker") if metadata else None
+            kind = (
+                blocker.get("block_kind")
+                if isinstance(blocker, dict)
+                else None
+            )
+            _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                kind=kind,
+                expected_run_id=task.current_run_id,
+            )
         finally:
             try:
                 c.close()

@@ -1732,6 +1732,7 @@ def run_kanban_goal_loop(
                 blocker_metadata = {
                     "goal_loop_blocker": {
                         "class": "finalize_protocol_violation",
+                        "block_kind": "capability",
                         "judge_verdict": verdict,
                         "judge_reason": reason,
                         "turns_used": turns_used,
@@ -1763,6 +1764,7 @@ def run_kanban_goal_loop(
             blocker_metadata = {
                 "goal_loop_blocker": {
                     "class": "turn_budget_exhausted",
+                    "block_kind": "capability",
                     "judge_verdict": verdict,
                     "judge_reason": reason,
                     "turns_used": turns_used,

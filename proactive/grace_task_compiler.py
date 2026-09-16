@@ -294,6 +294,9 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
             "For AI BizWeek direct delivery back to KJ, reject if the parent claims worker-side "
             "Telegram delivery in externalEffects instead of providing metadata.user_facing_report "
             "kind=content_package for Gateway post-review delivery.",
+            "For package_kind='full_publication_package', reject unless the parent metadata "
+            "contains facebook_page_post.text exactly equal to "
+            "user_facing_report.sections.facebook_page_post.",
             "For AI BizWeek Carter's Junk Away / EP04 readiness checks, use "
             "managed_policy_read.operational_readiness_evidence when available; otherwise use "
             "the embedded active policy/source evidence compiled by Grace/Hermes. If complete=true "
@@ -349,6 +352,10 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         "from the worker. Put the copyable text body and both image assets in "
         "metadata.user_facing_report kind=content_package so Gateway delivers them only "
         "after Grace Review accepts the package.",
+        "When package_kind='full_publication_package', also return "
+        "metadata.facebook_page_post={text:<exact Page body>}. Its text must exactly "
+        "match metadata.user_facing_report.sections.facebook_page_post; Hermes rejects "
+        "the execution completion before review if it is missing or different.",
         "The final OpenClaw JSON must contain metadata.user_facing_report with "
         "kind='content_package', delivery='inline_with_attachment', complete=true, "
         "title, observed_at (current Unix seconds), body (the entire copyable package "
@@ -628,7 +635,7 @@ def _render_user_facing_delivery_guidance(
             "delivery=inline_only, and " + detail
         ]
     if review:
-        return [
+        guidance = [
             "For the requested user-facing delivery, reject the parent unless "
             "metadata.user_facing_report matches user_facing_delivery and truthfully exposes "
             "every known gap. Never accept a Markdown attachment path as a substitute for an "
@@ -637,6 +644,29 @@ def _render_user_facing_delivery_guidance(
             "metadata.loop_contract_blocked_result.metadata.user_facing_report from the "
             "parent run as blocked-draft evidence before saying the deliverable is absent."
         ]
+        if delivery.get("kind") == "content_package":
+            guidance.append(
+                "For inline_with_attachment, count only the controller-verified rows named in "
+                "user_facing_delivery.asset_filenames. The Markdown body artifact is separate, "
+                "and historical duplicate row IDs with the same filename and exact bytes are one "
+                "deliverable; conflicting bytes fail closed. Use Controller content-package "
+                "readback for row IDs, MIME, byte size, dimensions and SHA-256. Never return an "
+                "already-completed content worker solely to change controller-owned report fields "
+                "or attachment rows."
+            )
+            guidance.append(
+                "Controller content-package readback is authoritative for controller-owned "
+                "fields. If it reports package_kind=full_publication_package, "
+                "package_complete=true and every contracted asset row verifies, do not reject "
+                "because an earlier worker report said complete=false, because the separate "
+                "Markdown body artifact increases the total attachment-row count, or because "
+                "worker evidence omits controller row IDs. A resized thumbnail is an optional "
+                "inspection aid, never an additional acceptance artifact or blocker unless the "
+                "pinned managed policy itself requires that exact derivative. A controller/schema "
+                "mismatch is not a human decision: block it as capability with a reason beginning "
+                "`Controller state conflict:`; never use needs_input."
+            )
+        return guidance
     return [
         "The contract requires user_facing_delivery. Return a validated "
         "metadata.user_facing_report matching its declared kind and delivery mode."
@@ -763,6 +793,16 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
     )
 
 
+def review_max_runtime_seconds(contract: Mapping[str, Any]) -> int:
+    """Resolve the profile-pinned formal-review runtime budget."""
+    from proactive.behavior_profiles.registry import implementation
+
+    behavior = implementation(contract, "compiler")
+    if behavior is not None and hasattr(behavior, "review_max_runtime_seconds"):
+        return int(behavior.review_max_runtime_seconds(contract))
+    return min(1800, int(contract["stop_rules"]["max_runtime_seconds"]))
+
+
 def _render_authorization_guidance(contract: Mapping[str, Any]) -> list[str]:
     """Explain scoped-elevation precedence without broadening its scope.
 
@@ -848,12 +888,14 @@ def _should_expose_backend_original_request(contract: Mapping[str, Any]) -> bool
         and domain_memory.get("mode") == "query"
     )
     delivery = contract.get("user_facing_delivery")
+    original_request = str(contract.get("original_request") or "")
     source_package = (
         isinstance(delivery, Mapping)
         and delivery.get("kind") == "content_package"
         and (
             bool(delivery.get("asset_filenames"))
-            or "facebook_page_source_text" in str(contract.get("original_request") or "")
+            or "facebook_page_source_text" in original_request.casefold()
+            or "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT" in original_request
         )
     )
     return (
@@ -1034,9 +1076,7 @@ def compile_and_delegate(
                 created_by="grace-loop-compiler",
                 parents=[execution_task_id],
                 workspace_kind="scratch",
-                max_runtime_seconds=min(
-                    1800, int(normalized["stop_rules"]["max_runtime_seconds"])
-                ),
+                max_runtime_seconds=review_max_runtime_seconds(normalized),
                 goal_mode=True,
                 goal_max_turns=min(
                     8, int(normalized["stop_rules"]["max_iterations"])

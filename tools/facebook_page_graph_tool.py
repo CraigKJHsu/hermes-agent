@@ -10,6 +10,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import stat
 import struct
 from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
@@ -330,12 +331,18 @@ def _embedded_page_source(contract: Mapping[str, Any]) -> tuple[str, str]:
     return match.group(2), match.group(1)
 
 
-def bind_accepted_page_preflight_source(
-    contract: Mapping[str, Any], *, board: Optional[str] = None,
+def _resolve_accepted_page_source(
+    contract: Mapping[str, Any],
+    *,
+    board: Optional[str] = None,
+    require_current_visual_safety: bool,
 ) -> Optional[dict[str, Any]]:
-    """Resolve an explicitly selected, same-Topic accepted package; never read a path."""
+    """Resolve one sealed, same-Topic accepted package from controller state."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.grace_review_metadata import grace_review_accepted
+    from hermes_cli.grace_review_metadata import (
+        grace_review_accepted,
+        page_hero_review_evidence,
+    )
 
     prefix = "Use accepted Facebook Page package: "
     entries = [s for s in (contract.get("scope") or {}).get("allowed", [])
@@ -368,8 +375,13 @@ def bind_accepted_page_preflight_source(
             raise ValueError("Accepted package must belong to this exact Topic and review link.")
         execution = kb.get_task(conn, execution_id)
         review = kb.get_task(conn, review_id)
-        source_run = kb.latest_run(conn, execution_id)
         review_run = kb.latest_run(conn, review_id)
+        try:
+            source_run = kb.reviewed_execution_run(conn, review_run, execution_id)
+        except ValueError as exc:
+            raise ValueError(
+                "Selected package review does not bind unchanged execution evidence."
+            ) from exc
         if (
             execution is None or review is None
             or execution.status != "done" or review.status != "done"
@@ -380,8 +392,10 @@ def bind_accepted_page_preflight_source(
             or not grace_review_accepted(review_run.metadata)
         ):
             raise ValueError("Selected package has no completed review of its latest execution.")
+        source_attachments = kb.list_attachments(conn, execution_id)
     source_metadata = source_run.metadata or {}
     source_identity = (source_metadata.get("loop_contract") or {}).get("identity") or {}
+    sealed_contract: Optional[dict[str, Any]] = None
     # Native Hermes completion replaces run metadata; the sealed delegation
     # remains the controller-owned authority for its original identity.
     snapshot = link["contract_snapshot"]
@@ -413,6 +427,7 @@ def bind_accepted_page_preflight_source(
     if any(text != message for _, text in candidates):
         raise ValueError("Accepted package has conflicting structured facebook_page_post text.")
     review_metadata = review_run.metadata or {}
+    normalized_review = page_hero_review_evidence(review_metadata)
     raw_images = review_metadata.get("asset_review")
     images = [dict(asset) for asset in raw_images
               if isinstance(asset, Mapping) and asset.get("asset_family") == "page_hero"] if isinstance(raw_images, list) else []
@@ -453,6 +468,214 @@ def bind_accepted_page_preflight_source(
             asset.update(width=dimensions[0], height=dimensions[1])
         asset.setdefault("accepted", True)
         images.append(asset)
+    native_visual = (
+        review_evidence.get("page_hero_actual_pixel_analysis")
+        if isinstance(review_evidence, Mapping)
+        else None
+    )
+    native_hashes = (
+        review_evidence.get("hash_verification")
+        if isinstance(review_evidence, Mapping)
+        else None
+    )
+    native_receipt = (
+        review_evidence.get("controller_content_package_readback")
+        if isinstance(review_evidence, Mapping)
+        else None
+    )
+    current_declaration = (
+        normalized_review.get("declaration")
+        if normalized_review is not None
+        else None
+    )
+    current_attachment = (
+        normalized_review.get("controller_attachment")
+        if normalized_review is not None
+        else None
+    )
+    current_post_readback = (
+        normalized_review.get("facebook_page_post_readback")
+        if normalized_review is not None
+        else None
+    )
+    current_inspected = (
+        normalized_review.get("actual_controller_attachment_inspected")
+        if normalized_review is not None
+        else None
+    )
+    current_schema_claimed = bool(
+        current_attachment is not None
+        or current_post_readback is not None
+        or current_inspected is not None
+    )
+    native_schema_claimed = bool(
+        native_visual is not None
+        or native_hashes is not None
+        or native_receipt is not None
+    )
+    if current_schema_claimed:
+        if (
+            not isinstance(current_declaration, Mapping)
+            or not isinstance(current_attachment, Mapping)
+            or not isinstance(current_post_readback, Mapping)
+            or current_inspected is not True
+        ):
+            raise ValueError(
+                "Accepted package has incomplete controller Page Hero evidence."
+            )
+        width = current_declaration.get("width")
+        height = current_declaration.get("height")
+        expected_hash = str(current_declaration.get("sha256") or "").lower()
+        expected_size = current_declaration.get("bytes")
+        expected_filename = str(current_declaration.get("filename") or "")
+        attachment_hash = str(current_attachment.get("sha256") or "").lower()
+        post_hash = str(current_post_readback.get("sha256") or "").lower()
+        if (
+            type(width) is not int
+            or type(height) is not int
+            or width <= 0
+            or height <= 0
+            or width * 9 != height * 16
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            or type(expected_size) is not int
+            or expected_size <= 0
+            or not expected_filename
+            or current_attachment.get("byte_for_byte_equal") is not True
+            or current_attachment.get("filename") != expected_filename
+            or attachment_hash != expected_hash
+            or current_attachment.get("width") != width
+            or current_attachment.get("height") != height
+            or current_attachment.get("bytes") != expected_size
+            or current_post_readback.get("byte_preserving") is not True
+            or current_post_readback.get("utf8_bytes")
+            != len(message.encode("utf-8"))
+            or post_hash
+            != hashlib.sha256(message.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError(
+                "Accepted package has malformed controller Page Hero evidence."
+            )
+        matching_attachments = []
+        for attachment in source_attachments:
+            path = Path(attachment.stored_path)
+            try:
+                image_bytes = path.read_bytes()
+                actual_width, actual_height = _png_dimensions(image_bytes)
+            except (OSError, ValueError):
+                continue
+            if (
+                attachment.id == current_attachment.get("attachment_id")
+                and attachment.filename == expected_filename
+                and attachment.stored_path == current_attachment.get("stored_path")
+                and attachment.size == expected_size == len(image_bytes)
+                and hashlib.sha256(image_bytes).hexdigest() == expected_hash
+                and (actual_width, actual_height) == (width, height)
+            ):
+                matching_attachments.append((attachment, path))
+        if len(matching_attachments) != 1:
+            raise ValueError(
+                "Accepted package controller evidence has no unique attachment."
+            )
+        attachment, path = matching_attachments[0]
+        images.append({
+            "asset_family": "page_hero",
+            "accepted": True,
+            "path": str(path),
+            "sha256": expected_hash,
+            "width": width,
+            "height": height,
+            "filename": attachment.filename,
+        })
+    elif normalized_review is not None and not native_schema_claimed:
+        raise ValueError(
+            "Accepted package has incomplete controller Page Hero evidence."
+        )
+    if native_visual is not None or native_hashes is not None:
+        asset_declarations = review_metadata.get("asset_declarations")
+        page_hero_declared = (
+            str(review_metadata.get("asset_family") or "").strip().lower()
+            == "page_hero"
+            or (
+                isinstance(asset_declarations, Mapping)
+                and asset_declarations.get("page_hero") is not None
+            )
+        )
+        visual_review = review_metadata.get("visual_review")
+        if (
+            not isinstance(native_visual, Mapping)
+            or not isinstance(native_hashes, Mapping)
+            or not isinstance(native_receipt, Mapping)
+        ):
+            raise ValueError("Accepted package has malformed actual-pixel Page Hero evidence.")
+        if require_current_visual_safety and (
+            not page_hero_declared
+            or not isinstance(visual_review, Mapping)
+            or visual_review.get("all_required_text_readable") is not True
+            or visual_review.get("text_occlusion_free") is not True
+            or visual_review.get("disclosure_non_obstructive") is not True
+            or visual_review.get("defects_found") != []
+        ):
+            raise ValueError(
+                "Accepted package lacks current structured Page Hero safety evidence."
+            )
+        dimensions_match = re.fullmatch(
+            r"([1-9][0-9]*)[x×]([1-9][0-9]*)",
+            str(native_visual.get("dimensions") or ""),
+        )
+        expected_hash = str(
+            native_hashes.get("page_hero_sha256") or ""
+        ).strip().lower()
+        if (
+            native_visual.get("asset_family") != "page_hero"
+            or native_visual.get("status") != "passed"
+            or native_visual.get("traditional_chinese_readable") is not True
+            or native_visual.get("ai_disclosure_visible") is not True
+            or dimensions_match is None
+            or native_hashes.get("exact_attachment_bytes_verified") is not True
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            or (
+                native_receipt.get("package_complete") is not True
+                and not (
+                    # completion_mode is controller-derived from the Objective
+                    # stage before this contract snapshot is fingerprinted.
+                    native_receipt.get("package_complete") is False
+                    and isinstance(sealed_contract, Mapping)
+                    and sealed_contract.get("completion_mode") == "intermediate"
+                )
+            )
+            or type(native_receipt.get("task_attachment_row_count")) is not int
+            or native_receipt["task_attachment_row_count"] < 1
+        ):
+            raise ValueError("Accepted package has malformed actual-pixel Page Hero evidence.")
+        width, height = (int(value) for value in dimensions_match.groups())
+        matching_attachments = []
+        for attachment in source_attachments:
+            path = Path(attachment.stored_path)
+            try:
+                image_bytes = path.read_bytes()
+                actual_width, actual_height = _png_dimensions(image_bytes)
+            except (OSError, ValueError):
+                continue
+            if (
+                hashlib.sha256(image_bytes).hexdigest() == expected_hash
+                and (actual_width, actual_height) == (width, height)
+                and attachment.size == len(image_bytes)
+            ):
+                matching_attachments.append((attachment, path))
+        if len(matching_attachments) != 1:
+            raise ValueError(
+                "Accepted package actual-pixel evidence has no unique controller attachment."
+            )
+        attachment, path = matching_attachments[0]
+        images.append({
+            "asset_family": "page_hero",
+            "accepted": True,
+            "path": str(path),
+            "sha256": expected_hash,
+            "width": width,
+            "height": height,
+            "filename": attachment.filename,
+        })
     if not images or any(asset.get("asset_family") != "page_hero" or asset.get("accepted") is not True
                          for asset in images):
         raise ValueError("Accepted package must have one reviewed Page Hero.")
@@ -476,7 +699,263 @@ def bind_accepted_page_preflight_source(
         "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
         "message_utf8_bytes": len(message.encode("utf-8")),
         "image_path": asset["path"], "image_sha256": asset["sha256"],
+        "image_filename": str(asset.get("filename") or Path(asset["path"]).name),
         "dimensions": f"{asset['width']}×{asset['height']}",
+    }
+
+
+def bind_accepted_page_preflight_source(
+    contract: Mapping[str, Any], *, board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Bind an accepted package that already has current visual-safety proof."""
+    return _resolve_accepted_page_source(
+        contract,
+        board=board,
+        require_current_visual_safety=True,
+    )
+
+
+_ACCEPTED_PAGE_RELAY_DELIVERY = {
+    "required": True,
+    "kind": "content_package",
+    "delivery": "inline_with_attachment",
+    "body_field": "metadata.facebook_page_post.text",
+    "asset_filenames": ["page-hero.png"],
+}
+
+
+def accepted_page_relay_delivery_contract(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require the delivery shape consumed by controller relay readback."""
+    delivery = contract.get("user_facing_delivery")
+    if not isinstance(delivery, Mapping) or any(
+        delivery.get(key) != value
+        for key, value in _ACCEPTED_PAGE_RELAY_DELIVERY.items()
+    ):
+        raise ValueError(
+            "Accepted Page relay requires content_package/inline_with_attachment "
+            "delivery from metadata.facebook_page_post.text with only page-hero.png."
+        )
+    return dict(delivery)
+
+
+def _write_controller_handoff_file(path: Path, data: bytes) -> None:
+    """Create one controller file, or verify an identical retry artifact."""
+    if path.is_symlink():
+        raise ValueError("Controller source handoff path must not be a symlink.")
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != data:
+            raise ValueError("Existing controller source handoff does not match accepted bytes.")
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def materialize_accepted_page_relay_handoff(
+    contract: Mapping[str, Any],
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Put exact accepted Page bytes in a native worker workspace.
+
+    This is intentionally weaker than publish binding only in one respect: a
+    historical accepted review may supply the source bytes for a zero-effect
+    relay whose output receives a fresh formal visual review.  It cannot make
+    that historical package directly publishable.
+    """
+    completion_handoff = contract.get("completion_handoff")
+    resolved = ((contract.get("routing") or {}).get("resolved") or {})
+    if (
+        not isinstance(completion_handoff, Mapping)
+        or completion_handoff.get("metadata_source") != "workspace_file"
+        or resolved.get("task_type") != "devops"
+    ):
+        return None
+    accepted = _resolve_accepted_page_source(
+        contract,
+        board=board,
+        require_current_visual_safety=False,
+    )
+    if accepted is None:
+        return None
+    accepted_page_relay_delivery_contract(contract)
+
+    root = Path(workspace).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("Controller source handoff requires a real worker workspace.")
+    handoff_dir = root / ".hermes-controller-handoff"
+    if handoff_dir.exists():
+        if handoff_dir.is_symlink() or not handoff_dir.is_dir():
+            raise ValueError("Controller source handoff directory is not trusted.")
+    else:
+        handoff_dir.mkdir(mode=0o700)
+
+    image_name = Path(str(accepted["image_filename"])).name
+    if not image_name or image_name != str(accepted["image_filename"]):
+        raise ValueError("Accepted Page Hero filename is invalid.")
+    source_image = Path(str(accepted["image_path"]))
+    image_bytes = source_image.read_bytes()
+    width, height = _png_dimensions(image_bytes)
+    if (
+        hashlib.sha256(image_bytes).hexdigest() != accepted["image_sha256"]
+        or f"{width}×{height}" != accepted["dimensions"]
+    ):
+        raise ValueError("Accepted Page Hero changed before controller handoff.")
+    # The source filename is evidence, not a controller storage name.  Keep it
+    # in the bundle while reserving fixed, non-overlapping handoff paths.
+    image_path = handoff_dir / "page-hero.png"
+    _write_controller_handoff_file(image_path, image_bytes)
+
+    bundle = {
+        "schema_version": "1.0",
+        "source_kind": "accepted_facebook_page_package",
+        "execution_task_id": accepted["execution_task_id"],
+        "execution_run_id": accepted["execution_run_id"],
+        "review_task_id": accepted["review_task_id"],
+        "review_run_id": accepted["review_run_id"],
+        "facebook_page_post": {
+            "text": accepted["message"],
+            "sha256": accepted["message_sha256"],
+            "utf8_bytes": accepted["message_utf8_bytes"],
+            "source_field": accepted["source_field"],
+        },
+        "page_hero": {
+            "asset_family": "page_hero",
+            "filename": image_name,
+            "path": str(image_path),
+            "sha256": accepted["image_sha256"],
+            "dimensions": accepted["dimensions"],
+        },
+        "external_effects": [],
+    }
+    bundle_bytes = json.dumps(
+        bundle,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    bundle_path = handoff_dir / "accepted-page-source.json"
+    _write_controller_handoff_file(bundle_path, bundle_bytes)
+    return {
+        "schema_version": "1.0",
+        "bundle_path": str(bundle_path),
+        "bundle_sha256": hashlib.sha256(bundle_bytes).hexdigest(),
+        "image_path": str(image_path),
+        "image_sha256": accepted["image_sha256"],
+        "message_sha256": accepted["message_sha256"],
+        "message_utf8_bytes": accepted["message_utf8_bytes"],
+        "execution_task_id": accepted["execution_task_id"],
+        "execution_run_id": accepted["execution_run_id"],
+        "review_task_id": accepted["review_task_id"],
+        "review_run_id": accepted["review_run_id"],
+    }
+
+
+def read_materialized_accepted_page_relay_handoff(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read back exact controller handoff bytes from an active-run receipt."""
+    bundle_path = Path(str(receipt.get("bundle_path") or ""))
+    image_path = Path(str(receipt.get("image_path") or ""))
+    if (
+        bundle_path.name != "accepted-page-source.json"
+        or bundle_path.parent.name != ".hermes-controller-handoff"
+        or image_path != bundle_path.parent / "page-hero.png"
+        or bundle_path.is_symlink()
+        or image_path.is_symlink()
+        or bundle_path.parent.is_symlink()
+    ):
+        raise ValueError("Controller accepted-source handoff paths are invalid.")
+
+    def read_regular(path: Path, limit: int) -> bytes:
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size > limit
+            ):
+                raise ValueError("Controller accepted-source handoff file is invalid.")
+            chunks: list[bytes] = []
+            size = 0
+            while size <= limit:
+                chunk = os.read(descriptor, min(65_536, limit + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            data = b"".join(chunks)
+            if len(data) != info.st_size or len(data) > limit:
+                raise ValueError("Controller accepted-source handoff file changed while read.")
+            return data
+        finally:
+            os.close(descriptor)
+
+    bundle_bytes = read_regular(bundle_path, 1_000_000)
+    if hashlib.sha256(bundle_bytes).hexdigest() != receipt.get("bundle_sha256"):
+        raise ValueError("Controller accepted-source bundle hash changed before completion.")
+    try:
+        bundle = json.loads(bundle_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Controller accepted-source bundle is invalid JSON.") from exc
+    post = bundle.get("facebook_page_post") if isinstance(bundle, Mapping) else None
+    hero = bundle.get("page_hero") if isinstance(bundle, Mapping) else None
+    message = post.get("text") if isinstance(post, Mapping) else None
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("Controller accepted-source bundle has no exact Page text.")
+    message_bytes = message.encode("utf-8")
+    identity_fields = (
+        "execution_task_id", "execution_run_id", "review_task_id", "review_run_id",
+    )
+    if (
+        bundle.get("schema_version") != "1.0"
+        or bundle.get("source_kind") != "accepted_facebook_page_package"
+        or bundle.get("external_effects") != []
+        or any(bundle.get(key) != receipt.get(key) for key in identity_fields)
+        or not isinstance(post, Mapping)
+        or hashlib.sha256(message_bytes).hexdigest() != post.get("sha256")
+        or len(message_bytes) != post.get("utf8_bytes")
+        or post.get("sha256") != receipt.get("message_sha256")
+        or post.get("utf8_bytes") != receipt.get("message_utf8_bytes")
+        or not isinstance(hero, Mapping)
+        or hero.get("asset_family") != "page_hero"
+        or hero.get("path") != str(image_path)
+        or hero.get("sha256") != receipt.get("image_sha256")
+    ):
+        raise ValueError("Controller accepted-source bundle disagrees with its receipt.")
+    image_bytes = read_regular(image_path, 64 * 1024 * 1024)
+    width, height = _png_dimensions(image_bytes)
+    if (
+        hashlib.sha256(image_bytes).hexdigest() != hero.get("sha256")
+        or hero.get("dimensions") != f"{width}×{height}"
+        or width * 9 != height * 16
+    ):
+        raise ValueError("Controller accepted-source Page Hero changed before completion.")
+    return {
+        "message": message,
+        "message_sha256": post["sha256"],
+        "message_utf8_bytes": post["utf8_bytes"],
+        "source_field": post.get("source_field"),
+        "image_path": str(image_path),
+        "image_sha256": hero["sha256"],
+        "image_data": image_bytes,
+        "image_bytes": len(image_bytes),
+        "width": width,
+        "height": height,
+        "dimensions": hero["dimensions"],
     }
 
 

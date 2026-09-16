@@ -3024,7 +3024,11 @@ def start_loop_contract_execution(
     )
     # Imported lazily to avoid the compiler/executor module cycle while keeping
     # one canonical worker-safe contract and Grace acceptance prompt.
-    from proactive.grace_task_compiler import render_execution_body, render_review_body
+    from proactive.grace_task_compiler import (
+        render_execution_body,
+        render_review_body,
+        review_max_runtime_seconds,
+    )
     idempotency_key = f"openclaw-loop:{delegation_id}:{fingerprint}"
     with kb.connect_closing(board=board) as conn:
         existing = conn.execute(
@@ -3190,9 +3194,7 @@ def start_loop_contract_execution(
                 created_by="grace-loop-compiler",
                 parents=[task_id],
                 workspace_kind="scratch",
-                max_runtime_seconds=min(
-                    1800, int(normalized["stop_rules"]["max_runtime_seconds"])
-                ),
+                max_runtime_seconds=review_max_runtime_seconds(normalized),
                 goal_mode=True,
                 goal_max_turns=min(
                     8, int(normalized["stop_rules"]["max_iterations"])
@@ -5097,6 +5099,20 @@ def make_loop_contract_poll_adapter(
             transport=transport,
             policy_path=policy_path,
         )
+        if (
+            not metadata.get("stop_rule_cleanup_pending")
+            and _ambiguous_transport_result(result)
+        ):
+            return {
+                "status": "running",
+                "backend_run_id": str(run.backend_run_id),
+                "backend_agent_id": str(metadata.get("backend_agent_id") or ""),
+                "backend_session_key": str(metadata.get("backend_session_key") or ""),
+                "protocol_version": "2.0",
+                "result_digest": _digest(result),
+                "delegated_result": result,
+                "transport_ambiguous": True,
+            }
         status = str(result.get("status") or "").strip().lower()
         if status not in {"queued", "running", "succeeded", "failed", "blocked"}:
             raise ValueError(f"Unexpected OpenClaw Loop Contract status={status!r}.")
@@ -6349,7 +6365,7 @@ def _materialize_content_package_report(
     # Internal delivery-field references must be expanded before user delivery.
     # Section completeness/source fidelity remain independent review checks.
     if re.search(
-        r"(?i)(?:acceptanceEvidence\.|metadata\.user_facing_report)",
+        r"(?i)(?:acceptanceEvidence\.|acceptance_evidence\.|metadata\.user_facing_report)",
         report["body"],
     ):
         return {}
@@ -6357,6 +6373,12 @@ def _materialize_content_package_report(
         normalized = normalize_user_facing_report(report)
     except ValueError:
         return {}
+    if normalized.get("package_kind") == "full_publication_package":
+        # ``complete`` describes the package, not the enclosing Objective.
+        # Reaching this point proves every required section and both canonical
+        # image manifests are present; the later Grace review/checkpoint still
+        # controls Objective progression.
+        normalized = {**normalized, "complete": True}
     contract = metadata.get("loop_contract")
     intermediate_objective = bool(
         isinstance(contract, Mapping)
@@ -6557,6 +6579,23 @@ def _materialize_content_package_report(
     }
 
 
+def _acceptance_body_value(
+    acceptance: Mapping[str, Any], body_field: str
+) -> Any:
+    """Resolve a contract body field relative to acceptanceEvidence."""
+    segments = body_field.split(".")
+    if segments[0] in {"acceptanceEvidence", "acceptance_evidence"}:
+        segments = segments[1:]
+    if not segments or any(not segment for segment in segments):
+        return None
+    value: Any = acceptance
+    for segment in segments:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(segment)
+    return value
+
+
 def _content_package_completion_metadata(
     audited_result: Mapping[str, Any],
     *,
@@ -6578,6 +6617,12 @@ def _content_package_completion_metadata(
     delivery = (
         contract.get("user_facing_delivery") if isinstance(contract, Mapping) else None
     )
+    if not (
+        isinstance(delivery, Mapping)
+        and delivery.get("required") is True
+        and delivery.get("kind") == "content_package"
+    ):
+        return {}
     worker_metadata = audited_result.get("metadata")
     inline_only = isinstance(delivery, Mapping) and delivery.get("delivery") == "inline_only"
     objective_inline = inline_only and bool(contract.get("objective_ref"))
@@ -6585,6 +6630,24 @@ def _content_package_completion_metadata(
         report = worker_metadata["user_facing_report"]
         if not isinstance(report, Mapping):
             return {}
+        if not inline_only:
+            from hermes_cli.user_facing_report import (
+                promote_full_publication_package,
+            )
+
+            report = promote_full_publication_package(
+                report,
+                evidence=acceptance,
+                expected_asset_filenames=delivery.get("asset_filenames"),
+                policy_receipts=policy_receipts,
+                external_effects=external_effects,
+            )
+        body_field = str(delivery.get("body_field") or "")
+        bound_body = (
+            report.get("body")
+            if body_field == "metadata.user_facing_report.body"
+            else _acceptance_body_value(acceptance, body_field)
+        )
         if report.get("package_kind") == "full_publication_package":
             report = {
                 **report,
@@ -6593,9 +6656,7 @@ def _content_package_completion_metadata(
             }
         if inline_only:
             # Gateway rebuilds inline-only reports from this pinned evidence field.
-            if acceptance.get(str(delivery.get("body_field") or "")) == report.get(
-                "body"
-            ):
+            if bound_body == report.get("body"):
                 report = {
                     **report,
                     "complete": (
@@ -6613,15 +6674,23 @@ def _content_package_completion_metadata(
             # A worker preview must not override or invalidate the complete,
             # contract-pinned inline body. Rebuild it below from acceptance evidence.
         else:
-            if acceptance.get(str(delivery.get("body_field") or "")) != report.get("body"):
+            if bound_body != report.get("body"):
                 return {}
-            return _materialize_content_package_report(
+            materialized = _materialize_content_package_report(
                 report, delivery=delivery, metadata=metadata,
                 task_id=task_id, board=board, run_id=run_id,
                 internal_tool_receipts=internal_tool_receipts,
                 source_run=source_run,
                 allow_trajectory_recovery=allow_trajectory_recovery,
             )
+            if (
+                materialized
+                and report.get("package_kind") == "full_publication_package"
+            ):
+                materialized["facebook_page_post"] = {
+                    "text": report["sections"]["facebook_page_post"],
+                }
+            return materialized
     if objective_inline and contract.get("completion_mode") != "intermediate":
         return {}
     if (
@@ -6631,7 +6700,7 @@ def _content_package_completion_metadata(
         and delivery.get("delivery") == "inline_only"
     ):
         body_field = str(delivery.get("body_field") or "").strip()
-        raw_body = acceptance.get(body_field)
+        raw_body = _acceptance_body_value(acceptance, body_field)
         if not body_field or not isinstance(raw_body, str):
             return {}
         body = raw_body.strip()
@@ -6712,7 +6781,7 @@ def _content_package_completion_metadata(
                and isinstance(raw_asset.get("height"), int) else {}),
         })
     body = "\n\n".join(sections)
-    return _materialize_content_package_report(
+    materialized = _materialize_content_package_report(
         {
             "kind": "content_package",
             "package_kind": "full_publication_package",
@@ -6731,6 +6800,11 @@ def _content_package_completion_metadata(
         source_run=source_run,
         allow_trajectory_recovery=allow_trajectory_recovery,
     )
+    if materialized:
+        materialized["facebook_page_post"] = {
+            "text": structured_sections["facebook_page_post"],
+        }
+    return materialized
 
 
 def make_loop_contract_terminal_handler(
@@ -6825,6 +6899,7 @@ def make_loop_contract_terminal_handler(
         )
         normalized_domain_memory_deltas: list[dict[str, Any]] | None = None
         domain_memory_error = ""
+        controller_domain_reconciliation: dict[str, Any] | None = None
         if domain_spec is None:
             if raw_domain_memory_deltas is not None:
                 domain_memory_error = (
@@ -6853,6 +6928,27 @@ def make_loop_contract_terminal_handler(
                     )
             except ValueError as exc:
                 domain_memory_error = str(exc)
+                try:
+                    with kb.connect_closing(board=board) as conn:
+                        recovery = kb.recover_verified_page_domain_deltas(
+                            conn,
+                            task_id=run.task_id,
+                            run_id=run.id,
+                            raw_deltas=raw_domain_memory_deltas,
+                            domain_spec=domain_spec,
+                            reported_external_effects=(
+                                normalized_external_effects or []
+                            ),
+                        )
+                except ValueError as recovery_exc:
+                    domain_memory_error = str(recovery_exc)
+                else:
+                    if recovery is not None:
+                        # Admission only. complete_task repeats the authoritative
+                        # registry/effect reads under its write transaction and
+                        # persists the controller receipt from that result.
+                        normalized_domain_memory_deltas = raw_domain_memory_deltas
+                        domain_memory_error = ""
         reclassified_external_effect_error = (
             isinstance(evidence, Mapping)
             and evidence.get("resultContractValid") is not True
@@ -7122,6 +7218,9 @@ def make_loop_contract_terminal_handler(
                                 if normalized_domain_memory_deltas is not None
                                 else raw_domain_memory_deltas
                             ),
+                            "controller_domain_reconciliation": (
+                                controller_domain_reconciliation
+                            ),
                             "external_effect_reconciliation_required": (
                                 isinstance(audited_result, Mapping)
                                 and audited_result.get("externalEffectReconciliationRequired") is True
@@ -7309,6 +7408,14 @@ def make_loop_contract_terminal_handler(
                         **(
                             {"domain_memory_deltas": normalized_domain_memory_deltas}
                             if normalized_domain_memory_deltas is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "controller_domain_reconciliation":
+                                    controller_domain_reconciliation
+                            }
+                            if controller_domain_reconciliation is not None
                             else {}
                         ),
                         **commerce_report_metadata,

@@ -11,7 +11,7 @@ import secrets
 import struct
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from gateway.session_context import (
     get_session_env,
@@ -26,6 +26,7 @@ from hermes_cli.telegram_message_path import (
 )
 from proactive.grace_task_compiler import (
     _contract_requires_backend_original_request,
+    _worker_safe_contract,
     compile_and_delegate,
 )
 from proactive.hubops_routing import (
@@ -53,6 +54,65 @@ _TASK_TYPES = [
     *registered_worker_task_types(),
     "secondhand_commerce_group_status",
 ]
+_CONTENT_ONLY_TASK_TYPES = frozenset(
+    {"content_draft", "campaign", "product_marketing"}
+)
+
+
+def _validate_artifact_route(task_type: str, delivery: Any) -> None:
+    """Keep binary package construction off content-only workers."""
+    if task_type not in _CONTENT_ONLY_TASK_TYPES or not isinstance(delivery, Mapping):
+        return
+    filenames = delivery.get("asset_filenames") or []
+    if any(Path(str(name)).suffix.casefold() == ".zip" for name in filenames):
+        raise ValueError(
+            "ZIP artifact creation and local verification require "
+            "task_type=devops; content-only workers cannot satisfy this contract."
+        )
+
+
+def _validate_objective_workflow_route(
+    task_type: str,
+    goal: Mapping[str, Any],
+    scope: Mapping[str, Any],
+    verification: Mapping[str, Any],
+) -> None:
+    """Keep operator CLI work off the Kanban-only ops runtime."""
+    clauses = [
+        *list(goal.get("deliverables") or []),
+        *list(scope.get("allowed") or []),
+        *list(verification.get("checks") or []),
+        *list(verification.get("evidence_required") or []),
+    ]
+    requires_cli = any(
+        re.search(r"(?:^|\s)-m\s+hermes_cli\.objective_workflow\b", str(clause))
+        for clause in clauses
+    )
+    if requires_cli and task_type != "devops":
+        raise ValueError(
+            "Objective workflow CLI work requires task_type=devops; "
+            "the ops runtime is limited to Kanban/status tools."
+        )
+
+
+def _validate_completion_handoff_route(task_type: str, value: Any) -> None:
+    """Bind filesystem-backed completion to the devops worker contract."""
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise ValueError("completion_handoff must be an object.")
+    if set(value) != {"metadata_source"}:
+        raise ValueError("completion_handoff accepts only metadata_source.")
+    metadata_source = str(value.get("metadata_source") or "").strip()
+    if metadata_source not in {"inline", "workspace_file"}:
+        raise ValueError(
+            "completion_handoff.metadata_source must be inline or workspace_file."
+        )
+    if metadata_source == "workspace_file" and task_type != "devops":
+        raise ValueError(
+            "completion_handoff.metadata_source=workspace_file requires "
+            "task_type=devops; the ops runtime is limited to Kanban/status tools."
+        )
 
 
 def _is_facebook_page_publish_preflight(
@@ -356,6 +416,18 @@ _FACEBOOK_GROUP_PUBLISH = {
     "additionalProperties": False,
 }
 
+_COMPLETION_HANDOFF = {
+    "type": "object",
+    "properties": {
+        "metadata_source": {
+            "type": "string",
+            "enum": ["inline", "workspace_file"],
+        },
+    },
+    "required": ["metadata_source"],
+    "additionalProperties": False,
+}
+
 CLAWOPS_DELEGATE_PARAMETERS = {
     "type": "object",
     "properties": {
@@ -407,6 +479,15 @@ CLAWOPS_DELEGATE_PARAMETERS = {
                 "terminal only when this contract's acceptance satisfies the "
                 "complete user outcome; intermediate when another stage, "
                 "approval checkpoint, or external action remains."
+            ),
+        },
+        "completion_handoff": {
+            **_COMPLETION_HANDOFF,
+            "description": (
+                "Declare how the execution worker will submit structured completion "
+                "metadata. Use workspace_file whenever the worker must call "
+                "kanban_complete(metadata_path=...); that mode requires task_type=devops. "
+                "Omission is legacy inline-only and metadata_path will be rejected at runtime."
             ),
         },
         "risk_level": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
@@ -470,7 +551,9 @@ CLAWOPS_DELEGATE_SCHEMA = {
         "For Facebook Page preflight or publishing of an accepted package, add one exact "
         "scope.allowed entry: 'Use accepted Facebook Page package: "
         "execution_task_id=t_<id>; review_task_id=t_<id>'. Hermes pins the reviewed "
-        "message and Page Hero before dispatch; file paths alone do not select a source."
+        "message and Page Hero before dispatch; file paths alone do not select a source. "
+        "When completion metadata is handed off from a workspace JSON file, set "
+        "completion_handoff.metadata_source=workspace_file and task_type=devops."
     ),
     "parameters": CLAWOPS_DELEGATE_PARAMETERS,
 }
@@ -1273,6 +1356,20 @@ _RETRY_REVIEW_NEGATION = re.compile(
     r"(?:不要|不得|不可|禁止|do\s+not|don't)\s*(?:重試|重新執行|重新驗收|unblock|retry|re[-\s]?run)",
     re.IGNORECASE,
 )
+_RETRY_REVIEW_CONTROL = re.compile(
+    r"^\s*請重試\s+Grace\s+Review\s+(t_[A-Za-z0-9]+)\s*[。.]?\s*$",
+    re.IGNORECASE,
+)
+_RETRY_REVIEW_SESSION_RESET_ATTENTION = (
+    "origin session changed; sent safe handoff notice; "
+    "completed callback outcome remains unresolved"
+)
+
+
+def grace_review_retry_task_id(message_text: str) -> str:
+    """Return the task id only for the advertised exact retry control phrase."""
+    match = _RETRY_REVIEW_CONTROL.fullmatch(str(message_text or ""))
+    return match.group(1) if match else ""
 
 
 def _is_explicit_retry_review_message(message_text: str) -> bool:
@@ -1452,6 +1549,9 @@ def _ensure_external_action_objective_ref(
     request_instance_id: str = "",
     board: str | None = None,
     origin_objective_id: str = "",
+    origin_stage_key: str = "",
+    origin_recoverable_blocker: bool = False,
+    origin_reserved_stage_key: str = "",
     behavior_project: str = "",
 ) -> dict[str, str] | None:
     """Create/reuse a lane-bound objective for any external-action request."""
@@ -1460,6 +1560,105 @@ def _ensure_external_action_objective_ref(
     # such as go_router are not control-plane references.
     mentioned = set(re.findall(r"\bgo_ext_[0-9a-f]{24}\b", original_request))
     supplied = args.get("objective_ref")
+    if origin_objective_id and isinstance(supplied, dict):
+        supplied_id = str(supplied.get("objective_id") or "").strip()
+        supplied_is_canonical = re.fullmatch(
+            r"go_ext_[0-9a-f]{24}", supplied_id,
+        ) is not None
+        if supplied_is_canonical and supplied_id != origin_objective_id:
+            raise ValueError(
+                "Objective reference conflicts with the verified callback origin"
+            )
+        if not origin_recoverable_blocker:
+            supplied_stage = str(supplied.get("stage_key") or "").strip()
+            clean_origin_stage = str(origin_stage_key or "").strip()
+            clean_reserved_stage = str(origin_reserved_stage_key or "").strip()
+            if not clean_origin_stage:
+                raise ValueError(
+                    "Verified callback origin is missing its exact Objective stage"
+                )
+            with kb.connect_closing(board=board) as conn:
+                origin_stage = conn.execute(
+                """
+                SELECT 1
+                  FROM grace_objectives AS o
+                  JOIN grace_objective_stages AS s
+                    ON s.objective_id = o.objective_id
+                  JOIN grace_objective_stages AS origin_s
+                    ON origin_s.objective_id = o.objective_id
+                   AND origin_s.stage_key = ?
+                 WHERE o.objective_id = ? AND s.stage_key = ?
+                   AND o.platform = ? AND o.chat_id = ? AND o.thread_id = ?
+                   AND o.status IN ('active', 'waiting_approval',
+                                    'blocked', 'verifying')
+                   AND (
+                        (
+                            ? <> ''
+                            AND s.stage_key = ?
+                            AND o.current_stage_key = s.stage_key
+                            AND s.status <> 'done'
+                        )
+                        OR
+                        (
+                            ? = ''
+                            AND o.current_stage_key = origin_s.stage_key
+                            AND origin_s.status <> 'done'
+                            AND (
+                                (
+                                    s.stage_key = origin_s.stage_key
+                                    AND s.status <> 'done'
+                                )
+                                OR
+                                (
+                                    s.status = 'planned'
+                                    AND s.delegation_id IS NULL
+                                    AND s.execution_task_id IS NULL
+                                    AND s.review_task_id IS NULL
+                                    AND s.outcome_kind IS NULL
+                                    AND s.completed_at IS NULL
+                                    AND s.stage_key = (
+                                        SELECT candidate.stage_key
+                                          FROM json_each(o.required_stage_keys) AS required
+                                          JOIN grace_objective_stages AS candidate
+                                            ON candidate.objective_id = o.objective_id
+                                           AND candidate.stage_key = required.value
+                                         WHERE candidate.status = 'planned'
+                                           AND candidate.delegation_id IS NULL
+                                           AND candidate.execution_task_id IS NULL
+                                           AND candidate.review_task_id IS NULL
+                                           AND candidate.outcome_kind IS NULL
+                                           AND candidate.completed_at IS NULL
+                                         ORDER BY CAST(required.key AS INTEGER)
+                                         LIMIT 1
+                                    )
+                                )
+                            )
+                        )
+                   )
+                """,
+                (
+                    clean_origin_stage,
+                    origin_objective_id,
+                    supplied_stage,
+                    str(platform or "").strip().lower(),
+                    str(chat_id or "").strip(),
+                    str(thread_id or "").strip(),
+                    clean_reserved_stage,
+                    clean_reserved_stage,
+                    clean_reserved_stage,
+                ),
+                ).fetchone()
+            if origin_stage is None:
+                raise ValueError(
+                    "Non-canonical Objective reference does not match the "
+                    "verified callback origin stage"
+                )
+            if not supplied_is_canonical:
+                supplied = {
+                    "objective_id": origin_objective_id,
+                    "stage_key": supplied_stage,
+                }
+                args["objective_ref"] = supplied
     if origin_objective_id:
         if (mentioned and mentioned != {origin_objective_id}) or (
             isinstance(supplied, dict)
@@ -1470,6 +1669,57 @@ def _ensure_external_action_objective_ref(
     if isinstance(supplied, dict):
         if mentioned and supplied.get("objective_id") not in mentioned:
             raise ValueError("Objective reference conflicts with the explicitly named originating objective")
+        supplied_id = str(supplied.get("objective_id") or "").strip()
+        supplied_stage = str(supplied.get("stage_key") or "").strip()
+        canonical_id = re.fullmatch(r"go_ext_[0-9a-f]{24}", supplied_id)
+        with kb.connect_closing(board=board) as conn:
+            if canonical_id:
+                objective = kb.get_grace_objective(conn, supplied_id)
+                if objective is None:
+                    raise ValueError("The supplied canonical Grace objective does not exist")
+                if (
+                    objective["platform"],
+                    objective["chat_id"],
+                    objective["thread_id"],
+                ) != (
+                    str(platform or "").strip().lower(),
+                    str(chat_id or "").strip(),
+                    str(thread_id or "").strip(),
+                ):
+                    raise ValueError("Grace objective belongs to another chat or topic")
+            else:
+                matches = conn.execute(
+                    """
+                    SELECT o.objective_id
+                      FROM grace_objectives AS o
+                      JOIN grace_objective_stages AS s
+                        ON s.objective_id = o.objective_id
+                     WHERE s.stage_key = ?
+                       AND o.platform = ? AND o.chat_id = ? AND o.thread_id = ?
+                       AND o.status IN ('active', 'waiting_approval',
+                                        'blocked', 'verifying')
+                       AND o.current_stage_key = s.stage_key
+                       AND s.status <> 'done'
+                     ORDER BY o.objective_id
+                    """,
+                    (
+                        supplied_stage,
+                        str(platform or "").strip().lower(),
+                        str(chat_id or "").strip(),
+                        str(thread_id or "").strip(),
+                    ),
+                ).fetchall()
+                if len(matches) != 1:
+                    reason = "ambiguous" if matches else "not found"
+                    raise ValueError(
+                        "Non-canonical Objective reference is "
+                        f"{reason}; provide an exact stage from the same chat or topic"
+                    )
+                supplied_id = str(matches[0]["objective_id"])
+                args["objective_ref"] = {
+                    "objective_id": supplied_id,
+                    "stage_key": supplied_stage,
+                }
         return None
     if len(mentioned) > 1:
         raise ValueError("Multiple objectives are named; supply an explicit same-Topic objective_ref")
@@ -1656,6 +1906,7 @@ def handle_clawops_cancel(
         "HERMES_SESSION_OWNER_USER_ID", "",
     ).strip()
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
     trusted_message_path = normalize_message_path(
         get_session_env("HERMES_TELEGRAM_MESSAGE_PATH", "")
@@ -1787,6 +2038,7 @@ def handle_clawops_retry_review(
         "HERMES_SESSION_OWNER_USER_ID", "",
     ).strip()
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
     internal_turn = (
         get_session_env("HERMES_SESSION_INTERNAL", "").strip().lower()
@@ -1847,11 +2099,26 @@ def handle_clawops_retry_review(
                        review.body AS review_body,
                        review.block_kind AS review_block_kind,
                        review.current_run_id AS review_current_run_id,
+                       review.consecutive_failures AS review_consecutive_failures,
+                       review.max_runtime_seconds AS review_max_runtime_seconds,
+                       review.max_retries AS review_max_retries,
                        callback.user_id AS origin_user_id,
                        callback.platform AS callback_platform,
                        callback.chat_id AS callback_chat_id,
                        callback.thread_id AS callback_thread_id,
-                       callback.session_id AS callback_session_id
+                       callback.session_id AS callback_session_id,
+                       callback.state AS callback_state,
+                       callback.last_event_id AS callback_last_event_id,
+                       callback.lease_event_id AS callback_lease_event_id,
+                       callback.lease_owner AS callback_lease_owner,
+                       callback.lease_expires AS callback_lease_expires,
+                       callback.attempt_event_id AS callback_attempt_event_id,
+                       callback.last_error AS callback_last_error,
+                       callback.outcome_event_id AS callback_outcome_event_id,
+                       callback.outcome_kind AS callback_outcome_kind,
+                       callback.outcome_payload AS callback_outcome_payload,
+                       callback.objective_id AS callback_objective_id,
+                       callback.stage_key AS callback_stage_key
                   FROM grace_delegations AS d
                   JOIN tasks AS execution ON execution.id = d.execution_task_id
                   JOIN tasks AS review ON review.id = d.review_task_id
@@ -1976,40 +2243,276 @@ def handle_clawops_retry_review(
                 )
             if value.get("review_current_run_id") is not None:
                 raise ValueError("Blocked Grace Review still has an active run pointer.")
-            if value.get("review_block_kind") != "capability":
+            repaired_fault = ""
+            receipt_extra: dict[str, Any] = {}
+            callback_attention_handoff = False
+            if value.get("review_block_kind") == "capability":
+                blocked_event = conn.execute(
+                    """
+                    SELECT payload
+                      FROM task_events
+                     WHERE task_id = ? AND kind = 'blocked'
+                     ORDER BY id DESC
+                     LIMIT 1
+                    """,
+                    (review_task_id,),
+                ).fetchone()
+                try:
+                    blocked_payload = (
+                        json.loads(blocked_event["payload"])
+                        if blocked_event is not None and blocked_event["payload"]
+                        else {}
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    blocked_payload = {}
+                blocked_reason = str(blocked_payload.get("reason") or "")
+                if (
+                    blocked_payload.get("kind") != "capability"
+                    or "managed_policy_read" not in blocked_reason
+                    or "Topic policy binding not found" not in blocked_reason
+                ):
+                    raise ValueError(
+                        "Grace Review blocker is not the repaired managed-policy binding fault."
+                    )
+                from proactive.policy_registry import resolve_task_policy_snapshots
+
+                resolve_task_policy_snapshots(str(value.get("review_body") or ""))
+                repaired_fault = "managed_policy_absent_binding"
+            elif value.get("review_block_kind") in {None, ""}:
+                from proactive.behavior_profiles import registry as behavior_registry
+
+                latest_event = conn.execute(
+                    """
+                    SELECT id, kind, payload
+                      FROM task_events
+                     WHERE task_id = ?
+                       AND kind IN ('completed', 'blocked', 'gave_up', 'cancelled')
+                     ORDER BY id DESC
+                     LIMIT 1
+                    """,
+                    (review_task_id,),
+                ).fetchone()
+                try:
+                    gave_up = (
+                        json.loads(latest_event["payload"] or "{}")
+                        if latest_event is not None else {}
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    gave_up = {}
+                if not isinstance(gave_up, dict):
+                    gave_up = {}
+                timeout_runs = conn.execute(
+                    """
+                    SELECT id, status, outcome, max_runtime_seconds, error
+                      FROM task_runs
+                     WHERE task_id = ?
+                     ORDER BY id
+                    """,
+                    (review_task_id,),
+                ).fetchall()
+                timeout_events = conn.execute(
+                    """
+                    SELECT run_id
+                      FROM task_events
+                     WHERE task_id = ? AND kind = 'timed_out'
+                     ORDER BY id
+                    """,
+                    (review_task_id,),
+                ).fetchall()
+                previous_runtime = int(value.get("review_max_runtime_seconds") or 0)
+                exact_timeout_lineage = bool(
+                    latest_event is not None
+                    and latest_event["kind"] == "gave_up"
+                    and gave_up.get("trigger_outcome") == "timed_out"
+                    and type(gave_up.get("failures")) is int
+                    and gave_up.get("failures") == 2
+                    and type(gave_up.get("effective_limit")) is int
+                    and gave_up.get("effective_limit") == 2
+                    and value.get("review_consecutive_failures") == 2
+                    and len(timeout_runs) == 2
+                    and [int(event["run_id"] or 0) for event in timeout_events]
+                    == [int(run["id"]) for run in timeout_runs]
+                    and all(
+                        run["status"] == "timed_out"
+                        and run["outcome"] == "timed_out"
+                        and int(run["max_runtime_seconds"] or 0) == previous_runtime
+                        and behavior_registry._timeout_error_matches(
+                            run["error"], previous_runtime,
+                        )
+                        for run in timeout_runs
+                    )
+                )
+                now = int(time.time())
+                callback_attention_handoff = bool(
+                    value.get("callback_state") == "attention"
+                    and value.get("callback_last_error")
+                    == _RETRY_REVIEW_SESSION_RESET_ATTENTION
+                    and value.get("callback_lease_event_id") is None
+                    and value.get("callback_lease_owner") is None
+                    and value.get("callback_lease_expires") is None
+                    and value.get("callback_attempt_event_id")
+                    == (latest_event["id"] if latest_event is not None else None)
+                    and session_id
+                )
+                callback_available = bool(
+                    (
+                        value.get("callback_state") in {"pending", "delivering"}
+                        or callback_attention_handoff
+                    )
+                    and value.get("callback_outcome_event_id") is None
+                    and value.get("callback_outcome_kind") is None
+                    and value.get("callback_outcome_payload") is None
+                    and int(value.get("callback_last_event_id") or 0)
+                    < int(latest_event["id"] if latest_event is not None else 0)
+                    and (
+                        value.get("callback_lease_expires") is None
+                        or int(value["callback_lease_expires"]) <= now
+                    )
+                )
+                objective_id = str(value.get("callback_objective_id") or "").strip()
+                stage_key = str(value.get("callback_stage_key") or "").strip()
+                objective = kb.get_grace_objective(conn, objective_id) if objective_id else None
+                stage = conn.execute(
+                    """
+                    SELECT status, review_task_id
+                      FROM grace_objective_stages
+                     WHERE objective_id = ? AND stage_key = ?
+                    """,
+                    (objective_id, stage_key),
+                ).fetchone()
+                objective_current = bool(
+                    objective is not None
+                    and objective.get("status") == "active"
+                    and objective.get("current_stage_key") == stage_key
+                    and stage is not None
+                    and stage["status"] == "queued"
+                    and stage["review_task_id"] == review_task_id
+                )
+                if not (exact_timeout_lineage and callback_available and objective_current):
+                    failed_checks = [
+                        name
+                        for name, passed in (
+                            ("timeout_lineage", exact_timeout_lineage),
+                            ("callback_available", callback_available),
+                            ("objective_current", objective_current),
+                        )
+                        if not passed
+                    ]
+                    raise ValueError(
+                        "Grace Review is not the exact current two-timeout recovery target: "
+                        + ", ".join(failed_checks)
+                    )
+                if callback_attention_handoff:
+                    conn.execute(
+                        """
+                        UPDATE grace_loop_callbacks
+                           SET state='pending', session_id=?, attempts=0,
+                               last_error=NULL, lease_event_id=NULL,
+                               lease_owner=NULL, lease_expires=NULL,
+                               attempt_event_id=NULL
+                         WHERE review_task_id=? AND state='attention'
+                           AND last_error=? AND attempt_event_id=?
+                           AND outcome_event_id IS NULL AND lease_owner IS NULL
+                        """,
+                        (
+                            session_id,
+                            review_task_id,
+                            _RETRY_REVIEW_SESSION_RESET_ATTENTION,
+                            int(latest_event["id"]),
+                        ),
+                    )
+                    if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                        raise RuntimeError(
+                            "Grace Review callback handoff changed before retry."
+                        )
+                    receipt_extra["callback_session_handoff_recovered"] = True
+                try:
+                    pin = behavior_registry.guard_task(conn, review_task_id)
+                except behavior_registry.BehaviorProfileError as exc:
+                    if str(exc) != "behavior.manifest_mismatch":
+                        raise
+                    previous_pin = behavior_registry.get_pin(conn, objective_id)
+                    if not previous_pin:
+                        raise ValueError(
+                            "Grace Review timeout recovery has no Objective behavior pin."
+                        ) from exc
+                    migration = behavior_registry.migrate_objective(
+                        conn,
+                        objective_id=objective_id,
+                        platform=str(objective["platform"]),
+                        chat_id=str(objective["chat_id"]),
+                        thread_id=str(objective["thread_id"]),
+                        profile_id=previous_pin["behavior_profile_id"],
+                        version=previous_pin["behavior_profile_version"],
+                        expected_revision=int(objective["revision"]),
+                        expected_pin_hash=behavior_registry.digest(previous_pin),
+                        reason=(
+                            "Authenticated same-card recovery after exactly two "
+                            "formal-review cold-start timeouts."
+                        ),
+                        project_namespace=previous_pin["project_namespace"],
+                        recovery_review_task_id=review_task_id,
+                        apply=True,
+                    )
+                    pin = behavior_registry.guard_task(conn, review_task_id)
+                    receipt_extra.update({
+                        "behavior_repin_previous_sha256": (
+                            behavior_registry.digest(previous_pin)
+                        ),
+                        "behavior_repin_next_sha256": behavior_registry.digest(
+                            migration["next_pin"]
+                        ),
+                        "behavior_repin_previous_generation": previous_pin["generation"],
+                        "behavior_repin_generation": migration["next_pin"]["generation"],
+                        "behavior_repin_objective_revision": migration["next_revision"],
+                    })
+                if not pin or pin.get("behavior_profile_version") != "v47":
+                    raise ValueError(
+                        "Grace Review timeout recovery requires the verified v47 runtime."
+                    )
+                contract = kb._grace_compiled_contract(
+                    str(value.get("review_body") or "")
+                )
+                if not isinstance(contract, dict):
+                    raise ValueError("Grace Review timeout recovery has no sealed contract.")
+                runtime_contract = dict(contract)
+                runtime_contract["behavior_pin"] = pin
+                # The re-pin is still uncommitted, so a board-opening resolver
+                # would see the old pin on its second SQLite connection.
+                manifest = behavior_registry.verify_pin(pin)
+                compiler = behavior_registry._load_component(manifest, "compiler")
+                repaired_runtime = int(
+                    compiler.review_max_runtime_seconds(runtime_contract)
+                )
+                if repaired_runtime <= previous_runtime:
+                    raise ValueError(
+                        "Grace Review timeout recovery did not increase its runtime budget."
+                    )
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET max_runtime_seconds = ?, max_retries = 1
+                     WHERE id = ? AND status = 'blocked'
+                       AND current_run_id IS NULL
+                       AND consecutive_failures = 2
+                       AND max_runtime_seconds = ?
+                    """,
+                    (repaired_runtime, review_task_id, previous_runtime),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise RuntimeError("Grace Review timeout recovery lost its task CAS.")
+                repaired_fault = "formal_review_cold_start_budget"
+                receipt_extra.update({
+                    "previous_max_runtime_seconds": previous_runtime,
+                    "max_runtime_seconds": repaired_runtime,
+                    "max_retries": 1,
+                    "timeout_run_ids": [int(run["id"]) for run in timeout_runs],
+                    "gave_up_event_id": int(latest_event["id"]),
+                })
+            else:
                 raise ValueError(
                     "Grace Review retry is restricted to a repaired capability blocker."
                 )
-            blocked_event = conn.execute(
-                """
-                SELECT payload
-                  FROM task_events
-                 WHERE task_id = ? AND kind = 'blocked'
-                 ORDER BY id DESC
-                 LIMIT 1
-                """,
-                (review_task_id,),
-            ).fetchone()
-            try:
-                blocked_payload = (
-                    json.loads(blocked_event["payload"])
-                    if blocked_event is not None and blocked_event["payload"]
-                    else {}
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                blocked_payload = {}
-            blocked_reason = str(blocked_payload.get("reason") or "")
-            if (
-                blocked_payload.get("kind") != "capability"
-                or "managed_policy_read" not in blocked_reason
-                or "Topic policy binding not found" not in blocked_reason
-            ):
-                raise ValueError(
-                    "Grace Review blocker is not the repaired managed-policy binding fault."
-                )
-            from proactive.policy_registry import resolve_task_policy_snapshots
-
-            resolve_task_policy_snapshots(str(value.get("review_body") or ""))
             if not kb.unblock_task(conn, review_task_id):
                 raise RuntimeError("Grace Review could not be moved back to ready.")
             kb._append_event(
@@ -2024,7 +2527,8 @@ def handle_clawops_retry_review(
                     "message_id": message_id,
                     "review_task_id": review_task_id,
                     "execution_task_id": value["execution_task_id"],
-                    "repaired_fault": "managed_policy_absent_binding",
+                    "repaired_fault": repaired_fault,
+                    **receipt_extra,
                 },
             )
             retried = kb.get_task(conn, review_task_id)
@@ -2187,6 +2691,7 @@ def _reviewed_source_asset_manifest(metadata: dict[str, Any]) -> list[dict[str, 
                 return
             candidates = (
                 (value.get("path"), value.get("sha256")),
+                (value.get("canonicalPath"), value.get("sha256")),
                 (value.get("image_path"), value.get("image_sha256")),
             )
             for raw_path, raw_sha in candidates:
@@ -2212,10 +2717,14 @@ def _reviewed_source_asset_manifest(metadata: dict[str, Any]) -> list[dict[str, 
                 except OSError:
                     continue
                 if actual_sha == sha256:
-                    assets[(str(path), sha256)] = {
+                    identity = (str(path), sha256)
+                    asset = assets.setdefault(identity, {
                         "path": str(path),
                         "sha256": sha256,
-                    }
+                    })
+                    family = str(value.get("asset_family") or "").strip()
+                    if family:
+                        asset["asset_family"] = family
             for child in value.values():
                 visit(child)
         elif isinstance(value, list):
@@ -2225,6 +2734,94 @@ def _reviewed_source_asset_manifest(metadata: dict[str, Any]) -> list[dict[str, 
     visit(metadata.get("acceptance_evidence"))
     visit(metadata.get("user_facing_report"))
     return [assets[key] for key in sorted(assets)]
+
+
+def _unique_reviewed_asset_source(
+    candidates: list[tuple[str, Any, list[dict[str, str]]]],
+    expected_names: set[str],
+) -> tuple[str, Any] | None:
+    matches: dict[tuple[tuple[str, str], ...], tuple[str, Any]] = {}
+    for execution_id, run, assets in candidates:
+        if len(assets) != len(expected_names) or {
+            Path(asset["path"]).name for asset in assets
+        } != expected_names:
+            continue
+        identity = tuple(
+            sorted((asset["path"], asset["sha256"]) for asset in assets)
+        )
+        matches.setdefault(identity, (execution_id, run))
+    if len(matches) > 1:
+        raise ValueError(
+            "Objective source lineage has ambiguous accepted asset identities; "
+            "stop internal handoff."
+        )
+    return next(iter(matches.values()), None)
+
+
+def _unique_reviewed_asset_manifest(
+    candidates: list[tuple[str, Any, list[dict[str, str]]]],
+    expected_names: set[str],
+) -> tuple[list[dict[str, str]], list[tuple[str, Any]]] | None:
+    """Resolve one reviewed identity per requested filename across stages.
+
+    Visual corrections can accept one asset family at a time.  Requiring a
+    single execution run to contain the whole requested set therefore loses a
+    preserved Page Hero when a later Audio-only correction is accepted.  The
+    requested filenames are already contract-bound, so merge only exact-name
+    matches and fail closed if any filename has more than one byte identity.
+    """
+    identities: dict[str, dict[tuple[str, str], tuple[str, Any]]] = {
+        name: {} for name in expected_names
+    }
+    for execution_id, run, assets in candidates:
+        for asset in assets:
+            identity = (asset["path"], asset["sha256"])
+            physical_name = Path(asset["path"]).name
+            family = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                str(asset.get("asset_family") or "").casefold(),
+            ).strip("_")
+            for name in expected_names:
+                normalized_name = re.sub(
+                    r"[^a-z0-9]+", "_", name.casefold()
+                ).strip("_")
+                if physical_name == name or (
+                    family
+                    and re.search(
+                        rf"(?:^|_){re.escape(family)}(?:_|$)",
+                        normalized_name,
+                    )
+                ):
+                    identities[name].setdefault(
+                        identity, (execution_id, run)
+                    )
+    if any(not matches for matches in identities.values()):
+        return None
+    if any(len(matches) > 1 for matches in identities.values()):
+        raise ValueError(
+            "Objective source lineage has ambiguous accepted asset identities; "
+            "stop internal handoff."
+        )
+    manifest: list[dict[str, str]] = []
+    sources: list[tuple[str, Any]] = []
+    seen_sources: set[tuple[str, int]] = set()
+    seen_assets: set[tuple[str, str]] = set()
+    for name in sorted(expected_names):
+        matches = identities[name]
+        (path, sha256), source = next(iter(matches.items()))
+        if (path, sha256) in seen_assets:
+            raise ValueError(
+                "Objective source lineage does not map accepted assets one-to-one; "
+                "stop internal handoff."
+            )
+        seen_assets.add((path, sha256))
+        manifest.append({"path": path, "sha256": sha256})
+        source_key = (source[0], int(source[1]["id"]))
+        if source_key not in seen_sources:
+            seen_sources.add(source_key)
+            sources.append(source)
+    return manifest, sources
 
 
 def _requires_objective_source_handoff(contract: dict[str, Any]) -> bool:
@@ -2241,6 +2838,20 @@ def _requires_objective_source_handoff(contract: dict[str, Any]) -> bool:
     return _contract_requires_backend_original_request(
         {**contract, "original_request": ""}
     )
+
+
+def _source_handoff_for_request(
+    conn: sqlite3.Connection,
+    contract: dict[str, Any],
+    source_origin: dict[str, Any],
+    *,
+    internal_turn: bool,
+) -> list[str]:
+    if source_origin or (
+        not internal_turn and _requires_objective_source_handoff(contract)
+    ):
+        return _objective_source_handoff(conn, contract, source_origin)
+    return []
 
 
 def _guard_recoverable_callback_domain_memory(
@@ -2300,6 +2911,44 @@ def _guard_recoverable_callback_domain_memory(
             "Recoverable callback successor cannot add, remove, or change "
             "domain_memory authorization. Correct the worker output within "
             "the originating contract."
+        )
+
+    source_delivery = source_contract.get("user_facing_delivery")
+    if not (
+        isinstance(source_delivery, dict)
+        and source_delivery.get("kind") == "content_package"
+        and source_delivery.get("delivery") == "inline_with_attachment"
+    ):
+        return
+    current_delivery = contract.get("user_facing_delivery")
+    if not isinstance(current_delivery, dict) or any(
+        type(current_delivery.get(field)) is not type(source_delivery.get(field))
+        or current_delivery.get(field) != source_delivery.get(field)
+        for field in ("required", "kind", "delivery")
+    ):
+        raise ValueError(
+            "Recoverable callback successor cannot change the originating "
+            "content-package delivery contract."
+        )
+    source_filenames = source_delivery.get("asset_filenames")
+    if not (
+        isinstance(source_filenames, list)
+        and source_filenames
+        and all(
+            isinstance(name, str) and bool(name.strip())
+            for name in source_filenames
+        )
+    ):
+        raise ValueError(
+            "Recoverable callback has no valid originating content-package "
+            "asset filenames; stop internal recovery."
+        )
+    if "asset_filenames" not in current_delivery:
+        current_delivery["asset_filenames"] = list(source_filenames)
+    elif current_delivery.get("asset_filenames") != source_filenames:
+        raise ValueError(
+            "Recoverable callback successor cannot change the originating "
+            "content-package asset filenames."
         )
 
 
@@ -2388,6 +3037,11 @@ def _objective_source_handoff(
     review_id = str(callback.get("review_task_id") or "").strip()
     lineage: list[tuple[str, list[sqlite3.Row]]] = []
     reviewed_source_run_ids: set[int] = set()
+    resolved_reviewed_assets: list[dict[str, str]] = []
+    sealed_source_contracts: dict[tuple[str, int], dict[str, Any]] = {}
+    canonical_root_assets: dict[
+        tuple[str, int], list[dict[str, str]]
+    ] = {}
     seen: set[str] = set()
     lineage_event_id: int | None = callback.get("source_event_id")
 
@@ -2469,11 +3123,14 @@ def _objective_source_handoff(
     def authenticated_root_source_run(
         delegation: dict[str, Any],
         trigger: sqlite3.Row | None,
-    ) -> sqlite3.Row:
-        """Recover only the compiler-sealed user request from a blocked root run."""
+        *,
+        stage_execution_id: str | None = None,
+    ) -> tuple[sqlite3.Row, bool]:
+        """Authenticate a blocked root and report whether it embeds source bytes."""
+        root_execution_id = stage_execution_id or execution_id
         if (
             trigger is None
-            or str(trigger["task_id"] or "") != execution_id
+            or str(trigger["task_id"] or "") != root_execution_id
             or trigger["run_id"] is None
             or delegation.get("origin_event_id") is not None
         ):
@@ -2484,7 +3141,7 @@ def _objective_source_handoff(
         run = kb.get_run(conn, int(trigger["run_id"]))
         task = conn.execute(
             "SELECT body, project_namespace FROM tasks WHERE id = ?",
-            (execution_id,),
+            (root_execution_id,),
         ).fetchone()
         row = conn.execute(
             "SELECT id, task_id, metadata FROM task_runs WHERE id = ?",
@@ -2507,9 +3164,23 @@ def _objective_source_handoff(
         trusted_ref = snapshot.get("objective_ref") if isinstance(snapshot, dict) else None
         original = snapshot.get("original_request") if isinstance(snapshot, dict) else None
         compiled_audit = compiled.get("audit") if isinstance(compiled, dict) else None
+        expected_compiled = (
+            _worker_safe_contract(snapshot) if isinstance(snapshot, dict) else None
+        )
         digest = (
             str(compiled_audit.get("original_request_sha256") or "").strip().lower()
             if isinstance(compiled_audit, dict)
+            else ""
+        )
+        requested_by = (
+            trusted_identity.get("requested_by")
+            if isinstance(trusted_identity, dict)
+            else None
+        )
+        codex_local_correction = requested_by == "codex_local_operator"
+        sealed_codex_thread_id = (
+            str(trusted_identity.get("codex_thread_id") or "").strip()
+            if isinstance(trusted_identity, dict)
             else ""
         )
         expected_identity = {
@@ -2517,7 +3188,7 @@ def _objective_source_handoff(
             "chat_id": lane[1],
             "thread_id": lane[2],
             "project": project,
-            "requested_by": "authenticated_user",
+            "requested_by": requested_by,
             "compiled_by": "Grace",
         }
         expected_ref = {
@@ -2526,7 +3197,7 @@ def _objective_source_handoff(
         }
         if (
             run is None
-            or run.task_id != execution_id
+            or run.task_id != root_execution_id
             or run.status != "blocked"
             or run.outcome != "blocked"
             or not run.ended_at
@@ -2535,21 +3206,65 @@ def _objective_source_handoff(
             or str(task["project_namespace"] or "").strip() != project
             or not isinstance(snapshot, dict)
             or not isinstance(compiled, dict)
-            or not isinstance(source_contract, dict)
+            or compiled != expected_compiled
             or not isinstance(trusted_identity, dict)
             or any(trusted_identity.get(key) != value for key, value in expected_identity.items())
             or trusted_ref != expected_ref
             or compiled.get("identity") != trusted_identity
             or compiled.get("objective_ref") != trusted_ref
-            or compiled.get("original_request") != original
-            or source_contract.get("identity") != trusted_identity
-            or source_contract.get("objective_ref") != trusted_ref
-            or source_contract.get("original_request") != original
+            or requested_by not in {"authenticated_user", "codex_local_operator"}
+            or (
+                codex_local_correction
+                and (
+                    re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                        r"[0-9a-f]{4}-[0-9a-f]{12}",
+                        sealed_codex_thread_id,
+                    )
+                    is None
+                    or delegation.get("session_key")
+                    != f"codex:thread:{sealed_codex_thread_id}"
+                    or re.fullmatch(
+                        r"gri_[0-9a-f]{32}",
+                        str(delegation.get("request_instance_id") or ""),
+                    )
+                    is None
+                    or trusted_identity.get("request_instance_id")
+                    != delegation.get("request_instance_id")
+                    or bool(delegation.get("approval_required"))
+                    or delegation.get("challenge_token") is not None
+                    or delegation.get("approved_message_id") is not None
+                    or bool(snapshot.get("external_targets"))
+                    or not _has_zero_external_effect_constraint(
+                        snapshot,
+                        snapshot.get("goal")
+                        if isinstance(snapshot.get("goal"), dict)
+                        else {},
+                        snapshot.get("scope")
+                        if isinstance(snapshot.get("scope"), dict)
+                        else {},
+                    )
+                )
+            )
             or not isinstance(original, str)
             or not original
             or original.lstrip().startswith("[SYSTEM: Grace Loop callback]")
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
             or hashlib.sha256(original.encode("utf-8")).hexdigest() != digest
+        ):
+            raise ValueError(
+                "Recoverable source blocker has no compiler-sealed authenticated "
+                "root request; stop internal handoff."
+            )
+        source_embedded = (
+            compiled.get("original_request") == original
+            and original == objective["objective"]
+        )
+        if source_embedded and (
+            not isinstance(source_contract, dict)
+            or source_contract.get("identity") != trusted_identity
+            or source_contract.get("objective_ref") != trusted_ref
+            or source_contract.get("original_request") != original
             or not isinstance(source_audit, dict)
             or source_audit.get("original_request_sha256") != digest
         ):
@@ -2557,7 +3272,64 @@ def _objective_source_handoff(
                 "Recoverable source blocker has no compiler-sealed authenticated "
                 "root request; stop internal handoff."
             )
-        return row
+        return row, source_embedded
+
+    def controller_sealed_source_contract(
+        delegation: dict[str, Any],
+        row: sqlite3.Row,
+    ) -> dict[str, Any] | None:
+        """Recover a legacy accepted run from its two controller-owned seals."""
+        task = conn.execute(
+            "SELECT body,project_namespace FROM tasks WHERE id=?",
+            (str(row["task_id"]),),
+        ).fetchone()
+        try:
+            snapshot = json.loads(delegation.get("contract_snapshot") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = None
+        compiled = (
+            kb._grace_compiled_contract(str(task["body"] or ""))
+            if task is not None
+            else None
+        )
+        identity = compiled.get("identity") if isinstance(compiled, dict) else None
+        ref = compiled.get("objective_ref") if isinstance(compiled, dict) else None
+        audit = compiled.get("audit") if isinstance(compiled, dict) else None
+        original = compiled.get("original_request") if isinstance(compiled, dict) else None
+        digest = (
+            str(audit.get("original_request_sha256") or "").strip().lower()
+            if isinstance(audit, dict)
+            else ""
+        )
+        without_audit = (
+            {key: value for key, value in compiled.items() if key != "audit"}
+            if isinstance(compiled, dict)
+            else None
+        )
+        if (
+            task is None
+            or str(task["project_namespace"] or "").strip() != project
+            or not isinstance(snapshot, dict)
+            or snapshot != without_audit
+            or not isinstance(identity, dict)
+            or (
+                str(identity.get("platform") or "").strip().lower(),
+                str(identity.get("chat_id") or "").strip(),
+                str(identity.get("thread_id") or "").strip(),
+            ) != lane
+            or str(identity.get("project") or "").strip() != project
+            or not isinstance(ref, dict)
+            or str(ref.get("objective_id") or "").strip() != objective_id
+            or str(ref.get("stage_key") or "").strip()
+            != str(delegation.get("stage_key") or "").strip()
+            or not isinstance(original, str)
+            or not original
+            or original.lstrip().startswith("[SYSTEM: Grace Loop callback]")
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or hashlib.sha256(original.encode("utf-8")).hexdigest() != digest
+        ):
+            return None
+        return compiled
 
     while execution_id:
         if execution_id in seen or len(seen) >= 64:
@@ -2639,13 +3411,23 @@ def _objective_source_handoff(
                 stage_execution_id=execution_id,
                 stage_review_id=review_id,
             )
+            try:
+                source_metadata = json.loads(source_run["metadata"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                source_metadata = {}
+            if not isinstance(source_metadata.get("loop_contract"), dict):
+                sealed = controller_sealed_source_contract(delegation, source_run)
+                if sealed is not None:
+                    sealed_source_contracts[(execution_id, int(source_run["id"]))] = sealed
             lineage.append((execution_id, [source_run]))
         review_id = str(delegation.get("origin_review_task_id") or "").strip()
         if not review_id:
             if recoverable_blocker:
-                lineage.append(
-                    (execution_id, [authenticated_root_source_run(delegation, trigger)])
+                source_row, source_embedded = authenticated_root_source_run(
+                    delegation, trigger
                 )
+                if source_embedded:
+                    lineage.append((execution_id, [source_row]))
             break
         parent_callback = kb.get_grace_loop_callback(conn, review_id)
         parent_execution_id = str(
@@ -2678,6 +3460,28 @@ def _objective_source_handoff(
         for task_id, runs in lineage
         for row in runs
     }
+    expected_asset_names = set(
+        (contract.get("user_facing_delivery") or {}).get("asset_filenames")
+        or []
+    )
+    if expected_asset_names:
+        lineage_candidates = [
+            (
+                task_id,
+                row,
+                _reviewed_source_asset_manifest(
+                    kb.get_run(conn, int(row["id"])).metadata or {}
+                ),
+            )
+            for task_id, runs in lineage
+            for row in runs
+            if int(row["id"]) in reviewed_source_run_ids
+        ]
+        resolved = _unique_reviewed_asset_manifest(
+            lineage_candidates, expected_asset_names
+        )
+        if resolved is not None:
+            resolved_reviewed_assets, _ = resolved
 
     def verified_payload(payload: dict[str, Any]) -> dict[str, Any]:
         source_text = payload.get("original_request")
@@ -2690,14 +3494,40 @@ def _objective_source_handoff(
             # A human continuation seals the declared root package rather than
             # a callback parent. Re-verify that root, never trust its text alone.
             origin = _declared_root_source_origin(conn, objective_ref)
-            if origin.get("execution_task_id") not in seen and origin:
-                canonical = _objective_source_handoff(conn, contract, origin)
-                root_payload = json.loads(canonical[0][len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX):])
-                fields = ("objective_id", "execution_task_id", "run_id", "original_request", "utf8_sha256")
-                if all(payload.get(key) == root_payload.get(key) for key in fields):
+            canonical_origin = (
+                origin
+                if origin and origin.get("execution_task_id") not in seen
+                else {}
+            )
+            try:
+                canonical = _objective_source_handoff(
+                    conn, contract, canonical_origin
+                )
+            except ValueError:
+                canonical = []
+            if canonical:
+                root_payload = json.loads(
+                    canonical[0][len(_OBJECTIVE_SOURCE_PACKAGE_PREFIX) :]
+                )
+                fields = (
+                    "objective_id",
+                    "execution_task_id",
+                    "run_id",
+                    "original_request",
+                    "utf8_sha256",
+                )
+                if all(
+                    payload.get(key) == root_payload.get(key)
+                    for key in fields
+                ):
                     trusted_lineage_runs.add((source_task_id, source_run_id))
-                    if root_payload.get("assets"):
-                        reviewed_source_run_ids.add(source_run_id)
+                    root_assets = root_payload.get("assets")
+                    if isinstance(root_assets, list) and root_assets:
+                        canonical_root_assets[(source_task_id, source_run_id)] = [
+                            dict(asset)
+                            for asset in root_assets
+                            if isinstance(asset, dict)
+                        ]
         if (
             payload.get("objective_id") != objective_id
             or not isinstance(source_text, str)
@@ -2715,6 +3545,10 @@ def _objective_source_handoff(
             if source_run is not None and source_run.task_id == source_task_id
             else None
         )
+        if not isinstance(source_contract, dict):
+            source_contract = sealed_source_contracts.get(
+                (source_task_id, source_run_id)
+            )
         source_audit = (
             source_contract.get("audit")
             if isinstance(source_contract, dict)
@@ -2738,11 +3572,11 @@ def _objective_source_handoff(
             )
         verified = dict(payload)
         verified.pop("assets", None)
-        assets = (
-            _reviewed_source_asset_manifest(source_run.metadata or {})
-            if source_run.id in reviewed_source_run_ids
-            else []
+        assets = canonical_root_assets.get(
+            (source_task_id, source_run_id), []
         )
+        if source_run.id in reviewed_source_run_ids:
+            assets = _reviewed_source_asset_manifest(source_run.metadata or {})
         # The manuscript stays rooted; images may be the accepted correction
         # from the nearest descendant review (for example, an episode change).
         for _, runs in lineage:
@@ -2753,8 +3587,13 @@ def _objective_source_handoff(
             if nearest_assets:
                 assets = nearest_assets
                 break
+        if resolved_reviewed_assets:
+            assets = resolved_reviewed_assets
         if assets:
-            verified["assets"] = assets
+            verified["assets"] = [
+                {"path": asset["path"], "sha256": asset["sha256"]}
+                for asset in assets
+            ]
         return verified
 
     for task_id, runs in lineage:
@@ -2764,6 +3603,10 @@ def _objective_source_handoff(
             except (TypeError, ValueError, json.JSONDecodeError):
                 metadata = {}
             source_contract = metadata.get("loop_contract")
+            if not isinstance(source_contract, dict):
+                source_contract = sealed_source_contracts.get(
+                    (task_id, int(row["id"]))
+                )
             if not isinstance(source_contract, dict):
                 continue
             original = source_contract.get("original_request")
@@ -2823,6 +3666,130 @@ def _objective_source_handoff(
                         separators=(",", ":"),
                     )
                 ]
+    # A user-authorized direct correction can intentionally start a new stage
+    # without a callback parent. Recover the canonical manuscript from the
+    # earliest authenticated Objective root and re-run every existing seal.
+    root = conn.execute(
+        "SELECT d.*, (SELECT MAX(e.id) FROM task_events e WHERE "
+        "e.task_id=d.execution_task_id AND e.kind='blocked') AS source_event_id "
+        "FROM grace_objective_stages s JOIN grace_delegations d "
+        "ON d.delegation_id=s.delegation_id "
+        "WHERE s.objective_id=? AND d.origin_event_id IS NULL "
+        "ORDER BY s.position",
+        (objective_id,),
+    ).fetchall()
+    candidates = []
+    for candidate in root:
+        try:
+            snapshot = json.loads(candidate["contract_snapshot"] or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        source_identity = snapshot.get("identity") if isinstance(snapshot, dict) else None
+        if (
+            str(candidate["execution_task_id"] or "") in seen
+            or not isinstance(source_identity, dict)
+            or source_identity.get("requested_by") != "authenticated_user"
+            or snapshot.get("original_request") != objective["objective"]
+        ):
+            continue
+        candidates.append(candidate)
+    if len(candidates) > 1:
+        raise ValueError(
+            "Objective source lineage has ambiguous authenticated root candidates; "
+            "stop internal handoff."
+        )
+    if candidates:
+        candidate = candidates[0]
+        source_execution_id = str(candidate["execution_task_id"] or "")
+        trigger = conn.execute(
+            "SELECT id,task_id,kind,payload,run_id FROM task_events WHERE id=?",
+            (candidate["source_event_id"],),
+        ).fetchone()
+        source_row, source_embedded = authenticated_root_source_run(
+            dict(candidate),
+            trigger,
+            stage_execution_id=source_execution_id,
+        )
+        if not source_embedded:
+            raise ValueError(
+                "Authenticated Objective root does not embed source bytes; "
+                "stop internal handoff."
+            )
+        trusted_lineage_runs.add((source_execution_id, int(source_row["id"])))
+        source_contract = json.loads(source_row["metadata"] or "{}")[
+            "loop_contract"
+        ]
+        original = source_contract["original_request"]
+        digest = source_contract["audit"]["original_request_sha256"]
+        expected_asset_names = set(
+            (contract.get("user_facing_delivery") or {}).get("asset_filenames")
+            or []
+        )
+        reviewed = conn.execute(
+            "SELECT d.execution_task_id,d.review_task_id FROM grace_delegations d "
+            "JOIN grace_loop_callbacks c ON c.review_task_id=d.review_task_id "
+            "JOIN tasks e ON e.id=d.execution_task_id "
+            "JOIN tasks r ON r.id=d.review_task_id "
+            "WHERE d.objective_id=? AND c.objective_id=? "
+            "AND c.execution_task_id=d.execution_task_id "
+            "AND c.platform=? AND c.chat_id=? AND c.thread_id=? "
+            "AND e.project_namespace=? AND r.project_namespace=? "
+            "AND EXISTS (SELECT 1 FROM task_links l WHERE "
+            "l.parent_id=d.execution_task_id AND l.child_id=d.review_task_id) "
+            "ORDER BY COALESCE(c.outcome_event_id,c.last_event_id,0) DESC",
+            (objective_id, objective_id, *lane, project, project),
+        ).fetchall()
+        reviewed_candidates = []
+        for reviewed_stage in reviewed:
+            stage_callback = kb.get_grace_loop_callback(
+                conn, str(reviewed_stage["review_task_id"])
+            )
+            try:
+                reviewed_run = accepted_source_run(
+                    stage_callback or {},
+                    stage_execution_id=str(reviewed_stage["execution_task_id"]),
+                    stage_review_id=str(reviewed_stage["review_task_id"]),
+                )
+            except ValueError:
+                continue
+            reviewed_assets = _reviewed_source_asset_manifest(
+                kb.get_run(conn, int(reviewed_run["id"])).metadata or {}
+            )
+            reviewed_candidates.append(
+                (
+                    str(reviewed_stage["execution_task_id"]),
+                    reviewed_run,
+                    reviewed_assets,
+                )
+            )
+        selected_assets = _unique_reviewed_asset_manifest(
+            reviewed_candidates, expected_asset_names
+        )
+        if selected_assets is not None:
+            resolved_reviewed_assets, selected_sources = selected_assets
+            for selected_execution_id, selected_run in selected_sources:
+                lineage.append((selected_execution_id, [selected_run]))
+                trusted_lineage_runs.add(
+                    (selected_execution_id, int(selected_run["id"]))
+                )
+                reviewed_source_run_ids.add(int(selected_run["id"]))
+        return [
+            _OBJECTIVE_SOURCE_PACKAGE_PREFIX
+            + json.dumps(
+                verified_payload(
+                    {
+                        "objective_id": objective_id,
+                        "execution_task_id": source_execution_id,
+                        "run_id": int(source_row["id"]),
+                        "original_request": original,
+                        "utf8_sha256": digest,
+                    }
+                ),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ]
     raise ValueError(
         "Source-bound content package has no exact original request in its "
         "verified Objective lineage; stop internal handoff."
@@ -3189,6 +4156,20 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         if _is_facebook_page_publish_preflight(goal, scope, verification):
             task_type = "facebook_page_publish_preflight"
         normalized_task_type = normalize_clawops_task_type(task_type)
+        _validate_artifact_route(
+            normalized_task_type,
+            args.get("user_facing_delivery"),
+        )
+        _validate_objective_workflow_route(
+            normalized_task_type,
+            goal,
+            scope,
+            verification,
+        )
+        _validate_completion_handoff_route(
+            normalized_task_type,
+            args.get("completion_handoff"),
+        )
         if (
             task_type == "secondhand_commerce_group_status"
             and not isinstance(args.get("user_facing_delivery"), dict)
@@ -3369,6 +4350,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "originating message or callback event exists."
             )
         origin_objective_id = ""
+        origin_stage_key = ""
+        origin_recoverable_blocker = False
+        origin_reserved_stage_key = ""
         verified_origin: dict[str, Any] = {}
         if internal_turn and origin_review_id and origin_event_id is not None:
             with kb.connect_closing(board=board) as conn:
@@ -3400,6 +4384,16 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_id=session_id,
                     )
                 origin_objective_id = str(verified_origin.get("objective_id") or "")
+                origin_stage_key = str(verified_origin.get("stage_key") or "")
+                trigger = conn.execute(
+                    "SELECT id,task_id,kind,payload FROM task_events WHERE id=?",
+                    (origin_event_id,),
+                ).fetchone()
+                origin_recoverable_blocker = kb._grace_callback_is_recoverable_blocker(
+                    conn,
+                    callback=verified_origin,
+                    trigger=trigger,
+                )
                 if not callback_lease_owner and not origin_objective_id:
                     raise ValueError(
                         "Delivered repair callback has no originating Objective; "
@@ -3414,6 +4408,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     if reserved["objective_id"] != origin_objective_id or not reserved["stage_key"]:
                         raise ValueError("This callback already reserved an unbound continuation; reconcile its lineage before another delegation")
                     args.setdefault("objective_ref", {"objective_id": reserved["objective_id"], "stage_key": reserved["stage_key"]})
+                    origin_reserved_stage_key = str(reserved["stage_key"])
         elif (
             not internal_turn
             and fresh_callback_origin_kind == "recoverable_blocker"
@@ -3433,6 +4428,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 origin_objective_id = str(
                     verified_origin.get("objective_id") or ""
                 )
+                origin_stage_key = str(verified_origin.get("stage_key") or "")
+                origin_recoverable_blocker = True
                 if not origin_objective_id:
                     raise ValueError(
                         "Fresh repair callback has no originating Objective; "
@@ -3459,6 +4456,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                             "stage_key": reserved["stage_key"],
                         },
                     )
+                    origin_reserved_stage_key = str(reserved["stage_key"])
         _ensure_external_action_objective_ref(
             args,
             platform=platform,
@@ -3473,6 +4471,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             request_instance_id=request_instance_id,
             board=board,
             origin_objective_id=origin_objective_id,
+            origin_stage_key=origin_stage_key,
+            origin_recoverable_blocker=origin_recoverable_blocker,
+            origin_reserved_stage_key=origin_reserved_stage_key,
             behavior_project=project,
         )
         if (
@@ -3502,6 +4503,11 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     else "authenticated_user"
                 ),
                 "compiled_by": "Grace",
+                **(
+                    {"codex_thread_id": codex_thread_id}
+                    if codex_local_operator
+                    else {}
+                ),
             },
             "original_request": str(args.get("original_request") or "").strip(),
             "grace_interpretation": str(args.get("grace_interpretation") or "").strip(),
@@ -3521,6 +4527,12 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             },
             "completion_mode": str(args.get("completion_mode") or "").strip(),
         }
+        if isinstance(args.get("completion_handoff"), Mapping):
+            contract["completion_handoff"] = {
+                "metadata_source": str(
+                    args["completion_handoff"].get("metadata_source") or ""
+                ).strip(),
+            }
         if isinstance(args.get("domain_memory"), dict):
             contract["domain_memory"] = dict(args["domain_memory"])
         if isinstance(args.get("user_facing_delivery"), dict):
@@ -3626,7 +4638,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             ref = contract["objective_ref"]
             with kb.connect_closing(board=board) as conn:
                 source_origin = _declared_root_source_origin(conn, ref)
-        if source_origin and isinstance(contract.get("objective_ref"), dict):
+        if isinstance(contract.get("objective_ref"), dict):
             with kb.connect_closing(board=board) as conn:
                 if verified_origin:
                     _guard_recoverable_callback_domain_memory(
@@ -3635,10 +4647,11 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         verified_origin,
                         event_id=int(origin_event_id or 0),
                     )
-                source_handoff = _objective_source_handoff(
+                source_handoff = _source_handoff_for_request(
                     conn,
                     contract,
                     source_origin,
+                    internal_turn=internal_turn,
                 )
             for entry in source_handoff:
                 _append_unique_text(contract["memory"]["working"], entry)
@@ -4520,6 +5533,40 @@ def handle_grace_reconcile(args: dict[str, Any] | None = None, **_kwargs: Any) -
             normalized = validate_loop_contract(contract)
             if contract_fingerprint(normalized) != row.get("contract_fingerprint"):
                 raise ValueError("Delegation contract snapshot fingerprint does not match.")
+            if (
+                row.get("approval_required")
+                or type(normalized.get("external_effect_budget")) is not int
+                or normalized.get("external_effect_budget") != 0
+            ):
+                raise ValueError(
+                    "Only sealed zero-external-effect contracts without approval grants "
+                    "can be reconciled."
+                )
+            for task_id in filter(None, (
+                row.get("execution_task_id"), row.get("review_task_id"),
+            )):
+                if kb.list_external_effects(conn, str(task_id)):
+                    raise ValueError(
+                        "A delegation with recorded external effects cannot be reconciled."
+                    )
+                task_run = kb.latest_run(conn, str(task_id))
+                run_metadata = (
+                    task_run.metadata
+                    if task_run is not None and isinstance(task_run.metadata, dict)
+                    else {}
+                )
+                if (
+                    str(run_metadata.get("approval_grant_id") or "").strip()
+                    or any(run_metadata.get(key) for key in (
+                        "external_effects",
+                        "raw_external_effects",
+                        "durable_external_effects",
+                    ))
+                ):
+                    raise ValueError(
+                        "A delegation with approval or external-effect evidence "
+                        "cannot be reconciled."
+                    )
             callback = kb.get_grace_loop_callback(conn, review_id)
             if callback is None:
                 raise ValueError("Delegation callback lineage is missing.")

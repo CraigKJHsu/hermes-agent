@@ -91,6 +91,22 @@ def _image_contract() -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    ("execution_runtime", "review_runtime"),
+    [(60, 900), (600, 1200), (900, 1500), (1800, 1800), (14_400, 1800)],
+)
+def test_v47_review_runtime_adds_bounded_cold_start_margin(
+    execution_runtime, review_runtime,
+):
+    from proactive.behavior_profiles.v47.compiler import (
+        review_max_runtime_seconds,
+    )
+
+    assert review_max_runtime_seconds(
+        {"stop_rules": {"max_runtime_seconds": execution_runtime}}
+    ) == review_runtime
+
+
 def _route_image_contract(contract: dict) -> tuple[dict, str]:
     preliminary = validate_loop_contract(contract)
     preview = route_clawops_objective(
@@ -857,3 +873,23 @@ def test_registry_readonly_package_preserves_exact_source_in_card(source_kind):
     else:
         assert "original_request" not in safe
         assert "original_request" not in async_safe
+
+
+def test_registry_readonly_assetless_page_marker_preserves_exact_source_in_card():
+    from proactive.grace_task_compiler import _worker_safe_contract
+
+    original = (
+        "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT\n"
+        "  完整 Page 原文，保留空白與標點！\n"
+        "END_FACEBOOK_PAGE_SOURCE_TEXT"
+    )
+    contract = {
+        "original_request": original,
+        "grace_interpretation": "Preserve the Page source verbatim.",
+        "domain_memory": {"mode": "query"},
+        "user_facing_delivery": {"kind": "content_package", "assets": []},
+    }
+
+    safe = _worker_safe_contract(contract)
+
+    assert safe["original_request"].encode("utf-8") == original.encode("utf-8")

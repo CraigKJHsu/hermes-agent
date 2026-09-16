@@ -745,6 +745,8 @@ def _sync_bundled_skills_for_startup() -> bool:
     storage. The git/ref stamp keeps post-update correctness: a changed
     checkout revision forces one real sync, then later starts skip it.
     """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
     if _is_termux_startup_environment() and not _termux_bundled_skills_sync_needed():
         return False
 
@@ -2314,7 +2316,8 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
+    # Interactive launches keep bundled skills current. Isolated kanban
+    # workers receive explicitly pinned skills and skip the complete tree.
     try:
         _sync_bundled_skills_for_startup()
     except Exception:

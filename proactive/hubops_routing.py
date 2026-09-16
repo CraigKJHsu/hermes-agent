@@ -35,6 +35,7 @@ ALWAYS_APPROVAL_TASK_TYPES = {
     "facebook_page_api_publish",
 }
 TASK_REQUIRED_CALLABLE_TOOLS = {
+    "devops": frozenset({"terminal"}),
     "facebook_page_publish_preflight": frozenset(
         {"facebook_page_publish_preflight"}
     ),
@@ -287,61 +288,6 @@ def route_clawops_objective(
             approval_required=False,
         )
 
-    runtime_profile = str(
-        worker.get("runtime_profile") or worker_id.replace(".", "-")
-    ).strip()
-    required_callable_tools = {
-        str(tool or "").strip()
-        for tool in worker.get("required_callable_tools") or []
-        if str(tool or "").strip()
-    }
-    required_callable_tools.update(
-        TASK_REQUIRED_CALLABLE_TOOLS.get(canonical_task_type, ())
-    )
-    if required_callable_tools:
-        if runtime_callable_tools is None:
-            if runtime_profile == OPENCLAW_FACEBOOK_PAGE_PROFILE:
-                capability = _probe_openclaw_facebook_page_tools(
-                    required_callable_tools
-                )
-            else:
-                from hermes_cli.kanban_db import probe_profile_callable_tools
-
-                capability = probe_profile_callable_tools(
-                    profile=runtime_profile,
-                    required_tools=sorted(required_callable_tools),
-                )
-            available_callable_tools = {
-                str(tool or "").strip()
-                for tool in capability.get("available_tools") or []
-                if str(tool or "").strip()
-            }
-        else:
-            capability = {"ok": True}
-            available_callable_tools = {
-                str(tool or "").strip()
-                for tool in runtime_callable_tools.get(runtime_profile, ())
-                if str(tool or "").strip()
-            }
-        missing_callable_tools = sorted(
-            required_callable_tools - available_callable_tools
-        )
-        if missing_callable_tools or capability.get("ok") is not True:
-            probe_error = str(capability.get("probe_error") or "").strip()
-            return _blocked(
-                "Runtime capability admission failed for "
-                f"profile={runtime_profile}: missing callable tools: "
-                f"{', '.join(missing_callable_tools)}."
-                + (f" Probe error: {probe_error}" if probe_error else ""),
-                objective=clean_objective,
-                project=project,
-                task_type=canonical_task_type,
-                risk_level=risk_level,
-                worker_id=worker_id,
-                worker=worker,
-                approval_required=True,
-            )
-
     risk = _normalize_risk(risk_level)
     risk_limit = _normalize_risk(str(worker.get("risk_level_limit") or "low"))
     contract_risk_limit = _normalize_risk(
@@ -400,6 +346,60 @@ def route_clawops_objective(
             "effective_risk_level_limit": risk,
             "reusable": False,
         }
+    runtime_profile = str(
+        worker.get("runtime_profile") or worker_id.replace(".", "-")
+    ).strip()
+    required_callable_tools = {
+        str(tool or "").strip()
+        for tool in worker.get("required_callable_tools") or []
+        if str(tool or "").strip()
+    }
+    required_callable_tools.update(
+        TASK_REQUIRED_CALLABLE_TOOLS.get(canonical_task_type, ())
+    )
+    if required_callable_tools:
+        if runtime_callable_tools is None:
+            if runtime_profile == OPENCLAW_FACEBOOK_PAGE_PROFILE:
+                capability = _probe_openclaw_facebook_page_tools(
+                    required_callable_tools
+                )
+            else:
+                from hermes_cli.kanban_db import probe_profile_callable_tools
+
+                capability = probe_profile_callable_tools(
+                    profile=runtime_profile,
+                    required_tools=sorted(required_callable_tools),
+                )
+            available_callable_tools = {
+                str(tool or "").strip()
+                for tool in capability.get("available_tools") or []
+                if str(tool or "").strip()
+            }
+        else:
+            capability = {"ok": True}
+            available_callable_tools = {
+                str(tool or "").strip()
+                for tool in runtime_callable_tools.get(runtime_profile, ())
+                if str(tool or "").strip()
+            }
+        missing_callable_tools = sorted(
+            required_callable_tools - available_callable_tools
+        )
+        if missing_callable_tools or capability.get("ok") is not True:
+            probe_error = str(capability.get("probe_error") or "").strip()
+            return _blocked(
+                "Runtime capability admission failed for "
+                f"profile={runtime_profile}: missing callable tools: "
+                f"{', '.join(missing_callable_tools)}."
+                + (f" Probe error: {probe_error}" if probe_error else ""),
+                objective=clean_objective,
+                project=project,
+                task_type=canonical_task_type,
+                risk_level=risk_level,
+                worker_id=worker_id,
+                worker=worker,
+                approval_required=True,
+            )
     agent_id = _match_agent_id(
         agent_routes if isinstance(agent_routes, list) else [],
         agents if isinstance(agents, Mapping) else {},
@@ -418,6 +418,7 @@ def route_clawops_objective(
         approval_required=approval_required,
         effective_risk_level_limit=(risk if risk_authorization else risk_limit),
     )
+    assignment["required_callable_tools"] = sorted(required_callable_tools)
     approval_checklist = str(
         (assign or {}).get("approval_checklist") or worker.get("approval_checklist") or ""
     )
