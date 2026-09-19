@@ -163,7 +163,7 @@ def set_selection(conn, *, platform, chat_id, thread_id, project, profile_id,
     if not all(isinstance(v, str) and v.strip() for v in (platform, chat_id, thread_id, project, reason)):
         raise BehaviorProfileError("behavior.selection_scope: exact Topic, project and reason required")
     if profile_id is not None:
-        profile(profile_id, version)
+        verify_pin(_make_pin(profile_id, version, {}, project_namespace=project))
     elif version is not None:
         raise BehaviorProfileError("behavior.selection_version: disabled pointer has no version")
     scope = (platform, chat_id, thread_id, project)
@@ -204,31 +204,72 @@ def _make_pin(profile_id, version, policy, generation=1, *, project_namespace=No
             "generation": generation}
 
 
-def verify_pin(pin):
-    manifest = profile(pin["behavior_profile_id"], pin["behavior_profile_version"])
-    expected = {
-        "contract_schema_version": manifest["contract_schema_version"],
-        "validator_set_hash": manifest["validator_set_hash"],
-        "behavior_bundle_hash": digest(manifest),
-        "safety_kernel_version": manifest["safety_kernel_version"],
-        "safety_kernel_hash": manifest["safety_kernel_hash"],
-    }
-    if any(pin.get(k) != v for k, v in expected.items()):
-        raise BehaviorProfileError("behavior.manifest_mismatch")
-    kernel_version = str(pin["safety_kernel_version"])
-    if not re.fullmatch(r"[1-9][0-9]*", kernel_version):
-        raise BehaviorProfileError("behavior.kernel_version")
-    kernel = json.loads((ROOT / f"kernel-v{kernel_version}.json").read_text())
-    if digest(kernel) != pin["safety_kernel_hash"]:
-        raise BehaviorProfileError("behavior.kernel_migration_required")
-    root = CODE_ROOT
-    for path, expected in kernel.items():
-        if hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
-            raise BehaviorProfileError(f"behavior.kernel_migration_required: {path}")
+def inspect_pin(pin):
+    """Read all compatibility failures without changing a pin or its history."""
+    result = {"ok": False, "errors": [], "kernel_mismatches": [], "manifest": None}
+    errors = result["errors"]
+    try:
+        manifest = profile(pin["behavior_profile_id"], pin["behavior_profile_version"])
+        result["manifest"] = manifest
+        expected = {
+            "contract_schema_version": manifest["contract_schema_version"],
+            "validator_set_hash": manifest["validator_set_hash"],
+            "behavior_bundle_hash": digest(manifest),
+            "safety_kernel_version": manifest["safety_kernel_version"],
+            "safety_kernel_hash": manifest["safety_kernel_hash"],
+        }
+        if any(pin.get(k) != v for k, v in expected.items()):
+            errors.append("behavior.manifest_mismatch")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        errors.append(str(exc))
+    try:
+        kernel_version = str(pin["safety_kernel_version"])
+        if not re.fullmatch(r"[1-9][0-9]*", kernel_version):
+            raise BehaviorProfileError("behavior.kernel_version")
+        kernel = json.loads((ROOT / f"kernel-v{kernel_version}.json").read_text())
+        if digest(kernel) != pin["safety_kernel_hash"]:
+            errors.append("behavior.kernel_migration_required")
+        for path, expected in kernel.items():
+            source = CODE_ROOT / path
+            if not source.resolve().is_relative_to(CODE_ROOT):
+                raise BehaviorProfileError("behavior.kernel_path")
+            try:
+                actual = hashlib.sha256(source.read_bytes()).hexdigest()
+            except OSError:
+                actual = None
+            if actual != expected:
+                result["kernel_mismatches"].append({
+                    "path": path, "expected_sha256": expected, "actual_sha256": actual,
+                })
+                errors.append(f"behavior.kernel_migration_required: {path}")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        errors.append(str(exc))
+    result["runtime"] = runtime_health()
+    errors.extend(result["runtime"]["errors"])
+    result["ok"] = not errors
+    return result
+
+
+def runtime_health():
+    """Attest only this process; a fresh CLI cannot attest a running gateway."""
     from hermes_cli import kanban_db as kb
-    if kb._review_runtime_digest() != kb._REVIEW_RUNTIME_SHA256:
-        raise BehaviorProfileError("behavior.runtime_reload_required")
-    return manifest
+    runtime = {"scope": "calling_process", "loaded_sha256": kb._REVIEW_RUNTIME_SHA256.hex(),
+               "disk_sha256": None, "ok": False, "errors": []}
+    try:
+        runtime["disk_sha256"] = kb._review_runtime_digest().hex()
+        runtime["ok"] = runtime["disk_sha256"] == runtime["loaded_sha256"]
+        if not runtime["ok"]:
+            runtime["errors"].append("behavior.runtime_reload_required")
+    except (OSError, ValueError, TypeError) as exc:
+        runtime["errors"].append(f"behavior.runtime_unavailable: {exc}")
+    return runtime
+
+
+def verify_pin(pin):
+    result = inspect_pin(pin)
+    if not result["ok"]:
+        raise BehaviorProfileError(result["errors"][0])
+    return result["manifest"]
 
 
 def guard_objective(conn, objective_id):

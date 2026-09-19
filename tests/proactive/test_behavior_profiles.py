@@ -17,28 +17,50 @@ from proactive.policy_registry import (
 from scripts.replay_behavior_observation import load_cases, make_contract, replay_case
 
 
-CURRENT_VERSION = "v47"
+CURRENT_VERSION = "v50"
 
 
-@pytest.mark.parametrize("relative_path", [
-    "gateway/kanban_watchers.py",
-    "gateway/run.py",
-    "hermes_cli/kanban_db.py",
-    "plugins/openclaw_bridge/clawops_delegate.py",
-    "tools/facebook_page_graph_tool.py",
-])
-def test_current_kernel_seals_callback_resume_and_page_source_authority(
-    relative_path,
-):
-    kernel = json.loads((br.ROOT / "kernel-v47.json").read_text())
-    source = br.CODE_ROOT / relative_path
-    assert kernel[relative_path] == hashlib.sha256(
-        source.read_bytes()
-    ).hexdigest()
+@pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
+def test_current_kernel_seals_every_declared_source(project):
+    manifest = br.profile(project, CURRENT_VERSION)
+    kernel = json.loads((br.ROOT / f"kernel-v{manifest['safety_kernel_version']}.json").read_text())
+    assert br.digest(kernel) == manifest["safety_kernel_hash"]
+    for relative_path, expected in kernel.items():
+        assert expected == hashlib.sha256((br.CODE_ROOT / relative_path).read_bytes()).hexdigest(), relative_path
+
+
+@pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
+def test_current_browser_readonly_route_carries_pinned_url_authority(project):
+    from proactive.grace_task_compiler import _browser_readonly_url
+    from proactive.hubops_routing import route_clawops_objective
+
+    contract = validate_loop_contract(setup_objective(project))
+    routed = route_clawops_objective(
+        "Read one exact authorized page",
+        project=project,
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=True,
+        behavior_contract=contract,
+    )
+
+    expected = [
+        "https://example.com/",
+        "https://www.linkedin.com/in/craig-k-j-hsu-6012b815",
+    ]
+    assert routed["status"] == "routed"
+    assert routed["assignment"]["allowed_urls"] == expected
+    assert routed["backend_role_card"]["allowed_urls"] == expected
+    assert "http://127.0.0.1:8766/" not in expected
+
+    delegated = deepcopy(contract)
+    delegated["scope"]["allowed"] = ["Read only https://example.com/"]
+    delegated["routing"]["resolved"] = routed
+    assert _browser_readonly_url(delegated) == "https://example.com/"
 
 
 def test_current_ai_bizweek_review_uses_controller_package_authority():
-    contract = setup_objective("ai_bizweek")
+    contract = validate_loop_contract(setup_objective("ai_bizweek"))
 
     body = render_review_body(contract, "t_execution")
 
@@ -46,6 +68,13 @@ def test_current_ai_bizweek_review_uses_controller_package_authority():
     assert "Markdown body artifact increases the total attachment-row count" in body
     assert "resized thumbnail is an optional inspection aid" in body
     assert "`Controller state conflict:`" in body
+    assert "contains facebook_page_post.text exactly equal to" in body
+    assert "user_facing_report.sections.facebook_page_post" in body
+    execution = render_execution_body(contract)
+    assert "metadata.facebook_page_post={text:<exact Page body>}" in execution
+    assert "match metadata.user_facing_report.sections.facebook_page_post" in execution
+    assert "pinned_version_verified=true" in body
+    assert "Read and obey the complete content of every policy snapshot before work." in execution
 
 
 def setup_objective(project="ai_bizweek", *, enabled=True, oid="go_profile", project_namespace=None, version=CURRENT_VERSION):
@@ -87,7 +116,7 @@ def test_pin_survives_policy_activation_and_uses_actual_versioned_compiler(proje
     receipt = {**{k: loaded["policies"][0][k] for k in ("policy_id", "version", "sha256")},
                "role": "review", "loaded": True, "pinned_version_verified": True}
     validate_policy_completion(render_review_body(normalized, "t_parent"), {"policy_receipts": [receipt]}, role="review")
-    assert br.implementation(normalized, "compiler").__name__.endswith(".v47.compiler")
+    assert br.implementation(normalized, "compiler").__name__.endswith(f".{br.profile(project, CURRENT_VERSION)['bundle']}.compiler")
 
 
 def test_contract_cannot_remove_or_replace_pin_or_change_topic():
@@ -115,6 +144,131 @@ def test_disabling_canary_does_not_relabel_existing_objective():
                              thread_id=identity["thread_id"], project="ai_bizweek", profile_id=None,
                              version=None, expected_revision=1, reason="Stale concurrent operator")
     assert validate_loop_contract(contract)["behavior_pin"] == before
+
+
+def _drift_kernel(tmp_path, monkeypatch):
+    import shutil
+
+    manifest = br.profile("ai_bizweek", CURRENT_VERSION)
+    kernel = json.loads((br.ROOT / f"kernel-v{manifest['safety_kernel_version']}.json").read_text())
+    source_root = tmp_path / "kernel-source"
+    for relative in kernel:
+        target = source_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(br.CODE_ROOT / relative, target)
+    changed = {"proactive/grace_task_compiler.py", "proactive/hubops_routing.py", "hermes_cli/kanban_db.py"}
+    for relative in changed:
+        with (source_root / relative).open("a") as target:
+            target.write("\n# Simulated unsealed release change.\n")
+    monkeypatch.setattr(br, "CODE_ROOT", source_root)
+    return changed
+
+
+@pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
+@pytest.mark.parametrize("fault", ["kernel", "runtime"])
+def test_selection_rejects_unhealthy_release_without_changing_revision(tmp_path, monkeypatch, project, fault):
+    contract = setup_objective(project)
+    identity = contract["identity"]
+    if fault == "kernel":
+        _drift_kernel(tmp_path, monkeypatch)
+    else:
+        monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SHA256", bytes(32))
+    with kb.connect_closing() as conn:
+        before = tuple(conn.execute("SELECT * FROM grace_behavior_selections").fetchone())
+        spec = dict(platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"],
+                    project=project, expected_revision=1, reason="Candidate release")
+        with pytest.raises(br.BehaviorProfileError, match="kernel_migration_required|runtime_reload_required"):
+            br.set_selection(conn, **spec, profile_id=project, version=CURRENT_VERSION)
+        assert tuple(conn.execute("SELECT * FROM grace_behavior_selections").fetchone()) == before
+        disabled = br.set_selection(conn, **spec, profile_id=None, version=None)
+        assert disabled["revision"] == 2
+        assert conn.execute("SELECT profile_id FROM grace_behavior_selections").fetchone()[0] is None
+
+
+@pytest.mark.parametrize("project", ["ai_bizweek", "secondhand_commerce"])
+def test_kernel_failure_at_birth_leaves_no_objective_or_cards(tmp_path, monkeypatch, project):
+    contract = setup_objective(project)
+    identity = contract["identity"]
+    _drift_kernel(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        before_tasks = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        with pytest.raises(br.BehaviorProfileError, match="kernel_migration_required"):
+            kb.create_grace_objective(
+                conn, objective_id="go_unsealed", platform="telegram", chat_id=identity["chat_id"],
+                thread_id=identity["thread_id"], session_key="fixture", title="fixture", objective="fixture",
+                original_request_sha256="b" * 64, required_stage_keys=["prepare", "publish"],
+                terminal_stage_key="publish", acceptance_criteria=["verified"], behavior_project=project,
+            )
+        assert kb.get_grace_objective(conn, "go_unsealed") is None
+        assert br.get_pin(conn, "go_unsealed") is None
+        assert conn.execute("SELECT count(*) FROM grace_objective_stages WHERE objective_id='go_unsealed'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM grace_delegations WHERE objective_id='go_unsealed'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before_tasks
+
+
+def test_health_reports_all_kernel_drift_and_nonterminal_pins_read_only(tmp_path, monkeypatch, capsys):
+    import sys
+    from hermes_cli.behavior_profiles import main
+
+    for project in ("ai_bizweek", "secondhand_commerce"):
+        setup_objective(project, oid="go_" + project)
+    with kb.connect_closing() as conn:
+        pin = br.get_pin(conn, "go_ai_bizweek")
+        pin["behavior_bundle_hash"] = "0" * 64
+        conn.execute("UPDATE grace_objective_behavior_pins SET pin=? WHERE objective_id=?",
+                     (json.dumps(pin), "go_ai_bizweek"))
+        conn.execute("UPDATE grace_objectives SET status='blocked' WHERE objective_id='go_ai_bizweek'")
+    changed = _drift_kernel(tmp_path, monkeypatch)
+    path = kb.kanban_db_path()
+    before = path.read_bytes()
+    monkeypatch.setattr(kb, "connect_closing", lambda **_kwargs: pytest.fail("health must not open a writable connection"))
+    monkeypatch.setattr(sys, "argv", ["behavior_profiles", "health"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False
+    assert report["runtime"]["scope"] == "calling_process"
+    assert report["runtime"]["ok"] is True
+    assert len(report["selections"]) == 2
+    assert {row["objective_id"] for row in report["objectives"]} == {"go_ai_bizweek", "go_secondhand_commerce"}
+    for row in report["selections"] + report["objectives"]:
+        assert {item["path"] for item in row["health"]["kernel_mismatches"]} == changed
+    old = next(row for row in report["objectives"] if row["objective_id"] == "go_ai_bizweek")
+    assert "behavior.manifest_mismatch" in old["health"]["errors"]
+    assert path.read_bytes() == before
+
+
+def test_health_candidate_does_not_open_board_and_missing_board_is_not_created(tmp_path, monkeypatch, capsys):
+    import sys
+    from hermes_cli.behavior_profiles import main
+
+    monkeypatch.setattr(kb, "kanban_db_path", lambda **_kwargs: pytest.fail("candidate must not resolve a board"))
+    monkeypatch.setattr(sys, "argv", ["behavior_profiles", "health", "--profile", "ai_bizweek", "--version", CURRENT_VERSION])
+    main()
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    missing = tmp_path / "absent-board" / "kanban.db"
+    monkeypatch.setattr(kb, "kanban_db_path", lambda **_kwargs: missing)
+    monkeypatch.setattr(sys, "argv", ["behavior_profiles", "health"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False
+    assert "board_unavailable" in report["errors"][0]
+    assert not missing.parent.exists()
+
+
+def test_shadow_requires_explicit_candidate_before_creating_output(tmp_path, monkeypatch):
+    import sys
+    from scripts.shadow_behavior_profiles import main
+
+    output = tmp_path / "not-created"
+    monkeypatch.setattr(sys, "argv", ["shadow_behavior_profiles", "--output", str(output)])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert not output.exists()
 
 
 def test_legacy_objective_remains_unpinned():
@@ -314,21 +468,23 @@ def test_callback_kernel_release_retains_behavior_and_migrates_policy(
     old_manifest = br.profile(project, old_version)
     new_manifest = br.profile(project, CURRENT_VERSION)
     for field in (
-        "profile_id", "route_snapshot", "contract_schema_version",
+        "profile_id", "contract_schema_version",
         "validator_set_hash",
     ):
         assert new_manifest[field] == old_manifest[field]
-    assert new_manifest["bundle"] == "v47"
+    assert old_manifest["route_snapshot"] == f"v1/{project}"
+    assert new_manifest["route_snapshot"] == f"v2/{project}"
+    bundle = new_manifest["bundle"]
     for component in (
         "contract", "domain", "preflight", "prompt", "review", "workflow",
     ):
-        assert new_manifest["files"][f"v47/{component}.py"] == old_manifest["files"][
+        assert new_manifest["files"][f"{bundle}/{component}.py"] == old_manifest["files"][
             f"v1/{component}.py"
         ]
-    assert new_manifest["files"]["v47/compiler.py"] != old_manifest["files"][
+    assert new_manifest["files"][f"{bundle}/compiler.py"] != old_manifest["files"][
         "v1/compiler.py"
     ]
-    assert new_manifest["files"]["v47/routing.py"] != old_manifest["files"][
+    assert new_manifest["files"][f"{bundle}/routing.py"] != old_manifest["files"][
         "v1/routing.py"
     ]
     contract = setup_objective(project, enabled=False)
@@ -473,10 +629,11 @@ def test_migration_accepts_resolved_callback_with_unstarted_review_card(
 def test_changed_profile_bytes_block_existing_pin(tmp_path, monkeypatch):
     import shutil
     contract = setup_objective()
+    bundle = br.profile("ai_bizweek", CURRENT_VERSION)["bundle"]
     catalog = tmp_path / "catalog"
     shutil.copytree(br.ROOT, catalog)
     monkeypatch.setattr(br, "ROOT", catalog)
-    (catalog / "v47" / "contract.py").write_text("# incompatible replacement\n")
+    (catalog / bundle / "contract.py").write_text("# incompatible replacement\n")
     with pytest.raises(br.BehaviorProfileError, match="bundle_changed"):
         validate_loop_contract(contract)
 
@@ -488,7 +645,7 @@ def test_real_ai_namespace_is_bound_separately_from_business_profile():
     assert normalized["identity"]["project"] == namespace
     assert normalized["behavior_pin"]["behavior_profile_id"] == "ai_bizweek"
     assert normalized["behavior_pin"]["project_namespace"] == namespace
-    assert br.implementation(normalized, "compiler").__name__.endswith(".v47.compiler")
+    assert br.implementation(normalized, "compiler").__name__.endswith(f".{br.profile('ai_bizweek', CURRENT_VERSION)['bundle']}.compiler")
     saved_body = render_execution_body(normalized)
     with kb.connect_closing() as conn:
         pin = br.get_pin(conn, "go_profile")

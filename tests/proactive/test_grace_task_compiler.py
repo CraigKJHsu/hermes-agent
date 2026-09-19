@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import (
+    _browser_readonly_url,
     compile_and_delegate,
     contract_internal_hermes_runtime,
     contract_requires_image_generation,
@@ -89,6 +90,38 @@ def _image_contract() -> dict:
         },
         "completion_mode": "terminal",
     }
+
+
+def test_browser_readonly_route_carries_exact_local_url_authority():
+    preview = route_clawops_objective(
+        "唯讀檢查本機首頁",
+        project="ingrids_marketing",
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=False,
+    )
+
+    assert preview["status"] == "routed"
+    assert "http://127.0.0.1:8766/" in preview["assignment"]["allowed_urls"]
+    assert "http://127.0.0.1:8766/" in preview["backend_role_card"]["allowed_urls"]
+
+
+def test_browser_readonly_url_is_extracted_from_scoped_prose_and_route_bound():
+    contract = _image_contract()
+    contract["scope"]["allowed"] = [
+        "以唯讀方式開啟與檢視 http://127.0.0.1:8766/"
+    ]
+    contract["routing"]["resolved"] = {
+        "assignment": {"allowed_urls": ["http://127.0.0.1:8766/"]}
+    }
+
+    assert _browser_readonly_url(contract) == "http://127.0.0.1:8766/"
+
+    contract["routing"]["resolved"]["assignment"]["allowed_urls"] = [
+        "https://example.com/"
+    ]
+    with pytest.raises(ValueError, match="outside the resolved route allowlist"):
+        _browser_readonly_url(contract)
 
 
 @pytest.mark.parametrize(

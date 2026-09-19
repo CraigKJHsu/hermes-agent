@@ -9,6 +9,7 @@ from hermes_cli import kanban_db as kb
 from proactive import openclaw_executor
 from proactive.backend_poll_worker import poll_due_openclaw_runs
 from proactive.openclaw_executor import execute_readonly_browser_snapshot
+from proactive.policy_registry import create_policy_version
 
 
 @pytest.fixture
@@ -18,6 +19,21 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v1",
+        source,
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version=None,
+    )
     return home
 
 
@@ -58,6 +74,13 @@ def _contract():
             "namespace": "hub_ops/openclaw-pilot",
             "working": ["Current backend attempt"],
             "promote_on_acceptance": ["Verified executor capability"],
+        },
+        "routing": {
+            "task_type": "browser_readonly",
+            "risk_level": "low",
+            "resolved": {
+                "assignment": {"allowed_urls": ["https://example.com/"]}
+            },
         },
     }
 
@@ -162,7 +185,7 @@ def test_readonly_openclaw_executor_closes_execution_and_review_tasks(kanban_hom
         review = kb.get_task(conn, result["review_task_id"])
         run = kb.latest_run(conn, result["execution_task_id"])
         assert execution is not None and execution.status == "done"
-        assert review is not None and review.status == "done"
+        assert review is not None and review.status == "ready"
         assert run is not None
         assert run.executor_backend == "openclaw"
         assert run.backend_run_id == "openclaw-run-1"
@@ -203,7 +226,7 @@ def test_readonly_openclaw_executor_persists_backend_token_usage(kanban_home):
         }
 
 
-def test_readonly_execution_and_review_finalize_in_one_transaction(
+def test_readonly_execution_finalizes_before_independent_review(
     kanban_home, monkeypatch
 ):
     original_complete = kb.complete_task
@@ -222,7 +245,7 @@ def test_readonly_execution_and_review_finalize_in_one_transaction(
     )
 
     assert result["status"] == "succeeded"
-    assert transaction_states == [True, True]
+    assert transaction_states == [True]
 
 
 def test_concurrent_idempotent_completion_returns_durable_success(
@@ -275,7 +298,7 @@ def test_concurrent_idempotent_completion_returns_durable_success(
         execution = kb.get_task(conn, result["execution_task_id"])
         review = kb.get_task(conn, result["review_task_id"])
         assert execution is not None and execution.status == "done"
-        assert review is not None and review.status == "done"
+        assert review is not None and review.status == "ready"
 
 
 def test_concurrent_mutable_wrapper_drift_reuses_terminal_evidence(
@@ -331,7 +354,7 @@ def test_concurrent_mutable_wrapper_drift_reuses_terminal_evidence(
         execution = kb.get_task(conn, result["execution_task_id"])
         review = kb.get_task(conn, result["review_task_id"])
         assert execution is not None and execution.status == "done"
-        assert review is not None and review.status == "done"
+        assert review is not None and review.status == "ready"
 
 
 def test_readonly_reservation_rolls_back_when_review_creation_fails(
@@ -645,8 +668,8 @@ def test_readonly_nonterminal_response_resumes_through_restart_safe_poller(
         review = kb.get_task(conn, result["review_task_id"])
         run = kb.latest_run(conn, result["execution_task_id"])
         assert execution is not None and execution.status == "done"
-        assert review is not None and review.status == "done"
-        assert review.result == "accepted"
+        assert review is not None and review.status == "ready"
+        assert review.result is None
         assert run is not None and run.outcome == "completed"
         assert run.backend_status == "succeeded"
 
@@ -1091,7 +1114,7 @@ def test_readonly_openclaw_executor_rejects_uncorrelated_protocol_result(
         assert run.backend_agent_id is None
 
 
-def test_deduplicated_retry_resumes_incomplete_grace_review(
+def test_deduplicated_retry_leaves_incomplete_grace_review_for_dispatcher(
     kanban_home, monkeypatch
 ):
     result = execute_readonly_browser_snapshot(
@@ -1137,12 +1160,12 @@ def test_deduplicated_retry_resumes_incomplete_grace_review(
 
     assert replay["status"] == "succeeded"
     assert replay["deduplicated"] is True
-    assert transaction_states == [("claim", True), ("complete", True)]
+    assert transaction_states == []
     with kb.connect() as conn:
         review = kb.get_task(conn, result["review_task_id"])
         assert review is not None
-        assert review.status == "done"
-        assert review.result == "accepted"
+        assert review.status == "ready"
+        assert review.result is None
 
 
 def test_readonly_openclaw_executor_rejects_url_outside_contract_scope(
@@ -1152,6 +1175,22 @@ def test_readonly_openclaw_executor_rejects_url_outside_contract_scope(
     contract["scope"]["allowed"] = ["https://www.iana.org/"]
 
     with pytest.raises(ValueError, match="explicitly allowed"):
+        execute_readonly_browser_snapshot(
+            "https://example.com/",
+            contract=contract,
+            transport=lambda task: _successful_result(task),
+        )
+
+
+def test_readonly_openclaw_executor_rejects_url_outside_resolved_route(
+    kanban_home,
+):
+    contract = _contract()
+    contract["routing"]["resolved"]["assignment"]["allowed_urls"] = [
+        "https://www.iana.org/"
+    ]
+
+    with pytest.raises(ValueError, match="authorized by"):
         execute_readonly_browser_snapshot(
             "https://example.com/",
             contract=contract,

@@ -1262,11 +1262,43 @@ def _has_unexcluded_facebook_group_destination(
     return False
 
 
-def _is_external_action_objective(text: str) -> bool:
+_TYPED_FACEBOOK_OBSERVATION = re.compile(
+    r"\b(?:check|verify|inspect|determine|report|see)\b.{0,80}\b(?:whether|if)\b|"
+    r"(?:查核|檢查|確認|查看|查詢|回報).{0,80}?(?:是否|有沒有)",
+    re.IGNORECASE,
+)
+_TYPED_FACEBOOK_PUBLICATION_POLARITY = re.compile(
+    r"(?P<obligation>不(?:得|能|可(?:以)?)不)|"
+    r"(?:不得|禁止|不要|不可|不准|避免|無需|毋須|勿|別|不)\s*"
+    r"(?:(?:重新|再次|再)\s*)?"
+    r"(?:(?:把|將)\s*(?:(?![，,。！？；;\n]|但是|但|而是|改為|然後|接著).){1,80}?)?"
+    r"(?:(?:重新|再次|再)\s*)?$"
+)
+
+
+def _has_typed_facebook_publication(text: str) -> bool:
+    """Add only clear publication clauses; leave compound observations unchanged."""
+    for clause in re.split(r"[\n。！？；;，,]", text):
+        if _TYPED_FACEBOOK_OBSERVATION.search(clause):
+            continue
+        if any(
+            polarity.group("obligation") is None
+            for verb in _GROUP_PUBLICATION_VERB.finditer(clause)
+            for polarity in _TYPED_FACEBOOK_PUBLICATION_POLARITY.finditer(
+                clause[:verb.start()]
+            )
+        ):
+            continue
+        if _has_positive_facebook_group_publication(clause, facebook_context=True):
+            return True
+    return False
+
+
+def _is_external_action_objective(text: str, *, task_type: str = "") -> bool:
     facebook_context = re.search(
         r"(?:facebook|\bfb\b|臉書|marketplace)", text, re.IGNORECASE,
     ) is not None
-    return bool(
+    legacy_result = bool(
         _EXTERNAL_ACTION_OBJECTIVE.search(text)
         or _has_positive_facebook_group_publication(
             text, facebook_context=facebook_context,
@@ -1274,6 +1306,12 @@ def _is_external_action_objective(text: str) -> bool:
         or _has_unexcluded_facebook_group_destination(
             text, facebook_context=facebook_context,
         )
+    )
+    if legacy_result:
+        return True
+    return bool(
+        normalize_clawops_task_type(task_type).startswith("facebook_")
+        and _has_typed_facebook_publication(text)
     )
 
 
@@ -1497,7 +1535,10 @@ def _guard_external_action_objective_downgrade(
     if isinstance(contract.get("objective_ref"), dict):
         return
     original_request = str(args.get("original_request") or "").strip()
-    if not _is_external_action_objective(original_request):
+    routing = contract.get("routing") if isinstance(contract.get("routing"), dict) else {}
+    if not _is_external_action_objective(
+        original_request, task_type=str(routing.get("task_type") or ""),
+    ):
         return
     goal = contract.get("goal") if isinstance(contract.get("goal"), dict) else {}
     scope = contract.get("scope") if isinstance(contract.get("scope"), dict) else {}
@@ -1506,7 +1547,6 @@ def _guard_external_action_objective_downgrade(
         if isinstance(contract.get("verification"), dict)
         else {}
     )
-    routing = contract.get("routing") if isinstance(contract.get("routing"), dict) else {}
     compiled_text = "\n".join(
         str(item or "")
         for item in (
@@ -1723,7 +1763,9 @@ def _ensure_external_action_objective_ref(
         return None
     if len(mentioned) > 1:
         raise ValueError("Multiple objectives are named; supply an explicit same-Topic objective_ref")
-    if not mentioned and not _is_external_action_objective(original_request):
+    if not mentioned and not _is_external_action_objective(
+        original_request, task_type=str(args.get("task_type") or ""),
+    ):
         return None
     clean_platform = str(platform or "").strip().lower()
     clean_chat = str(chat_id or "").strip()

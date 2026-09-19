@@ -11262,10 +11262,17 @@ def complete_task(
                 evidence = {**(evidence if isinstance(evidence, dict) else {}), **review_source}
                 metadata["evidence"] = evidence
                 metadata["workflow_review_source"] = review_source
+                parent_task = get_task(conn, parent_id)
+                if parent_task is not None and parent_task.status == "blocked":
+                    raise ValueError(
+                        "Workflow review cannot accept a blocked execution parent. "
+                        "Call kanban_block with kind=dependency and preserve the "
+                        "parent blocker instead of completing the review."
+                    )
                 if not (
                     parent_run is not None and parent_run.ended_at
                     and parent_run.outcome == "completed"
-                    and get_task(conn, parent_id).status == "done"
+                    and parent_task is not None and parent_task.status == "done"
                     and isinstance(evidence, dict)
                     and evidence.get("parent_execution_task_id") == parent_id
                     and type(evidence.get("parent_execution_run_id")) is int

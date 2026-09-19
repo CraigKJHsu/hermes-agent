@@ -607,15 +607,94 @@ def test_cancel_classifier_masks_only_approval_checkpoint_stop(
     assert _is_explicit_cancel_message(message) is is_cancel
 
 
-def test_external_action_request_cannot_be_silently_downgraded_to_readonly_stage():
+@pytest.mark.parametrize(
+    "request_text, task_type, expected",
+    [
+        ("[KJ HSU] 請幫我重新刊登咖啡機至5個新的社團", "facebook_marketplace_readonly", True),
+        ("請發布望遠鏡到3個社團", "facebook_marketplace_readonly", True),
+        ("請幫我重新刊登咖啡機至5個新的社團", "research", False),
+        ("請唯讀查核候選社團，列出可用清單", "facebook_marketplace_readonly", False),
+        ("請查核咖啡機是否刊登在社團", "facebook_marketplace_readonly", False),
+        ("請唯讀查核咖啡機是否已刊登在社團", "facebook_marketplace_readonly", False),
+        ("查詢咖啡機有沒有刊登在社團", "facebook_marketplace_readonly", False),
+        ("請不要重新刊登咖啡機至任何社團", "facebook_marketplace_readonly", False),
+        ("請勿刊登咖啡機至任何社團", "facebook_marketplace_readonly", False),
+        ("請不要把咖啡機刊登在新的社團", "facebook_marketplace_readonly", False),
+        ("請別把咖啡機刊登在新的社團", "facebook_marketplace_readonly", False),
+        ("Do not share this listing with any groups", "facebook_marketplace_readonly", False),
+        ("請不要把咖啡機刊登在社團，但請發布望遠鏡到新的社團", "facebook_marketplace_readonly", True),
+        ("請把不常用的望遠鏡刊登在新的社團", "facebook_marketplace_readonly", True),
+        ("請不要忘記把咖啡機刊登在新的社團", "facebook_marketplace_readonly", True),
+    ],
+)
+def test_external_objective_uses_facebook_route_without_inventing_publication(
+    request_text, task_type, expected,
+):
+    from plugins.openclaw_bridge.clawops_delegate import _is_external_action_objective
+
+    assert _is_external_action_objective(request_text, task_type=task_type) is expected
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "請不要把咖啡機重新刊登至新的社團",
+        "請不要再把咖啡機重新刊登至新的社團",
+        "請勿將望遠鏡再次刊登至新的社團",
+        "請查核咖啡機是否刊登至社團",
+        "請別把咖啡機刊登至新的社團",
+        "請不要把望遠鏡重新刊登至新的社團",
+        "check whether the coffee maker is posted in that Facebook group and then Do not post the telescope to one Facebook group",
+        "check whether the coffee maker is posted in that Facebook group and then Prepare a post for the Facebook Page",
+        "請不能夠不把咖啡機刊登至新的社團",
+        "Post to one Facebook group and then check whether the coffee maker is posted in that Facebook group",
+    ],
+)
+def test_typed_facebook_fallback_preserves_legacy_true_classifications(request_text):
+    # Some rows are preexisting false positives. This route fix does not redefine
+    # their meaning or claim to protect them; it preserves the baseline contract.
+    from plugins.openclaw_bridge.clawops_delegate import _is_external_action_objective
+
+    assert _is_external_action_objective(request_text) is True
+    assert _is_external_action_objective(
+        request_text, task_type="facebook_marketplace_readonly",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Post the telescope to one Facebook group and then check whether the coffee maker is posted in that Facebook group",
+        "Check the details then post the telescope to one Facebook group and verify whether the coffee maker is posted in that Facebook group",
+        "請查核咖啡機是否刊登在社團再發布望遠鏡到新的社團",
+    ],
+)
+def test_typed_facebook_fallback_keeps_ambiguous_observation_clauses_unchanged(request_text):
+    # Advanced same-clause observations remain a documented baseline limitation.
+    from plugins.openclaw_bridge.clawops_delegate import _is_external_action_objective
+
+    assert _is_external_action_objective(request_text) is False
+    assert _is_external_action_objective(
+        request_text, task_type="facebook_marketplace_readonly",
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "request_text, task_type",
+    [
+        ("請將 Kolin KD-291M06 重新刊登至最多 20 個原本已刊登過的 Facebook 社團", "secondhand_commerce_group_status"),
+        ("請幫我重新刊登咖啡機至5個新的社團", "facebook_marketplace_readonly"),
+    ],
+)
+def test_external_action_request_cannot_be_silently_downgraded_to_readonly_stage(
+    request_text, task_type,
+):
     from plugins.openclaw_bridge.clawops_delegate import (
         _guard_external_action_objective_downgrade,
     )
 
     args = _nested_args()
-    args["original_request"] = (
-        "請將 Kolin KD-291M06 重新刊登至最多 20 個原本已刊登過的 Facebook 社團"
-    )
+    args["original_request"] = request_text
     contract = {
         "goal": {
             "objective": "唯讀盤點原本已刊登過的 Facebook 社團，最多 20 個目的地",
@@ -630,7 +709,7 @@ def test_external_action_request_cannot_be_silently_downgraded_to_readonly_stage
             "checks": ["列出可驗證目的地"],
             "acceptance_criteria": ["external_effects=[]"],
         },
-        "routing": {"task_type": "secondhand_commerce_group_status"},
+        "routing": {"task_type": task_type},
     }
 
     with pytest.raises(ValueError, match="downgraded into preparatory/text-only"):
@@ -4563,6 +4642,87 @@ def test_delegate_requires_devops_for_workspace_file_completion_handoff(
     assert execution is not None
     assert execution.assignee == "clawops-dev"
     assert '"metadata_source": "workspace_file"' in execution.body
+
+
+@pytest.mark.parametrize(
+    "topic_name, project, request_text, expected_objective",
+    [
+        # Historical failure sample, not Topic-specific behavior.
+        ("二手拍賣", "secondhand_commerce", "[KJ HSU] 請幫我重新刊登咖啡機至5個新的社團", True),
+        ("望遠鏡交換", "telescope_exchange", "請發布望遠鏡到3個社團", True),
+        ("二手拍賣", "secondhand_commerce", "請查核咖啡機是否刊登在社團", False),
+        ("望遠鏡交換", "telescope_exchange", "請不要把望遠鏡刊登在新的社團", False),
+    ],
+)
+def test_readonly_preflight_preserves_external_objective_across_topics(
+    tmp_path, monkeypatch, topic_name, project, request_text, expected_objective,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-external-objective-preflight",
+        "HERMES_SESSION_MESSAGE_TEXT": request_text,
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(
+        tmp_path, monkeypatch, values,
+        topic_name=topic_name, project=project,
+        memory_namespace=f"topic:2/{project}",
+    )
+    args = _nested_args()
+    args["original_request"] = request_text
+    args["task_type"] = "facebook_marketplace_readonly"
+    args["goal"] = {
+        "objective": "唯讀查核候選社團",
+        "deliverables": ["可用目的地清單"],
+        "non_goals": ["本階段不發布或變更任何外部狀態"],
+    }
+    args["scope"] = {
+        "allowed": ["唯讀查核候選社團"],
+        "forbidden": ["不得勾選、刊登或改變 Facebook 狀態"],
+    }
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    result = json.loads(handle_clawops_delegate(args))
+
+    assert result["status"] == "queued", result
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        delegation = kb.get_grace_delegation(conn, delegation_id=result["delegation_id"])
+        contract = json.loads(delegation["contract_snapshot"])
+        objective = (
+            kb.get_grace_objective(conn, delegation["objective_id"])
+            if delegation["objective_id"] else None
+        )
+        callback = kb.get_grace_loop_callback(conn, result["grace_review_task_id"])
+        run = kb.latest_run(conn, result["execution_task_id"])
+        assert conn.execute("SELECT COUNT(*) FROM grace_approval_challenges").fetchone()[0] == 0
+    assert contract["identity"]["topic_name"] == topic_name
+    assert contract["identity"]["project"] == project
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["approval_grant_id"] == ""
+    if not expected_objective:
+        assert objective is None
+        assert not contract.get("objective_ref")
+        assert callback["objective_id"] is None
+        assert contract["completion_mode"] == callback["completion_mode"] == "terminal"
+        return
+    assert contract.get("objective_ref"), "Preflight lost the original external objective"
+    assert objective["thread_id"] == contract["identity"]["thread_id"]
+    assert objective["terminal_stage_key"] == "execute_external_action"
+    assert delegation["stage_key"].startswith("prepare_")
+    assert contract["objective_ref"] == {
+        "objective_id": delegation["objective_id"],
+        "stage_key": delegation["stage_key"],
+    }
+    assert contract["completion_mode"] == callback["completion_mode"] == "intermediate"
+    assert callback["objective_id"] == delegation["objective_id"]
+    assert callback["stage_key"] == delegation["stage_key"]
+
 
 
 def test_marketplace_readonly_target_queues_without_external_approval(

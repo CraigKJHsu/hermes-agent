@@ -90,6 +90,44 @@ def test_protocol_v2_schemas_require_identity_and_success_evidence():
         validate_delegated_result(base_result)
 
 
+def test_protocol_v2_task_schema_accepts_readonly_url_authority():
+    from plugins.openclaw_bridge.schemas import validate_delegated_task
+
+    task = {
+        "task_id": "task-1",
+        "requested_by": "hermes",
+        "objective": "Read the exact page without side effects.",
+        "context_refs": [],
+        "allowed_tools": ["browser.read"],
+        "denied_tools": ["browser.click"],
+        "risk_level": "low",
+        "requires_confirmation": False,
+        "max_runtime_seconds": 300,
+        "output_format": "json",
+        "audit_required": True,
+        "protocol_version": "2.0",
+        "delegation_id": "grace:task-1",
+        "attempt_id": "task-1:run:1",
+        "contract_fingerprint": "fingerprint",
+        "project": "hub_ops",
+        "topic_id": "general",
+        "executor_backend": "openclaw",
+        "executor_profile": "browser-readonly",
+        "backend_agent_id": "missioncrew-browser-readonly",
+        "external_effect_budget": 0,
+        "workspace_policy": "dedicated",
+        "session_policy": "ephemeral",
+        "credential_refs": [],
+        "idempotency_key": "task-1:run:1",
+        "openclaw_task_id": "openclaw.browser.read_snapshot",
+        "target_url": "http://127.0.0.1:8766/",
+        "allowed_urls": ["http://127.0.0.1:8766/"],
+        "dry_run": False,
+    }
+
+    assert validate_delegated_task(task) == task
+
+
 def test_protocol_v3_task_schema_requires_context_and_confirmation_contracts():
     from plugins.openclaw_bridge.schemas import validate_delegated_task
 
@@ -978,6 +1016,7 @@ def test_plugin_registers_tool_command_and_gateway_hook():
             "clawops_cancel",
             "clawops_retry_review",
             "grace_callback_outcome",
+            "grace_reconcile",
             "openclaw_delegate",
         ],
         "commands": ["openclaw-dry-run"],
@@ -1840,6 +1879,7 @@ def test_protocol_v2_http_failure_preserves_request_identity_without_echo_claim(
             "idempotency_key": "attempt-http-error",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2013,7 +2053,8 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
             "credential_refs": [],
             "idempotency_key": "attempt-1",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
-            "target_url": "https://example.com/",
+            "target_url": "http://127.0.0.1:8766/",
+            "allowed_urls": ["http://127.0.0.1:8766/"],
             "dry_run": False,
         }
     )
@@ -2028,7 +2069,7 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
     assert payload["protocolVersion"] == "2.0"
     assert payload["taskId"] == "openclaw.browser.read_snapshot"
     assert payload["dryRun"] is False
-    assert payload["input"]["url"] == "https://example.com/"
+    assert payload["input"]["url"] == "http://127.0.0.1:8766/"
     assert payload["identity"]["delegationId"] == "delegation-1"
     assert payload["identity"]["topicId"] == "readonly-browser"
     assert payload["routing"]["executorBackend"] == "openclaw"
@@ -2039,6 +2080,110 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
         "sessionPolicy": "ephemeral",
         "credentialRefs": [],
     }
+
+
+def test_live_readonly_template_is_not_misclassified_by_clawops_objective():
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "Read-only snapshot queued.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": ["queued"],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll the backend run.",
+            "protocol_version": "2.0",
+            "delegation_id": task["delegation_id"],
+            "attempt_id": task["attempt_id"],
+            "contract_fingerprint": task["contract_fingerprint"],
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "browser-run-1",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "backend_session_key": "browser-session-1",
+        }
+
+    result = tools.delegate_to_openclaw(
+        {
+            "task_id": "browser-contract-clawops-word",
+            "objective": "Use the ClawOps browser_readonly path to read one page.",
+            "risk_level": "low",
+            "allowed_tools": ["browser.read"],
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-clawops-word",
+            "attempt_id": "attempt-clawops-word",
+            "contract_fingerprint": "sha256:clawops-word",
+            "project": "hub_ops",
+            "topic_id": "general",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser-readonly",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-clawops-word",
+            "openclaw_task_id": "openclaw.browser.read_snapshot",
+            "target_url": "http://127.0.0.1:8766/",
+            "allowed_urls": ["http://127.0.0.1:8766/"],
+            "dry_run": False,
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert len(seen) == 1
+
+
+def test_protocol_v2_readonly_browser_rejects_url_authority_mismatch():
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "objective": "Read one exact page.",
+            "allowed_tools": ["browser.read"],
+            "allowed_urls": ["https://www.iana.org/"],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-mismatch",
+            "attempt_id": "attempt-mismatch",
+            "contract_fingerprint": "sha256:mismatch",
+            "project": "hub_ops",
+            "topic_id": "readonly-browser",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser-readonly",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-mismatch",
+            "openclaw_task_id": "openclaw.browser.read_snapshot",
+            "target_url": "https://example.com/",
+            "dry_run": False,
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    with pytest.raises(ValueError, match="zero-effect OpenClaw templates"):
+        tools._openclaw_payload(task, config)
+
+    task["target_url"] = "https://www.iana.org/"
+    with pytest.raises(ValueError, match="zero-effect OpenClaw templates"):
+        tools._openclaw_payload(task, config)
 
 
 @pytest.mark.parametrize(
@@ -2078,6 +2223,7 @@ def test_protocol_v2_readonly_browser_lifecycle_payload_requires_exact_run(
             "backend_run_id": "backend-run-1",
             "openclaw_task_id": template,
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2315,6 +2461,7 @@ def test_protocol_v2_http_response_must_explicitly_echo_v2(
             "idempotency_key": "attempt-response",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2393,6 +2540,7 @@ def test_protocol_v2_http_response_maps_matching_execution_identity(monkeypatch)
             "idempotency_key": "attempt-identity",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2563,6 +2711,7 @@ def test_protocol_v2_http_response_preserves_backend_token_usage(monkeypatch):
             "idempotency_key": "attempt-usage",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2696,6 +2845,7 @@ def test_protocol_v2_http_response_rejects_uncorrelated_or_evidence_free_success
             "backend_agent_id": "missioncrew-browser-readonly",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )

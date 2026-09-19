@@ -27,8 +27,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--version",
-        default="v13",
-        help="Installed compatible behavior profile version (default: current v13)",
+        required=True,
+        help="Exact installed candidate behavior profile version to verify",
     )
     args = parser.parse_args()
     output = args.output.resolve()

@@ -74,7 +74,7 @@ From the `hermes-agent` repository root, run in the candidate checkout with the
 supported Python environment:
 
 ```sh
-.venv312/bin/python scripts/shadow_behavior_profiles.py --output /absolute/new/output-directory
+.venv312/bin/python scripts/shadow_behavior_profiles.py --version EXACT_CANDIDATE_VERSION --output /absolute/new/output-directory
 ```
 
 Each representative fixture runs through actual contract/compiler, SQLite
@@ -108,6 +108,54 @@ zero-external-effect Objective through Grace delegation, execution, independent
 review and the original Objective's acceptance. Record task/run IDs and confirm
 all pins, policy receipts, callback/stage transitions and effect count zero.
 Synthetic shadow alone is not this production canary.
+
+Before installation, verify each exact candidate in its candidate checkout:
+
+```sh
+.venv312/bin/python -m hermes_cli.behavior_profiles health --profile ai_bizweek --version EXACT_CANDIDATE_VERSION
+.venv312/bin/python -m hermes_cli.behavior_profiles health --profile secondhand_commerce --version EXACT_CANDIDATE_VERSION
+```
+
+Candidate health does not open a board or inspect its current selections. Replace
+`EXACT_CANDIDATE_VERSION` explicitly; the shadow command also requires a version.
+Health reports all kernel source mismatches and returns a nonzero exit status on
+any failure. Enabling a selection verifies its bundle, kernel and calling process
+before changing the selection revision. Disabling a selection remains available
+when the selected version is unhealthy.
+
+After installation and the affected runtime restarts, inspect the selected
+versions and every nonterminal pinned Objective with the read-only board check:
+
+```sh
+.venv312/bin/python -m hermes_cli.behavior_profiles health
+```
+
+Use `--board EXACT_BOARD` before `health` for a named board. This command never
+creates or migrates a board. Its runtime digest attests only the calling process;
+a fresh CLI cannot prove that a running gateway or dispatcher loaded the release.
+Verify those processes through their normal runtime attestation before enabling
+the new exact Topic selections. Review the board health report again after
+selection changes. An older Objective keeps its old pin and may still fail;
+resolve it through the explicit migration procedure below, preserving its policy,
+stages and audit history. Never overwrite an old manifest or silently rebind it
+to make health pass. Record approved unresolved Objectives separately from the
+new-Objective canary; do not report whole-board health as passed while one fails.
+
+Shared `browser_readonly` routing also requires the deployment's existing HubOps
+configuration at `../docs/projects/hub-ops/agent-registry.yaml` and
+`../docs/projects/hub-ops/routing-rules.yaml`, outside this Hermes repository.
+The trusted `worker_profiles.clawops.browser_readonly.allowed_urls` list must
+authorize the exact target URL; missing or invalid authority fails closed.
+For an isolated worktree, supply copies at the same parent-relative location and
+record their source and copy hashes. These external configuration files are a
+deployment prerequisite and are not part of the Hermes commit.
+
+A pinned profile must carry the same URL authority inside its immutable route
+snapshot, and its immutable routing bundle must copy `allowed_urls` into both
+the resolved assignment and backend role card. Profile v50 introduces route
+snapshot v2 for this reason while retaining safety kernel v49. The snapshot
+preserves the two URLs historically admitted by the prior pinned compiler; it
+does not inherit later deployment-only URLs such as localhost targets.
 
 Rollback new admissions with `profile_id:null`, `version:null` and the current
 selection revision. Existing pinned work stays pinned; never delete its history.

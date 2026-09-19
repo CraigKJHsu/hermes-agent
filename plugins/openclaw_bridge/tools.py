@@ -11,6 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+import yaml
+
 from plugins.openclaw_bridge.schemas import validate_delegated_result, validate_delegated_task
 from proactive.tool_policy import PolicyLevel, decide_action, load_tool_policy
 
@@ -19,12 +21,6 @@ DEFAULT_OPENCLAW_BRIDGE_PATH = "/api/plugins/hermes-bridge/tasks"
 DEFAULT_OPENCLAW_TEMPLATE = "agents.ask_team"
 _ZERO_EFFECT_ASYNC_CAPABILITY = object()
 _LOOP_CONTRACT_ASYNC_CAPABILITY = object()
-_READONLY_BROWSER_ALLOWED_URLS = frozenset(
-    {
-        "https://example.com/",
-        "https://www.linkedin.com/in/craig-k-j-hsu-6012b815",
-    }
-)
 _LOOP_CONTRACT_AGENT_IDS = frozenset(
     {
         "missioncrew-browser-readonly",
@@ -42,6 +38,30 @@ _ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "browser"})
 _ZERO_EFFECT_INTERNAL_DEVOPS_TOOLS = frozenset({"read", "write", "web_search"})
 
 
+def _readonly_browser_allowed_urls() -> frozenset[str]:
+    """Read the trusted worker URL authority from the HubOps registry."""
+    registry_path = (
+        Path(__file__).resolve().parents[3]
+        / "docs"
+        / "projects"
+        / "hub-ops"
+        / "agent-registry.yaml"
+    )
+    try:
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        worker = (registry.get("worker_profiles") or {}).get(
+            "clawops.browser_readonly"
+        )
+        values = worker.get("allowed_urls") if isinstance(worker, Mapping) else []
+        return frozenset(
+            str(value or "").strip()
+            for value in values or []
+            if str(value or "").strip()
+        )
+    except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
+        return frozenset()
+
+
 @dataclass(frozen=True)
 class OpenClawBridgeConfig:
     base_url: str
@@ -57,6 +77,7 @@ OPENCLAW_DELEGATE_PARAMETERS = {
         "objective": {"type": "string"},
         "context_refs": {"type": "array", "items": {"type": "string"}},
         "allowed_tools": {"type": "array", "items": {"type": "string"}},
+        "allowed_urls": {"type": "array", "items": {"type": "string"}},
         "denied_tools": {"type": "array", "items": {"type": "string"}},
         "risk_level": {"type": "string"},
         "requires_confirmation": {"type": "boolean"},
@@ -120,6 +141,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
         for field in (
             "context_refs",
             "allowed_tools",
+            "allowed_urls",
             "denied_tools",
             "credential_refs",
         ):
@@ -219,6 +241,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
                 "workspace_policy": str(args.get("workspace_policy") or "dedicated").strip(),
                 "session_policy": str(args.get("session_policy") or "ephemeral").strip(),
                 "credential_refs": list(args.get("credential_refs") or []),
+                "allowed_urls": list(args.get("allowed_urls") or []),
                 "dry_run": bool(args.get("dry_run", True)),
                 "idempotency_key": str(
                     args.get("idempotency_key") or args["attempt_id"]
@@ -359,6 +382,18 @@ def _is_explicit_openclaw_dry_run(task: dict[str, Any]) -> bool:
 def _requires_clawops_runtime(task: dict[str, Any]) -> bool:
     """Return True for work that should enter the Hermes-owned ClawOps queue."""
     if _is_explicit_openclaw_dry_run(task):
+        return False
+    if (
+        task.get("protocol_version") == "2.0"
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.browser.read_snapshot",
+            "openclaw.browser.read_snapshot_poll",
+            "openclaw.browser.read_snapshot_cancel",
+        }
+        and task.get("executor_profile") == "browser-readonly"
+        and task.get("dry_run") is False
+    ):
         return False
     haystack = " ".join(
         [
@@ -547,8 +582,11 @@ def _openclaw_payload(
         and task.get("credential_refs") == []
         and task.get("requires_confirmation") is False
         and task.get("allowed_tools") == ["browser.read"]
+        and task.get("allowed_urls")
+        == [str(task.get("target_url") or "").strip()]
         and str(task.get("target_url") or "").strip()
-        in _READONLY_BROWSER_ALLOWED_URLS
+        in _readonly_browser_allowed_urls()
+        and bool(str(task.get("target_url") or "").strip())
         and bool(str(task.get("project") or "").strip())
         and bool(str(task.get("topic_id") or "").strip())
         and bool(str(task.get("idempotency_key") or "").strip())
