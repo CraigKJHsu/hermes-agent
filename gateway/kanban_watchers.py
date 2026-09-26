@@ -2996,6 +2996,13 @@ class GatewayKanbanWatchersMixin:
         """
         from pathlib import Path as _Path
 
+        from hermes_cli.kanban_db import _grace_loop_stage_header
+
+        # A source path quoted in Loop evidence is not a delivery artifact.
+        # Controlled tasks must declare uploads explicitly in completion data.
+        implicit_paths_allowed = not bool(_grace_loop_stage_header(
+            str(getattr(task, "body", "") or "")
+        ))
         candidates: list[str] = []
         missing_explicit: list[str] = []
         seen: set[str] = set()
@@ -3023,13 +3030,13 @@ class GatewayKanbanWatchersMixin:
 
             # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
+            if implicit_paths_allowed and isinstance(summary, str) and summary:
                 paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
                     _add(p)
 
         # 3. Legacy: paths embedded in task.result.
-        if task is not None and getattr(task, "result", None):
+        if implicit_paths_allowed and task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
             for p in paths:

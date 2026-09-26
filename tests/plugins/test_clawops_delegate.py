@@ -546,6 +546,11 @@ def test_delegate_rejects_explicit_stop_instead_of_creating_cancel_task(
     ("message", "is_cancel"),
     [
         ("停止執行", True),
+        ("請建立研究r5；complete=false須停止，complete=true且其他證據成功才能accepted。", False),
+        ("complete=false須停止；另外請停止目前任務", True),
+        ("verified: false 時必須停止並回報", False),
+        ("complete=true須停止目前任務", True),
+
         ("建立 task-scoped approval challenge 後停止，等待我核准", False),
         ("建立 task-scoped approval challenge 後停止並等待我核准", False),
         ("create an approval challenge then stop and wait for approval", False),

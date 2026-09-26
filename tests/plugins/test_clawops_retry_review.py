@@ -2537,3 +2537,49 @@ def test_clawops_retry_review_rejects_when_policy_fault_is_not_repaired(
     assert "policy_stale" in result["reason"]
     with kb.connect_closing(db_path) as conn:
         assert _durable_state(conn, execution_id, review_id) == initial
+
+
+@pytest.mark.parametrize("kind", ["capability", "transient"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_runtime_reload_review_retry_preserves_exact_card(tmp_path, monkeypatch, kind, stale):
+    db_path = tmp_path / "runtime-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db(db_path)
+    reason = (
+        "Formal review evidence passed and the accepted decision is recorded in comment 954, "
+        "but kanban_complete is blocked by control-plane integrity error: "
+        "`Kanban review runtime source changed; restart the dispatcher/gateway before claiming "
+        "or completing workflow reviews`. Operator must restart dispatcher/gateway, "
+        "then reclaim and complete this accepted review; do not treat it as rejected."
+    )
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(conn, block_kind=kind, block_reason=reason)
+        before = _durable_state(conn, execution_id, review_id)
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr("plugins.openclaw_bridge.clawops_delegate.get_session_env",
+                        lambda key, default="": values.get(key, default))
+    monkeypatch.setattr(kb, "_REVIEW_RUNTIME_SHA256", "stale" if stale else kb._review_runtime_digest())
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+    with kb.connect_closing(db_path) as conn:
+        after = _durable_state(conn, execution_id, review_id)
+        if stale:
+            assert result["status"] == "rejected"
+            assert "runtime source changed" in result["reason"]
+            assert after == before
+        else:
+            assert result["status"] == "queued"
+            assert result["task_created"] is False
+            assert after["review_status"] == "ready"
+            assert after["execution_status"] == "done"
+            assert result["grace_review_task_id"] == review_id
+
+
+def test_runtime_reload_reason_rejects_composite_and_unrelated_faults():
+    from hermes_cli.review_retry_recovery import is_runtime_source_block_reason, _runtime_source_block_reason
+    reason = _runtime_source_block_reason("t_review")
+    assert is_runtime_source_block_reason(reason, "t_review")
+    assert not is_runtime_source_block_reason(reason + "; missing credential", "t_review")
+    assert not is_runtime_source_block_reason(reason, "t_another")
+    assert not is_runtime_source_block_reason("Kanban review runtime source changed", "t_review")

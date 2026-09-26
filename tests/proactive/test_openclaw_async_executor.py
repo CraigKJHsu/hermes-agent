@@ -8431,3 +8431,27 @@ def test_first_formal_native_admission_persists_controller_history_baseline(kanb
         assert baseline['execution_run_id'] == run.id
         assert baseline['delegation_contract_fingerprint'] == delegation['contract_fingerprint']
         assert baseline['source'] == 'controller_pre_admission_snapshot'
+
+
+def test_research_admission_can_fetch_public_sources_without_mutation(kanban_home, monkeypatch):
+    monkeypatch.setattr(openclaw_async_executor, "_existing_loop_agent_or_executor", lambda agent_id: agent_id)
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "research-public-source-capability"
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract, task_type="research", risk_level="low", approved=False,
+        delegation_id="research-public-source-delegation", transport=transport,
+    )
+    assert started["status"] == "queued"
+    assert seen["backend_agent_id"] == "missioncrew-research"
+    assert seen["external_effect_budget"] == 0
+    assert "web_fetch" in seen["allowed_tools"]
+    assert not set(seen["allowed_tools"]) & {"exec", "write", "edit", "message"}
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run.metadata["allowed_tools"] == seen["allowed_tools"]

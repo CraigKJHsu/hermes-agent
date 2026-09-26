@@ -521,7 +521,8 @@ def test_zero_effect_missioncrew_content_loop_allows_content_tools_confirmation(
     assert seen[0]["allowed_tools"] == allowed_tools
 
 
-def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
+@pytest.mark.parametrize("allowed_tools", [["read", "web_search", "browser"], ["read", "web_search", "web_fetch", "browser"]])
+def test_zero_effect_generic_loop_allows_readonly_tool_confirmation(allowed_tools):
     from plugins.openclaw_bridge import tools
 
     seen = []
@@ -554,7 +555,7 @@ def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
             "task_id": "task-generic-readonly",
             "objective": "Read current task evidence without changing external state.",
             "risk_level": "medium",
-            "allowed_tools": ["read", "web_search", "browser"],
+            "allowed_tools": allowed_tools,
             "requires_confirmation": False,
             "requested_by": "hermes",
             "protocol_version": "2.0",
@@ -587,7 +588,7 @@ def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
     assert result["backend_agent_id"] == "missioncrew-executor"
     assert result["protocol_correlated"] is True
     assert len(seen) == 1
-    assert seen[0]["allowed_tools"] == ["read", "web_search", "browser"]
+    assert seen[0]["allowed_tools"] == allowed_tools
 
 
 @pytest.mark.parametrize("controller_capability", [False, True])

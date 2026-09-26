@@ -29,6 +29,21 @@ def _runtime_source_block_reason(review_task_id: str) -> str:
     )
 
 
+
+def is_runtime_source_block_reason(reason: str, review_task_id: str) -> bool:
+    """Match only the known sole runtime-integrity fault, never composite blockers."""
+    if reason == _runtime_source_block_reason(review_task_id):
+        return True
+    return re.fullmatch(
+        r"Formal review evidence passed and the accepted decision is recorded in comment [0-9]+, "
+        r"but kanban_complete is blocked by control-plane integrity error: "
+        r"`Kanban review runtime source changed; restart the dispatcher/gateway before claiming "
+        r"or completing workflow reviews`. Operator must restart dispatcher/gateway, "
+        r"then reclaim and complete this accepted review; do not treat it as rejected\.",
+        reason,
+    ) is not None
+
+
 def _state_path(value: str | Path | None) -> Path:
     return Path(
         value
@@ -418,9 +433,9 @@ def _retry(
             resolve_task_policy_snapshots(task.body if task is not None else "")
             repaired_fault = "managed_policy_absent_binding"
         elif (
-            value["block_kind"] == "transient"
-            and payload.get("kind") == "transient"
-            and reason == _runtime_source_block_reason(review_id)
+            value["block_kind"] in {"transient", "capability"}
+            and payload.get("kind") == value["block_kind"]
+            and is_runtime_source_block_reason(reason, review_id)
         ):
             kb._workflow_review_source(conn, review_id)
             repaired_fault = "review_runtime_reloaded"

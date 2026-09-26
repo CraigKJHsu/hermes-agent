@@ -399,6 +399,9 @@ def _loop_allowed_tools(
         "secondhand_commerce_group_status",
     }:
         allowed = ["read", "web_search", "browser"]
+        if task_type == "research":
+            # Public document fetch preserves DNS/SSRF protection without browser navigation.
+            allowed.insert(2, "web_fetch")
         for tool in direct_tools:
             if tool not in allowed:
                 allowed.append(tool)
@@ -1379,6 +1382,13 @@ def _objective_durable_evidence_snapshot(
         and str(domain_spec.get("domain_key") or "").strip()
         and str(domain_spec.get("entity_type") or "").strip()
     )
+    verification = contract.get("verification")
+    required = verification.get("evidence_required", []) if isinstance(verification, Mapping) else []
+    if not isinstance(required, (list, tuple)) or not all(isinstance(item, str) for item in required):
+        raise ValueError("verification.evidence_required must be a sequence of exact evidence class names")
+    source_inventory_requested = "controller_runtime_source_inventory" in required
+    if source_inventory_requested and not objective_id:
+        raise ValueError("Controller source inventory requires a canonical Objective binding")
     referenced_task_ids = _loop_contract_task_ids(contract)
     if not objective_id and not has_domain_query and not referenced_task_ids:
         return {}
@@ -1446,6 +1456,9 @@ def _objective_durable_evidence_snapshot(
             if not project_namespace or project_namespace != workflow_project:
                 raise ValueError("Objective snapshot belongs to another project")
         snapshot["publication_progress"] = progress(conn, objective_id)
+        if source_inventory_requested:
+            from hermes_cli.source_inventory import runtime_source_inventory
+            snapshot["runtime_source_inventory"] = runtime_source_inventory()
     if has_domain_query:
         domain_inventory = kb.domain_inventory_report(
             conn,

@@ -224,3 +224,30 @@ def test_kanban_artifact_delivery_uploads_existing_markdown(tmp_path):
         file_path=str(report),
         metadata={},
     )
+
+
+def test_controlled_loop_artifact_delivery_does_not_upload_referenced_sources(tmp_path):
+    import asyncio
+    from gateway.platforms.base import BasePlatformAdapter
+    source = tmp_path / "config.yaml"
+    source.write_text("private runtime configuration")
+    output = tmp_path / "deliverable.md"
+    output.write_text("user deliverable")
+    for explicit in (False, True):
+        adapter = SimpleNamespace(
+            extract_local_files=BasePlatformAdapter.extract_local_files,
+            send=AsyncMock(), send_document=AsyncMock(), send_multiple_images=AsyncMock(),
+        )
+        task = SimpleNamespace(body="GRACE_LOOP_CONTRACT_STAGE: execution\n", result=str(source))
+        payload = {"summary": str(source), "artifacts": [str(output)] if explicit else []}
+        asyncio.run(GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+            SimpleNamespace(), adapter=adapter, chat_id="chat-1", metadata={},
+            event_payload=payload, task=task,
+        ))
+        if explicit:
+            adapter.send_document.assert_awaited_once()
+            assert str(output) in str(adapter.send_document.await_args)
+            assert str(source) not in str(adapter.send_document.await_args)
+        else:
+            adapter.send_document.assert_not_awaited()
+            adapter.send_multiple_images.assert_not_awaited()

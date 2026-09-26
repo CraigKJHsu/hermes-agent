@@ -43,7 +43,7 @@ _LOOP_CONTRACT_AGENT_IDS = frozenset(
         "missioncrew-executor",
     }
 )
-_ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "browser"})
+_ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "web_fetch", "browser"})
 _ZERO_EFFECT_INTERNAL_DEVOPS_TOOLS = frozenset({"read", "write", "web_search"})
 
 

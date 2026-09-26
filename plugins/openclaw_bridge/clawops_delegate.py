@@ -952,6 +952,9 @@ _APPROVAL_CHECKPOINT_STOP = re.compile(
 )
 _FAIL_CLOSED_GUARD_STOP = re.compile(
     r"(?:"
+    r"\b(?:complete|verified|success|ready)\s*(?:=|:)\s*false(?![A-Za-z0-9_])"
+    r"\s*(?:時|則|即|就)?\s*(?:須|應|必須|需)?\s*(?P<stop_bool>停止|停下)"
+    r"|"
     r"(?:任一|任何(?:一項)?|上述|以上|這些|所有)?"
     r"(?:條件|要求|項目|一項|路徑|模型|工具|執行者|架構|admission|gate|receipt|evidence)"
     r".{0,24}?"
@@ -1428,6 +1431,7 @@ def _without_fail_closed_guard_stop(message_text: str) -> str:
         group = next(
             name
             for name in (
+                "stop_bool",
                 "stop_zh",
                 "stop_zh_first",
                 "stop_zh_no_progress",
@@ -2477,7 +2481,26 @@ def handle_clawops_retry_review(
             repaired_fault = ""
             receipt_extra: dict[str, Any] = {}
             callback_attention_handoff = False
-            if value.get("review_block_kind") == "capability":
+            from hermes_cli.review_retry_recovery import is_runtime_source_block_reason
+
+            reload_event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+                (review_task_id,),
+            ).fetchone()
+            try:
+                reload_payload = json.loads(reload_event["payload"] or "{}") if reload_event else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                reload_payload = {}
+            if (
+                isinstance(reload_payload, dict)
+                and value.get("review_block_kind") in {"capability", "transient"}
+                and reload_payload.get("kind") == value.get("review_block_kind")
+                and is_runtime_source_block_reason(str(reload_payload.get("reason") or ""), review_task_id)
+            ):
+                # Restart must already have restored exact runtime-source integrity.
+                kb._workflow_review_source(conn, review_task_id)
+                repaired_fault = "review_runtime_reloaded"
+            elif value.get("review_block_kind") == "capability":
                 blocked_event = conn.execute(
                     """
                     SELECT payload
