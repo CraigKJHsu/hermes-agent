@@ -8406,3 +8406,162 @@ def test_approval_outcome_ignores_only_retired_successors(tmp_path, monkeypatch,
                 kb.record_grace_loop_callback_outcome(conn,**args)
         assert dict(conn.execute("SELECT * FROM grace_delegations WHERE delegation_id='gd-retired'").fetchone())==before
         assert kb.get_grace_approval_challenge(conn,challenge['token'])['state']=='pending'
+
+
+def test_verified_owner_wakeup_instance_precedes_cached_human_message(tmp_path,monkeypatch):
+    """Routing unit: real lease/scope denials live in test_objective_recovery."""
+    from hermes_cli import objective_recovery as recovery
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+    context={'request_id':'gsw_verified_test','lease':'verified-controller-lease'}
+    values={'HERMES_SESSION_PLATFORM':'telegram','HERMES_SESSION_CHAT_ID':'chat-1',
+            'HERMES_SESSION_THREAD_ID':'2','HERMES_SESSION_USER_ID':'kj',
+            'HERMES_SESSION_OWNER_USER_ID':'kj','HERMES_SESSION_KEY':'agent:main:telegram:group:chat-1:2',
+            'HERMES_SESSION_ID':'grace-session-1','HERMES_SESSION_MESSAGE_ID':'cached-human-message',
+            'HERMES_SESSION_INTERNAL':'true',
+            'HERMES_SESSION_MESSAGE_TEXT':recovery.ENVELOPE+json.dumps(context)+'\nverified owner stage'}
+    _configure_secondhand_context(tmp_path,monkeypatch,values)
+    verified=[]
+    def accepted_scope(conn,received,args,**scope):
+        assert received==context and scope['session_key']==values['HERMES_SESSION_KEY']
+        verified.append(True);args['request_instance_id']='gri_gsw_verified_test'
+    monkeypatch.setattr(recovery,'validate_recovery_turn',accepted_scope)
+    args=_nested_args();args.update(task_type='content_draft',external_effect_budget=0,approved=False,external_targets=[])
+    result=json.loads(handle_clawops_delegate(args))
+    assert verified and result['status']=='queued',result
+    with kb.connect_closing(tmp_path/'kanban.db') as conn:
+        delegation=kb.get_grace_delegation(conn,delegation_id=result['delegation_id'])
+        assert delegation['request_instance_id']=='gri_gsw_verified_test'
+        assert delegation['approval_required']==0
+
+
+def _seed_delivered_terminal_content(conn, values):
+    """Small durable fixture with exact-run accepted review and zero-effect seal."""
+    from proactive.loop_contract import contract_fingerprint
+    oid = 'go_user_content_revision_test'
+    kb.create_grace_objective(conn, objective_id=oid, platform='telegram', chat_id='chat-1',
+        thread_id='2', session_key=values['HERMES_SESSION_KEY'], title='content', objective='deliver content',
+        original_request_sha256='a'*64, required_stage_keys=['deliver'], terminal_stage_key='deliver',
+        acceptance_criteria=['all roles'], current_stage_key='deliver')
+    contract = {'objective_ref': {'objective_id': oid, 'stage_key': 'deliver'},
+        'user_facing_delivery': {'required': True, 'kind': 'content_package', 'delivery': 'inline_only', 'body_field': 'baseline'}, 'external_effect_budget': 0}
+    fingerprint = contract_fingerprint(contract)
+    body = 'GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n'+json.dumps(contract)+'\n```'
+    execution = kb.create_task(conn,title='content execution',body=body)
+    review = kb.create_task(conn,title='content review',parents=(execution,))
+    conn.execute("UPDATE tasks SET status='done',completed_at=2,executor_backend='openclaw' WHERE id IN (?,?)", (execution,review))
+    erun = conn.execute("INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at,metadata) VALUES (?,'done','completed',1700000001,1700000002,?)", (execution,json.dumps({'external_effect_budget':0,'external_effects':[], 'execution_card_fingerprint':fingerprint, 'acceptance_evidence': {'baseline': 'Previously delivered incomplete role plan'}}))).lastrowid
+    source = {'parent_execution_task_id':execution,'parent_execution_run_id':erun,
+        'parent_execution_evidence_sha256':kb.workflow_review_evidence_hash(kb.get_run(conn,erun)),
+        'parent_task_body_sha256':hashlib.sha256(body.encode()).hexdigest(),
+        'review_task_body_sha256':hashlib.sha256((kb.get_task(conn,review).body or "").encode()).hexdigest()}
+    rrun = conn.execute("INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at,metadata) VALUES (?,'done','completed',2,3,?)", (review,json.dumps({'review_outcome':'accepted','workflow_review_source':source}))).lastrowid
+    _bind_callback_delegation(conn,execution_id=execution,review_id=review,contract_fingerprint=fingerprint,suffix='terminal-content')
+    conn.execute("UPDATE grace_delegations SET objective_id=?,stage_key='deliver' WHERE review_task_id=?",(oid,review))
+    conn.execute("UPDATE grace_objective_stages SET status='done',delegation_id='gd-terminal-content',execution_task_id=?,review_task_id=?,outcome_kind='closed',completed_at=4 WHERE objective_id=?",(execution,review,oid))
+    event = conn.execute("INSERT INTO task_events(task_id,run_id,kind,payload,created_at) VALUES (?,?,'completed','{}',3)",(review,rrun)).lastrowid
+    kb.add_grace_loop_callback(conn,review_task_id=review,execution_task_id=execution,platform='telegram',chat_id='chat-1',thread_id='2',session_key=values['HERMES_SESSION_KEY'],session_id='grace-session-1',contract_fingerprint=fingerprint,objective_id=oid,stage_key='deliver',completion_mode='terminal')
+    conn.execute("UPDATE grace_loop_callbacks SET state='delivered',last_event_id=?,outcome_event_id=?,outcome_kind='closed',user_report_event_id=?,user_report_delivered_at=4 WHERE review_task_id=?",(event,event,event,review))
+    conn.execute("UPDATE grace_objectives SET status='completed',completed_at=4 WHERE objective_id=?",(oid,))
+    return oid,execution,review,event
+
+
+@pytest.mark.parametrize('case', ['valid','nonowner','effectful','wrong-event','approved','wrong-stage','changed-body','noncontent','old-message','reservation-failure','new-session','wrong-source-run'])
+def test_fresh_owner_can_formally_revise_delivered_content_without_rewriting_history(tmp_path,monkeypatch,case):
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+    values={'HERMES_SESSION_PLATFORM':'telegram','HERMES_SESSION_CHAT_ID':'chat-1','HERMES_SESSION_THREAD_ID':'2',
+        'HERMES_SESSION_USER_ID':'other' if case=='nonowner' else 'kj','HERMES_SESSION_OWNER_USER_ID':'kj',
+        'HERMES_SESSION_KEY':'agent:main:telegram:group:chat-1:2','HERMES_SESSION_ID':'grace-session-1',
+        'HERMES_SESSION_MESSAGE_ID':'fresh-content-correction','HERMES_SESSION_MESSAGE_TEXT':'修正交付內容，補齊所有角色',
+        'HERMES_SESSION_INTERNAL':'false'}
+    _configure_secondhand_context(tmp_path,monkeypatch,values)
+    with kb.connect_closing(tmp_path/'kanban.db') as conn:
+        oid,execution,review,event=_seed_delivered_terminal_content(conn,values)
+        before=dict(conn.execute('SELECT * FROM grace_objective_stages WHERE objective_id=?',(oid,)).fetchone())
+        callback_before=kb.get_grace_loop_callback(conn,review)
+        if case=='changed-body':
+            conn.execute("UPDATE tasks SET body=body||'changed' WHERE id=?",(execution,))
+        if case=='old-message':
+            conn.execute("UPDATE grace_loop_callbacks SET message_id=? WHERE review_task_id=?",(values['HERMES_SESSION_MESSAGE_ID'],review))
+            callback_before=kb.get_grace_loop_callback(conn,review)
+    if case == 'new-session':
+        values['HERMES_SESSION_ID']='fresh-after-gateway-restart'
+        monkeypatch.setenv('HERMES_SESSION_ID', values['HERMES_SESSION_ID'])
+    args=_nested_args();args.update({'task_type':'content_draft','external_targets':['Internal content correction only - zero external platform action'],
+        'user_facing_delivery':{'required':True,'kind':'content_package','delivery':'inline_only','body_field':'acceptance_evidence.inline_content_package.body','asset_filenames':[],'subject_keys':['all-roles']},
+        'objective_ref':{'objective_id':oid,'stage_key':'deliver_r2'},'origin_callback_review_id':review,
+        'origin_callback_event_id':event+1 if case=='wrong-event' else event,'origin_callback_board':'default'})
+    if case=='wrong-stage':args['objective_ref']['stage_key']='deliver'
+    if case=='noncontent':args['task_type']='research'
+    if case=='approved':args['approved']=True
+    if case=='wrong-source-run':args['source_package_ref']={'execution_task_id':execution,'review_task_id':review,'execution_run_id':-1,'review_run_id':-1}
+    if case=='effectful':args['external_effect_budget']=1
+    if case=='reservation-failure':
+        def fail_reservation(*args,**kwargs):
+            raise RuntimeError('injected reservation failure')
+        monkeypatch.setattr(kb,'reserve_grace_delegation',fail_reservation)
+    result=json.loads(handle_clawops_delegate(args))
+    with kb.connect_closing(tmp_path/'kanban.db') as conn:
+        assert dict(conn.execute("SELECT * FROM grace_objective_stages WHERE objective_id=? AND stage_key='deliver'",(oid,)).fetchone())==before
+        assert kb.get_grace_loop_callback(conn,review)==callback_before
+        objective=kb.get_grace_objective(conn,oid)
+        if case not in {'valid','new-session'}:
+            assert result['status']=='rejected',result
+            assert objective['status']=='completed'
+            assert len(list(conn.execute('SELECT * FROM grace_objective_stages WHERE objective_id=?',(oid,))))==1
+        else:
+            assert result['status']=='queued',result
+            assert objective['status']=='active' and objective['revision']==2
+            assert json.loads(objective['required_stage_keys'])==['deliver','deliver_r2']
+            assert objective['terminal_stage_key']=='deliver_r2'
+            journal=conn.execute('SELECT * FROM grace_objective_revisions WHERE objective_id=?',(oid,)).fetchone()
+            assert journal['source_message_id']=='fresh-content-correction'
+            delegation=conn.execute('SELECT session_id FROM grace_delegations WHERE execution_task_id=?',(result['execution_task_id'],)).fetchone()
+            assert delegation['session_id']==('fresh-after-gateway-restart' if case=='new-session' else values['HERMES_SESSION_ID'])
+            assert json.loads(journal['snapshot'])['objective']['status']=='completed'
+    if case in {'valid','new-session'}:
+        repeated=json.loads(handle_clawops_delegate(args))
+        assert repeated['status'] in {'queued','existing'},repeated
+        assert repeated['execution_task_id']==result['execution_task_id']
+
+
+@pytest.mark.parametrize("boundary", ["reservation", "claim", "missing-journal", "wrong-instance"])
+def test_content_revision_keeps_accepted_asset_bytes_across_admission(tmp_path, monkeypatch, boundary):
+    from hermes_cli import content_revision as revision
+    values={'HERMES_SESSION_PLATFORM':'telegram','HERMES_SESSION_CHAT_ID':'chat-1','HERMES_SESSION_THREAD_ID':'2',
+        'HERMES_SESSION_KEY':'agent:main:telegram:group:chat-1:2','HERMES_SESSION_ID':'grace-session-1'}
+    _configure_secondhand_context(tmp_path,monkeypatch,values)
+    asset=tmp_path/'previous.png';asset.write_bytes(b'accepted original image')
+    original=revision.materialize_content_revision_baseline
+    def read_accepted_bytes(*args, **kwargs):
+        baseline=original(*args, **kwargs)
+        baseline['verified_attachments']={'assets':[{'stored_path':str(asset),'sha256':hashlib.sha256(asset.read_bytes()).hexdigest()}]}
+        return baseline
+    monkeypatch.setattr(revision,'materialize_content_revision_baseline',read_accepted_bytes)
+    with kb.connect_closing(tmp_path/'kanban.db') as conn:
+        oid,execution,review,event=_seed_delivered_terminal_content(conn,values)
+        callback=kb.get_grace_loop_callback(conn,review)
+        baseline=read_accepted_bytes(conn,callback)
+        args=dict(callback=callback,objective_ref={'objective_id':oid,'stage_key':'deliver_r2'},
+            source_message_id='fresh-revision',owner_user_id='kj',user_id='kj',session_key=values['HERMES_SESSION_KEY'],
+            reason='correct full role coverage',acceptance_criteria=['all roles'],request_instance_id='fresh-revision-instance',baseline=baseline)
+        if boundary=='reservation':
+            asset.write_bytes(b'replaced after accepted read')
+            with pytest.raises(ValueError,match='baseline changed before reservation'):
+                revision.reopen_delivered_content(conn,**args)
+            assert kb.get_grace_objective(conn,oid)['status']=='completed'
+        else:
+            revision.reopen_delivered_content(conn,**args)
+            contract={'identity':{'requested_by':'authenticated_user'},'external_effect_budget':0,'user_facing_delivery':{'kind':'content_package'},
+                'durable_evidence_snapshot':{'accepted_content_revision':revision.content_revision_binding(callback,{'objective_id':oid,'stage_key':'deliver_r2'},revision._baseline_sha256(baseline))}}
+            delegation={'objective_id':oid,'stage_key':'deliver_r2','request_instance_id':'fresh-revision-instance','origin_review_task_id':review,
+                'origin_event_id':event,'session_key':values['HERMES_SESSION_KEY'],'platform':'telegram','chat_id':'chat-1','thread_id':'2','approval_required':False,'contract_snapshot':json.dumps(contract)}
+            revision.verify_content_revision_execution(conn,delegation)
+            if boundary=='missing-journal':
+                conn.execute('DELETE FROM grace_objective_revisions WHERE objective_id=?',(oid,))
+            elif boundary=='wrong-instance':
+                delegation['request_instance_id']='unbound-instance'
+            asset.write_bytes(b'replaced after reservation')
+            with pytest.raises(ValueError):
+                revision.verify_content_revision_execution(conn,delegation)
+        assert kb.get_task(conn,execution).status=='done'
+        assert kb.get_task(conn,review).status=='done'

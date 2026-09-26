@@ -18,6 +18,9 @@ from gateway.session_context import (
     record_cron_functional_error,
 )
 from hermes_cli import kanban_db as kb
+from hermes_cli.content_revision import (
+    validate_delivered_content_revision_callback, reopen_delivered_content, materialize_content_revision_baseline, content_revision_binding, _baseline_sha256,
+)
 from hermes_cli.telegram_message_path import (
     actor,
     append_hop,
@@ -843,16 +846,20 @@ def _resolve_completed_callback_board(
                         )
                         origin_kind = "human_blocker"
                     except ValueError:
-                        kb.validate_recoverable_blocked_callback(
-                            conn,
-                            review_task_id=review_task_id,
-                            event_id=event_id,
-                            platform=platform,
-                            chat_id=chat_id,
-                            thread_id=thread_id,
-                            session_id=callback_session_id,
-                        )
-                        origin_kind = "recoverable_blocker"
+                        try:
+                            kb.validate_recoverable_blocked_callback(
+                                conn, review_task_id=review_task_id, event_id=event_id,
+                                platform=platform, chat_id=chat_id, thread_id=thread_id,
+                                session_id=callback_session_id,
+                            )
+                            origin_kind = "recoverable_blocker"
+                        except ValueError:
+                            validate_delivered_content_revision_callback(
+                                conn, review_task_id=review_task_id, event_id=event_id,
+                                platform=platform, chat_id=chat_id, thread_id=thread_id,
+                                session_id=callback_session_id,
+                            )
+                            origin_kind = "content_revision"
         except (ValueError, OSError):
             continue
         matches.append((slug, callback_session_id, origin_kind))
@@ -2721,8 +2728,7 @@ def handle_clawops_retry_review(
                         "behavior_repin_objective_revision": migration["next_revision"],
                     })
                 # guard_task already verifies the sealed runtime and exact pin.
-                # The recovery capability introduced in v47 remains available
-                # in subsequent verified profiles without changing their pin.
+                # The capability remains available in subsequent verified profiles.
                 recovery_version = re.fullmatch(r"v([0-9]+)", str((pin or {}).get("behavior_profile_version", "")))
                 if recovery_version is None or int(recovery_version.group(1)) < 47:
                     raise ValueError(
@@ -5054,7 +5060,16 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     if not notifier_profile:
         notifier_profile = "default"
     try:
-        _promote_authenticated_message_source(args, message_text)
+        from hermes_cli.objective_recovery import recovery_context, validate_recovery_turn
+        recovery = recovery_context(message_text, internal_turn)
+        if recovery is not None:
+            if approval_refresh_token:
+                raise ValueError("Objective recovery supplies no approval refresh authority")
+            with kb.connect_closing(board=board) as conn:
+                validate_recovery_turn(conn, recovery, args,
+                    platform=platform, chat_id=chat_id, thread_id=thread_id, session_key=session_key)
+        if recovery is None:
+            _promote_authenticated_message_source(args, message_text)
         approval_candidate = _approval_token_candidate(message_text)
         if (
             not internal_turn
@@ -5203,7 +5218,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 thread_id=thread_id,
             )
             if (
-                fresh_callback_origin_kind != "recoverable_blocker"
+                fresh_callback_origin_kind not in {"recoverable_blocker", "content_revision"}
                 and not _is_same_compression_lineage(
                     approval_callback_session_id,
                     session_id,
@@ -5320,13 +5335,20 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 raise ValueError(
                     "Approval token is bound to another request instance."
                 )
-        elif origin_review_id and origin_event_id is not None:
+        elif (origin_review_id and origin_event_id is not None
+              and fresh_callback_origin_kind != "content_revision"):
             request_instance_id = "gri_" + hashlib.sha256(
                 (
                     f"callback:{board or 'default'}:"
                     f"{origin_review_id}:{origin_event_id}"
                 ).encode("utf-8")
             ).hexdigest()[:32]
+        elif recovery is not None:
+            # A verified owner-stage envelope is not its session's cached human
+            # message. Lease/scope checks above derive this exact internal instance.
+            if not supervised_internal_artifact:
+                raise ValueError('Owner stage wakeup requires an unapproved internal artifact')
+            request_instance_id = supplied_request_instance
         elif not scheduled_turn and not codex_local_operator and message_id:
             chat_contract_discriminator = _stable_contract_discriminator(
                 identity=source_bound_identity,
@@ -5539,25 +5561,53 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         },
                     )
                     origin_reserved_stage_key = str(reserved["stage_key"])
-        _ensure_external_action_objective_ref(
-            args,
-            platform=platform,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            session_key=session_key,
-            topic_name=topic_name,
-            goal=goal,
-            scope=scope,
-            verification=verification,
-            internal_only_contract=internal_only_contract,
-            request_instance_id=request_instance_id,
-            board=board,
-            origin_objective_id=origin_objective_id,
-            origin_stage_key=origin_stage_key,
-            origin_recoverable_blocker=origin_recoverable_blocker,
-            origin_reserved_stage_key=origin_reserved_stage_key,
-            behavior_project=project,
-        )
+        if fresh_callback_origin_kind == "content_revision":
+            if (internal_turn or scheduled_turn or not owner_user_id
+                    or owner_user_id != user_id or not message_id
+                    or not internal_only_contract or bool(args.get("approved"))
+                    or approval_token or approval_refresh_token
+                    or task_type not in _CONTENT_ONLY_TASK_TYPES
+                    or (args.get("user_facing_delivery") or {}).get("kind") != "content_package"
+                    or args.get("credential_refs")
+                    or type(args.get("external_effect_budget")) is not int
+                    or args["external_effect_budget"] != 0):
+                raise ValueError("Content revision is limited to fresh owner-requested unapproved zero-effect content packages")
+            with kb.connect_closing(board=board) as conn:
+                verified_origin = validate_delivered_content_revision_callback(
+                    conn, review_task_id=origin_review_id, event_id=origin_event_id,
+                    platform=platform, chat_id=chat_id, thread_id=thread_id,
+                    session_id=approval_callback_session_id or session_id,
+                )
+                revised = reopen_delivered_content(
+                    conn, callback=verified_origin, objective_ref=args.get("objective_ref"),
+                    source_message_id=message_id, owner_user_id=owner_user_id,
+                    user_id=user_id, session_key=session_key,
+                    reason=goal["objective"], acceptance_criteria=verification.get("acceptance_criteria") or [],
+                    request_instance_id=request_instance_id, preview=True,
+                )
+                origin_objective_id = revised["objective_id"]
+                origin_stage_key = verified_origin["stage_key"]
+                origin_reserved_stage_key = revised["stage_key"]
+        if fresh_callback_origin_kind != "content_revision":
+            _ensure_external_action_objective_ref(
+                args,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                session_key=session_key,
+                topic_name=topic_name,
+                goal=goal,
+                scope=scope,
+                verification=verification,
+                internal_only_contract=internal_only_contract,
+                request_instance_id=request_instance_id,
+                board=board,
+                origin_objective_id=origin_objective_id,
+                origin_stage_key=origin_stage_key,
+                origin_recoverable_blocker=origin_recoverable_blocker,
+                origin_reserved_stage_key=origin_reserved_stage_key,
+                behavior_project=project,
+            )
         _guard_required_current_objective_ref(args, verification)
         if (
             isinstance(args.get("facebook_group_publish"), dict)
@@ -5712,7 +5762,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                             stage_key=clean_objective_ref["stage_key"],
                         )
                     )
-                contract["completion_mode"] = kb.grace_objective_stage_mode(
+                contract["completion_mode"] = "terminal" if fresh_callback_origin_kind == "content_revision" else kb.grace_objective_stage_mode(
                     conn,
                     objective_id=clean_objective_ref["objective_id"],
                     stage_key=clean_objective_ref["stage_key"],
@@ -5761,16 +5811,21 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         verified_origin,
                         event_id=int(origin_event_id or 0),
                     )
-                source_handoff = _source_handoff_for_request(
-                    conn,
-                    contract,
-                    source_origin,
-                    internal_turn=internal_turn,
-                    accepted_page_source_bound=accepted_page_source is not None,
-                )
+                if fresh_callback_origin_kind == "content_revision":
+                    baseline = materialize_content_revision_baseline(conn, verified_origin, contract.get("source_package_ref"))
+                    contract.setdefault("durable_evidence_snapshot", {})["accepted_content_revision"] = content_revision_binding(verified_origin, contract["objective_ref"], _baseline_sha256(baseline))
+                    source_handoff = ["Controller-verified prior delivery baseline (correct according to the fresh owner revision request; prior acceptance is not new acceptance):\n" + json.dumps(baseline, ensure_ascii=False, sort_keys=True)]
+                else:
+                    source_handoff = _source_handoff_for_request(
+                        conn,
+                        contract,
+                        source_origin,
+                        internal_turn=internal_turn,
+                        accepted_page_source_bound=accepted_page_source is not None,
+                    )
             for entry in source_handoff:
                 _append_unique_text(contract["memory"]["working"], entry)
-            if source_handoff:
+            if source_handoff and fresh_callback_origin_kind != "content_revision":
                 _append_unique_text(
                     contract["memory"]["working"],
                     "For this source-bound content package, use only the exact UTF-8 "
@@ -6138,7 +6193,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             with kb.connect_closing(board=board) as conn:
                 validator = (
-                    kb.validate_delivered_human_blocker
+                    validate_delivered_content_revision_callback
+                    if fresh_callback_origin_kind == "content_revision"
+                    else kb.validate_delivered_human_blocker
                     if fresh_callback_origin_kind == "human_blocker"
                     else kb.validate_recoverable_blocked_callback
                     if fresh_callback_origin_kind == "recoverable_blocker"
@@ -6438,33 +6495,42 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 effective_approved = True
         else:
             with kb.connect_closing(board=board) as conn:
-                delegation = kb.reserve_grace_delegation(
-                    conn,
-                    contract_fingerprint=exact_fingerprint,
-                    request_instance_id=request_instance_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_key=session_key,
-                    session_id=(approval_callback_session_id or session_id),
-                    telegram_message_path_session_id=session_id,
-                    resolved_route=contract["routing"]["resolved"],
-                    publication_contract=contract if contract.get("facebook_group_publish") else None,
-                    approval_required=False,
-                    origin_review_task_id=origin_review_id,
-                    origin_event_id=origin_event_id,
-                    callback_lease_owner=(
-                        callback_lease_owner if internal_turn else ""
-                    ),
-                    objective_id=str(
-                        (contract.get("objective_ref") or {}).get("objective_id") or ""
-                    ),
-                    stage_key=str(
-                        (contract.get("objective_ref") or {}).get("stage_key") or ""
-                    ),
-                    telegram_message_path=trusted_message_path,
-                    compiled_contract=normalized_contract,
-                )
+                with kb.write_txn(conn):
+                    if fresh_callback_origin_kind == "content_revision":
+                        reopen_delivered_content(
+                            conn, callback=verified_origin, objective_ref=contract["objective_ref"],
+                            source_message_id=message_id, owner_user_id=owner_user_id,
+                            user_id=user_id, session_key=session_key, reason=goal["objective"],
+                            acceptance_criteria=verification.get("acceptance_criteria") or [],
+                            request_instance_id=request_instance_id, baseline=baseline,
+                        )
+                    delegation = kb.reserve_grace_delegation(
+                        conn,
+                        contract_fingerprint=exact_fingerprint,
+                        request_instance_id=request_instance_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_key=session_key,
+                        session_id=(session_id if fresh_callback_origin_kind == "content_revision" else approval_callback_session_id or session_id),
+                        telegram_message_path_session_id=session_id,
+                        resolved_route=contract["routing"]["resolved"],
+                        publication_contract=contract if contract.get("facebook_group_publish") else None,
+                        approval_required=False,
+                        origin_review_task_id=origin_review_id,
+                        origin_event_id=origin_event_id,
+                        callback_lease_owner=(
+                            callback_lease_owner if internal_turn else ""
+                        ),
+                        objective_id=str(
+                            (contract.get("objective_ref") or {}).get("objective_id") or ""
+                        ),
+                        stage_key=str(
+                            (contract.get("objective_ref") or {}).get("stage_key") or ""
+                        ),
+                        telegram_message_path=trusted_message_path,
+                        compiled_contract=normalized_contract,
+                    )
         if approval_provenance:
             contract["approval_provenance"] = approval_provenance
         replay = _queued_delegation_replay(

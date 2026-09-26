@@ -3459,6 +3459,8 @@ def start_loop_contract_execution(
                 conn,
                 worker_contract,
             )
+            from hermes_cli.controller_readback import capture_execution_history
+            capture_execution_history(conn, task_id, run_id)
             if evidence_snapshot:
                 worker_contract["durable_evidence_snapshot"] = evidence_snapshot
             metadata["loop_contract"] = worker_contract
@@ -4128,6 +4130,8 @@ def retry_ready_loop_contract_execution(
                         correction_contract["durable_evidence_snapshot"] = (
                             evidence_snapshot
                         )
+            from hermes_cli.controller_readback import capture_execution_history
+            capture_execution_history(conn, task_id, run_id)
             if not kb.merge_active_run_metadata(
                 conn,
                 task_id,
@@ -4847,6 +4851,8 @@ def _retry_loop_contract_after_capability_repair(
                         previous_metadata.get("external_effect_budget") or 0
                     ),
                 )
+            from hermes_cli.controller_readback import capture_execution_history
+            capture_execution_history(conn, task_id, run_id)
             if not kb.merge_active_run_metadata(
                 conn,
                 task_id,

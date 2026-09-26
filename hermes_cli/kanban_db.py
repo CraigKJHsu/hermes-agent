@@ -9916,6 +9916,8 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        from hermes_cli.controller_readback import capture_execution_history
+        capture_execution_history(conn, task_id, run_id)
         claimed = get_task(conn, task_id)
         if claimed is not None:
             claimed.worker_auth_token = worker_auth_token
@@ -19929,15 +19931,19 @@ def mark_grace_delegation_queued(
                         session_id=str(existing.get("session_id") or ""),
                     )
                 except ValueError:
-                    validate_recoverable_blocked_callback(
-                        conn,
-                        review_task_id=origin_review_id,
-                        event_id=int(origin_event_raw),
-                        platform=str(existing.get("platform") or ""),
-                        chat_id=str(existing.get("chat_id") or ""),
-                        thread_id=str(existing.get("thread_id") or ""),
-                        session_id=str(existing.get("session_id") or ""),
-                    )
+                    try:
+                        validate_recoverable_blocked_callback(
+                            conn,
+                            review_task_id=origin_review_id,
+                            event_id=int(origin_event_raw),
+                            platform=str(existing.get("platform") or ""),
+                            chat_id=str(existing.get("chat_id") or ""),
+                            thread_id=str(existing.get("thread_id") or ""),
+                            session_id=str(existing.get("session_id") or ""),
+                        )
+                    except ValueError:
+                        from hermes_cli.content_revision import validate_content_revision_admission
+                        validate_content_revision_admission(conn, existing)
         for key, value in (
             ("execution_task_id", execution_task_id),
             ("review_task_id", review_task_id),

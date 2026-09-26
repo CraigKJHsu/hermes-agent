@@ -249,7 +249,7 @@ def _durable_state(conn, execution_id, review_id):
     }
 
 
-def _seed_two_timeout_recovery(conn):
+def _seed_two_timeout_recovery(conn, *, profile_version="v47"):
     execution_id, review_id = _seed_blocked_review(conn)
     conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='blocked'", (review_id,))
     conn.execute("DELETE FROM task_runs WHERE task_id=? AND outcome='blocked'", (review_id,))
@@ -2583,3 +2583,24 @@ def test_runtime_reload_reason_rejects_composite_and_unrelated_faults():
     assert not is_runtime_source_block_reason(reason + "; missing credential", "t_review")
     assert not is_runtime_source_block_reason(reason, "t_another")
     assert not is_runtime_source_block_reason("Kanban review runtime source changed", "t_review")
+
+
+def test_timeout_recovery_remains_available_on_current_verified_profile(tmp_path, monkeypatch):
+    db_path = tmp_path / "current-profile-timeout.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        _, review_id, oid, _, _, _ = _seed_two_timeout_recovery(conn, profile_version="v96")
+        before = kb._grace_compiled_contract(kb.get_task(conn, review_id).body)
+        task_count = len(kb.list_tasks(conn, include_archived=True))
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr("plugins.openclaw_bridge.clawops_delegate.get_session_env", lambda key, default="": values.get(key, default))
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+    assert result["status"] == "queued", result
+    assert result["task_created"] is False
+    with kb.connect_closing(db_path) as conn:
+        assert behavior_registry.guard_task(conn, review_id)["behavior_profile_version"] == "v96"
+        assert kb._grace_compiled_contract(kb.get_task(conn, review_id).body) == before
+        assert len(kb.list_tasks(conn, include_archived=True)) == task_count

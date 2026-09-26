@@ -948,13 +948,15 @@ def _handle_show(args: dict, **kw) -> str:
                     effect_records = kb.list_external_effects(conn, parent_id)
                     from hermes_cli.controller_readback import task_controller_readback
                     controller_readback = task_controller_readback(conn, parent_id)
-                    from hermes_cli.controller_readback import compare_native_history_baseline
+                    from hermes_cli.controller_readback import compare_native_history_baseline, execution_history_baseline
                     native_contract = metadata.get('loop_contract')
                     native_snapshot = (native_contract.get('durable_evidence_snapshot')
                         if isinstance(native_contract, Mapping) else None)
                     native_snapshot = native_snapshot if isinstance(native_snapshot, Mapping) else {}
                     history_comparison = compare_native_history_baseline(
-                        controller_readback, native_snapshot.get('controller_history_baseline'),
+                        controller_readback,
+                        execution_history_baseline(conn, parent_id, latest.id)
+                        if latest else None,
                         execution_run_id=latest.id if latest else None,
                     )
                     if controller_readback["binding_verified"]:
