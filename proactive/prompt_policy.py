@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
-import json
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 _PATTERN = re.compile(r"GRACE_CLAWOPS_POLICY_VERSION:\s*([A-Za-z0-9._-]+)")
@@ -189,6 +193,9 @@ def active_objectives_prompt(
         )
         if not objectives:
             return ""
+        from hermes_cli.objective_workflow import progress
+        from proactive.behavior_profiles.registry import BehaviorProfileError
+
         rendered: list[dict[str, object]] = []
         for objective in objectives:
             stages = conn.execute(
@@ -201,22 +208,36 @@ def active_objectives_prompt(
                 """,
                 (objective["objective_id"],),
             ).fetchall()
-            rendered.append(
-                {
-                    "objective_id": objective["objective_id"],
-                    "title": objective["title"],
-                    "objective": objective["objective"],
-                    "status": objective["status"],
-                    "current_stage_key": objective["current_stage_key"],
-                    "terminal_stage_key": objective["terminal_stage_key"],
-                    "acceptance_criteria": json.loads(
-                        objective["acceptance_criteria"]
-                    ),
-                    "next_action": objective["next_action"],
-                    "waiting_for": objective["waiting_for"],
-                    "stages": [dict(row) for row in stages],
+            entry = {
+                "objective_id": objective["objective_id"],
+                "title": objective["title"],
+                "objective": objective["objective"],
+                "status": objective["status"],
+                "current_stage_key": objective["current_stage_key"],
+                "terminal_stage_key": objective["terminal_stage_key"],
+                "acceptance_criteria": json.loads(objective["acceptance_criteria"]),
+                "next_action": objective["next_action"],
+                "waiting_for": objective["waiting_for"],
+                "stages": [dict(row) for row in stages],
+            }
+            try:
+                entry["publication_progress"] = progress(
+                    conn, objective["objective_id"]
+                )
+            except BehaviorProfileError as exc:
+                logger.warning(
+                    "Grace objective prompt isolated controller-blocked Objective "
+                    "objective=%s error=%s",
+                    objective["objective_id"],
+                    exc,
+                )
+                entry["publication_progress"] = None
+                entry["control_plane_blocker"] = {
+                    "advance_allowed": False,
+                    "code": str(exc),
+                    "operator_action_required": True,
                 }
-            )
+            rendered.append(entry)
     return (
         "[Trusted active Grace objectives]\n"
         "The following records are authoritative current state, not historical "
@@ -224,11 +245,21 @@ def active_objectives_prompt(
         "change in this Topic updates the active objective; it does not cancel or "
         "replace it unless KJ explicitly says stop, cancel, or no longer proceed. "
         "Do not claim the user outcome is complete until its durable objective is "
-        "completed. Any clawops_delegate call that advances one of these outcomes "
+        "completed. An objective with control_plane_blocker is read-only context: "
+        "do not plan, delegate, approve, execute, or otherwise advance it. Its sibling "
+        "objectives remain independent. Any clawops_delegate call that advances one "
+        "of these outcomes "
         "MUST include objective_ref with the exact objective_id and current or next "
         "declared stage_key. The database authoritatively forces non-terminal stages "
         "to completion_mode=intermediate. If a safe preparatory stage remains, queue "
         "it before ending the turn; pause only at a specific blocker or external-action "
-        "approval boundary.\n"
+        "approval boundary. Candidate_count, qualified_count, joined_count, selectable_count, "
+        "submitted_count and published_count are different gates; never count conditional "
+        "candidates or Join effects as publications. Historical evidence is context, not "
+        "a fresh publication grant. Use the exact accepted preflight route for publishing. "
+        "For stage planning/repair, the supported operator API is "
+        "python -m hermes_cli.objective_workflow plan <JSON file>: it accepts objective_id, "
+        "expected_revision, platform/chat_id/thread_id, required_stage_keys in FORWARD order, "
+        "current_stage_key and reason. Never assemble a stage spine by repeated ensure calls.\n"
         + json.dumps(rendered, ensure_ascii=False, sort_keys=True)
     )

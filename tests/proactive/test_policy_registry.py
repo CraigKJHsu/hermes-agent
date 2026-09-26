@@ -37,6 +37,7 @@ def _contract(namespace: str) -> dict:
         "grace_interpretation": "Create one internal governed artifact",
         "trigger": "authenticated user request",
         "completion_mode": "terminal",
+        "external_effect_budget": 0,
         "goal": {
             "objective": "Create the governed artifact",
             "deliverables": ["artifact"],
@@ -592,6 +593,15 @@ def test_policy_marker_and_duplicate_receipts_fail_closed(tmp_path, monkeypatch)
             {"policy_receipts": [receipt, dict(receipt)]},
             role="execution",
         )
+
+    with pytest.raises(PolicyRegistryError) as mismatch:
+        validate_policy_completion(
+            body,
+            {"policy_receipts": [{**receipt, "role": "review"}]},
+            role="execution",
+        )
+    assert "expected role=execution" in str(mismatch.value)
+    assert f"('review', '{snapshot['policy_id']}')" in str(mismatch.value)
 
     malformed_lines = body.splitlines()
     marker_index = next(

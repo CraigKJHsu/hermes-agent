@@ -333,6 +333,8 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_FAST_DELAY_S = 0.18
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
+    _FLOOD_RECOVERY_PACING_S = 3.2
+    _FLOOD_RECOVERY_WINDOW_S = 600.0
 
     @staticmethod
     def _env_float_clamped(
@@ -395,6 +397,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # endpoint) so later sends skip the doomed rich attempt entirely.
         self._rich_send_disabled: bool = False
         self._rich_draft_disabled: bool = False
+        self._send_rate_limit_lock = asyncio.Lock()
+        self._send_retry_after_until = 0.0
+        self._send_flood_recovery_until = 0.0
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
@@ -2481,7 +2486,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Send a seed message so the topic is visible in Telegram's client.
                     # Empty topics are hidden by the client UI until they contain a message.
                     try:
-                        await self._bot.send_message(
+                        await self._send_message_with_rate_limit(
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_thread_id=thread_id,
                             text=f"\U0001f4cc {topic_name}",
@@ -3249,7 +3254,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # bypass Markdown parsing so provider-preserved symbols
                         # cannot alter rendering or reject delivery.
                         if plain_text:
-                            msg = await self._bot.send_message(
+                            msg = await self._send_message_with_rate_limit(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
                                 parse_mode=None,
@@ -3262,7 +3267,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             # Try Markdown first, fall back to plain text if it fails
                             try:
-                                msg = await self._bot.send_message(
+                                msg = await self._send_message_with_rate_limit(
                                     chat_id=normalize_telegram_chat_id(chat_id),
                                     text=chunk,
                                     parse_mode=ParseMode.MARKDOWN_V2,
@@ -3277,7 +3282,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                     logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                     plain_chunk = _strip_mdv2(chunk)
-                                    msg = await self._bot.send_message(
+                                    msg = await self._send_message_with_rate_limit(
                                         chat_id=normalize_telegram_chat_id(chat_id),
                                         text=plain_chunk,
                                         parse_mode=None,
@@ -3920,7 +3925,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # the raw chunk (raw ** / ``` markers would render
                         # literally); streaming previews stay raw.
                         text = _strip_mdv2(chunk) if finalize else chunk
-                    sent_msg = await self._bot.send_message(
+                    sent_msg = await self._send_message_with_rate_limit(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         text=text,
                         parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -3943,7 +3948,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             )
                         )
                         try:
-                            sent_msg = await self._bot.send_message(
+                            sent_msg = await self._send_message_with_rate_limit(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=_strip_mdv2(chunk) if finalize else chunk,
                                 **retry_thread_kwargs,
@@ -4152,6 +4157,49 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return SendResult(success=False, error="draft_rejected")
 
+    async def _send_message_with_rate_limit(self, **kwargs):
+        """Serialize text sends and share Telegram flood-control cooldowns."""
+        if not self._bot:
+            raise RuntimeError("Not connected")
+
+        loop = asyncio.get_running_loop()
+        lock = getattr(self, "_send_rate_limit_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_rate_limit_lock = lock
+            self._send_retry_after_until = 0.0
+            self._send_flood_recovery_until = 0.0
+        async with lock:
+            wait = getattr(self, "_send_retry_after_until", 0.0) - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                message = await self._bot.send_message(**kwargs)
+            except Exception as exc:
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after is not None or "retry after" in str(exc).lower():
+                    try:
+                        delay = max(float(retry_after), 1.0)
+                    except (TypeError, ValueError):
+                        delay = 1.0
+                    now = loop.time()
+                    self._send_retry_after_until = max(
+                        getattr(self, "_send_retry_after_until", 0.0), now + delay,
+                    )
+                    self._send_flood_recovery_until = max(
+                        getattr(self, "_send_flood_recovery_until", 0.0),
+                        now + self._FLOOD_RECOVERY_WINDOW_S,
+                    )
+                raise
+
+            now = loop.time()
+            if now < getattr(self, "_send_flood_recovery_until", 0.0):
+                self._send_retry_after_until = max(
+                    getattr(self, "_send_retry_after_until", 0.0),
+                    now + self._FLOOD_RECOVERY_PACING_S,
+                )
+            return message
+
     async def _send_message_with_thread_fallback(self, **kwargs):
         """Send a Telegram message, retrying once without message_thread_id
         if Telegram returns 'Message thread not found'.
@@ -4167,7 +4215,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         message_thread_id = kwargs.get("message_thread_id")
         try:
-            return await self._bot.send_message(**kwargs)
+            return await self._send_message_with_rate_limit(**kwargs)
         except Exception as send_err:
             if (
                 message_thread_id is not None
@@ -4188,7 +4236,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
-                return await self._bot.send_message(**retry_kwargs)
+                return await self._send_message_with_rate_limit(**retry_kwargs)
             raise
 
     async def send_update_prompt(

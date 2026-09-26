@@ -76,25 +76,171 @@ def _asset_declarations_valid(value: Any) -> bool:
     return True
 
 
+def page_hero_review_evidence(metadata: Any) -> dict[str, Any] | None:
+    """Normalize one Page Hero review across canonical and evidence wrappers."""
+    review_metadata = metadata if isinstance(metadata, dict) else {}
+    nested = review_metadata.get("evidence")
+    containers = [review_metadata]
+    if isinstance(nested, dict):
+        containers.append(nested)
+
+    families = {
+        str(container.get("asset_family") or "").strip().lower()
+        for container in containers
+        if str(container.get("asset_family") or "").strip()
+    }
+    declarations: list[dict[str, Any]] = []
+    for container in containers:
+        raw_declarations = container.get("asset_declarations")
+        if raw_declarations is None:
+            continue
+        if not isinstance(raw_declarations, dict):
+            raise ValueError("Page Hero asset_declarations must be an object")
+        page_hero = raw_declarations.get("page_hero")
+        if page_hero is not None:
+            if not isinstance(page_hero, dict):
+                raise ValueError("Page Hero declaration must be an object")
+            declarations.append(page_hero)
+
+    if "page_hero" not in families and not declarations:
+        return None
+    if families - {"page_hero"}:
+        raise ValueError("Page Hero review has conflicting asset families")
+    if not declarations:
+        raise ValueError("Page Hero review requires one asset declaration")
+    if any(
+        not _asset_declarations_valid({"page_hero": declaration})
+        or (parsed := _parse_dimensions(declaration)) is None
+        or parsed[0] <= 0
+        or parsed[1] <= 0
+        for declaration in declarations
+    ):
+        raise ValueError("Page Hero declaration must have exact 16:9 dimensions")
+    for declaration in declarations:
+        parsed = _parse_dimensions(declaration)
+        declared_width = declaration.get("width")
+        declared_height = declaration.get("height")
+        if (declared_width is None) != (declared_height is None) or (
+            declared_width is not None
+            and (
+                type(declared_width) is not int
+                or type(declared_height) is not int
+                or (declared_width, declared_height) != parsed
+            )
+        ):
+            raise ValueError("Page Hero declaration has conflicting dimensions")
+        filename = declaration.get("filename")
+        sha256 = declaration.get("sha256")
+        byte_count = declaration.get("bytes")
+        if filename is not None and (
+            not isinstance(filename, str) or not filename.strip()
+        ):
+            raise ValueError("Page Hero declaration has invalid filename")
+        if sha256 is not None and (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in sha256)
+        ):
+            raise ValueError("Page Hero declaration has invalid sha256")
+        if byte_count is not None and (
+            type(byte_count) is not int or byte_count <= 0
+        ):
+            raise ValueError("Page Hero declaration has invalid byte count")
+
+    normalized_declarations: list[dict[str, Any]] = []
+    for declaration in declarations:
+        normalized = dict(declaration)
+        width, height = _parse_dimensions(declaration) or (0, 0)
+        normalized["width"] = width
+        normalized["height"] = height
+        if isinstance(normalized.get("sha256"), str):
+            normalized["sha256"] = normalized["sha256"].lower()
+        normalized_declarations.append(normalized)
+
+    dimensions = {
+        parsed
+        for declaration in normalized_declarations
+        if (parsed := _parse_dimensions(declaration)) is not None
+    }
+    if len(dimensions) > 1:
+        raise ValueError("Page Hero review has conflicting dimensions")
+    for key in ("filename", "sha256", "bytes", "width", "height"):
+        values = [
+            declaration[key]
+            for declaration in normalized_declarations
+            if declaration.get(key) not in (None, "")
+        ]
+        if values and any(value != values[0] for value in values[1:]):
+            raise ValueError(f"Page Hero review has conflicting {key}")
+
+    visuals = [
+        container.get("visual_review")
+        for container in containers
+        if container.get("visual_review") is not None
+    ]
+    if not visuals or any(not isinstance(value, dict) for value in visuals):
+        raise ValueError("Page Hero review requires structured visual_review")
+    if any(
+        value.get("all_required_text_readable") is not True
+        or value.get("text_occlusion_free") is not True
+        or value.get("disclosure_non_obstructive") is not True
+        or value.get("defects_found") != []
+        for value in visuals
+    ):
+        raise ValueError("Page Hero review failed visual safety checks")
+
+    def one_mapping(name: str) -> dict[str, Any] | None:
+        values = [
+            container.get(name)
+            for container in containers
+            if container.get(name) is not None
+        ]
+        if any(not isinstance(value, dict) for value in values):
+            raise ValueError(f"Page Hero {name} must be an object")
+        if len(values) > 1 and any(value != values[0] for value in values[1:]):
+            raise ValueError(f"Page Hero review has conflicting {name}")
+        return dict(values[0]) if values else None
+
+    inspected_values = [
+        container["actual_controller_attachment_inspected"]
+        for container in containers
+        if "actual_controller_attachment_inspected" in container
+    ]
+    if any(type(value) is not bool for value in inspected_values) or (
+        inspected_values
+        and any(value != inspected_values[0] for value in inspected_values[1:])
+    ):
+        raise ValueError("Page Hero review has conflicting inspection evidence")
+    if inspected_values and inspected_values[0] is not True:
+        raise ValueError("Page Hero review requires an inspected controller attachment")
+    return {
+        "asset_family": "page_hero",
+        "declaration": {key: value for declaration in normalized_declarations
+                        for key, value in declaration.items() if value is not None},
+        "visual_review": dict(visuals[0]),
+        "controller_attachment": one_mapping("controller_attachment"),
+        "facebook_page_post_readback": one_mapping(
+            "facebook_page_post_readback"
+        ),
+        "actual_controller_attachment_inspected": (
+            inspected_values[0] if inspected_values else None
+        ),
+    }
+
+
 def _declares_page_hero(metadata: dict[str, Any]) -> bool:
-    declarations = metadata.get("asset_declarations")
-    return (
-        str(metadata.get("asset_family") or "").strip().lower() == "page_hero"
-        or (isinstance(declarations, dict) and declarations.get("page_hero") is not None)
-    )
+    try:
+        return page_hero_review_evidence(metadata) is not None
+    except ValueError:
+        return True
 
 
 def _page_hero_visual_safety_valid(metadata: dict[str, Any]) -> bool:
-    if not _declares_page_hero(metadata):
-        return True
-    visual_review = metadata.get("visual_review")
-    return (
-        isinstance(visual_review, dict)
-        and visual_review.get("all_required_text_readable") is True
-        and visual_review.get("text_occlusion_free") is True
-        and visual_review.get("disclosure_non_obstructive") is True
-        and visual_review.get("defects_found") == []
-    )
+    try:
+        page_hero_review_evidence(metadata)
+    except ValueError:
+        return False
+    return True
 
 
 def grace_review_accepted(metadata: Any) -> bool:

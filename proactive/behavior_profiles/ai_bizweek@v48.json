@@ -1,0 +1,22 @@
+{
+  "profile_id": "ai_bizweek",
+  "version": "v48",
+  "bundle": "v48",
+  "route_snapshot": "v1/ai_bizweek",
+  "contract_schema_version": "1.0",
+  "files": {
+    "v1/ai_bizweek/agent-registry.yaml": "38ab4db9b970dc88dd043b5b443d27058463b414c75d6f3975d0d78f9e5ad86e",
+    "v1/ai_bizweek/routing-rules.yaml": "8367bc11925ec32cac615a7faed7687c27b6f6ebdd63d0d8089bab9d1e5e2e70",
+    "v48/compiler.py": "a0790b1a359a99b519552f0ea701d757ef5e984194f0c36ea984cf571158dd40",
+    "v48/contract.py": "7fb84519b1621d6e67b0e4e50b14089da4a1718bd5f462d95adedb18e209347b",
+    "v48/domain.py": "e39fbf96d5eea36ddb131ac94cbdfabc475641828cb5c677f1a173c52a00ed90",
+    "v48/preflight.py": "708f1961f85f5f58d8a889d1daa7e76de8f9de7d32ac541badab8a3076af121c",
+    "v48/prompt.py": "1310563e9d4980f304a8dd95c54a1a07fc53018af72b0b6983a27a6a7aac6113",
+    "v48/review.py": "3df83a86924098d225d86de391b00594b58ff6615554ff8bb05505992633305c",
+    "v48/routing.py": "f547ddbb4d29505873b4b0ecb081d3146dc18abe836dbf42442c5d15b63294cd",
+    "v48/workflow.py": "bd157cb345cb76f46b426cbd040527374218d2ed117e04d83f59995a1ec4c537"
+  },
+  "validator_set_hash": "2227494da54ac7aa9b84f5a2f266c6699034425d84770830d92d3e47fa43fe89",
+  "safety_kernel_version": "48",
+  "safety_kernel_hash": "09eeee1dbe0ce5c9c75d95fb576720f8086a618d33e851d9ff24250c1dc3fe18"
+}

@@ -54,6 +54,25 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+_MESSAGE_CONTENT_LIMIT = 1_200
+_PREVIEW_LIMIT = 500
+
+
+def _truncate_text(value: Any, limit: int) -> tuple[Any, Optional[int]]:
+    """Return a bounded representation plus original serialized size."""
+    if isinstance(value, str):
+        text = value
+    elif value is None:
+        return value, None
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(value)
+    if len(text) <= limit:
+        return value, None
+    omitted = len(text) - limit
+    return f"{text[:limit]}<truncated chars={omitted}>", len(text)
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -122,16 +141,28 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
+    content, content_chars = _truncate_text(
+        m.get("content"), _MESSAGE_CONTENT_LIMIT
+    )
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": content,
         "timestamp": m.get("timestamp"),
     }
+    if content_chars is not None:
+        entry["content_truncated"] = True
+        entry["content_original_chars"] = content_chars
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        tool_calls, tool_call_chars = _truncate_text(
+            m.get("tool_calls"), _MESSAGE_CONTENT_LIMIT
+        )
+        entry["tool_calls"] = tool_calls
+        if tool_call_chars is not None:
+            entry["tool_calls_truncated"] = True
+            entry["tool_calls_original_chars"] = tool_call_chars
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
@@ -283,7 +314,9 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                 "started_at": s.get("started_at", ""),
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
-                "preview": s.get("preview", ""),
+                "preview": _truncate_text(
+                    s.get("preview", ""), _PREVIEW_LIMIT
+                )[0],
             })
             if len(results) >= limit:
                 break
@@ -483,7 +516,10 @@ def _title_match_result(
         "title": session_meta.get("title") or title_query,
         "matched_role": "session_title",
         "match_message_id": anchor_id,
-        "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
+        "snippet": _truncate_text(
+            f"Session title matched: {session_meta.get('title') or title_query}",
+            _PREVIEW_LIMIT,
+        )[0],
         "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
         "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
         "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
@@ -595,7 +631,9 @@ def _discover(
             "title": session_meta.get("title") or None,
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
-            "snippet": match_info.get("snippet") or "",
+            "snippet": _truncate_text(
+                match_info.get("snippet") or "", _PREVIEW_LIMIT
+            )[0],
             "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
             "messages": [_shape_message(m, anchor_id=msg_id) for m in (view.get("window") or [])],
             "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
@@ -918,4 +956,5 @@ registry.register(
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
+    max_result_size_chars=20_000,
 )

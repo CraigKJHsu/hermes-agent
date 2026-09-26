@@ -4568,6 +4568,11 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # The callback watcher owns the lease until this exact turn exits.
+        # A dispatch timeout must not orphan a still-running background turn.
+        internal_context = getattr(event, "internal_context", None) or {}
+        if internal_context.get("processing_completion_future") is not None:
+            internal_context["processing_task"] = asyncio.current_task()
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False

@@ -114,8 +114,12 @@ def test_managed_policy_read_uses_current_policy_pinned_kanban_task(
             "version": "v1",
             "sha256": hashlib.sha256(content.encode()).hexdigest(),
             "loaded": True,
+            "pinned_version_verified": True,
             "latest_active_verified": True,
         }
+    ]
+    assert result["execution_policy_receipts"] == [
+        {**result["review_policy_receipts"][0], "role": "execution"}
     ]
 
 
@@ -404,3 +408,76 @@ def test_managed_policy_read_returns_carter_page_source_material(
     assert f"source=session:{source['session_id']}" in bound["original_request"]
     contract["scope"]["allowed"] = [source["selection_scope_entry"] + "-wrong-hash"]
     assert _augment_ai_bizweek_source_evidence(contract, session_id="session-carter") == contract
+
+
+def test_worker_profile_session_reads_only_its_task_policy(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from proactive.policy_registry import policy_snapshot_marker, resolve_contract_policies
+
+    home = tmp_path / "hermes"
+    profile = home / "profiles" / "worker"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("worker-session", "telegram", chat_id="wrong", thread_id="wrong")
+    db.close()
+    conn = kb.connect()
+    task_ids = []
+    try:
+        for index in (1, 2):
+            policy_id = f"case-{index}"
+            create_policy_version(policy_id, "v1", f"Policy for case {index}", owner_scope="brand", owner_id="test", activate=True)
+            namespace = f"telegram:chat:{index}/project"
+            bind_topic_policies(namespace, [{"policy_id": policy_id, "resolution": "latest_active"}])
+            normalized = resolve_contract_policies({"memory": {"namespace": namespace}, "policy_requirements": []})
+            task_ids.append(kb.create_task(conn, title=f"Case {index}", body=policy_snapshot_marker(normalized), assignee="worker"))
+    finally:
+        conn.close()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("worker-session", "cli")
+    db.close()
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    for index, task_id in enumerate(task_ids, 1):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        result = json.loads(managed_policy_read(session_id="worker-session"))
+        assert result["success"] is True
+        assert result["scope"] == {"kind": "kanban_task", "task_id": task_id}
+        assert [p["policy_id"] for p in result["policies"]] == [f"case-{index}"]
+        assert result["policies"][0]["content"] == f"Policy for case {index}"
+    # A root-only session cannot authorize this profile's worker context.
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("root-only", "cli")
+    db.close()
+    assert json.loads(managed_policy_read(session_id="root-only"))["success"] is False
+
+
+def test_task_policy_receipts_satisfy_behavior_review_validator(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from proactive.behavior_profiles import registry as br
+    from tests.proactive.test_behavior_profiles import CURRENT_VERSION
+    from proactive.grace_task_compiler import render_review_body
+    from scripts.replay_behavior_observation import load_cases, make_contract
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    case = load_cases()["cases"][0]
+    contract = make_contract(load_cases(), case)
+    contract["objective_ref"]["objective_id"] = "go_receipt"
+    identity = contract["identity"]
+    create_policy_version("receipt-policy", "v1", "Full pinned policy", owner_scope="topic", owner_id="test", activate=True)
+    namespace = f"telegram:{identity['chat_id']}:{identity['thread_id']}/{identity['project']}"
+    contract["memory"]["namespace"] = namespace
+    bind_topic_policies(namespace, [{"policy_id": "receipt-policy", "resolution": "latest_active"}])
+    with kb.connect_closing() as conn:
+        br.set_selection(conn, platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], project=identity["project"], profile_id="ai_bizweek", version=CURRENT_VERSION, expected_revision=0, reason="Receipt integration fixture")
+        kb.create_grace_objective(conn, objective_id="go_receipt", platform="telegram", chat_id=identity["chat_id"], thread_id=identity["thread_id"], session_key="fixture", title="fixture", objective="fixture", original_request_sha256="a"*64, required_stage_keys=["prepare", "publish"], terminal_stage_key="publish", acceptance_criteria=["verified"], behavior_project=identity["project"])
+        bound = br.bind_contract(conn, contract)
+        body = render_review_body(bound, "t_parent")
+        task_id = kb.create_task(conn, title="review", body=body)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("receipt-session", "cli")
+    db.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    result = json.loads(managed_policy_read(session_id="receipt-session"))
+    assert result["success"]
+    assert br.validate_task_policy_completion(body, {"policy_receipts": result["review_policy_receipts"]}, "review") is True

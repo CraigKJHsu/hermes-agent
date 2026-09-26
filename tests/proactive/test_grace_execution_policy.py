@@ -44,6 +44,13 @@ def test_grace_can_use_read_only_browser_for_task_classification(monkeypatch):
         assert called
 
 
+def test_grace_can_complete_simple_direct_web_reads(monkeypatch):
+    for tool_name in ("web_search", "web_extract", "grace_read_url"):
+        result, called = _call(monkeypatch, tool_name, {})
+        assert result == "executed"
+        assert called
+
+
 def test_grace_current_page_tools_reject_navigation_arguments(monkeypatch):
     for tool_name in ("browser_snapshot", "browser_scroll", "browser_vision"):
         result, called = _call(
@@ -259,10 +266,8 @@ def test_worker_identity_is_bound_to_persisted_execution_delegation(
             ),
         )
         execution = kb.claim_task(conn, execution_id, claimer="worker:execution")
-        review = kb.claim_task(conn, review_id, claimer="worker:review")
 
     assert execution is not None
-    assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", execution_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(execution.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(execution.claim_lock))
@@ -314,6 +319,13 @@ def test_worker_identity_is_bound_to_persisted_execution_delegation(
     assert not grace_execution_policy._is_authorized_clawops_worker(
         "runtime-session-is-not-the-logical-loop-session",
     )
+
+    with kb.connect_closing(db_path) as conn:
+        conn.execute("UPDATE task_runs SET status='blocked',outcome='blocked',ended_at=? WHERE id=?",
+                     (int(time.time()), execution.current_run_id))
+        conn.execute("UPDATE tasks SET status='blocked',current_run_id=NULL WHERE id=?", (execution_id,))
+        review = kb.claim_task(conn, review_id, claimer="worker:review")
+    assert review is not None
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
@@ -423,7 +435,6 @@ def test_review_worker_self_report_allowed_when_token_not_propagated(
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (review_id,))
         review = kb.claim_task(conn, review_id, claimer="review:claim")
 
-    assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(review.claim_lock))

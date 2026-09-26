@@ -488,6 +488,19 @@ def test_termux_forced_bundled_skill_sync_runs(monkeypatch, tmp_path, main_mod):
     assert calls == [True]
 
 
+def test_kanban_worker_skips_bundled_skill_sync(monkeypatch, main_mod):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.skills_sync",
+        types.SimpleNamespace(
+            sync_skills=lambda quiet: pytest.fail("worker must not sync skills")
+        ),
+    )
+
+    assert main_mod._sync_bundled_skills_for_startup() is False
+
+
 def test_read_git_revision_fingerprint_resolves_packed_refs(tmp_path, main_mod):
     repo = tmp_path / "repo"
     git_dir = repo / ".git"

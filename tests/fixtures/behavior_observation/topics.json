@@ -1,0 +1,65 @@
+{
+  "provenance": "Representative historical failure samples, not hardcoded Topic behavior. Audio 3-to-30 rejection comes from the user report on 2026-09-10; no live DB snapshot or LLM fact-check is claimed. Other shapes follow test_loop_contract.py and test_grace_objectives.py.",
+  "base_contract": {
+    "identity": {"platform": "telegram", "chat_id": "fixture-chat", "request_instance_id": "fixture-request"},
+    "original_request": "Prepare evidence for review; external publication requires separate approval.",
+    "grace_interpretation": "Prepare the scoped package and let Grace review it.",
+    "trigger": "user_request",
+    "completion_mode": "intermediate",
+    "goal": {"objective": "Review the scoped publication package", "deliverables": ["reviewed package"], "non_goals": ["external publication"]},
+    "scope": {"allowed": ["internal preparation"], "forbidden": ["external publication without scoped approval"]},
+    "verification": {"checks": ["review against source evidence"], "evidence_required": ["review result"], "acceptance_criteria": ["source facts and package agree"]},
+    "stop_rules": {"success": ["review complete"], "blocked": ["review rejected"], "no_progress": ["same error twice"], "max_iterations": 3, "max_runtime_seconds": 600},
+    "memory": {"namespace": "fixture", "working": ["scoped review"], "promote_on_acceptance": []},
+    "user_facing_delivery": {"required": true, "kind": "content_package", "delivery": "inline_only", "body_field": "finalPasteReadyDraft"}
+  },
+  "cases": [
+    {
+      "id": "solobizai_corrected",
+      "project": "ai_bizweek", "thread_id": "fixture-solobizai", "topic_name": "SoloBizAi",
+      "task_type": "content_draft", "review_outcome": "accepted",
+      "package": {"source": "3 -> 30 candidates", "audio_brief": "Candidates increased from 3 to 30."},
+      "expected_status": "waiting_approval", "expected_stage": "publish"
+    },
+    {
+      "id": "solobizai_audio_rejected",
+      "project": "ai_bizweek", "thread_id": "fixture-solobizai", "topic_name": "SoloBizAi",
+      "task_type": "content_draft", "review_outcome": "rejected",
+      "package": {"source": "3 -> 30 candidates", "audio_brief": "候選人增加到 30 倍。"},
+      "reason": "Audio Brief misstates 3 -> 30 candidates as 30 times.",
+      "expected_status": "active", "expected_stage": "prepare"
+    },
+    {
+      "id": "secondhand_preflight",
+      "project": "secondhand_commerce", "thread_id": "fixture-secondhand", "topic_name": "二手拍賣",
+      "task_type": "facebook_marketplace_readonly", "review_outcome": "accepted",
+      "contract_override": {
+        "external_targets": ["12345"],
+        "user_facing_delivery": {
+          "required": true,
+          "kind": "commerce_group_status",
+          "delivery": "inline_only",
+          "subject_keys": ["facebook_marketplace_listing:12345"]
+        }
+      },
+      "package": {"source_listing_id": "12345", "selectable_destination_ids": ["222"], "sideEffectsPerformed": false},
+      "expected_status": "waiting_approval", "expected_stage": "publish"
+    },
+    {
+      "id": "secondhand_invalid_destination",
+      "project": "secondhand_commerce", "thread_id": "fixture-secondhand", "topic_name": "二手拍賣",
+      "task_type": "facebook_marketplace_readonly", "review_outcome": "not_run",
+      "contract_override": {
+        "external_targets": ["12345"],
+        "user_facing_delivery": {
+          "required": true,
+          "kind": "commerce_group_status",
+          "delivery": "inline_only",
+          "subject_keys": ["facebook_marketplace_listing:12345"]
+        },
+        "facebook_group_publish": {"mode": "canonical_url_per_group", "source_listing_id": "12345", "destinations": [{"group_id": "222", "canonical_name": "Fixture group", "canonical_url": "https://www.facebook.com/groups/333"}]}
+      },
+      "expected_error": "canonical_url must match group_id"
+    }
+  ]
+}

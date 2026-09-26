@@ -275,8 +275,10 @@ def enforce_grace_execution_boundary(
         )
     else:
         reason = (
-            "Grace may use read-only browser inspection to understand and classify the task, "
-            "but may not click, type, submit, upload, mutate external state, or execute the task. "
+            "Grace should complete simple read-only retrieval with web_search, web_extract, "
+            "grace_read_url for an exact allowlisted loopback page, or current-page browser "
+            "inspection, but may not click, type, submit, upload, mutate external state, or "
+            "execute the task. "
             "Compile a complete Loop Contract and call clawops_delegate; ClawOps performs "
             "execution and Grace reviews the evidence."
         )
