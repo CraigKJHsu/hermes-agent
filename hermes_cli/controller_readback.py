@@ -39,13 +39,13 @@ def _artifact_parent(value):
         raise
 
 
-def _evidence_file(value, max_bytes=MAX_EVIDENCE_FILE_BYTES, *, _file_budget=None):
+def _evidence_file(value, max_bytes=MAX_EVIDENCE_FILE_BYTES, *, _file_budget=None, capture=False):
     """Return a hash and bytes read only for one stable bounded regular file."""
     if not isinstance(value, str) or not value or not Path(value).is_absolute():
-        return None, 0
+        return None, 0, None
     budget = _file_budget if _file_budget is not None else {'files': 0, 'bytes': 0}
     if budget['files'] >= MAX_ATTACHMENT_FILES or budget['bytes'] >= MAX_ATTACHMENT_BYTES:
-        return None, 0
+        return None, 0, None
     max_bytes = min(max_bytes, MAX_ATTACHMENT_BYTES - budget['bytes'])
     budget['files'] += 1
     total = 0
@@ -54,31 +54,34 @@ def _evidence_file(value, max_bytes=MAX_EVIDENCE_FILE_BYTES, *, _file_budget=Non
         parent, name = _artifact_parent(value)
         before = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
-            return None, 0
+            return None, 0, None
         descriptor = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
         with os.fdopen(descriptor, 'rb') as stream:
             opened = os.fstat(stream.fileno())
             if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(before):
-                return None, 0
+                return None, 0, None
             digest = hashlib.sha256()
+            captured = bytearray() if capture and before.st_size <= 65536 else None
             for chunk in iter(lambda: stream.read(min(65536, max_bytes - total + 1)), b''):
                 total += len(chunk)
                 if total > max_bytes:
-                    return None, total
+                    return None, total, None
                 digest.update(chunk)
+                if captured is not None:
+                    captured.extend(chunk)
             if total != before.st_size or _file_identity(os.fstat(stream.fileno())) != _file_identity(before):
-                return None, total
+                return None, total, None
             # Rewalk the currently named directory without following links.
             # Renaming/replacing any parent between validation/read is failure.
             current_parent, current_name = _artifact_parent(value)
             try:
                 if _file_identity(os.stat(current_name,dir_fd=current_parent,follow_symlinks=False)) != _file_identity(before):
-                    return None, total
+                    return None, total, None
             finally:
                 os.close(current_parent)
-            return digest.hexdigest(), total
+            return digest.hexdigest(), total, bytes(captured) if captured is not None else None
     except (OSError, ValueError):
-        return None, total
+        return None, total, None
     finally:
         if parent is not None:
             os.close(parent)
@@ -120,10 +123,17 @@ def _snapshot_readback(conn, task_id, *, include_related=True, _file_budget=None
     binding_verified = False
     if binding and binding['objective_id']:
         row = conn.execute(
-            "SELECT objective_id,status,current_stage_key,terminal_stage_key,required_stage_keys,original_request_sha256,created_at,revision "
+            "SELECT objective_id,status,current_stage_key,terminal_stage_key,required_stage_keys,acceptance_criteria,original_request_sha256,created_at,revision "
             "FROM grace_objectives WHERE objective_id=?", (binding['objective_id'],)
         ).fetchone()
         objective = dict(row) if row else None
+        if objective is not None:
+            raw_criteria = objective['acceptance_criteria']
+            if isinstance(raw_criteria, str):
+                objective['acceptance_criteria_sha256'] = hashlib.sha256(raw_criteria.encode()).hexdigest()
+            else:
+                objective['acceptance_criteria'] = None
+                objective['acceptance_criteria_error'] = 'invalid_controller_text'
         stages = [dict(r) for r in conn.execute(
             "SELECT stage_key,position,status,delegation_id,execution_task_id,review_task_id,outcome_kind "
             "FROM grace_objective_stages WHERE objective_id=? ORDER BY position", (binding['objective_id'],)
@@ -158,12 +168,44 @@ def _snapshot_readback(conn, task_id, *, include_related=True, _file_budget=None
             digest.update(encoded)
     related = []
     attachment_digest = hashlib.sha256()
+    attachment_files = []
+    attachment_count = 0
     attachments_available = True
     expected_attachments = {key: value["sha256"] for key, value in (_expected_attachment_sha256 or {}).items() if value["task_id"] == task_id}
     seen_attachments = set()
     for attachment in conn.execute('SELECT * FROM task_attachments WHERE task_id=? ORDER BY id', (task_id,)):
+        attachment_count += 1
         record = dict(attachment)
-        record['content_sha256'], _ = _evidence_file(record['stored_path'], _file_budget=_file_budget)
+        record['content_sha256'], observed_size, content = _evidence_file(
+            record['stored_path'], _file_budget=_file_budget,
+            capture=record['filename'].endswith('.json') and record['content_type'] == 'application/json',
+        )
+        if len(attachment_files) < MAX_ATTACHMENT_FILES:
+            item = {
+                'id': record['id'], 'filename': record['filename'],
+                'stored_path': record['stored_path'],
+                'size': observed_size if record['content_sha256'] else None,
+                'sha256': record['content_sha256'],
+            }
+            if (content is None and record['content_sha256']
+                    and record['filename'].endswith('.json')
+                    and record['content_type'] == 'application/json'):
+                item['json_claims_unavailable'] = 'attachment_exceeds_65536_bytes'
+            if content is not None and record['content_sha256']:
+                try:
+                    report = json.loads(content)
+                    model = report['result']['meta']['agentMeta']['model']
+                    status = report['status']
+                    if (isinstance(model, str) and len(model) <= 80
+                            and isinstance(status, str) and len(status) <= 80):
+                        item['attachment_json_claims'] = {
+                            'status': status, 'model': model,
+                            'model_source': 'result.meta.agentMeta.model',
+                            'trust_scope': 'untrusted_attachment_content',
+                        }
+                except (ValueError, TypeError, KeyError, RecursionError):
+                    pass
+            attachment_files.append(item)
         if record['id'] in expected_attachments:
             if record['content_sha256'] != expected_attachments[record['id']]:
                 raise ValueError('Accepted content attachment changed during claim baseline capture')
@@ -228,6 +270,8 @@ def _snapshot_readback(conn, task_id, *, include_related=True, _file_budget=None
             'task': dict(task), 'delegation': binding, 'delegation_sha256': delegation_sha256, 'objective': objective, 'stages': stages,
             'binding_verified': binding_verified, 'delegation_count': len(delegations),
             'attachments_sha256': attachment_digest.hexdigest(),
+            'attachment_files': attachment_files,
+            'attachment_files_truncated': len(attachment_files) < attachment_count,
             'attachments_available': attachments_available,
             'history': {'sha256': digest.hexdigest(), 'run_count': run_count, 'event_count': event_count,
                         'runs': runs[-100:], 'events': events[-100:],

@@ -2430,6 +2430,11 @@ def handle_clawops_retry_review(
                     )
             if value.get("delegation_state") != "queued":
                 raise ValueError("Grace delegation is no longer active and cannot be retried.")
+            if value.get("callback_state") == "delivered":
+                raise ValueError(
+                    "Grace Review callback is finalized; use a declared continuation "
+                    "instead of retrying the sealed review."
+                )
             execution_run_completed = (
                 value.get("execution_run_status") in {"done", "completed", "succeeded"}
                 and value.get("execution_run_outcome") == "completed"
@@ -2776,6 +2781,11 @@ def handle_clawops_retry_review(
             else:
                 raise ValueError(
                     "Grace Review retry is restricted to a repaired capability blocker."
+                )
+            if value.get("callback_outcome_event_id") is not None:
+                raise ValueError(
+                    "Grace Review callback outcome is finalized; use a declared "
+                    "continuation instead of retrying the sealed review."
                 )
             if not kb.unblock_task(conn, review_task_id):
                 raise RuntimeError("Grace Review could not be moved back to ready.")
@@ -5046,9 +5056,9 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 },
                 ensure_ascii=False,
             )
-        board = trusted_callback_board or None
+        board = trusted_callback_board or kb.get_current_board()
     else:
-        board = None
+        board = kb.get_current_board()
     owner_user_id = get_session_env("HERMES_SESSION_OWNER_USER_ID", "").strip()
     notifier_profile = get_session_env("HERMES_PROFILE", "").strip()
     if not notifier_profile:
@@ -5146,9 +5156,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             origin_event_id = challenge_event_id
             if challenge_review_id and challenge_event_id is not None:
                 requested_callback_board = approval_board
-            board = (
-                None if approval_board == kb.DEFAULT_BOARD else approval_board
-            )
+            board = approval_board
             raw_bound_args = approval_challenge.get("delegation_args")
             if raw_bound_args:
                 try:
@@ -5235,7 +5243,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "Callback board does not match the durable approval "
                     "checkpoint or callback origin."
                 )
-            board = None if resolved_board == kb.DEFAULT_BOARD else resolved_board
+            board = resolved_board
         elif requested_callback_board:
             board = requested_callback_board
         if scheduled_turn:

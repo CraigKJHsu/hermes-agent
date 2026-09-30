@@ -2421,6 +2421,34 @@ def test_clawops_retry_review_rejects_unrelated_block_classes(
             assert _durable_state(conn, execution_id, review_id) == initial
 
 
+def test_clawops_retry_review_rejects_finalized_callback(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry-review-finalized.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_blocked_review(conn)
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET state='delivered', "
+            "outcome_event_id=1, outcome_kind='terminal_blocked' "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        initial = _durable_state(conn, execution_id, review_id)
+    values = _session_values(f"請重試 Grace Review {review_id}")
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate.get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_retry_review
+
+    result = json.loads(handle_clawops_retry_review({"review_task_id": review_id}))
+    assert result["status"] == "rejected"
+    assert "callback is finalized" in result["reason"]
+    with kb.connect_closing(db_path) as conn:
+        assert _durable_state(conn, execution_id, review_id) == initial
+
+
 def test_clawops_retry_review_rejects_dependency_todo_without_reconciliation(
     tmp_path, monkeypatch
 ):
@@ -2591,7 +2619,7 @@ def test_timeout_recovery_remains_available_on_current_verified_profile(tmp_path
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     kb.init_db(db_path)
     with kb.connect_closing(db_path) as conn:
-        _, review_id, oid, _, _, _ = _seed_two_timeout_recovery(conn, profile_version="v96")
+        _, review_id, oid, _, _, _ = _seed_two_timeout_recovery(conn, profile_version=CURRENT_VERSION)
         before = kb._grace_compiled_contract(kb.get_task(conn, review_id).body)
         task_count = len(kb.list_tasks(conn, include_archived=True))
     values = _session_values(f"請重試 Grace Review {review_id}")
@@ -2601,6 +2629,6 @@ def test_timeout_recovery_remains_available_on_current_verified_profile(tmp_path
     assert result["status"] == "queued", result
     assert result["task_created"] is False
     with kb.connect_closing(db_path) as conn:
-        assert behavior_registry.guard_task(conn, review_id)["behavior_profile_version"] == "v96"
+        assert behavior_registry.guard_task(conn, review_id)["behavior_profile_version"] == CURRENT_VERSION
         assert kb._grace_compiled_contract(kb.get_task(conn, review_id).body) == before
         assert len(kb.list_tasks(conn, include_archived=True)) == task_count

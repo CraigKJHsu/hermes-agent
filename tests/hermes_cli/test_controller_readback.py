@@ -1,9 +1,65 @@
 import json
+import hashlib
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.controller_readback import task_controller_readback
+
+
+def test_controller_readback_exposes_verified_attachment_hash(control_db, tmp_path, monkeypatch):
+    conn, execution, _ = control_db
+    root = tmp_path / 'attachments'
+    path = root / execution / 'probe.json'
+    path.parent.mkdir(parents=True)
+    path.write_text('{"status":"ok"}')
+    monkeypatch.setattr(kb, 'attachments_root', lambda board=None: root)
+    attachment_id = kb.add_attachment(
+        conn, execution, filename='probe.json', stored_path=str(path),
+        content_type='application/json', size=path.stat().st_size,
+    )
+    observed = task_controller_readback(conn, execution)
+    assert observed['attachment_files'] == [{
+        'id': attachment_id, 'filename': 'probe.json', 'stored_path': str(path),
+        'size': path.stat().st_size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+    }]
+    path.write_text('changed')
+    changed = task_controller_readback(conn, execution)['attachment_files'][0]
+    assert observed['attachment_files'][0]['sha256'] != changed['sha256']
+    assert changed['size'] == len(b'changed')
+    for index in range(32):
+        extra = path.parent / f'extra-{index}.json'
+        extra.write_text('{}')
+        kb.add_attachment(
+            conn, execution, filename=extra.name, stored_path=str(extra),
+            content_type='application/json', size=2,
+        )
+    bounded = task_controller_readback(conn, execution)
+    assert len(bounded['attachment_files']) == 32
+    assert bounded['attachment_files_truncated'] is True
+    assert bounded['attachments_available'] is False
+
+
+def test_controller_readback_extracts_gateway_model_from_verified_attachment(control_db, tmp_path, monkeypatch):
+    conn, execution, _ = control_db
+    root = tmp_path / 'attachments'
+    path = root / execution / 'gateway.json'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'status': 'ok', 'result': {'meta': {'agentMeta': {'model': 'gpt-6-sol'}}}}))
+    monkeypatch.setattr(kb, 'attachments_root', lambda board=None: root)
+    kb.add_attachment(conn, execution, filename=path.name, stored_path=str(path),
+                      content_type='application/json', size=path.stat().st_size)
+    item = task_controller_readback(conn, execution)['attachment_files'][0]
+    assert item['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert item['attachment_json_claims'] == {
+        'status': 'ok', 'model': 'gpt-6-sol',
+        'model_source': 'result.meta.agentMeta.model',
+        'trust_scope': 'untrusted_attachment_content',
+    }
+    path.write_text('[' * 300 + '0' + ']' * 300)
+    assert 'attachment_json_claims' not in task_controller_readback(conn, execution)['attachment_files'][0]
+    path.write_text(' ' * 65537)
+    assert task_controller_readback(conn, execution)['attachment_files'][0]['json_claims_unavailable'] == 'attachment_exceeds_65536_bytes'
 
 
 def test_native_claim_persists_controller_baseline_and_detects_attachment_changes(control_db, tmp_path):
@@ -65,6 +121,10 @@ def test_controller_binding_spine_and_history(control_db):
     assert evidence['task']['assignee'] == 'clawops-ops'
     assert [s['stage_key'] for s in evidence['stages']] == ['prepare', 'execute']
     assert evidence['delegation']['review_task_id'] == review
+    assert json.loads(evidence['objective']['acceptance_criteria']) == ['verified']
+    assert evidence['objective']['acceptance_criteria_sha256'] == hashlib.sha256(
+        json.dumps(['verified'], ensure_ascii=False).encode()
+    ).hexdigest()
     assert task_controller_readback(conn, execution)['history']['sha256'] == evidence['history']['sha256']
     with kb.write_txn(conn):
         kb._append_event(conn, execution, 'diagnostic_observed')
@@ -72,6 +132,15 @@ def test_controller_binding_spine_and_history(control_db):
     assert changed['history']['sha256'] != evidence['history']['sha256']
     assert changed['external_effect_count'] == 0
     assert 'controller_zero_effect_check' not in changed
+
+
+def test_controller_readback_marks_nontext_criteria_invalid(control_db):
+    conn, execution, _ = control_db
+    with kb.write_txn(conn):
+        conn.execute("UPDATE grace_objectives SET acceptance_criteria=? WHERE objective_id='objective'", (b'not-json',))
+    objective = task_controller_readback(conn, execution)['objective']
+    assert objective['acceptance_criteria'] is None
+    assert objective['acceptance_criteria_error'] == 'invalid_controller_text'
 
 
 def test_mismatched_stage_never_attests_binding(control_db):
