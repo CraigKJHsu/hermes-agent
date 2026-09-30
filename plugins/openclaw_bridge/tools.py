@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import ipaddress
 import os
 import shlex
 import uuid
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlparse
+from urllib.request import (
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
+
+import yaml
 
 from plugins.openclaw_bridge.schemas import validate_delegated_result, validate_delegated_task
 from proactive.tool_policy import PolicyLevel, decide_action, load_tool_policy
@@ -19,12 +30,6 @@ DEFAULT_OPENCLAW_BRIDGE_PATH = "/api/plugins/hermes-bridge/tasks"
 DEFAULT_OPENCLAW_TEMPLATE = "agents.ask_team"
 _ZERO_EFFECT_ASYNC_CAPABILITY = object()
 _LOOP_CONTRACT_ASYNC_CAPABILITY = object()
-_READONLY_BROWSER_ALLOWED_URLS = frozenset(
-    {
-        "https://example.com/",
-        "https://www.linkedin.com/in/craig-k-j-hsu-6012b815",
-    }
-)
 _LOOP_CONTRACT_AGENT_IDS = frozenset(
     {
         "missioncrew-browser-readonly",
@@ -38,7 +43,43 @@ _LOOP_CONTRACT_AGENT_IDS = frozenset(
         "missioncrew-executor",
     }
 )
-_ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "browser"})
+_ZERO_EFFECT_LOOP_CONFIRM_ACTIONS = frozenset({"read", "web_search", "web_fetch", "browser"})
+_ZERO_EFFECT_INTERNAL_DEVOPS_TOOLS = frozenset({"read", "write", "web_search"})
+
+
+def _browser_profile_urls(field: str) -> frozenset[str]:
+    # The operations registry belongs to the sibling workspace docs,
+    # outside the Hermes fork; an absent registry must fail closed.
+    registry_path = (
+        Path(__file__).resolve().parents[3]
+        / "docs"
+        / "projects"
+        / "hub-ops"
+        / "agent-registry.yaml"
+    )
+    try:
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        worker = (registry.get("worker_profiles") or {}).get(
+            "clawops.browser_readonly"
+        )
+        values = worker.get(field) if isinstance(worker, Mapping) else []
+        return frozenset(
+            str(value or "").strip()
+            for value in values or []
+            if str(value or "").strip()
+        )
+    except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
+        return frozenset()
+
+
+def _readonly_browser_allowed_urls() -> frozenset[str]:
+    """Read the trusted worker URL authority from the HubOps registry."""
+    return _browser_profile_urls("allowed_urls")
+
+
+def _grace_direct_read_urls() -> frozenset[str]:
+    """Read the narrower Grace-direct URL authority from the HubOps registry."""
+    return _browser_profile_urls("grace_direct_read_urls")
 
 
 @dataclass(frozen=True)
@@ -56,6 +97,7 @@ OPENCLAW_DELEGATE_PARAMETERS = {
         "objective": {"type": "string"},
         "context_refs": {"type": "array", "items": {"type": "string"}},
         "allowed_tools": {"type": "array", "items": {"type": "string"}},
+        "allowed_urls": {"type": "array", "items": {"type": "string"}},
         "denied_tools": {"type": "array", "items": {"type": "string"}},
         "risk_level": {"type": "string"},
         "requires_confirmation": {"type": "boolean"},
@@ -99,6 +141,128 @@ OPENCLAW_DELEGATE_SCHEMA = {
     "parameters": OPENCLAW_DELEGATE_PARAMETERS,
 }
 
+GRACE_READ_URL_SCHEMA = {
+    "description": (
+        "Read one exact allowlisted loopback static URL without browser automation, "
+        "cookies, credentials, redirects, JavaScript, or ClawOps delegation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"],
+    },
+}
+
+_GRACE_READ_MAX_BYTES = 200_000
+_GRACE_READ_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "application/xhtml+xml",
+        "application/xml",
+        "text/html",
+        "text/plain",
+        "text/xml",
+    }
+)
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() in {"script", "style", "template", "noscript"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "template", "noscript"}:
+            self._hidden_depth = max(0, self._hidden_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        value = " ".join(data.split())
+        if not self._hidden_depth and value:
+            self.parts.append(value)
+
+
+def _is_loopback_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+        return False
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def grace_read_url(args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read one explicitly authorized local static page for Grace."""
+    url = str((args or {}).get("url") or "").strip()
+    if not _is_loopback_url(url):
+        return {
+            "status": "blocked",
+            "reason": "Use web_extract for public URLs; this tool accepts loopback URLs only.",
+        }
+    if url not in _grace_direct_read_urls():
+        return {
+            "status": "blocked",
+            "reason": "URL is not an exact allowlisted browser_readonly URL.",
+        }
+
+    request = Request(
+        url,
+        method="GET",
+        headers={
+            "Accept": "text/html,text/plain,application/json,application/xml",
+            "User-Agent": "Hermes-Grace-ReadOnly/1.0",
+        },
+    )
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(request, timeout=10) as response:
+            if response.geturl() != url:
+                raise ValueError("response URL changed")
+            content_type = response.headers.get_content_type().lower()
+            if content_type not in _GRACE_READ_CONTENT_TYPES:
+                raise ValueError(f"unsupported content type: {content_type}")
+            raw = response.read(_GRACE_READ_MAX_BYTES + 1)
+            truncated = len(raw) > _GRACE_READ_MAX_BYTES
+            raw = raw[:_GRACE_READ_MAX_BYTES]
+            charset = response.headers.get_content_charset() or "utf-8"
+            text = raw.decode(charset, errors="replace")
+    except (HTTPError, URLError, LookupError, OSError, ValueError) as exc:
+        return {"status": "blocked", "reason": f"Read failed safely: {exc}"}
+
+    if content_type in {"text/html", "application/xhtml+xml"}:
+        parser = _VisibleTextParser()
+        parser.feed(text)
+        text = "\n".join(parser.parts)
+    return {
+        "status": "succeeded",
+        "url": url,
+        "content_type": content_type,
+        "content": text,
+        "truncated": truncated,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "external_effect_budget": 0,
+        "side_effects_performed": False,
+    }
+
+
+def handle_grace_read_url(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
+    merged_args = dict(args or {})
+    merged_args.update({key: value for key, value in kwargs.items() if value is not None})
+    return json.dumps(grace_read_url(merged_args), ensure_ascii=False)
+
 
 def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
     raw_protocol_version = args.get("protocol_version")
@@ -119,6 +283,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
         for field in (
             "context_refs",
             "allowed_tools",
+            "allowed_urls",
             "denied_tools",
             "credential_refs",
         ):
@@ -218,6 +383,7 @@ def build_delegated_task(args: dict[str, Any]) -> dict[str, Any]:
                 "workspace_policy": str(args.get("workspace_policy") or "dedicated").strip(),
                 "session_policy": str(args.get("session_policy") or "ephemeral").strip(),
                 "credential_refs": list(args.get("credential_refs") or []),
+                "allowed_urls": list(args.get("allowed_urls") or []),
                 "dry_run": bool(args.get("dry_run", True)),
                 "idempotency_key": str(
                     args.get("idempotency_key") or args["attempt_id"]
@@ -317,6 +483,34 @@ def _requires_external_browser_capability(task: dict[str, Any]) -> bool:
     )
 
 
+def _is_zero_effect_internal_devops_loop(task: dict[str, Any]) -> bool:
+    """Recognize the sealed internal repair contract that may write locally."""
+    return (
+        task.get("protocol_version") == "2.0"
+        and task.get("executor_backend") == "openclaw"
+        and task.get("executor_profile") == "loop-contract"
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.agent.loop_contract_start",
+            "openclaw.agent.loop_contract_poll",
+            "openclaw.agent.loop_contract_cancel",
+        }
+        and task.get("task_type") == "devops"
+        and task.get("backend_agent_id") == "missioncrew-executor"
+        and task.get("external_effect_budget") == 0
+        and task.get("dry_run") is False
+        and task.get("workspace_policy") == "dedicated"
+        and task.get("session_policy") in {"ephemeral", "persistent"}
+        and task.get("credential_refs") == []
+        and bool(str(task.get("delegation_id") or "").strip())
+        and str(task.get("approval_grant_id") or "").strip()
+        == str(task.get("delegation_id") or "").strip()
+        and set(task.get("allowed_tools") or []).issubset(
+            _ZERO_EFFECT_INTERNAL_DEVOPS_TOOLS
+        )
+    )
+
+
 def _is_explicit_openclaw_dry_run(task: dict[str, Any]) -> bool:
     haystack = " ".join(
         [
@@ -331,6 +525,18 @@ def _is_explicit_openclaw_dry_run(task: dict[str, Any]) -> bool:
 def _requires_clawops_runtime(task: dict[str, Any]) -> bool:
     """Return True for work that should enter the Hermes-owned ClawOps queue."""
     if _is_explicit_openclaw_dry_run(task):
+        return False
+    if (
+        task.get("protocol_version") == "2.0"
+        and task.get("openclaw_task_id")
+        in {
+            "openclaw.browser.read_snapshot",
+            "openclaw.browser.read_snapshot_poll",
+            "openclaw.browser.read_snapshot_cancel",
+        }
+        and task.get("executor_profile") == "browser-readonly"
+        and task.get("dry_run") is False
+    ):
         return False
     haystack = " ".join(
         [
@@ -519,8 +725,11 @@ def _openclaw_payload(
         and task.get("credential_refs") == []
         and task.get("requires_confirmation") is False
         and task.get("allowed_tools") == ["browser.read"]
+        and task.get("allowed_urls")
+        == [str(task.get("target_url") or "").strip()]
         and str(task.get("target_url") or "").strip()
-        in _READONLY_BROWSER_ALLOWED_URLS
+        in _readonly_browser_allowed_urls()
+        and bool(str(task.get("target_url") or "").strip())
         and bool(str(task.get("project") or "").strip())
         and bool(str(task.get("topic_id") or "").strip())
         and bool(str(task.get("idempotency_key") or "").strip())
@@ -1391,12 +1600,18 @@ def delegate_to_openclaw(
         }
     )
     scoped_approval = bool(str(task.get("approval_grant_id") or "").strip())
+    zero_effect_internal_devops_loop = (
+        _live_async_capability is _LOOP_CONTRACT_ASYNC_CAPABILITY
+        and _is_zero_effect_internal_devops_loop(task)
+    )
     if task["requires_confirmation"] or (
         risk in {"high", "critical"}
         and not (is_loop_contract_async and scoped_approval)
     ):
         return _blocked_result(task, f"Delegated task risk_level={risk} requires approval.")
-    if _requires_clawops_runtime(task) and not is_loop_contract_async:
+    if _requires_clawops_runtime(task) and not (
+        is_loop_contract_async or zero_effect_internal_devops_loop
+    ):
         return _blocked_capability_result(
             task,
             "This work belongs in the Hermes-owned ClawOps runtime queue, not the OpenClaw dry-run bridge.",
@@ -1434,6 +1649,7 @@ def delegate_to_openclaw(
             "openclaw.agent.loop_contract_cancel",
         }
         and _live_async_capability is not _LOOP_CONTRACT_ASYNC_CAPABILITY
+        and not zero_effect_internal_devops_loop
     ):
         return _blocked_capability_result(
             task,
@@ -1478,6 +1694,7 @@ def delegate_to_openclaw(
                 zero_effect_missioncrew_content_loop
                 and action in {"read", "write", "web_search", "image_generate"}
             )
+            and not zero_effect_internal_devops_loop
             and not (
                 zero_effect_facebook_page_preflight
                 and action == "facebook_page_publish_preflight"

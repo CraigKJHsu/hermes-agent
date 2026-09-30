@@ -40,6 +40,7 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _looks_like_context_only_injection,
     _should_clear_resume_pending_after_turn,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
@@ -154,10 +155,18 @@ def _simulate_note_injection(
             else "a gateway interruption"
         )
         if message:
-            resume_guidance = (
-                "Address the user's NEW message below FIRST and focus "
-                "on what the user is asking now."
-            )
+            if _looks_like_context_only_injection(message):
+                resume_guidance = (
+                    "The message below is runtime/environment context "
+                    "only, not a new user task. Recover the active "
+                    "unfinished work from the conversation history and "
+                    "continue or report that work."
+                )
+            else:
+                resume_guidance = (
+                    "Address the user's NEW message below FIRST and focus "
+                    "on what the user is asking now."
+                )
         else:
             resume_guidance = (
                 "Report to the user that the session was restored "
@@ -705,6 +714,45 @@ class TestResumePendingSystemNote:
         # Nothing appended after the closing bracket (no empty user text).
         assert result.rstrip().endswith("]")
 
+    def test_resume_pending_context_only_injection_continues_active_work(self):
+        """Context refresh payloads must not be mistaken for the user's task."""
+
+        entry = self._pending_entry(reason="restart_timeout")
+        context_only_message = (
+            "<recommended_plugins>\n"
+            "Here is a list of plugins that are available but not installed.\n"
+            "</recommended_plugins>"
+            "# AGENTS.md instructions\n"
+            "<INSTRUCTIONS>\n"
+            "Do not delete files in bulk.\n"
+            "</INSTRUCTIONS>"
+            "<environment_context>\n"
+            "  <cwd>/Users/kj/my_agent_team</cwd>\n"
+            "</environment_context>"
+        )
+
+        assert _looks_like_context_only_injection(context_only_message) is True
+
+        result = _simulate_note_injection(
+            history=[
+                {"role": "user", "content": "核准兩件live動作", "timestamp": time.time() - 2},
+                {"role": "assistant", "content": "我會繼續處理 live 任務。", "timestamp": time.time() - 1},
+            ],
+            user_message=context_only_message,
+            resume_entry=entry,
+        )
+        assert "runtime/environment context only" in result
+        assert "not a new user task" in result
+        assert "Recover the active unfinished work" in result
+        assert "Address the user's NEW message below FIRST" not in result
+
+    def test_context_only_classifier_rejects_mixed_user_text(self):
+        mixed = (
+            "<environment_context><cwd>/tmp</cwd></environment_context>\n"
+            "請繼續剛剛那個"
+        )
+        assert _looks_like_context_only_injection(mixed) is False
+
 
 # ---------------------------------------------------------------------------
 # Freshness helpers
@@ -950,12 +998,102 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True
+    assert event.internal_context["gateway_resume_reason"] == "restart_timeout"
     assert event.message_type == MessageType.TEXT
     assert event.source == source
     # Text is empty — the existing _is_resume_pending branch in
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_recovers_pending_review_retry_first(tmp_path):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._session_db = MagicMock(db_path=tmp_path / "state.db")
+    adapter.handle_message = AsyncMock()
+    recovered = {
+        "status": "queued",
+        "task_created": False,
+        "grace_review_task_id": "t_review",
+    }
+
+    with patch(
+        "hermes_cli.review_retry_recovery.recover_interrupted_review_retry",
+        return_value=recovered,
+    ) as recover:
+        assert runner._schedule_resume_pending_sessions() == 1
+        await asyncio.sleep(0)
+
+    recover.assert_called_once_with(
+        session_id="sid",
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        platform="telegram",
+        chat_id="resume-chat",
+        chat_type="group",
+        thread_id="topic-1",
+        user_id=str(source.user_id or ""),
+        owner_user_id=runner._configured_external_action_owner(source),
+        state_db_path=tmp_path / "state.db",
+        freshness_seconds=_auto_continue_freshness_window(),
+    )
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal_context["gateway_recovered_review_retry"] == recovered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_raises", [False, True])
+async def test_startup_auto_resume_waits_for_durable_review_retry_result(tmp_path, recovery_raises):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._session_db = MagicMock(db_path=tmp_path / "state.db")
+    adapter.handle_message = AsyncMock()
+    pending = {
+        "status": "state_write_pending",
+        "task_created": False,
+        "grace_review_task_id": "t_review",
+        "tool_result_durable": False,
+    }
+
+    with patch(
+        "hermes_cli.review_retry_recovery.recover_interrupted_review_retry",
+        **({"side_effect": RuntimeError("controller unavailable")}
+           if recovery_raises else {"return_value": pending}),
+    ):
+        assert runner._schedule_resume_pending_sessions() == 0
+        await asyncio.sleep(0)
+
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.session_key not in runner._running_agents
+    assert pending_entry.session_key not in runner._running_agents_ts
+    assert pending_entry.resume_pending is True
 
 
 @pytest.mark.asyncio
@@ -1018,6 +1156,47 @@ async def test_startup_auto_resume_skips_stale_entries():
 
     assert scheduled == 0
     adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_stale_session_can_finish_durable_review_receipt(tmp_path):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stale-receipt-chat")
+    stale_marker = datetime.now() - timedelta(
+        seconds=_auto_continue_freshness_window() + 60
+    )
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:stale-receipt-chat",
+        session_id="sid",
+        created_at=stale_marker,
+        updated_at=stale_marker,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=stale_marker,
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = MagicMock(db_path=tmp_path / "state.db")
+    adapter.handle_message = AsyncMock()
+    recovered = {
+        "status": "queued",
+        "grace_review_task_id": "t_review",
+    }
+
+    with patch(
+        "hermes_cli.review_retry_recovery.recover_interrupted_review_retry",
+        return_value=recovered,
+    ) as recover:
+        assert runner._schedule_resume_pending_sessions() == 0
+        await asyncio.sleep(0)
+
+    recover.assert_called_once()
+    adapter.handle_message.assert_not_called()
+    assert entry.session_key not in runner._running_agents
+    assert entry.session_key not in runner._running_agents_ts
+    assert entry.resume_pending is True
 
 
 @pytest.mark.asyncio

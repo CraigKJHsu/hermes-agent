@@ -61,6 +61,7 @@ backends:
       - browser_write
       - code
       - content
+      - deterministic_image_render
       - image_generate
       - facebook_page_graph
       - facebook_page_graph_status

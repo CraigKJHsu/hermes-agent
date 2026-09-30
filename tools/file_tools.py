@@ -2,9 +2,12 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
+import stat
+import sys
 import threading
 from pathlib import Path
 
@@ -1766,6 +1769,16 @@ READ_FILE_SCHEMA = {
     }
 }
 
+FILE_SHA256_SCHEMA = {
+    "name": "file_sha256",
+    "description": "Compute the SHA-256 and size of a regular local file without returning its contents (maximum 4 MiB). Uses the same read denylist as read_file.",
+    "parameters": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "description": "Absolute or task-relative file path"}},
+        "required": ["path"],
+    },
+}
+
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
     "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
@@ -1860,6 +1873,68 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+def _handle_file_sha256(args, **kw):
+    path = args.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return tool_error("file_sha256: path is required")
+    task_id = kw.get("task_id") or "default"
+
+    def descriptor_path(fd):
+        if sys.platform == "darwin":
+            import fcntl
+
+            value = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0]
+            return os.fsdecode(value)
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/self/fd/{fd}")
+        return None
+
+    try:
+        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
+        if _is_blocked_device(path, base_dir=device_base):
+            return tool_error("file_sha256: device paths are not allowed")
+        resolved = _resolve_path_for_task(path, task_id)
+        block_error = get_read_block_error(str(resolved))
+        if block_error:
+            return tool_error(block_error)
+        # Reject final-component symlinks and FIFOs before any blocking read.
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(resolved, flags), "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 4 * 1024 * 1024:
+                return tool_error("file_sha256: regular files up to 4 MiB only")
+            opened_path = descriptor_path(source.fileno())
+            if opened_path is None:
+                return tool_error("file_sha256: descriptor path verification unavailable")
+            if Path(opened_path).resolve() != resolved or get_read_block_error(opened_path):
+                return tool_error("file_sha256: opened file path changed or is blocked")
+            digest = hashlib.sha256()
+            total = 0
+            for chunk in iter(lambda: source.read(65536), b""):
+                total += len(chunk)
+                if total > 4 * 1024 * 1024:
+                    return tool_error("file_sha256: regular files up to 4 MiB only")
+                digest.update(chunk)
+            after = os.fstat(source.fileno())
+            final_opened_path = descriptor_path(source.fileno())
+            final_path_stat = os.stat(resolved)
+            if (
+                final_opened_path is None
+                or Path(final_opened_path).resolve() != resolved
+                or get_read_block_error(final_opened_path)
+                or (final_path_stat.st_dev, final_path_stat.st_ino)
+                != (after.st_dev, after.st_ino)
+            ):
+                return tool_error("file_sha256: file path changed during read")
+        if total != after.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            return tool_error("file_sha256: file changed during read")
+    except (OSError, ValueError, RuntimeError) as exc:
+        return tool_error(f"file_sha256: {getattr(exc, 'strerror', None) or type(exc).__name__}")
+    return json.dumps({"path": str(resolved), "size": after.st_size, "sha256": digest.hexdigest()})
+
+
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1910,6 +1985,7 @@ def _handle_search_files(args, **kw):
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="file_sha256", toolset="file", schema=FILE_SHA256_SCHEMA, handler=_handle_file_sha256, check_fn=_check_file_reqs, emoji="🔏")
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

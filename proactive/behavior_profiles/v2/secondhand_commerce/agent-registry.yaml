@@ -1,0 +1,506 @@
+version: 1
+updated_at: "2026-07-25"
+default_approval_required: true
+
+# Capability vocabulary used by HubOps routing. These are responsibility
+# labels, not callable Hermes runtime tool names. Worker startup may skip the
+# expensive runtime-schema probe only when every declared item is in this
+# reserved list.
+abstract_capability_labels:
+  - memory_read
+  - docs_read
+  - web_research
+  - report_generate
+  - draft_markdown
+  - filesystem_read
+  - filesystem_write
+  - shell
+  - tests
+  - kanban
+  - status_check
+  - scheduler_read
+  - logs_read
+
+models:
+  codex:
+    provider: openai
+    purpose: engineering, orchestration, risk review, final synthesis
+  gemini-3.1-pro:
+    provider: google
+    purpose: fallback for strategy, course design, product marketing, and compliance-adjacent review
+  gemini-2.5-flash:
+    provider: google
+    purpose: high-volume drafts, summaries, classification, CRM templates
+
+escalation_policies:
+  escalate_public_or_financial_outputs_to_risk_review:
+    target: risk_review
+    reason: Public or financial outputs need compliance screening before release.
+  escalate_malformed_or_high_risk_tasks_to_hermes_grace:
+    target: hermes_grace
+    reason: Malformed or high-risk tasks need chief-of-staff triage.
+  escalate_financial_claims_to_risk_review:
+    target: risk_review
+    reason: Financial claims require compliance review before use.
+  escalate_public_proposal_assets_to_risk_review:
+    target: risk_review
+    reason: Public proposal assets need review before publication.
+  route_publishable_assets_to_risk_review:
+    target: risk_review
+    reason: Publishable assets should pass a risk review gate first.
+  route_campaign_launches_to_hermes_grace:
+    target: hermes_grace
+    reason: Campaign launches need chief-of-staff coordination and approval flow.
+  require_human_approval_before_outbound_message:
+    target: human
+    reason: Outbound messages require explicit human approval in v1.
+  require_human_approval_before_transaction_commitment:
+    target: human
+    reason: Transaction commitments require explicit human approval in v1.
+  route_all_trading_claims_to_risk_review:
+    target: risk_review
+    reason: Trading claims need compliance review before release.
+  escalate_unresolved_risk_to_human:
+    target: human
+    reason: Unresolved compliance issues require human decision-making.
+  require_human_lawyer_for_legal_advice:
+    target: human_lawyer
+    reason: Formal legal advice, legal opinions, disputes, enforcement, and jurisdiction-specific legal conclusions require qualified human counsel.
+  escalate_anomalies_to_hermes_grace:
+    target: hermes_grace
+    reason: Operational anomalies need chief-of-staff escalation.
+  require_human_approval_before_deploy_or_credentials:
+    target: human
+    reason: Deployments and credential access require explicit human approval.
+
+agents:
+  hermes_grace:
+    display_name: Hermes-Grace
+    role: chief_of_staff
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hub_ops, hahow_course, course_marketing, secondhand_commerce, ingrids_marketing]
+    allowed_tools: [task_router, memory_read, memory_write, report_generate]
+    approval_required: false
+    escalation_policy: escalate_public_or_financial_outputs_to_risk_review
+
+  orchestrator:
+    display_name: Operations Orchestrator
+    role: task_router
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hub_ops, hahow_course, course_marketing, secondhand_commerce, ingrids_marketing]
+    allowed_tools: [task_router, task_queue, memory_read, report_generate]
+    approval_required: false
+    escalation_policy: escalate_malformed_or_high_risk_tasks_to_hermes_grace
+
+  research:
+    display_name: Research Agent
+    role: market_research_and_evidence
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hub_ops, hahow_course, course_marketing, secondhand_commerce, ingrids_marketing]
+    allowed_tools: [memory_read, docs_read, web_research, report_generate]
+    approval_required: false
+    escalation_policy: escalate_public_or_financial_outputs_to_risk_review
+
+  strategy:
+    display_name: Strategy Agent
+    role: business_strategy
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hahow_course, course_marketing, ingrids_marketing, hub_ops]
+    allowed_tools: [memory_read, research_notes, draft_markdown]
+    approval_required: false
+    escalation_policy: escalate_financial_claims_to_risk_review
+
+  course_designer:
+    display_name: Course Designer Agent
+    role: course_planning
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hahow_course]
+    allowed_tools: [memory_read, draft_markdown]
+    approval_required: false
+    escalation_policy: escalate_public_proposal_assets_to_risk_review
+
+  content_creator:
+    display_name: Content Creator Agent
+    role: content_drafting
+    primary_model: openai/gpt-image-2
+    fallback_model: codex
+    allowed_projects: [ai_bizweek, course_marketing, ingrids_marketing, secondhand_commerce]
+    allowed_tools: [memory_read, draft_markdown, image_generate]
+    approval_required: true
+    escalation_policy: route_publishable_assets_to_risk_review
+
+  marketing_operator:
+    display_name: Marketing Operator Agent
+    role: campaign_planning
+    primary_model: gemini-2.5-flash
+    fallback_model: codex
+    allowed_projects: [course_marketing, ingrids_marketing]
+    allowed_tools: [memory_read, draft_markdown, image_generate, report_generate]
+    approval_required: true
+    escalation_policy: route_campaign_launches_to_hermes_grace
+
+  crm_sales:
+    display_name: CRM Sales Agent
+    role: lead_followup
+    primary_model: gemini-2.5-flash
+    fallback_model: codex
+    allowed_projects: [course_marketing]
+    allowed_tools: [memory_read, draft_markdown]
+    approval_required: true
+    escalation_policy: require_human_approval_before_outbound_message
+
+  secondhand_commerce:
+    display_name: Secondhand Commerce Agent
+    role: resale_listing
+    primary_model: gemini-2.5-flash
+    fallback_model: codex
+    allowed_projects: [secondhand_commerce]
+    allowed_tools: [memory_read, draft_markdown]
+    approval_required: true
+    escalation_policy: require_human_approval_before_transaction_commitment
+
+  ingrids_product_marketing:
+    display_name: Ingrids Product Marketing Agent
+    role: product_marketing
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [ingrids_marketing]
+    allowed_tools: [memory_read, draft_markdown, report_generate]
+    approval_required: true
+    escalation_policy: route_all_trading_claims_to_risk_review
+
+  risk_review:
+    display_name: Risk Review Agent
+    role: compliance_review
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hahow_course, course_marketing, secondhand_commerce, ingrids_marketing, hub_ops]
+    allowed_tools: [memory_read, draft_markdown]
+    approval_required: false
+    escalation_policy: escalate_unresolved_risk_to_human
+
+  legal_compliance:
+    display_name: Legal & Compliance Agent
+    role: legal_compliance_research
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hub_ops, hahow_course, course_marketing, secondhand_commerce, ingrids_marketing]
+    allowed_tools: [memory_read, docs_read, research_notes, draft_markdown]
+    approval_required: false
+    escalation_policy: require_human_lawyer_for_legal_advice
+    boundaries:
+      - source-grounded compliance research, issue spotting, risk classification, and counsel handoff only
+      - no formal legal advice, legal opinions, representation, filings, signatures, or external legal actions
+      - every matter must identify jurisdiction, source freshness, confidence, uncertainty, and human-lawyer escalation status
+
+  analytics:
+    display_name: Analytics Agent
+    role: reporting
+    primary_model: gemini-2.5-flash
+    fallback_model: codex
+    allowed_projects: [hub_ops, hahow_course, course_marketing, secondhand_commerce, ingrids_marketing]
+    allowed_tools: [memory_read, report_generate]
+    approval_required: false
+    escalation_policy: escalate_anomalies_to_hermes_grace
+
+  devops_integration:
+    display_name: DevOps Integration Agent
+    role: deployment_and_integration
+    primary_model: codex
+    fallback_model: gemini-3.1-pro
+    allowed_projects: [hub_ops]
+    allowed_tools: [filesystem_read, filesystem_write, shell, tests]
+    approval_required: true
+    escalation_policy: require_human_approval_before_deploy_or_credentials
+
+worker_profiles:
+  clawops.research:
+    display_name: ClawOps Research Worker
+    runtime_profile: clawops-research
+    role: research
+    allowed_tools: [memory_read, docs_read, web_research, report_generate]
+    risk_level_limit: medium
+    approval_required: false
+    approval_required_actions: [external_contact, publish, credentials, deployment]
+    approval_checklist: Public Content
+    output_schema:
+      format: markdown
+      required_sections: [summary, evidence, risks, open_questions, next_actions]
+    timeout_seconds: 1200
+    retry_policy:
+      max_attempts: 2
+      backoff_seconds: 30
+
+  missioncrew.content:
+    display_name: MissionCrew Content Worker
+    runtime_profile: missioncrew-content
+    role: content
+    allowed_tools: [memory_read, docs_read, draft_markdown, image_generate]
+    risk_level_limit: medium
+    approval_required: true
+    approval_required_actions: [publish, outbound_message, public_claim]
+    approval_checklist: Public Content
+    output_schema:
+      format: markdown
+      required_sections: [summary, draft, risks, approval_needed, next_actions]
+    timeout_seconds: 1200
+    retry_policy:
+      max_attempts: 2
+      backoff_seconds: 30
+
+  clawops.dev:
+    display_name: ClawOps Dev Worker
+    runtime_profile: clawops-dev
+    role: development
+    allowed_tools: [filesystem_read, filesystem_write, shell, tests, docs_read]
+    risk_level_limit: medium
+    approval_required: false
+    approval_required_actions: [deployment, credential_access, destructive_command, external_send]
+    approval_checklist: DevOps and Integration
+    output_schema:
+      format: markdown
+      required_sections: [summary, changed_files, tests, risks, next_actions]
+    timeout_seconds: 1800
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.ops:
+    display_name: ClawOps Ops Worker
+    runtime_profile: clawops-ops
+    role: operations
+    allowed_tools: [kanban, status_check, scheduler_read, logs_read, report_generate]
+    risk_level_limit: medium
+    approval_required: false
+    approval_required_actions: [external_send, publish, deployment, credential_access]
+    approval_checklist: DevOps and Integration
+    output_schema:
+      format: markdown
+      required_sections: [summary, routing, status, blockers, next_actions]
+    timeout_seconds: 900
+    retry_policy:
+      max_attempts: 2
+      backoff_seconds: 20
+
+  clawops.facebook_page_api:
+    display_name: ClawOps Facebook Page API Worker
+    runtime_profile: missioncrew-facebook-page-operator
+    role: facebook_page_api_publish
+    allowed_tools:
+      - memory_read
+      - docs_read
+      - kanban
+      - status_check
+      - facebook_page_graph_status
+      - facebook_page_graph_publish
+      - report_generate
+    required_callable_tools:
+      - facebook_page_graph_status
+      - facebook_page_graph_publish
+    risk_level_limit: medium
+    contract_risk_level_limit: high
+    approval_required: true
+    approval_required_actions:
+      - publish
+      - changed_copy
+      - changed_assets
+      - new_destination
+      - credential_access
+    approval_checklist: Facebook Page Graph API Publish
+    output_schema:
+      format: json
+      required_sections: [summary, post_id, permalink_url, evidence, warnings]
+    timeout_seconds: 900
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.facebook_page_preflight:
+    display_name: ClawOps Facebook Page Preflight Worker
+    runtime_profile: missioncrew-facebook-page-operator
+    role: facebook_page_publish_preflight
+    allowed_tools:
+      - facebook_page_publish_preflight
+    required_callable_tools:
+      - facebook_page_publish_preflight
+    risk_level_limit: medium
+    approval_required: false
+    approval_required_actions: []
+    approval_checklist: Facebook Page Read-Only Preflight
+    output_schema:
+      format: json
+      required_sections: [summary, manifest, final_message, evidence]
+    timeout_seconds: 900
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.facebook_marketplace_group:
+    display_name: ClawOps Facebook Marketplace Group Worker
+    runtime_profile: clawops-browser
+    role: facebook_marketplace_group_publish
+    allowed_tools:
+      - memory_read
+      - docs_read
+      - kanban
+      - status_check
+      - browser_snapshot
+      - browser_navigate
+      - browser_click
+      - browser_scroll
+      - report_generate
+    risk_level_limit: medium
+    contract_risk_level_limit: high
+    approval_required: true
+    approval_required_actions:
+      - publish
+      - new_destination
+      - join_group
+      - credential_access
+    approval_checklist: Facebook Marketplace Group Publish
+    output_schema:
+      format: json
+      required_sections: [summary, listing_id, destinations, evidence, warnings]
+    timeout_seconds: 900
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.browser:
+    display_name: ClawOps Browser Worker
+    runtime_profile: clawops-browser
+    role: external_browser_execution
+    allowed_tools:
+      - memory_read
+      - docs_read
+      - kanban
+      - status_check
+      - browser_cdp
+      - browser_snapshot
+      - browser_navigate
+      - browser_click
+      - browser_type
+      - browser_scroll
+      - browser_press
+      - browser_dialog
+      - browser_upload_files
+      - report_generate
+    risk_level_limit: medium
+    # Hermes may elevate only one validated, approved Loop Contract at a time.
+    # This does not change the worker's global medium ceiling.
+    contract_risk_level_limit: high
+    approval_required: true
+    approval_required_actions:
+      - new_destination
+      - changed_copy
+      - changed_assets
+      - join_group
+      - private_message
+      - comment
+      - payment
+      - promotion
+      - account_setting
+      - credential_access
+    approval_checklist: External Browser Publish
+    output_schema:
+      format: markdown
+      required_sections: [summary, destinations, evidence, warnings, next_actions]
+    timeout_seconds: 1800
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.browser_readonly:
+    display_name: ClawOps Browser Read-Only Worker
+    runtime_profile: clawops-browser
+    role: external_browser_readonly
+    allowed_urls:
+      - https://example.com/
+      - https://www.linkedin.com/in/craig-k-j-hsu-6012b815
+    interaction_mode: passive_readonly
+    allowed_tools:
+      - memory_read
+      - docs_read
+      - kanban
+      - status_check
+      - browser_cdp
+      - browser_snapshot
+      - browser_scroll
+      - report_generate
+    risk_level_limit: low
+    approval_required: false
+    approval_required_actions:
+      - browser_navigate
+      - browser_click
+      - browser_type
+      - browser_press
+      - browser_dialog
+      - browser_upload_files
+      - publish
+      - external_send
+      - credential_access
+    approval_checklist: External Browser Read-Only
+    output_schema:
+      format: markdown
+      required_sections: [summary, evidence, warnings, next_actions]
+    timeout_seconds: 1800
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.facebook_marketplace_readonly:
+    display_name: ClawOps Facebook Marketplace Read-Only Worker
+    runtime_profile: clawops-browser
+    role: facebook_marketplace_readonly
+    interaction_mode: interactive_readonly
+    allowed_tools:
+      - memory_read
+      - docs_read
+      - kanban
+      - status_check
+      - browser_cdp
+      - browser_snapshot
+      - browser_navigate
+      - browser_click
+      - browser_type
+      - browser_scroll
+      - report_generate
+    risk_level_limit: low
+    approval_required: false
+    approval_required_actions:
+      - browser_press
+      - browser_dialog
+      - browser_upload_files
+      - publish
+      - external_send
+      - credential_access
+    approval_checklist: Facebook Marketplace Read-Only
+    output_schema:
+      format: markdown
+      required_sections: [summary, destinations, evidence, warnings, next_actions]
+    timeout_seconds: 900
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  clawops.review:
+    display_name: ClawOps Review Worker
+    runtime_profile: clawops-review
+    role: review
+    allowed_tools: [memory_read, docs_read, tests, report_generate]
+    risk_level_limit: high
+    approval_required: true
+    approval_required_actions: [approval_gate, publish, deployment, financial_claim]
+    approval_checklist: Finance, Crypto, Trading, and ingrids.app
+    output_schema:
+      format: markdown
+      required_sections: [summary, findings, risk_decision, approval_status, next_actions]
+    timeout_seconds: 1500
+    retry_policy:
+      max_attempts: 1
+      backoff_seconds: 0

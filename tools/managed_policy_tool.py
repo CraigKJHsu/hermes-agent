@@ -306,7 +306,7 @@ def _ai_bizweek_carter_source_materials(
 
 def managed_policy_read(*, session_id: str | None) -> str:
     """Read policies bound to the caller's persisted messaging Topic."""
-    from hermes_constants import get_default_hermes_root
+    from hermes_constants import get_default_hermes_root, get_hermes_home
     from hermes_state import SessionDB
     from proactive.policy_registry import (
         PolicyRegistryError,
@@ -318,7 +318,10 @@ def managed_policy_read(*, session_id: str | None) -> str:
     if not clean_session_id:
         return json.dumps({"success": False, "error": "trusted session_id is required"})
 
-    db = SessionDB(db_path=get_default_hermes_root() / "state.db")
+    kanban_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    # Workers persist sessions in their own profile; gateway Topics use the root.
+    session_home = get_hermes_home() if kanban_task_id else get_default_hermes_root()
+    db = SessionDB(db_path=session_home / "state.db")
     try:
         session = db.get_session(clean_session_id)
     finally:
@@ -330,8 +333,7 @@ def managed_policy_read(*, session_id: str | None) -> str:
     chat_id = str(session.get("chat_id") or "").strip()
     thread_id = str(session.get("thread_id") or "").strip()
 
-    if not chat_id or not thread_id:
-        kanban_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if kanban_task_id or not chat_id or not thread_id:
         if not kanban_task_id:
             return json.dumps(
                 {
@@ -374,6 +376,7 @@ def managed_policy_read(*, session_id: str | None) -> str:
                 "version": policy["version"],
                 "sha256": policy["sha256"],
                 "loaded": True,
+                "pinned_version_verified": True,
                 **(
                     {"latest_active_verified": True}
                     if policy.get("resolution") == "latest_active"
@@ -386,6 +389,10 @@ def managed_policy_read(*, session_id: str | None) -> str:
             {
                 "success": True,
                 "scope": scope,
+                "execution_policy_receipts": [
+                    {**receipt, "role": "execution"}
+                    for receipt in review_policy_receipts
+                ],
                 "review_policy_receipts": review_policy_receipts,
                 **(
                     {"asset_policy_guidance": asset_guidance}
@@ -471,6 +478,8 @@ registry.register(
             "session or the current policy-pinned Kanban task. In Grace review tasks, "
             "use this tool to verify the task's pinned snapshot and copy its exact "
             "review_policy_receipts into kanban_complete metadata.policy_receipts. "
+            "In policy-pinned execution tasks, copy execution_policy_receipts after "
+            "reading the complete policy content. "
             "For AI BizWeek image work, also use asset_policy_guidance to compile only "
             "the requested asset family and to reject mixed Page Hero / Audio Brief layouts. "
             "For AI BizWeek Facebook Page copy, also use content_policy_guidance to "

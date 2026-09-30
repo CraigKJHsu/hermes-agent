@@ -566,6 +566,12 @@ def validate_delta_external_effect_refs(
         "not_created",
         "planned",
         "draft",
+        # ``reserved`` is a durable *internal* registry state.  Its evidence
+        # comes from the contract-bound Domain Episode Reservation ledger,
+        # not from a public-platform effect.  Treating it as externally
+        # materialized made a preparation-only reservation impossible unless
+        # the worker also held an unrelated publication capability.
+        "reserved",
         "unknown",
     }
     for delta in deltas:

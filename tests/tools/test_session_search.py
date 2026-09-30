@@ -17,8 +17,25 @@ from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
     _format_timestamp,
+    _shape_message,
     session_search,
 )
+
+
+def test_message_shape_bounds_large_content_and_tool_calls():
+    shaped = _shape_message({
+        "id": 1,
+        "role": "tool",
+        "content": "x" * 5_000,
+        "tool_calls": [{"arguments": "y" * 5_000}],
+    })
+
+    assert shaped["content_truncated"] is True
+    assert shaped["content_original_chars"] == 5_000
+    assert "<truncated chars=" in shaped["content"]
+    assert shaped["tool_calls_truncated"] is True
+    assert shaped["tool_calls_original_chars"] > 5_000
+    assert "<truncated chars=" in shaped["tool_calls"]
 
 
 @pytest.fixture

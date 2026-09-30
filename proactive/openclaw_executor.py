@@ -227,43 +227,16 @@ def _complete_or_resume_grace_review_locked(
     if not all(checks):
         return False, ["Completed execution does not contain resumable review evidence."]
 
-    review_claim = kb.claim_task(
-        conn, review_task_id, claimer="grace-policy-review"
-    )
-    if review_claim is None or review_claim.current_run_id is None:
-        refreshed = kb.get_task(conn, review_task_id)
-        if refreshed is not None and refreshed.status == "done":
-            return (
-                refreshed.result == "accepted",
-                [] if refreshed.result == "accepted" else [
-                    "Grace review completed without acceptance."
-                ],
-            )
-        return False, ["Grace review task could not be claimed or resumed."]
-    completed = kb.complete_task(
-        conn,
-        review_task_id,
-        result="accepted",
-        summary=(
-            "Grace policy review accepted the backend identity, requested "
-            "URL, structured snapshot, and zero-effect evidence."
-        ),
-        metadata={
-            "reviewed_execution_task_id": execution_task_id,
-            "backend_run_id": execution_run.backend_run_id,
-            "result_digest": execution_run.result_digest,
-            "checks": [
-                "backend_identity",
-                "requested_url",
-                "structured_output",
-                "external_effect_budget_zero",
-                "side_effects_false",
+    review = kb.get_task(conn, review_task_id)
+    if review is None:
+        return False, ["Grace review task is missing."]
+    if review is not None and review.status == "done":
+        return (
+            review.result == "accepted",
+            [] if review.result == "accepted" else [
+                "Grace review completed without acceptance."
             ],
-        },
-        expected_run_id=int(review_claim.current_run_id),
-    )
-    if not completed:
-        return False, ["Grace review task changed before acceptance was recorded."]
+        )
     return True, []
 
 
@@ -421,14 +394,7 @@ def _finalize_readonly_terminal_locked(
     completed_run = kb.latest_run(conn, execution_task_id)
     if completed_run is None:
         raise RuntimeError("Completed execution task has no run evidence.")
-    accepted, errors = _complete_or_resume_grace_review(
-        conn,
-        execution_task_id=execution_task_id,
-        review_task_id=review_task_id,
-        execution_run=completed_run,
-        expected_url=expected_url,
-    )
-    return accepted, errors, result_digest
+    return True, [], result_digest
 
 
 def _finalize_readonly_terminal(
@@ -475,7 +441,7 @@ def execute_readonly_browser_snapshot(
     claimed Kanban attempt before either the execution or review task can
     complete.
     """
-    normalized_contract = validate_loop_contract(contract)
+    normalized_contract = validate_loop_contract(contract, effect_budget_mode="zero")
     fingerprint = contract_fingerprint(normalized_contract)
     identity = normalized_contract["identity"]
     objective = normalized_contract["goal"]["objective"]
@@ -485,6 +451,23 @@ def execute_readonly_browser_snapshot(
         raise ValueError(
             "Read-only browser URL must be explicitly allowed and not forbidden "
             "by the Loop Contract scope."
+        )
+    routing = normalized_contract.get("routing")
+    resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
+    assignment = resolved.get("assignment") if isinstance(resolved, Mapping) else {}
+    route_allowed_urls = [
+        str(value or "").strip()
+        for value in (
+            assignment.get("allowed_urls")
+            if isinstance(assignment, Mapping)
+            else []
+        ) or []
+        if str(value or "").strip()
+    ]
+    if url not in route_allowed_urls:
+        raise ValueError(
+            "Read-only browser URL must be authorized by the "
+            "resolved route assignment."
         )
     request_instance_id = str(identity["request_instance_id"])
     idempotency_key = hashlib.sha256(
@@ -735,6 +718,23 @@ def execute_readonly_browser_snapshot(
                 "No eligible OpenClaw backend: "
                 f"{routing_decision['selection_reason']}"
             )
+        from proactive.model_routing import route_grace, route_worker
+
+        route_fields = {
+            "task_risk": "low",
+            "memory_impact": (
+                "durable"
+                if normalized_contract.get("memory", {}).get(
+                    "promote_on_acceptance"
+                )
+                else "none"
+            ),
+            "external_action": False,
+        }
+        worker_model_route = route_worker("browser_readonly", route_fields)
+        review_model_route = route_grace("acceptance_review", route_fields)
+        routing_decision = dict(routing_decision)
+        routing_decision["model_route"] = worker_model_route
         with kb.write_txn(conn):
             execution_task_id = kb.create_task(
                 conn,
@@ -752,6 +752,7 @@ def execute_readonly_browser_snapshot(
                 executor_profile="browser-readonly",
                 project_namespace=str(identity["project"]),
                 routing_decision=routing_decision,
+                model_override=worker_model_route["requested_model"],
             )
             review_task_id = kb.create_task(
                 conn,
@@ -767,6 +768,11 @@ def execute_readonly_browser_snapshot(
                 executor_backend="hermes",
                 executor_profile="grace-policy-review",
                 project_namespace=str(identity["project"]),
+                routing_decision={
+                    "selected_backend": "hermes",
+                    "model_route": review_model_route,
+                },
+                model_override=review_model_route["requested_model"],
             )
             task = kb.get_task(conn, execution_task_id)
             if task is not None and task.status == "done":
@@ -894,12 +900,14 @@ def execute_readonly_browser_snapshot(
                         "review_task_id": review_task_id,
                         "circuit_generation": circuit_generation,
                         "requested_url": url,
+                        "allowed_urls": [url],
                         "project": str(identity["project"]),
                         "topic_id": str(
                             identity.get("thread_id")
                             or identity["topic_name"]
                         ),
                         "executor_profile": "browser-readonly",
+                        "model_route": worker_model_route,
                     },
                 ):
                     raise RuntimeError(
@@ -947,6 +955,7 @@ def execute_readonly_browser_snapshot(
                 "executor_backend": "openclaw",
                 "executor_profile": "browser-readonly",
                 "backend_agent_id": READONLY_BROWSER_AGENT,
+                "model_route": worker_model_route,
                 "external_effect_budget": 0,
                 "workspace_policy": "dedicated",
                 "session_policy": "ephemeral",
@@ -954,6 +963,7 @@ def execute_readonly_browser_snapshot(
                 "idempotency_key": f"{execution_task_id}:run:{run_id}",
                 "openclaw_task_id": "openclaw.browser.read_snapshot",
                 "target_url": url,
+                "allowed_urls": [url],
                 "dry_run": False,
             },
             transport=transport,
@@ -1406,6 +1416,8 @@ def _readonly_browser_delegation_args(
     requested_url = str(metadata.get("requested_url") or "").strip()
     if not requested_url:
         raise ValueError("Browser run is missing its durable requested URL.")
+    if metadata.get("allowed_urls") != [requested_url]:
+        raise ValueError("Browser run is missing its exact durable URL authority.")
     args: dict[str, Any] = {
         "task_id": run.task_id,
         "objective": (
@@ -1442,6 +1454,7 @@ def _readonly_browser_delegation_args(
         "executor_backend": "openclaw",
         "executor_profile": "browser-readonly",
         "backend_agent_id": READONLY_BROWSER_AGENT,
+        "model_route": dict(metadata.get("model_route") or {}),
         "external_effect_budget": 0,
         "workspace_policy": "dedicated",
         "session_policy": "ephemeral",
@@ -1449,6 +1462,7 @@ def _readonly_browser_delegation_args(
         "idempotency_key": idempotency_key,
         "openclaw_task_id": openclaw_task_id,
         "target_url": requested_url,
+        "allowed_urls": [requested_url],
         "dry_run": False,
     }
     if start_idempotency_key:

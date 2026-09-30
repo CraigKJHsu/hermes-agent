@@ -154,6 +154,11 @@ def test_cancel_grace_loop_is_idempotent_and_lane_bound(tmp_path):
             requested_by="kj",
             requested_message_id="stop-1",
         )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET outcome_kind=NULL "
+            "WHERE review_task_id=?",
+            (_review_id,),
+        )
         second = kb.cancel_grace_delegation(
             conn,
             execution_id,
@@ -166,9 +171,146 @@ def test_cancel_grace_loop_is_idempotent_and_lane_bound(tmp_path):
 
         assert first["idempotent_replay"] is False
         assert second["idempotent_replay"] is True
+        assert kb.get_grace_loop_callback(conn, _review_id)["outcome_kind"] == "cancelled"
         cancelled_events = [
             event
             for event in kb.list_events(conn, execution_id)
             if event.kind == "cancelled"
         ]
         assert len(cancelled_events) == 1
+
+
+def test_cancel_closes_legacy_objective_stage_without_workflow_row(tmp_path):
+    db_path = tmp_path / "cancel-legacy-objective.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_grace_loop(conn)
+        kb.create_grace_objective(
+            conn,
+            objective_id="go-legacy",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2120",
+            session_key="agent:main:telegram:group:chat-1:2120",
+            title="Legacy objective",
+            objective="Finish the legacy objective",
+            original_request_sha256="b" * 64,
+            required_stage_keys=["prepare"],
+            terminal_stage_key="prepare",
+            acceptance_criteria=["reviewed"],
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go-legacy", stage_key="prepare",
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id='go-legacy', "
+            "stage_key='prepare' WHERE delegation_id='gd-cancel'"
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET delegation_id='gd-cancel', "
+            "execution_task_id=?, review_task_id=? "
+            "WHERE objective_id='go-legacy' AND stage_key='prepare'",
+            (execution_id, review_id),
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET objective_id='go-legacy', "
+            "stage_key='prepare' WHERE review_task_id=?",
+            (review_id,),
+        )
+        assert conn.execute(
+            "SELECT 1 FROM grace_objective_workflows "
+            "WHERE objective_id='go-legacy'"
+        ).fetchone() is None
+
+        kb.cancel_grace_delegation(
+            conn,
+            execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2120",
+            requested_by="kj",
+            requested_message_id="stop-legacy",
+        )
+
+        stage = conn.execute(
+            "SELECT status,outcome_kind FROM grace_objective_stages "
+            "WHERE objective_id='go-legacy' AND stage_key='prepare'"
+        ).fetchone()
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert tuple(stage) == ("done", "cancelled")
+        assert callback["state"] == "cancelled"
+        assert callback["outcome_kind"] == "cancelled"
+
+
+def test_cancel_preserves_completed_stage_outcome_for_migration(tmp_path):
+    db_path = tmp_path / "cancel-completed-stage.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _seed_grace_loop(conn)
+        kb.create_grace_objective(
+            conn,
+            objective_id="go-completed",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2120",
+            session_key="agent:main:telegram:group:chat-1:2120",
+            title="Completed stage",
+            objective="Preserve the completed stage outcome",
+            original_request_sha256="c" * 64,
+            required_stage_keys=["prepare"],
+            terminal_stage_key="prepare",
+            acceptance_criteria=["history preserved"],
+        )
+        kb.ensure_grace_objective_stage(
+            conn, objective_id="go-completed", stage_key="prepare",
+        )
+        conn.execute(
+            "UPDATE grace_delegations SET objective_id='go-completed', "
+            "stage_key='prepare' WHERE delegation_id='gd-cancel'"
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET delegation_id='gd-cancel', "
+            "execution_task_id=?, review_task_id=?, status='done', "
+            "outcome_kind='intermediate_blocked' "
+            "WHERE objective_id='go-completed' AND stage_key='prepare'",
+            (execution_id, review_id),
+        )
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET objective_id='go-completed', "
+            "stage_key='prepare' WHERE review_task_id=?",
+            (review_id,),
+        )
+
+        first = kb.cancel_grace_delegation(
+            conn,
+            execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2120",
+            requested_by="kj",
+            requested_message_id="stop-completed",
+        )
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        assert first["idempotent_replay"] is False
+        assert callback["state"] == "cancelled"
+        assert callback["outcome_kind"] == "intermediate_blocked"
+
+        conn.execute(
+            "UPDATE grace_loop_callbacks SET outcome_kind='cancelled' "
+            "WHERE review_task_id=?",
+            (review_id,),
+        )
+        second = kb.cancel_grace_delegation(
+            conn,
+            execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2120",
+            requested_by="kj",
+            requested_message_id="stop-completed-again",
+        )
+        assert second["idempotent_replay"] is True
+        assert (
+            kb.get_grace_loop_callback(conn, review_id)["outcome_kind"]
+            == "intermediate_blocked"
+        )

@@ -261,10 +261,12 @@ def build_top_level_parser():
     )
     _inherited_flag(
         chat_parser,
-        "-m", "--model", help="Model to use (e.g., anthropic/claude-sonnet-4)",
+        "-m", "--model", default=argparse.SUPPRESS,
+        help="Model to use (e.g., anthropic/claude-sonnet-4)",
     )
     chat_parser.add_argument(
-        "-t", "--toolsets", help="Comma-separated toolsets to enable"
+        "-t", "--toolsets", default=argparse.SUPPRESS,
+        help="Comma-separated toolsets to enable"
     )
     _inherited_flag(
         chat_parser,
@@ -281,7 +283,7 @@ def build_top_level_parser():
         # are also valid values, and runtime resolution (resolve_runtime_provider)
         # handles validation/error reporting consistently with the top-level
         # `--provider` flag.
-        default=None,
+        default=argparse.SUPPRESS,
         help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
     )
     chat_parser.add_argument(

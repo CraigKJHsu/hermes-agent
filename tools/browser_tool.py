@@ -65,6 +65,7 @@ import time
 import requests
 from typing import Dict, Any, Callable, Mapping, Optional, List, Tuple, Union
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from agent.auxiliary_client import call_llm
 from agent.redact import (
     redact_sensitive_text,
@@ -402,6 +403,10 @@ class _CDPRecoveryRequiredError(RuntimeError):
     """The endpoint is quarantined after an unclean browser operation."""
 
 
+class _CDPEndpointUnavailableError(ConnectionError):
+    """Configured CDP discovery failed; do not switch browser identities."""
+
+
 def _cdp_endpoint_state_path(cdp_url: str, suffix: str) -> str:
     digest = hashlib.sha256(cdp_url.encode("utf-8")).hexdigest()[:16]
     return os.path.join(
@@ -708,7 +713,17 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
-def _resolve_cdp_override(cdp_url: str) -> str:
+def _valid_cdp_websocket(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return bool(parsed.scheme in {"ws", "wss"} and parsed.hostname and not parsed.fragment
+                    and (parsed.port is None or 0 < parsed.port <= 65535)
+                    and not any(c.isspace() for c in url))
+    except ValueError:
+        return False
+
+
+def _resolve_cdp_override(cdp_url: str, *, require_websocket: bool = False) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete connectable URL.
 
     Accepts:
@@ -719,6 +734,8 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     For discovery-style endpoints we fetch /json/version and return the
     webSocketDebuggerUrl so downstream tools always receive a concrete browser
     websocket instead of an ambiguous host:port URL.
+    Active browser operations require_websocket=True: a failed discovery
+    must not hand an HTTP URL to a WebSocket client or change browser identity.
     """
     raw = (cdp_url or "").strip()
     if not raw:
@@ -726,21 +743,33 @@ def _resolve_cdp_override(cdp_url: str) -> str:
 
     lowered = raw.lower()
     if "/devtools/browser/" in lowered:
+        if require_websocket and not _valid_cdp_websocket(raw):
+            raise _CDPEndpointUnavailableError("CDP browser endpoint must use ws:// or wss://")
         return raw
 
     discovery_url = raw
     if lowered.startswith(("ws://", "wss://")):
-        if raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]:
-            discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
+        try:
+            parsed_ws = urlsplit(raw)
+        except ValueError as exc:
+            if require_websocket:
+                raise _CDPEndpointUnavailableError("Configured CDP WebSocket URL is invalid") from exc
+            return raw
+        if parsed_ws.path.rstrip("/") in {"", "/json/version"}:
+            discovery_url = urlunsplit(parsed_ws._replace(
+                scheme="http" if parsed_ws.scheme == "ws" else "https"))
         else:
+            if require_websocket and not _valid_cdp_websocket(raw):
+                raise _CDPEndpointUnavailableError("Configured CDP WebSocket URL is invalid")
             return raw
 
-    if discovery_url.lower().endswith("/json/version"):
-        version_url = discovery_url
-    else:
-        version_url = discovery_url.rstrip("/") + "/json/version"
-
+    version_url = discovery_url
     try:
+        parsed = urlsplit(discovery_url)
+        discovery_path = parsed.path.rstrip("/")
+        if not discovery_path.lower().endswith("/json/version"):
+            discovery_path += "/json/version"
+        version_url = urlunsplit(parsed._replace(path=discovery_path))
         response = requests.get(version_url, timeout=10)
         response.raise_for_status()
         payload = response.json()
@@ -751,10 +780,17 @@ def _resolve_cdp_override(cdp_url: str) -> str:
             _sanitize_url_for_logs(version_url),
             _sanitize_url_for_logs(exc),
         )
+        if require_websocket:
+            raise _CDPEndpointUnavailableError(
+                "Configured CDP discovery is unavailable at "
+                + _sanitize_url_for_logs(version_url)
+                + f" ({type(exc).__name__}). Restore that managed browser endpoint "
+                "or reconnect it with /browser connect; no destination was opened."
+            ) from exc
         return raw
 
-    ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
-    if ws_url:
+    ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip() if isinstance(payload, dict) else ""
+    if ws_url and (not require_websocket or _valid_cdp_websocket(ws_url)):
         logger.info(
             "Resolved CDP endpoint %s -> %s",
             _sanitize_url_for_logs(raw),
@@ -762,6 +798,12 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         )
         return ws_url
 
+    if require_websocket:
+        raise _CDPEndpointUnavailableError(
+            "Configured CDP discovery did not return a valid webSocketDebuggerUrl at "
+            + _sanitize_url_for_logs(version_url)
+            + "; no destination was opened. Restore the configured managed browser endpoint."
+        )
     logger.warning(
         "CDP discovery at %s did not return webSocketDebuggerUrl; using raw endpoint",
         _sanitize_url_for_logs(version_url),
@@ -769,8 +811,8 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
-def _get_cdp_override() -> str:
-    """Return a normalized CDP URL override, or empty string.
+def _get_configured_cdp_override() -> str:
+    """Read endpoint configuration without probing or changing browser identity.
 
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
@@ -782,7 +824,7 @@ def _get_cdp_override() -> str:
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
-        return _resolve_cdp_override(env_override)
+        return env_override
 
     try:
         from hermes_cli.config import read_raw_config
@@ -790,11 +832,16 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _get_cdp_override() -> str:
+    """Resolve configured CDP to a WebSocket, or fail before browser I/O."""
+    return _resolve_cdp_override(_get_configured_cdp_override(), require_websocket=True)
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -852,7 +899,11 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
-    cdp_url = _get_cdp_override()
+    try:
+        cdp_url = _get_cdp_override()
+    except _CDPEndpointUnavailableError as exc:
+        logger.debug("CDP supervisor unavailable: %s", exc)
+        return
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
         # cloud provider (Browserbase sets this).
@@ -860,7 +911,11 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
             session_info = _active_sessions.get(task_id, {})
         maybe = str(session_info.get("cdp_url") or "")
         if maybe:
-            cdp_url = _resolve_cdp_override(maybe)
+            try:
+                cdp_url = _resolve_cdp_override(maybe, require_websocket=True)
+            except _CDPEndpointUnavailableError as exc:
+                logger.debug("CDP supervisor unavailable: %s", exc)
+                return
     if not cdp_url:
         return
     try:
@@ -1101,7 +1156,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _get_configured_cdp_override():
         return False
     return _get_cloud_provider() is None
 
@@ -1577,7 +1632,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_configured_cdp_override():
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -2331,7 +2386,9 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
                     # Some cloud providers (including Browser-Use v3) return an HTTP
                     # CDP discovery URL instead of a raw websocket endpoint.
                     session_info = dict(session_info)
-                    session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
+                    session_info["cdp_url"] = _resolve_cdp_override(
+                        str(session_info["cdp_url"]), require_websocket=True,
+                    )
             except Exception as e:
                 provider_name = type(provider).__name__
                 logger.warning(
@@ -4043,7 +4100,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # website-policy checks pass, and before the first destination navigation
     # for this logical task.  This avoids a 120s ``open`` followed by stacked
     # snapshot / screenshot timeouts on the same poisoned renderer.
-    cdp_override = _get_cdp_override()
+    try:
+        cdp_override = _get_cdp_override()
+    except _CDPEndpointUnavailableError as exc:
+        return json.dumps({
+            "success": False, "error": str(exc),
+            "error_code": "cdp_endpoint_unavailable",
+            "browser_recovery_required": True,
+        }, ensure_ascii=False)
     if cdp_override and not auto_local_this_nav:
         with _cleanup_lock:
             needs_cdp_preflight = nav_session_key not in _active_sessions
@@ -5813,7 +5877,7 @@ def check_browser_requirements() -> bool:
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    if _get_configured_cdp_override():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.

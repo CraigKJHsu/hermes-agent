@@ -937,6 +937,26 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
     return message
 
 
+_CONTEXT_ONLY_INJECTION_BLOCK_RE = re.compile(
+    r"(?s)"
+    r"<recommended_plugins>.*?</recommended_plugins>"
+    r"|# AGENTS\.md instructions\s*<INSTRUCTIONS>.*?</INSTRUCTIONS>"
+    r"|<environment_context>.*?</environment_context>"
+)
+
+
+def _looks_like_context_only_injection(message: Any) -> bool:
+    """Return True when a gateway turn contains only injected runtime context."""
+
+    if not isinstance(message, str):
+        return False
+    text = message.strip()
+    if not text:
+        return False
+    stripped = _CONTEXT_ONLY_INJECTION_BLOCK_RE.sub("", text).strip()
+    return stripped == "" and stripped != text
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -6159,8 +6179,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scheduled = 0
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
-                continue
+            stale = marker is not None and (now - marker).total_seconds() > window
 
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
@@ -6186,6 +6205,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
+            retry_recovery = None
+            try:
+                from hermes_cli.review_retry_recovery import (
+                    recover_interrupted_review_retry,
+                )
+
+                session_db = getattr(self, "_session_db", None)
+                if session_db is not None:
+                    retry_recovery = recover_interrupted_review_retry(
+                        session_id=entry.session_id,
+                        session_key=entry.session_key,
+                        platform=source.platform.value,
+                        chat_id=str(source.chat_id or ""),
+                        chat_type=str(entry.chat_type or ""),
+                        thread_id=str(source.thread_id or ""),
+                        user_id=str(source.user_id or ""),
+                        owner_user_id=self._configured_external_action_owner(source),
+                        state_db_path=session_db.db_path,
+                        freshness_seconds=window,
+                    )
+                if retry_recovery is not None:
+                    logger.info(
+                        "Recovered interrupted Grace Review retry: review=%s status=%s",
+                        retry_recovery.get("grace_review_task_id"),
+                        retry_recovery.get("status"),
+                    )
+                if (
+                    retry_recovery
+                    and retry_recovery.get("tool_result_durable") is False
+                ):
+                    self._running_agents.pop(entry.session_key, None)
+                    self._running_agents_ts.pop(entry.session_key, None)
+                    self._persist_active_agents()
+                    logger.error(
+                        "Deferred session resume until Grace Review retry tool "
+                        "result is durable: review=%s",
+                        retry_recovery.get("grace_review_task_id"),
+                    )
+                    continue
+                if stale:
+                    self._running_agents.pop(entry.session_key, None)
+                    self._running_agents_ts.pop(entry.session_key, None)
+                    self._persist_active_agents()
+                    continue
+            except Exception:
+                logger.warning(
+                    "Interrupted Grace Review retry recovery failed closed",
+                    exc_info=True,
+                )
+                self._running_agents.pop(entry.session_key, None)
+                self._running_agents_ts.pop(entry.session_key, None)
+                self._persist_active_agents()
+                continue
+
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
@@ -6194,6 +6267,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                internal_context={
+                    "gateway_resume_reason": entry.resume_reason,
+                    "gateway_recovered_review_retry": retry_recovery,
+                },
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -10558,6 +10635,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+
+        # _handle_message has already passed the ordinary user authorization
+        # gate before this inner handler can consume the exact control phrase.
+        # The session-reset handoff notice advertises an exact control phrase.
+        # Consume it before the model so the callback's durable Objective row,
+        # not natural-language reconstruction, owns the continuation identity.
+        try:
+            _resumed_callback = await asyncio.to_thread(
+                self._resume_grace_callback_handoff,
+                text=str(event.text or ""),
+                source=source,
+                session_key=session_key,
+                session_id=session_entry.session_id,
+            )
+        except ValueError as exc:
+            return f"無法接續 Grace 驗收：{exc}"
+        if _resumed_callback is not None:
+            from hermes_cli import kanban_db as _kb
+
+            self._schedule_due_grace_loop_callbacks(_kb)
+            return (
+                "已驗證並重新載入 Grace 驗收結果："
+                f"{_resumed_callback['review_task_id']}。"
+                "Controller 已從同一 Topic 的 durable callback 取回完整 "
+                f"Objective {_resumed_callback['objective_id']}；"
+                "不會由模型猜測 ID。"
+            )
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -10614,6 +10718,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             internal=bool(getattr(event, "internal", False)),
             owner_user_id=self._configured_external_action_owner(source),
             message_text=str(event.text or ""),
+            message_timestamp=getattr(event, "timestamp", None),
             grace_callback_board=str(
                 (
                     getattr(event, "internal_context", None) or {}
@@ -10640,6 +10745,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             telegram_message_path=_telegram_message_path,
         )
+
+        # A guarded same-card Grace Review retry may need to repair an old
+        # same-version Objective pin.  Consume only the advertised exact
+        # authenticated control phrase before active_objectives_prompt() asks
+        # that old pin to verify.  The existing retry handler still owns every
+        # lane, owner, timeout, callback, receipt, and migration invariant.
+        from plugins.openclaw_bridge.clawops_delegate import (
+            grace_review_retry_task_id,
+            handle_clawops_retry_review,
+        )
+
+        _retry_review_id = grace_review_retry_task_id(str(event.text or ""))
+        if _retry_review_id:
+            try:
+                _retry_raw = await asyncio.to_thread(
+                    handle_clawops_retry_review,
+                    {"review_task_id": _retry_review_id},
+                )
+                _retry_result = json.loads(_retry_raw)
+            except Exception as exc:
+                logger.exception("Deterministic Grace Review retry failed")
+                _retry_result = {
+                    "status": "rejected",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            finally:
+                self._clear_session_env(_session_env_tokens)
+
+            if _retry_result.get("status") == "queued":
+                return (
+                    "已重新排入同一個 Grace Review："
+                    f"{_retry_review_id}。沒有建立新的 Execution 或 Review；"
+                    "Grace 會沿用原 Objective 完成驗收。"
+                )
+            if _retry_result.get("status") == "already_completed":
+                return f"Grace Review {_retry_review_id} 已完成，不需要重試。"
+            return (
+                f"無法重試 Grace Review {_retry_review_id}："
+                f"{_retry_result.get('reason') or '控制平面拒絕此請求。'}"
+            )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -11387,7 +11532,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 reason = str(approval_result.get("reason") or "")
-                if (
+                if approval_result.get("approval_saved"):
+                    response = (
+                        "已保存你對這份契約的核准；目前委派尚未成功建立。"
+                        "系統會重試同一請求；持續故障時保留收據待修復，不需要重新核准。"
+                        "尚未有可計入的刊登成果。原因：" + reason
+                    )
+                elif (
                     approval_result.get("status") == "rejected"
                     and "expired" in reason.lower()
                 ):
@@ -14950,6 +15101,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         internal: bool = False,
         owner_user_id: str = "",
         message_text: str = "",
+        message_timestamp: Any = None,
         grace_callback_board: str = "",
         grace_callback_lease_owner: str = "",
         grace_callback_review_id: str = "",
@@ -14987,6 +15139,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             message_text=message_text,
+            message_timestamp=(
+                str(int(timestamp))
+                if (timestamp := _coerce_gateway_timestamp(message_timestamp))
+                is not None
+                else ""
+            ),
             internal=internal,
             owner_user_id=owner_user_id,
             grace_callback_board=grace_callback_board,
@@ -18666,10 +18824,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # no NEW user message to address, so tell the model to report
                 # recovery instead of the (nonexistent) "new message".
                 if message:
-                    _resume_guidance = (
-                        "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
-                    )
+                    if _looks_like_context_only_injection(message):
+                        _resume_guidance = (
+                            "The message below is runtime/environment context "
+                            "only, not a new user task. Recover the active "
+                            "unfinished work from the conversation history and "
+                            "continue or report that work."
+                        )
+                    else:
+                        _resume_guidance = (
+                            "Address the user's NEW message below FIRST and "
+                            "focus on what the user is asking now."
+                        )
                 else:
                     _resume_guidance = (
                         "Report to the user that the session was restored "
@@ -19745,9 +19911,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 from gateway.session_context import rebind_turn_vars
 
+                # Interrupt-text follow-ups may not carry a MessageEvent. Keep
+                # the authenticated source anchor in that case so delegated
+                # work can still derive its request_instance_id. A real
+                # pending event supplies its own fresh message identity above.
+                rebound_message_id = str(next_message_id or "").strip()
+                if not rebound_message_id and pending_event is None:
+                    rebound_message_id = str(
+                        getattr(next_source, "message_id", None) or ""
+                    ).strip()
                 rebind_turn_vars(
-                    message_id=str(next_message_id or ""),
+                    message_id=rebound_message_id,
                     message_text=str(next_message or ""),
+                    message_timestamp=(
+                        str(int(timestamp))
+                        if pending_event is not None
+                        and (
+                            timestamp := _coerce_gateway_timestamp(
+                                getattr(pending_event, "timestamp", None)
+                            )
+                        )
+                        is not None
+                        else ""
+                    ),
                     internal=bool(
                         getattr(pending_event, "internal", False)
                         if pending_event is not None

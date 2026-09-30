@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import (
+    _browser_readonly_url,
     compile_and_delegate,
     contract_internal_hermes_runtime,
     contract_requires_image_generation,
@@ -88,7 +89,56 @@ def _image_contract() -> dict:
             "risk_level": "low",
         },
         "completion_mode": "terminal",
+        "external_effect_budget": 0,
     }
+
+
+def test_browser_readonly_route_carries_exact_local_url_authority():
+    preview = route_clawops_objective(
+        "唯讀檢查本機首頁",
+        project="ingrids_marketing",
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=False,
+    )
+
+    assert preview["status"] == "routed"
+    assert "http://127.0.0.1:8766/" in preview["assignment"]["allowed_urls"]
+    assert "http://127.0.0.1:8766/" in preview["backend_role_card"]["allowed_urls"]
+
+
+def test_browser_readonly_url_is_extracted_from_scoped_prose_and_route_bound():
+    contract = _image_contract()
+    contract["scope"]["allowed"] = [
+        "以唯讀方式開啟與檢視 http://127.0.0.1:8766/"
+    ]
+    contract["routing"]["resolved"] = {
+        "assignment": {"allowed_urls": ["http://127.0.0.1:8766/"]}
+    }
+
+    assert _browser_readonly_url(contract) == "http://127.0.0.1:8766/"
+
+    contract["routing"]["resolved"]["assignment"]["allowed_urls"] = [
+        "https://example.com/"
+    ]
+    with pytest.raises(ValueError, match="outside the resolved route allowlist"):
+        _browser_readonly_url(contract)
+
+
+@pytest.mark.parametrize(
+    ("execution_runtime", "review_runtime"),
+    [(60, 900), (600, 1200), (900, 1500), (1800, 1800), (14_400, 1800)],
+)
+def test_v47_review_runtime_adds_bounded_cold_start_margin(
+    execution_runtime, review_runtime,
+):
+    from proactive.behavior_profiles.v47.compiler import (
+        review_max_runtime_seconds,
+    )
+
+    assert review_max_runtime_seconds(
+        {"stop_rules": {"max_runtime_seconds": execution_runtime}}
+    ) == review_runtime
 
 
 def _route_image_contract(contract: dict) -> tuple[dict, str]:
@@ -668,6 +718,7 @@ def test_source_truth_content_contract_exposes_original_request_to_openclaw(
 
 def test_facebook_page_api_contract_uses_openclaw_operator_runtime():
     contract = _image_contract()
+    contract["external_effect_budget"] = 1
     contract["routing"] = {
         "task_type": "facebook_page_api_publish",
         "risk_level": "medium",
@@ -758,6 +809,21 @@ def test_internal_ops_contract_uses_hermes_ops_runtime(tmp_path, monkeypatch):
         normalized,
         task_type="ops",
     ) == "clawops-ops"
+    protocol_required = json.loads(json.dumps(normalized, ensure_ascii=False))
+    protocol_required["verification"]["evidence_required"].append(
+        "正式 Protocol v2 執行回執"
+    )
+    assert contract_internal_hermes_runtime(
+        protocol_required,
+        task_type="ops",
+    ) == ""
+    protocol_required["verification"]["evidence_required"][-1] = (
+        "正式 Protocol-v2 執行回執"
+    )
+    assert contract_internal_hermes_runtime(
+        protocol_required,
+        task_type="ops",
+    ) == ""
     unsafe_route = json.loads(json.dumps(normalized, ensure_ascii=False))
     unsafe_route["routing"]["resolved"]["assignment"]["allowed_tools"].append(
         "browser_snapshot"
@@ -850,8 +916,30 @@ def test_registry_readonly_package_preserves_exact_source_in_card(source_kind):
             "kind": "content_package", "asset_filenames": ["newcase_page.png"],
         }
     safe = _worker_safe_contract(contract)
+    async_safe = _worker_safe_loop_contract(contract)
     if source_kind == "package":
         assert safe["original_request"].encode("utf-8") == original.encode("utf-8")
-        assert _worker_safe_loop_contract(safe)["original_request"] == original
+        assert async_safe["original_request"].encode("utf-8") == original.encode("utf-8")
     else:
         assert "original_request" not in safe
+        assert "original_request" not in async_safe
+
+
+def test_registry_readonly_assetless_page_marker_preserves_exact_source_in_card():
+    from proactive.grace_task_compiler import _worker_safe_contract
+
+    original = (
+        "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT\n"
+        "  完整 Page 原文，保留空白與標點！\n"
+        "END_FACEBOOK_PAGE_SOURCE_TEXT"
+    )
+    contract = {
+        "original_request": original,
+        "grace_interpretation": "Preserve the Page source verbatim.",
+        "domain_memory": {"mode": "query"},
+        "user_facing_delivery": {"kind": "content_package", "assets": []},
+    }
+
+    safe = _worker_safe_contract(contract)
+
+    assert safe["original_request"].encode("utf-8") == original.encode("utf-8")

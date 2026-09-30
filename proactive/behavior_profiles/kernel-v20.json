@@ -1,0 +1,23 @@
+{
+    "proactive/loop_contract.py": "9fe7238f7d0b3d0d134c50859e956d1725fb00fd57d5f41559f7c750d1cc474c",
+    "proactive/policy_registry.py": "fac635c4a330ef684f607f299131f194df5a327ead5dfd22913d3835bb36d740",
+    "proactive/domain_memory.py": "53ee89e571424943519f1c643419cd211a8532f4f9f9e5bbf016f731b752216a",
+    "proactive/grace_task_compiler.py": "c31b4dc23e2b97301a498e7e830a176ae9461857046caab58641e8ee1725fa8d",
+    "proactive/hubops_routing.py": "d922354868cc1aea403b2e73b34e49774ed9e0e65d923933b2f4c271e82dcb67",
+    "proactive/openclaw_async_executor.py": "05714df51ab1d60ad1256d50c5dcb6fdf708f5fef30ccce359db621ed9d2edc9",
+    "proactive/backend_poll_worker.py": "7eedd1e0aedea4b9f0b1efe6d16c8767b602ecb5803f3d0b522ce32f47c6bf4d",
+    "plugins/openclaw_bridge/clawops_delegate.py": "37dcca0818bea74d8f568def4583ddcee196b40a2dcc2d3392127d5b094217c0",
+    "gateway/kanban_watchers.py": "2ec6dac97d9c14062b893bae14ba5673f1604e9392b20d7632d9a7f9390b9bf2",
+    "hermes_cli/kanban_db.py": "8845ad065c2170ac25a49f906b63ae19438a9f41e2ae059a3a0b4e8ee7d0a2f2",
+    "hermes_cli/objective_workflow.py": "4b2fbfeff22bbdf667d7241e1030aef3f7cfd7f9b6e4eb7573ee9e4ff282b914",
+    "hermes_cli/grace_review_metadata.py": "3df83a86924098d225d86de391b00594b58ff6615554ff8bb05505992633305c",
+    "hermes_cli/user_facing_report.py": "5e051cbdd1325870791e64041e297bfd6596b4a6cb32e03bd1a4a0312801dad0",
+    "hermes_cli/facebook_group_preflight.py": "708f1961f85f5f58d8a889d1daa7e76de8f9de7d32ac541badab8a3076af121c",
+    "proactive/model_routing.py": "ee9d6420aafa9c699e17b68e1abef8a476e024942e938208c93a41632edc7445",
+    "proactive/thread_context_registry.py": "81c78e92b5fbdb335860566892a2940c04f468bba6f4cfcf4876b560954d237c",
+    "proactive/behavior_profiles/registry.py": "d5b57095d16b272d3b24e7ad49931093e6a8268c4fa12aef08d70270a81c7155",
+    "proactive/clawops_intake.py": "ca696f7fb2491dd590df9fd0544083e148071ebc1234ec4cb7eee92d95244d3a",
+    "proactive/behavior_observation.py": "1eea4c4b1db1d53fc987a42ae5815466125f90e0706c4725bfe3857a0be22ffb",
+    "gateway/platforms/base.py": "de9c15ba733984e4c7635ba45a6714224fc216bc7d690c66791c9aff2d5f3518",
+    "hermes_cli/delivery_readback.py": "ea043efefe0b9c35d2f0c43d2b4e56a35d878c92e420cdc9ab939c7f09d83202"
+}

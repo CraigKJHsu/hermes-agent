@@ -94,6 +94,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_comment",
     "kanban_heartbeat",
     "kanban_show",
+    "kanban_domain_inventory",
+    "kanban_domain_episode_reserve",
     "kanban_list",
     # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
     # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.

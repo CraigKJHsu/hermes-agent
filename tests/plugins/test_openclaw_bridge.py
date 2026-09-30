@@ -1,8 +1,98 @@
 from __future__ import annotations
 
 import json
+from email.message import Message
 
 import pytest
+
+
+class _ReadResponse:
+    def __init__(self, url: str, body: bytes, content_type: str = "text/html"):
+        self._url = url
+        self._body = body
+        self.headers = Message()
+        self.headers["Content-Type"] = f"{content_type}; charset=utf-8"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def geturl(self):
+        return self._url
+
+    def read(self, size: int):
+        return self._body[:size]
+
+
+def test_grace_read_url_reads_exact_allowlisted_loopback_without_scripts(monkeypatch):
+    from plugins.openclaw_bridge import tools
+
+    url = "http://127.0.0.1:8766/"
+    monkeypatch.setattr(tools, "_grace_direct_read_urls", lambda: frozenset({url}))
+
+    class _Opener:
+        def open(self, request, timeout):
+            assert request.full_url == url
+            assert request.get_method() == "GET"
+            assert timeout == 10
+            assert request.headers.get("Authorization") is None
+            assert request.headers.get("Cookie") is None
+            return _ReadResponse(
+                url,
+                b"<main><h1>Home</h1><script>mutate()</script><p>Safe copy</p></main>",
+            )
+
+    monkeypatch.setattr(tools, "build_opener", lambda *_handlers: _Opener())
+    result = tools.grace_read_url({"url": url})
+
+    assert result["status"] == "succeeded"
+    assert result["content"] == "Home\nSafe copy"
+    assert result["external_effect_budget"] == 0
+    assert result["side_effects_performed"] is False
+    assert len(result["sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    "url, reason",
+    [
+        ("https://example.com/", "loopback URLs only"),
+        ('http://' + 'user:secret@' + '127.0.0.1:8766/', "loopback URLs only"),
+        ("http://127.0.0.1:9999/", "not an exact allowlisted"),
+    ],
+)
+def test_grace_read_url_fails_closed_outside_exact_loopback_allowlist(
+    monkeypatch, url, reason
+):
+    from plugins.openclaw_bridge import tools
+
+    monkeypatch.setattr(
+        tools,
+        "_grace_direct_read_urls",
+        lambda: frozenset({"http://127.0.0.1:8766/"}),
+    )
+    result = tools.grace_read_url({"url": url})
+    assert result["status"] == "blocked"
+    assert reason in result["reason"]
+
+
+def test_grace_read_url_does_not_follow_redirects(monkeypatch):
+    from urllib.error import HTTPError
+
+    from plugins.openclaw_bridge import tools
+
+    url = "http://127.0.0.1:8766/"
+    monkeypatch.setattr(tools, "_grace_direct_read_urls", lambda: frozenset({url}))
+
+    class _Opener:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 302, "Found", {}, None)
+
+    monkeypatch.setattr(tools, "build_opener", lambda *_handlers: _Opener())
+    result = tools.grace_read_url({"url": url})
+    assert result["status"] == "blocked"
+    assert "302" in result["reason"]
 
 
 def test_delegated_task_and_result_schema_validation_accepts_required_payloads():
@@ -88,6 +178,44 @@ def test_protocol_v2_schemas_require_identity_and_success_evidence():
     }
     with pytest.raises(ValueError):
         validate_delegated_result(base_result)
+
+
+def test_protocol_v2_task_schema_accepts_readonly_url_authority():
+    from plugins.openclaw_bridge.schemas import validate_delegated_task
+
+    task = {
+        "task_id": "task-1",
+        "requested_by": "hermes",
+        "objective": "Read the exact page without side effects.",
+        "context_refs": [],
+        "allowed_tools": ["browser.read"],
+        "denied_tools": ["browser.click"],
+        "risk_level": "low",
+        "requires_confirmation": False,
+        "max_runtime_seconds": 300,
+        "output_format": "json",
+        "audit_required": True,
+        "protocol_version": "2.0",
+        "delegation_id": "grace:task-1",
+        "attempt_id": "task-1:run:1",
+        "contract_fingerprint": "fingerprint",
+        "project": "hub_ops",
+        "topic_id": "general",
+        "executor_backend": "openclaw",
+        "executor_profile": "browser-readonly",
+        "backend_agent_id": "missioncrew-browser-readonly",
+        "external_effect_budget": 0,
+        "workspace_policy": "dedicated",
+        "session_policy": "ephemeral",
+        "credential_refs": [],
+        "idempotency_key": "task-1:run:1",
+        "openclaw_task_id": "openclaw.browser.read_snapshot",
+        "target_url": "http://127.0.0.1:8766/",
+        "allowed_urls": ["http://127.0.0.1:8766/"],
+        "dry_run": False,
+    }
+
+    assert validate_delegated_task(task) == task
 
 
 def test_protocol_v3_task_schema_requires_context_and_confirmation_contracts():
@@ -294,8 +422,24 @@ def test_scoped_loop_contract_approval_passes_browser_confirmation_policy():
         "openclaw.agent.loop_contract_poll",
     ],
 )
+@pytest.mark.parametrize(
+    ("risk_level", "allowed_tools"),
+    [
+        ("medium", ["read", "write", "web_search", "image_generate"]),
+        (
+            "low",
+            [
+                "read",
+                "write",
+                "web_search",
+                "image_generate",
+                "deterministic_image_render",
+            ],
+        ),
+    ],
+)
 def test_zero_effect_missioncrew_content_loop_allows_content_tools_confirmation(
-    openclaw_task_id,
+    openclaw_task_id, risk_level, allowed_tools,
 ):
     from plugins.openclaw_bridge import tools
 
@@ -328,8 +472,8 @@ def test_zero_effect_missioncrew_content_loop_allows_content_tools_confirmation(
         {
             "task_id": "task-content-read",
             "objective": "Correlate admission receipt for a zero-effect content Loop Contract.",
-            "risk_level": "medium",
-            "allowed_tools": ["read", "write", "web_search", "image_generate"],
+            "risk_level": risk_level,
+            "allowed_tools": allowed_tools,
             "requires_confirmation": False,
             "requested_by": "hermes",
             "protocol_version": "2.0",
@@ -374,15 +518,11 @@ def test_zero_effect_missioncrew_content_loop_allows_content_tools_confirmation(
     assert result["protocol_correlated"] is True
     assert len(seen) == 1
     assert seen[0]["backend_agent_id"] == "missioncrew-content"
-    assert seen[0]["allowed_tools"] == [
-        "read",
-        "write",
-        "web_search",
-        "image_generate",
-    ]
+    assert seen[0]["allowed_tools"] == allowed_tools
 
 
-def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
+@pytest.mark.parametrize("allowed_tools", [["read", "web_search", "browser"], ["read", "web_search", "web_fetch", "browser"]])
+def test_zero_effect_generic_loop_allows_readonly_tool_confirmation(allowed_tools):
     from plugins.openclaw_bridge import tools
 
     seen = []
@@ -415,7 +555,7 @@ def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
             "task_id": "task-generic-readonly",
             "objective": "Read current task evidence without changing external state.",
             "risk_level": "medium",
-            "allowed_tools": ["read", "web_search", "browser"],
+            "allowed_tools": allowed_tools,
             "requires_confirmation": False,
             "requested_by": "hermes",
             "protocol_version": "2.0",
@@ -448,7 +588,124 @@ def test_zero_effect_generic_loop_allows_readonly_tool_confirmation():
     assert result["backend_agent_id"] == "missioncrew-executor"
     assert result["protocol_correlated"] is True
     assert len(seen) == 1
-    assert seen[0]["allowed_tools"] == ["read", "web_search", "browser"]
+    assert seen[0]["allowed_tools"] == allowed_tools
+
+
+@pytest.mark.parametrize("controller_capability", [False, True])
+def test_zero_effect_internal_devops_requires_controller_capability(controller_capability):
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "Internal repair accepted.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": [],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll.",
+            "protocol_version": "2.0",
+            "delegation_id": task["delegation_id"],
+            "attempt_id": task["attempt_id"],
+            "contract_fingerprint": task["contract_fingerprint"],
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "run-internal-repair",
+            "backend_agent_id": "missioncrew-executor",
+            "backend_session_key": "agent:missioncrew-executor:subagent:test",
+        }
+
+    result = tools.delegate_to_openclaw(
+        {
+            "task_id": "task-internal-repair",
+            "objective": "Repair the internal control-plane adapter.",
+            "risk_level": "medium",
+            "allowed_tools": ["read", "write"],
+            "requires_confirmation": False,
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-internal-repair",
+            "attempt_id": "attempt-internal-repair",
+            "contract_fingerprint": "fingerprint-internal-repair",
+            "project": "ai_bizweek",
+            "topic_id": "4641",
+            "task_type": "devops",
+            "executor_backend": "openclaw",
+            "executor_profile": "loop-contract",
+            "backend_agent_id": "missioncrew-executor",
+            "approval_grant_id": "delegation-internal-repair",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "openclaw_task_id": "openclaw.agent.loop_contract_start",
+            "dry_run": False,
+        },
+        transport=transport,
+        _live_async_capability=(tools._LOOP_CONTRACT_ASYNC_CAPABILITY if controller_capability else None),
+    )
+
+    if not controller_capability:
+        assert result["status"] == "blocked"
+        assert seen == []
+        return
+    assert result["status"] == "queued"
+    assert seen[0]["allowed_tools"] == ["read", "write"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"approval_grant_id": ""}, {"external_effect_budget": 1},
+     {"delegation_id": "", "approval_grant_id": ""}],
+)
+def test_zero_effect_internal_devops_loop_does_not_widen_confirmation_boundary(overrides):
+    from plugins.openclaw_bridge import tools
+
+    args = {
+        "task_id": "task-internal-repair-boundary",
+        "objective": "Repair the internal control-plane adapter.",
+        "risk_level": "medium",
+        "allowed_tools": ["write"],
+        "requires_confirmation": False,
+        "protocol_version": "2.0",
+        "delegation_id": "delegation-boundary",
+        "attempt_id": "attempt-boundary",
+        "contract_fingerprint": "fingerprint-boundary",
+        "project": "ai_bizweek",
+        "topic_id": "4641",
+        "task_type": "devops",
+        "executor_backend": "openclaw",
+        "executor_profile": "loop-contract",
+        "backend_agent_id": "missioncrew-executor",
+        "approval_grant_id": "delegation-boundary",
+        "external_effect_budget": 0,
+        "workspace_policy": "dedicated",
+        "session_policy": "ephemeral",
+        "credential_refs": [],
+        "openclaw_task_id": "openclaw.agent.loop_contract_start",
+        "dry_run": False,
+    }
+    args.update(overrides)
+
+    if not args.get("delegation_id"):
+        with pytest.raises(ValueError, match="delegation_id"):
+            tools.delegate_to_openclaw(args, transport=lambda task: pytest.fail("transport called"))
+        return
+    result = tools.delegate_to_openclaw(args, transport=lambda task: pytest.fail("transport called"))
+
+    assert result["status"] == "blocked"
+    assert any(
+        marker in result["summary"]
+        for marker in (
+            "requires confirmation",
+            "requires the durable OpenClaw execution adapter",
+        )
+    )
 
 
 def test_zero_effect_facebook_page_preflight_needs_no_read_confirmation():
@@ -868,10 +1125,13 @@ def test_plugin_registers_tool_command_and_gateway_hook():
 
     assert calls == {
         "tools": [
+            "grace_objective_create",
+            "grace_read_url",
             "clawops_delegate",
             "clawops_cancel",
             "clawops_retry_review",
             "grace_callback_outcome",
+            "grace_reconcile",
             "openclaw_delegate",
         ],
         "commands": ["openclaw-dry-run"],
@@ -1734,6 +1994,7 @@ def test_protocol_v2_http_failure_preserves_request_identity_without_echo_claim(
             "idempotency_key": "attempt-http-error",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -1907,7 +2168,8 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
             "credential_refs": [],
             "idempotency_key": "attempt-1",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
-            "target_url": "https://example.com/",
+            "target_url": "http://127.0.0.1:8766/",
+            "allowed_urls": ["http://127.0.0.1:8766/"],
             "dry_run": False,
         }
     )
@@ -1922,7 +2184,7 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
     assert payload["protocolVersion"] == "2.0"
     assert payload["taskId"] == "openclaw.browser.read_snapshot"
     assert payload["dryRun"] is False
-    assert payload["input"]["url"] == "https://example.com/"
+    assert payload["input"]["url"] == "http://127.0.0.1:8766/"
     assert payload["identity"]["delegationId"] == "delegation-1"
     assert payload["identity"]["topicId"] == "readonly-browser"
     assert payload["routing"]["executorBackend"] == "openclaw"
@@ -1933,6 +2195,110 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
         "sessionPolicy": "ephemeral",
         "credentialRefs": [],
     }
+
+
+def test_live_readonly_template_is_not_misclassified_by_clawops_objective():
+    from plugins.openclaw_bridge import tools
+
+    seen = []
+
+    def transport(task):
+        seen.append(task)
+        return {
+            "task_id": task["task_id"],
+            "status": "queued",
+            "summary": "Read-only snapshot queued.",
+            "artifacts": [],
+            "tool_calls": [],
+            "audit_log": ["queued"],
+            "errors": [],
+            "requires_human_review": False,
+            "recommended_next_action": "Poll the backend run.",
+            "protocol_version": "2.0",
+            "delegation_id": task["delegation_id"],
+            "attempt_id": task["attempt_id"],
+            "contract_fingerprint": task["contract_fingerprint"],
+            "identity_correlated": True,
+            "protocol_correlated": True,
+            "backend_run_id": "browser-run-1",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "backend_session_key": "browser-session-1",
+        }
+
+    result = tools.delegate_to_openclaw(
+        {
+            "task_id": "browser-contract-clawops-word",
+            "objective": "Use the ClawOps browser_readonly path to read one page.",
+            "risk_level": "low",
+            "allowed_tools": ["browser.read"],
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-clawops-word",
+            "attempt_id": "attempt-clawops-word",
+            "contract_fingerprint": "sha256:clawops-word",
+            "project": "hub_ops",
+            "topic_id": "general",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser-readonly",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-clawops-word",
+            "openclaw_task_id": "openclaw.browser.read_snapshot",
+            "target_url": "http://127.0.0.1:8766/",
+            "allowed_urls": ["http://127.0.0.1:8766/"],
+            "dry_run": False,
+        },
+        transport=transport,
+    )
+
+    assert result["status"] == "queued"
+    assert len(seen) == 1
+
+
+def test_protocol_v2_readonly_browser_rejects_url_authority_mismatch():
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "objective": "Read one exact page.",
+            "allowed_tools": ["browser.read"],
+            "allowed_urls": ["https://www.iana.org/"],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-mismatch",
+            "attempt_id": "attempt-mismatch",
+            "contract_fingerprint": "sha256:mismatch",
+            "project": "hub_ops",
+            "topic_id": "readonly-browser",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser-readonly",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": "attempt-mismatch",
+            "openclaw_task_id": "openclaw.browser.read_snapshot",
+            "target_url": "https://example.com/",
+            "dry_run": False,
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    with pytest.raises(ValueError, match="zero-effect OpenClaw templates"):
+        tools._openclaw_payload(task, config)
+
+    task["target_url"] = "https://www.iana.org/"
+    with pytest.raises(ValueError, match="zero-effect OpenClaw templates"):
+        tools._openclaw_payload(task, config)
 
 
 @pytest.mark.parametrize(
@@ -1972,6 +2338,7 @@ def test_protocol_v2_readonly_browser_lifecycle_payload_requires_exact_run(
             "backend_run_id": "backend-run-1",
             "openclaw_task_id": template,
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2209,6 +2576,7 @@ def test_protocol_v2_http_response_must_explicitly_echo_v2(
             "idempotency_key": "attempt-response",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2287,6 +2655,7 @@ def test_protocol_v2_http_response_maps_matching_execution_identity(monkeypatch)
             "idempotency_key": "attempt-identity",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2457,6 +2826,7 @@ def test_protocol_v2_http_response_preserves_backend_token_usage(monkeypatch):
             "idempotency_key": "attempt-usage",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )
@@ -2590,6 +2960,7 @@ def test_protocol_v2_http_response_rejects_uncorrelated_or_evidence_free_success
             "backend_agent_id": "missioncrew-browser-readonly",
             "openclaw_task_id": "openclaw.browser.read_snapshot",
             "target_url": "https://example.com/",
+            "allowed_urls": ["https://example.com/"],
             "dry_run": False,
         }
     )

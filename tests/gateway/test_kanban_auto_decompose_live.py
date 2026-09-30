@@ -10,9 +10,12 @@ called every tick, reading the current config.
 from __future__ import annotations
 
 import pytest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from types import SimpleNamespace
 
+from hermes_cli import kanban_db as kb
 from gateway.kanban_watchers import (
     _is_loop_breaker_triage,
     _resolve_auto_decompose_settings,
@@ -102,3 +105,27 @@ def test_fresh_triage_remains_auto_decomposable():
         SimpleNamespace(block_kind=None, block_recurrences=0)
     ) is False
     assert _is_loop_breaker_triage(None) is False
+
+
+def test_background_board_scope_cannot_redirect_concurrent_delegate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb.create_board("canary")
+    barrier = Barrier(2)
+
+    def scan_canary():
+        with kb.scoped_current_board("canary"):
+            barrier.wait()
+            assert kb.get_current_board() == "canary"
+            barrier.wait()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(scan_canary)
+        barrier.wait()
+        try:
+            assert kb.get_current_board() == kb.DEFAULT_BOARD
+            assert kb.kanban_db_path() == tmp_path / "kanban.db"
+        finally:
+            barrier.wait()
+        future.result()

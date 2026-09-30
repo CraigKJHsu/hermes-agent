@@ -49,6 +49,7 @@ def test_routes_isolated_readonly_browser_to_openclaw_with_audit_evidence():
 def test_routes_image_generation_loop_contract_to_openclaw():
     requirements = ExecutionRequirements.build(
         capabilities=[
+            "deterministic_image_render",
             "isolated_session",
             "long_running",
             "image_generate",

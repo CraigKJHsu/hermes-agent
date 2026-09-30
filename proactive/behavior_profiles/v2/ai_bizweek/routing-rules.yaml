@@ -1,0 +1,260 @@
+version: 1
+updated_at: "2026-07-25"
+
+default_route:
+  agent: orchestrator
+  model_policy: use_agent_primary
+  approval_required: true
+
+default_worker_route:
+  worker: clawops.ops
+  approval_required: false
+  approval_checklist: DevOps and Integration
+
+worker_routes:
+  - match:
+      task_type: facebook_page_publish_preflight
+    assign:
+      worker: clawops.facebook_page_preflight
+      approval_required: false
+      approval_checklist: Facebook Page Read-Only Preflight
+
+  - match:
+      task_type: facebook_marketplace_price_update
+    assign:
+      worker: clawops.browser
+      approval_required: true
+      approval_checklist: Facebook Marketplace Price Update
+
+  - match:
+      task_type: facebook_page_api_publish
+    assign:
+      worker: clawops.facebook_page_api
+      approval_required: true
+      approval_checklist: Facebook Page Graph API Publish
+
+  - match:
+      task_type: facebook_marketplace_group_publish
+    assign:
+      worker: clawops.facebook_marketplace_group
+      approval_required: true
+      approval_checklist: Facebook Marketplace Group Publish
+
+  - match:
+      task_type: browser_publish
+    assign:
+      worker: clawops.browser
+      approval_required: false
+      approval_checklist: External Browser Publish
+
+  - match:
+      task_type: browser_ops
+    assign:
+      worker: clawops.browser
+      approval_required: false
+      approval_checklist: External Browser Publish
+
+  - match:
+      task_type: browser_readonly
+    assign:
+      worker: clawops.browser_readonly
+      approval_required: false
+      approval_checklist: External Browser Read-Only
+
+  - match:
+      task_type: facebook_marketplace_readonly
+    assign:
+      worker: clawops.facebook_marketplace_readonly
+      approval_required: false
+      approval_checklist: Facebook Marketplace Read-Only
+
+  - match:
+      task_type: research
+    assign:
+      worker: clawops.research
+      approval_required: false
+      approval_checklist: Public Content
+
+  - match:
+      task_type: content_draft
+    assign:
+      worker: missioncrew.content
+      approval_required: true
+      approval_checklist: Public Content
+
+  - match:
+      task_type: campaign
+    assign:
+      worker: missioncrew.content
+      approval_required: true
+      approval_checklist: Public Content
+
+  - match:
+      task_type: product_marketing
+    assign:
+      worker: missioncrew.content
+      approval_required: true
+      approval_checklist: Public Content
+
+  - match:
+      task_type: devops
+    assign:
+      worker: clawops.dev
+      approval_required: false
+      approval_checklist: DevOps and Integration
+
+  - match:
+      task_type: ops
+    assign:
+      worker: clawops.ops
+      approval_required: false
+      approval_checklist: DevOps and Integration
+
+  - match:
+      task_type: risk_review
+    assign:
+      worker: clawops.review
+      approval_required: true
+      approval_checklist: Finance, Crypto, Trading, and ingrids.app
+
+  - match:
+      task_type: legal_compliance
+    assign:
+      worker: clawops.review
+      approval_required: true
+      approval_checklist: Legal & Compliance
+
+routes:
+  - match:
+      task_type: facebook_page_publish_preflight
+    assign:
+      agent: orchestrator
+      model_policy: use_agent_primary
+      approval_required: false
+
+  - match:
+      task_type: facebook_page_api_publish
+    assign:
+      agent: orchestrator
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      project: secondhand_commerce
+      task_type: facebook_marketplace_group_publish
+    assign:
+      agent: secondhand_commerce
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      project: secondhand_commerce
+      task_type: browser_publish
+    assign:
+      agent: secondhand_commerce
+      model_policy: use_agent_primary
+      approval_required: false
+
+  - match:
+      task_type: strategy
+    assign:
+      agent: strategy
+      model_policy: use_agent_primary
+      approval_required: false
+
+  - match:
+      task_type: research
+    assign:
+      agent: research
+      model_policy: use_agent_primary
+      approval_required: false
+
+  - match:
+      project: hahow_course
+      task_type: course_design
+    assign:
+      agent: course_designer
+      model_policy: use_agent_primary
+      approval_required: false
+
+  - match:
+      task_type: content_draft
+      risk_level: low
+    assign:
+      agent: content_creator
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      project: course_marketing
+      task_type: campaign
+    assign:
+      agent: marketing_operator
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      project: course_marketing
+      task_type: crm
+    assign:
+      agent: crm_sales
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      project: secondhand_commerce
+    assign:
+      agent: secondhand_commerce
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      project: ingrids_marketing
+      task_type: product_marketing
+    assign:
+      agent: ingrids_product_marketing
+      model_policy: use_agent_primary
+      approval_required: true
+
+  - match:
+      task_type: legal_compliance
+    assign:
+      agent: legal_compliance
+      model_policy: force_codex
+      approval_required: false
+
+  - match:
+      task_type: risk_review
+    assign:
+      agent: risk_review
+      model_policy: force_codex
+      approval_required: false
+
+  - match:
+      task_type: analytics
+    assign:
+      agent: analytics
+      model_policy: use_agent_primary
+      approval_required: false
+
+  - match:
+      task_type: devops
+    assign:
+      agent: devops_integration
+      model_policy: force_codex
+      approval_required: true
+
+overrides:
+  force_codex_when:
+    - code_or_config_change
+    - deployment_or_credential_change
+    - public_financial_or_trading_claim
+    - final_synthesis_across_agents
+    - approval_gate
+
+  force_risk_review_when:
+    - public_content
+    - investment_or_trading_language
+    - performance_or_backtest_claim
+    - outbound_sales_message
+    - transaction_commitment

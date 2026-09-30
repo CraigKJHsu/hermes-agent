@@ -626,12 +626,23 @@ def compress_context(
                     pass
                 agent._session_db_created = False
                 try:
+                    child_source = agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli")
+                    # Tools may run on this child before the gateway's post-turn
+                    # refresh. Carry the persisted peer from this exact parent,
+                    # never from process-global env or another platform lane.
+                    parent = agent._session_db.get_session(old_session_id)
+                    peer = {}
+                    if isinstance(parent, dict) and parent.get("source") == child_source:
+                        peer = {key: parent.get(key) for key in (
+                            "user_id", "session_key", "chat_id", "chat_type", "thread_id",
+                        )}
                     agent._session_db.create_session(
                         session_id=agent.session_id,
-                        source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        source=child_source,
                         model=agent.model,
                         model_config=agent._session_init_model_config,
                         parent_session_id=old_session_id,
+                        **peer,
                     )
                 except Exception as _cs_err:
                     # The child row could not be created (e.g. FK constraint,

@@ -536,3 +536,25 @@ class TestDisabledToolsetsPlatformBundle:
         from toolsets import bundle_non_core_tools
         # A non-existent bundle resolves to an empty set (no tools), not a crash.
         assert bundle_non_core_tools("hermes-does-not-exist") == set()
+
+
+def test_kanban_scoped_discovery_filters_toolset_siblings(monkeypatch):
+    import model_tools
+
+    captured = {}
+    monkeypatch.setattr(
+        model_tools,
+        "_KANBAN_DISCOVERY_NAMES",
+        {"read_file", "kanban_complete"},
+    )
+    def fake_definitions(names, quiet):
+        captured["names"] = set(names)
+        return []
+
+    monkeypatch.setattr(model_tools.registry, "get_definitions", fake_definitions)
+
+    model_tools._compute_tool_definitions(
+        enabled_toolsets=["file", "kanban"], quiet_mode=True,
+    )
+
+    assert captured["names"] == {"read_file", "kanban_complete"}

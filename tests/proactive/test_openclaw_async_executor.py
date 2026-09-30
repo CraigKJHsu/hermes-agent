@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from proactive.openclaw_async_executor import (
     make_loop_contract_terminal_handler,
     make_zero_effect_async_poll_adapter,
     make_zero_effect_async_terminal_handler,
+    revalidate_zero_effect_loop_contract_after_controller_repair,
     retry_ready_approved_loop_contract_after_capability_repair,
     retry_ready_loop_contract_execution,
     retry_zero_effect_loop_contract_after_capability_repair,
@@ -66,6 +68,7 @@ def _contract():
         "grace_interpretation": "啟動、輪詢、驗收並清理一個零工具任務。",
         "trigger": "Package 3 acceptance",
         "completion_mode": "terminal",
+        "external_effect_budget": 0,
         "goal": {
             "objective": "Verify asynchronous OpenClaw execution.",
             "deliverables": ["Correlated terminal evidence"],
@@ -95,6 +98,49 @@ def _contract():
     }
 
 
+def test_protocol_v2_ops_connection_check_starts_without_worker_tools(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_existing_loop_agent_or_executor",
+        lambda agent_id: agent_id,
+    )
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "ops-protocol-v2-connection"
+    contract["verification"]["evidence_required"].append(
+        "正式 Protocol v2 執行回執"
+    )
+    contract["routing"] = {
+        "task_type": "ops",
+        "resolved": {
+            "assignment": {
+                "assigned_worker": "clawops.ops",
+                "runtime_profile": "clawops-ops",
+                "allowed_tools": ["status_check"],
+                "approval_required": False,
+            }
+        },
+    }
+    observed = []
+
+    def transport(task):
+        observed.append(task)
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="ops",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-ops-protocol-v2-connection",
+        transport=transport,
+    )
+
+    assert started["status"] == "queued"
+    assert observed[0]["allowed_tools"] == []
+    assert observed[0]["external_effect_budget"] == 0
+    assert observed[0]["backend_agent_id"] == "missioncrew-ops"
+
+
 def test_facebook_page_api_uses_dedicated_openclaw_capability(monkeypatch):
     contract = _contract()
     contract["routing"] = {
@@ -120,11 +166,14 @@ def test_facebook_page_api_uses_dedicated_openclaw_capability(monkeypatch):
         external_effects=True,
         contract_tools=openclaw_async_executor._contract_runtime_tools(contract),
     ) == ["facebook_page_graph_status", "facebook_page_graph_publish"]
-    assert openclaw_async_executor._loop_backend_agent_id(
-        contract,
-        task_type="facebook_page_api_publish",
-        external_effects=True,
-    ) == "missioncrew-facebook-page-operator"
+    assert (
+        openclaw_async_executor._loop_backend_agent_id(
+            contract,
+            task_type="facebook_page_api_publish",
+            external_effects=True,
+        )
+        == "missioncrew-facebook-page-operator"
+    )
 
 
 def test_facebook_page_preflight_uses_one_zero_effect_capability(monkeypatch):
@@ -149,11 +198,58 @@ def test_facebook_page_preflight_uses_one_zero_effect_capability(monkeypatch):
         external_effects=False,
         contract_tools=openclaw_async_executor._contract_runtime_tools(contract),
     ) == ["facebook_page_publish_preflight"]
-    assert openclaw_async_executor._loop_backend_agent_id(
-        contract,
-        task_type="facebook_page_publish_preflight",
+    assert (
+        openclaw_async_executor._loop_backend_agent_id(
+            contract,
+            task_type="facebook_page_publish_preflight",
+            external_effects=False,
+        )
+        == "missioncrew-facebook-page-operator"
+    )
+
+
+def test_content_contract_can_request_deterministic_image_render():
+    contract = _contract()
+    contract["routing"] = {
+        "resolved": {
+            "assignment": {
+                "allowed_tools": ["image_generate", "deterministic_image_render"],
+            }
+        }
+    }
+
+    runtime_tools = openclaw_async_executor._contract_runtime_tools(contract)
+
+    assert runtime_tools == ["image_generate", "deterministic_image_render"]
+    assert openclaw_async_executor._loop_allowed_tools(
+        "campaign",
         external_effects=False,
-    ) == "missioncrew-facebook-page-operator"
+        contract_tools=runtime_tools,
+    ) == [
+        "read",
+        "write",
+        "web_search",
+        "image_generate",
+        "deterministic_image_render",
+    ]
+
+
+def test_correction_exposes_required_callable_tools_only():
+    contract = _contract()
+    contract["routing"] = {
+        "resolved": {
+            "assignment": {
+                "allowed_tools": ["image_generate", "deterministic_image_render"],
+                "required_callable_tools": ["deterministic_image_render"],
+            }
+        }
+    }
+
+    assert openclaw_async_executor._loop_correction_contract_tools(
+        contract,
+        task_type="campaign",
+        previous_metadata={"allowed_tools": ["image_generate"]},
+    ) == ["deterministic_image_render"]
 
 
 def _generated_media_path(name):
@@ -246,23 +342,29 @@ def _loop_result(task, status):
         "task_id": task["task_id"],
         "status": status,
         "summary": f"OpenClaw Loop Contract is {status}.",
-        "artifacts": ([{
-            "type": "openclaw_result",
-            "value": {
-                "evidence": {
-                    "terminal": True,
-                    "resultContractValid": True,
-                    "externalEffectBudget": 0,
-                },
-                "result": {
-                    "status": "succeeded",
-                    "summary": "Loop Contract completed.",
-                    "acceptanceEvidence": ["verified"],
-                    "externalEffects": [],
-                    "policyReceipts": policy_receipts,
-                },
-            },
-        }] if terminal else []),
+        "artifacts": (
+            [
+                {
+                    "type": "openclaw_result",
+                    "value": {
+                        "evidence": {
+                            "terminal": True,
+                            "resultContractValid": True,
+                            "externalEffectBudget": 0,
+                        },
+                        "result": {
+                            "status": "succeeded",
+                            "summary": "Loop Contract completed.",
+                            "acceptanceEvidence": ["verified"],
+                            "externalEffects": [],
+                            "policyReceipts": policy_receipts,
+                        },
+                    },
+                }
+            ]
+            if terminal
+            else []
+        ),
         "tool_calls": [{"name": "openclaw_bridge_http"}],
         "audit_log": ["accepted"],
         "errors": [],
@@ -321,6 +423,14 @@ def test_loop_contract_routes_execution_to_openclaw_and_keeps_grace_review(
     assert execution.executor_profile == "loop-contract"
     assert run is not None
     assert run.metadata["backend_agent_id"] == "missioncrew-executor"
+    assert run.metadata["approval_grant_id"] == ""
+    lifecycle_args = openclaw_async_executor._loop_delegation_args(
+        run,
+        openclaw_task_id="openclaw.agent.loop_contract_poll",
+        idempotency_key="loop-routing-1:poll",
+        objective=contract["goal"]["objective"],
+    )
+    assert lifecycle_args["approval_grant_id"] == ""
     role_card = run.metadata["loop_contract"]["routing"]["resolved"][
         "backend_role_card"
     ]
@@ -339,6 +449,50 @@ def test_loop_contract_routes_execution_to_openclaw_and_keeps_grace_review(
     assert review is not None
     assert review.executor_backend == "hermes"
     assert review.executor_profile == "grace-policy-review"
+
+
+def test_zero_effect_devops_executor_does_not_get_internal_control_grant(
+    kanban_home,
+    monkeypatch,
+):
+    agent_root = kanban_home.parent / "openclaw-agents"
+    executor_workspace = agent_root / "missioncrew-executor"
+    executor_workspace.mkdir(parents=True)
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_loop_workspace",
+        lambda agent_id: agent_root / agent_id,
+    )
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "LOOP_CONTRACT_WORKSPACE",
+        executor_workspace,
+    )
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-devops-control-grant-1"
+
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="devops",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-devops-control-grant-1",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    assert run.metadata["backend_agent_id"] == "missioncrew-executor"
+    assert run.metadata["external_effect_budget"] == 0
+    assert run.metadata["approval_grant_id"] == ""
+    lifecycle_args = openclaw_async_executor._loop_delegation_args(
+        run,
+        openclaw_task_id="openclaw.agent.loop_contract_poll",
+        idempotency_key="loop-devops-control-grant-1:poll",
+        objective=contract["goal"]["objective"],
+    )
+    assert lifecycle_args["approval_grant_id"] == ""
 
 
 def test_external_loop_contract_requires_scoped_approval(kanban_home):
@@ -385,9 +539,17 @@ def test_approved_external_capability_recovery_supports_browser_write_topics(
         run = kb.get_run(conn, int(started["run_id"]))
         assert run is not None
         polluted_metadata = dict(run.metadata)
-        polluted_metadata.update(terminal=True, loop_contract_blocked_result={"summary": "old blocker"}, domain_memory_deltas=[{"entity_id": "old"}], external_effects=[], read_only_zero_external_effects=True)
+        polluted_metadata.update(
+            terminal=True,
+            loop_contract_blocked_result={"summary": "old blocker"},
+            domain_memory_deltas=[{"entity_id": "old"}],
+            external_effects=[],
+            read_only_zero_external_effects=True,
+        )
         polluted_contract = dict(polluted_metadata["loop_contract"])
-        polluted_contract["original_request"] = "[SYSTEM: Grace Loop callback]\nreplay envelope"
+        polluted_contract["original_request"] = (
+            "[SYSTEM: Grace Loop callback]\nreplay envelope"
+        )
         polluted_metadata["loop_contract"] = polluted_contract
         conn.execute(
             "UPDATE task_runs SET metadata = ? WHERE id = ?",
@@ -428,7 +590,13 @@ def test_approved_external_capability_recovery_supports_browser_write_topics(
     assert run is not None
     assert run.metadata["capability_recovery"] is True
     assert run.metadata["approval_grant_id"] == "delegation-loop-external-recovery-1"
-    for key in ("terminal", "loop_contract_blocked_result", "domain_memory_deltas", "external_effects", "read_only_zero_external_effects"):
+    for key in (
+        "terminal",
+        "loop_contract_blocked_result",
+        "domain_memory_deltas",
+        "external_effects",
+        "read_only_zero_external_effects",
+    ):
         assert key not in run.metadata
 
 
@@ -548,9 +716,7 @@ def test_explicit_zh_internal_targets_have_no_external_effect_budget(kanban_home
 def test_content_draft_url_target_has_no_external_effect_budget(kanban_home):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "tasker-content-draft-1"
-    contract["external_targets"] = [
-        "https://www.tasker.com.tw/users/tasker/profile"
-    ]
+    contract["external_targets"] = ["https://www.tasker.com.tw/users/tasker/profile"]
     contract["scope"] = {
         "allowed": ["僅產製本地文字草稿"],
         "forbidden": ["瀏覽、登入或修改外部網站"],
@@ -624,9 +790,7 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
     contract["identity"]["request_instance_id"] = "marketplace-readonly-1"
     contract["identity"].update(platform="telegram", chat_id="chat-1")
     contract["identity"]["thread_id"] = "topic-1"
-    contract["external_targets"] = [
-        "Facebook Marketplace listing ID 915975414881937"
-    ]
+    contract["external_targets"] = ["Facebook Marketplace listing ID 915975414881937"]
     contract["objective_ref"] = {
         "objective_id": "go-ext-marketplace-readonly-1",
         "stage_key": "prepare-readonly",
@@ -664,11 +828,20 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "secondhand", "ResaleItem", "celestron-130eq",
-                "Celestron 130EQ", "listed",
+                "secondhand",
+                "ResaleItem",
+                "celestron-130eq",
+                "Celestron 130EQ",
+                "listed",
                 json.dumps({"subject_key": "celestron-130eq"}),
-                "secondhand.item.v1", "source-task", 7,
-                "review-task", 8, now, now, now,
+                "secondhand.item.v1",
+                "source-task",
+                7,
+                "review-task",
+                8,
+                now,
+                now,
+                now,
             ),
         )
         conn.execute(
@@ -682,13 +855,25 @@ def test_marketplace_readonly_target_keeps_zero_external_effect_budget(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "secondhand", "ResaleItem", "celestron-130eq",
-                "facebook_marketplace_listing", "facebook",
-                "facebook_marketplace_listing:27700220586305145", "listed",
+                "secondhand",
+                "ResaleItem",
+                "celestron-130eq",
+                "facebook_marketplace_listing",
+                "facebook",
+                "facebook_marketplace_listing:27700220586305145",
+                "listed",
                 "https://www.facebook.com/marketplace/item/27700220586305145/",
-                "27700220586305145", "{}", "2026-09-04T06:25:00Z",
-                "task_event:t_source:completed", "source-task", 7,
-                "review-task", 8, now, now, now,
+                "27700220586305145",
+                "{}",
+                "2026-09-04T06:25:00Z",
+                "task_event:t_source:completed",
+                "source-task",
+                7,
+                "review-task",
+                8,
+                now,
+                now,
+                now,
             ),
         )
 
@@ -741,10 +926,20 @@ def test_commerce_evidence_lookup_batches_large_registry_inventory(kanban_home):
             """,
             [
                 (
-                    f"item-{index}", f"Item {index}", f"group-{index}",
-                    f"Group {index}", str(10_000_000_000 + index), "unknown",
-                    "unknown", "test evidence", "source-task", 7, index,
-                    "2026-09-04T00:00:00Z", index, index,
+                    f"item-{index}",
+                    f"Item {index}",
+                    f"group-{index}",
+                    f"Group {index}",
+                    str(10_000_000_000 + index),
+                    "unknown",
+                    "unknown",
+                    "test evidence",
+                    "source-task",
+                    7,
+                    index,
+                    "2026-09-04T00:00:00Z",
+                    index,
+                    index,
                 )
                 for index in range(count)
             ],
@@ -760,11 +955,21 @@ def test_commerce_evidence_lookup_batches_large_registry_inventory(kanban_home):
             """,
             [
                 (
-                    f"item-{index}", f"Item {index}", "facebook",
-                    str(10_000_000_000 + index), str(20_000_000_000 + index),
-                    "seller", f"Item {index}", "NT$1", "test evidence",
-                    "source-task", 7, index, "2026-09-04T00:00:00Z",
-                    index, index,
+                    f"item-{index}",
+                    f"Item {index}",
+                    "facebook",
+                    str(10_000_000_000 + index),
+                    str(20_000_000_000 + index),
+                    "seller",
+                    f"Item {index}",
+                    "NT$1",
+                    "test evidence",
+                    "source-task",
+                    7,
+                    index,
+                    "2026-09-04T00:00:00Z",
+                    index,
+                    index,
                 )
                 for index in range(count)
             ],
@@ -791,9 +996,7 @@ def test_standalone_snapshot_includes_full_explicit_task_evidence(kanban_home):
             {
                 "name": "Astronomy Taiwan",
                 "group_id": "454415024674480",
-                "canonical_url": (
-                    "https://www.facebook.com/groups/454415024674480/"
-                ),
+                "canonical_url": ("https://www.facebook.com/groups/454415024674480/"),
                 "evidence": "e" * 2_000,
             }
         ],
@@ -899,8 +1102,7 @@ def test_standalone_snapshot_includes_full_explicit_task_evidence(kanban_home):
 
         contract = _contract()
         contract["goal"]["deliverables"] = [
-            "Preserve all rows from "
-            f"{execution_task_id} and {review_task_id}.",
+            f"Preserve all rows from {execution_task_id} and {review_task_id}.",
             f"Inspect evidence from {conflicting_child_id} and {ambiguous_child_id}.",
             f"Ignore {unrelated_task_id}.",
         ]
@@ -922,14 +1124,12 @@ def test_standalone_snapshot_includes_full_explicit_task_evidence(kanban_home):
         )
 
     assert snapshot["objective_id"] == ""
-    assert snapshot["referenced_task_ids"] == sorted(
-        [
-            execution_task_id,
-            review_task_id,
-            conflicting_child_id,
-            ambiguous_child_id,
-        ]
-    )
+    assert snapshot["referenced_task_ids"] == sorted([
+        execution_task_id,
+        review_task_id,
+        conflicting_child_id,
+        ambiguous_child_id,
+    ])
     referenced = {
         item["task_id"]: item for item in snapshot["referenced_task_evidence"]
     }
@@ -1102,7 +1302,9 @@ def test_loop_start_replays_ambiguous_timeout_with_same_key(kanban_home):
 
 
 @pytest.mark.parametrize("transport_error", [TimeoutError, ConnectionError])
-def test_loop_poll_preserves_ambiguous_admission_until_reconciled(kanban_home, transport_error):
+def test_loop_poll_preserves_ambiguous_admission_until_reconciled(
+    kanban_home, transport_error
+):
     seen_keys = []
 
     def unavailable(task):
@@ -1110,8 +1312,12 @@ def test_loop_poll_preserves_ambiguous_admission_until_reconciled(kanban_home, t
         raise transport_error("response lost after admission")
 
     started = start_loop_contract_execution(
-        contract=_contract(), task_type="research", risk_level="low",
-        approved=False, delegation_id="loop-poll-ambiguous", transport=unavailable,
+        contract=_contract(),
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="loop-poll-ambiguous",
+        transport=unavailable,
     )
     assert started["status"] == "retrying"
     with kb.connect() as conn:
@@ -1122,7 +1328,8 @@ def test_loop_poll_preserves_ambiguous_admission_until_reconciled(kanban_home, t
     polled = poll_due_backend_runs(
         adapters={"openclaw": make_loop_contract_poll_adapter(transport=unavailable)},
         terminal_handlers={"openclaw": lambda *args: terminal_calls.append(args)},
-        owner="ambiguous-loop-poller", now=int(run.backend_next_poll_at),
+        owner="ambiguous-loop-poller",
+        now=int(run.backend_next_poll_at),
     )
     assert polled.retried == 1
     assert polled.terminal == 0
@@ -1142,7 +1349,8 @@ def test_loop_poll_preserves_ambiguous_admission_until_reconciled(kanban_home, t
     polled = poll_due_backend_runs(
         adapters={"openclaw": make_loop_contract_poll_adapter(transport=recovered)},
         terminal_handlers={"openclaw": lambda *args: terminal_calls.append(args)},
-        owner="recovered-loop-poller", now=int(run.backend_next_poll_at),
+        owner="recovered-loop-poller",
+        now=int(run.backend_next_poll_at),
     )
     assert polled.observed == 1
     assert polled.terminal == 0
@@ -1208,12 +1416,18 @@ def test_loop_poll_blocks_repeated_ambiguous_admission_by_no_progress(kanban_hom
 
 def test_loop_missing_worker_result_does_not_claim_zero_effects(kanban_home):
     started = start_loop_contract_execution(
-        contract=_contract(), task_type="research", risk_level="low", approved=False,
-        delegation_id="loop-missing-result", transport=lambda task: _loop_result(task, "queued"),
+        contract=_contract(),
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="loop-missing-result",
+        transport=lambda task: _loop_result(task, "queued"),
     )
     with kb.connect() as conn:
         run = kb.get_run(conn, int(started["run_id"]))
-    handled = make_loop_contract_terminal_handler()(run, {"delegated_result": {"artifacts": []}})
+    handled = make_loop_contract_terminal_handler()(
+        run, {"delegated_result": {"artifacts": []}}
+    )
     assert handled["accepted"] is False
     assert "no accepted external-effect evidence" in handled["reason"]
     assert "reported zero external effects" not in handled["reason"]
@@ -1378,9 +1592,287 @@ def test_domain_mutation_loop_contract_sends_terminal_result_contract(kanban_hom
     )
 
 
+def _seed_page_recovery_registry(conn, *, objective_id: str) -> None:
+    now = 1_789_486_000
+    conn.execute(
+        """
+        INSERT INTO domain_entities (
+            domain_key, entity_type, entity_id, label, status, attributes,
+            schema_id, source_task_id, source_run_id,
+            accepted_review_task_id, accepted_review_run_id,
+            observed_at, created_at, updated_at
+        ) VALUES ('solobizai','SoloBizAiCase','dpr-construction',
+                  'DPR Construction','planned',?, 'solobizai.case.v1',
+                  't_seed',99,'t_seed_review',100,?,?,?)
+        """,
+        (json.dumps({"episode_number": "EP09"}), now, now, now),
+    )
+    rows = [
+        (
+            "audio_brief",
+            "internal",
+            "audio-brief",
+            "reserved",
+            None,
+            None,
+            {"episode_number": "EP09"},
+            None,
+            "domain_episode_reservation:der_11111111111111111111111111111111",
+        ),
+        (
+            "facebook_page_post",
+            "facebook",
+            "facebook-page-post",
+            "draft",
+            None,
+            None,
+            {},
+            None,
+            "",
+        ),
+        (
+            "podcast_episode",
+            "podcast",
+            "podcast-episode",
+            "planned",
+            None,
+            None,
+            {"episode_number": "EP09"},
+            None,
+            "",
+        ),
+    ]
+    for (
+        artifact_type,
+        platform,
+        key,
+        status,
+        url,
+        external_id,
+        attrs,
+        verified_at,
+        ref,
+    ) in rows:
+        conn.execute(
+            """
+            INSERT INTO domain_artifacts (
+                domain_key, entity_type, entity_id, artifact_type, platform,
+                artifact_key, status, public_url, external_id, attributes,
+                verified_at, source_task_id, source_run_id,
+                accepted_review_task_id, accepted_review_run_id,
+                observed_at, created_at, updated_at, evidence_ref
+            ) VALUES ('solobizai','SoloBizAiCase','dpr-construction',?,?,?,?,
+                      ?,?,?,?, 't_seed',99,'t_seed_review',100,?,?,?,?)
+            """,
+            (
+                artifact_type,
+                platform,
+                key,
+                status,
+                url,
+                external_id,
+                json.dumps(attrs),
+                verified_at,
+                now,
+                now,
+                now,
+                ref,
+            ),
+        )
+    conn.execute(
+        """
+        INSERT INTO domain_episode_reservations (
+            reservation_id, receipt_version, domain_key, schema_id,
+            entity_type, artifact_type, episode_number, episode_label,
+            subject_entity_id, subject_label, objective_id,
+            source_task_id, source_run_id, authorization_fingerprint,
+            evidence, status, created_at, updated_at
+        ) VALUES ('der_11111111111111111111111111111111','v2','solobizai',
+                  'solobizai.case.v1','SoloBizAiCase','audio_brief',9,'EP09',
+                  'dpr-construction','DPR Construction',?,'t_seed',99,?,
+                  '{}','consumed',?,?)
+        """,
+        (objective_id, "a" * 64, now, now),
+    )
+
+
+@pytest.mark.parametrize(
+    ("effect_state", "conflicting_post"),
+    [("verified", False), ("existing", False), ("verified", True)],
+)
+def test_page_terminal_recovers_verified_effect_domain_snapshot(
+    kanban_home,
+    effect_state,
+    conflicting_post,
+):
+    objective_id = "go_page_domain_recovery"
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = (
+        f"page-domain-recovery-{effect_state}-{int(conflicting_post)}"
+    )
+    contract["identity"].update(
+        project="SoloBizAi",
+        platform="telegram",
+        chat_id="chat-page-recovery",
+        thread_id="4641",
+    )
+    contract["objective_ref"] = {
+        "objective_id": objective_id,
+        "stage_key": "execute_external_action",
+    }
+    contract["routing"] = {"task_type": "facebook_page_api_publish"}
+    contract["domain_memory"] = {
+        "schema_id": "solobizai.case.v1",
+        "mode": "mutate",
+        "expected_total": 1,
+    }
+    contract["external_targets"] = ["Facebook Page ID 531289396730654"]
+    with kb.connect() as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id=objective_id,
+            platform="telegram",
+            chat_id="chat-page-recovery",
+            thread_id="4641",
+            session_key="agent:main:telegram:chat-page-recovery:topic:4641",
+            title="Publish DPR Page",
+            objective="Publish and reconcile the DPR Page post.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=("execute_external_action",),
+            terminal_stage_key="execute_external_action",
+            acceptance_criteria=("Verified Page post and domain projection.",),
+        )
+        _seed_page_recovery_registry(conn, objective_id=objective_id)
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="facebook_page_api_publish",
+        risk_level="medium",
+        approved=True,
+        delegation_id=(
+            f"delegation-page-domain-recovery-{effect_state}-{int(conflicting_post)}"
+        ),
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+        assert run is not None
+        effect = {
+            "platform": "facebook",
+            "effect_key": "create",
+            "state": effect_state,
+            "external_id": "531289396730654_122182697174694189",
+            "details": {
+                "verified": True,
+                "published": True,
+                "post_id": "531289396730654_122182697174694189",
+                "photo_id": "122182697156694189",
+                "permalink_url": (
+                    "https://www.facebook.com/122180328530694189/"
+                    "posts/122182697174694189"
+                ),
+                "created_time": "2026-09-15T15:31:44+0000",
+                "message_sha256": "d" * 64,
+                "image_sha256": "b" * 64,
+            },
+        }
+        reported_effect = {
+            **effect,
+            "details": {
+                "target": "https://www.facebook.com/solobizai",
+                "readback": {
+                    **effect["details"],
+                    "success": True,
+                    "retry_permitted": False,
+                },
+            },
+        }
+        kb.record_external_effect(
+            conn,
+            run.task_id,
+            expected_run_id=run.id,
+            **effect,
+        )
+
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    output = terminal["artifacts"][0]["value"]
+    output["evidence"]["externalEffectBudget"] = run.metadata["external_effect_budget"]
+    output["result"]["externalEffects"] = [reported_effect]
+    output["result"]["domainMemoryDeltas"] = [
+        {
+            "operation": "upsert",
+            "entity_id": "dpr-construction",
+            "label": "DPR Construction／EP09",
+            "status": "published",
+            "artifacts": [
+                {
+                    "artifact_type": "facebook_page_post",
+                    "platform": "facebook",
+                    "status": "published",
+                    "external_id": (
+                        "different-post" if conflicting_post else effect["external_id"]
+                    ),
+                    "public_url": effect["details"]["permalink_url"],
+                    "evidence_ref": "task_external_effect:facebook:create",
+                }
+            ],
+            "evidence_refs": ["task_external_effect:facebook:create"],
+        }
+    ]
+
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": f"page-domain-recovery-{int(conflicting_post)}",
+        },
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, run.task_id)
+        completed_run = kb.latest_run(conn, run.task_id)
+        durable_effect = kb.list_external_effects(conn, run.task_id)[0]
+        reservation = conn.execute(
+            "SELECT status FROM domain_episode_reservations"
+        ).fetchone()
+    assert task is not None
+    assert completed_run is not None
+    assert reservation["status"] == "consumed"
+    if conflicting_post:
+        assert handled["accepted"] is False
+        assert task.status == "blocked"
+        assert (
+            "external_id conflicts"
+            in completed_run.metadata["domain_memory_delta_error"]
+        )
+        return
+    assert handled["accepted"] is True
+    assert task.status == "done"
+    assert (
+        completed_run.metadata["controller_domain_reconciliation"]["read_only"] is True
+    )
+    assert completed_run.metadata["external_effects"] == [effect]
+    assert durable_effect["details"] == effect["details"]
+    assert {
+        item["artifact_type"]
+        for item in completed_run.metadata["domain_memory_deltas"][0]["artifacts"]
+    } == {"facebook_page_post", "audio_brief", "podcast_episode"}
+
+
 @pytest.mark.parametrize("blocked_without_write", [False, True])
 def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
-    kanban_home, blocked_without_write,
+    kanban_home,
+    blocked_without_write,
 ):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-domain-mutation-invalid-delta-1"
@@ -1455,7 +1947,11 @@ def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
         "result_digest": "terminal-invalid-domain-delta-digest",
     }
     if blocked_without_write:
-        output["result"].update(status="blocked", summary="Preflight route unavailable; no write attempted", domainMemoryDeltas=[])
+        output["result"].update(
+            status="blocked",
+            summary="Preflight route unavailable; no write attempted",
+            domainMemoryDeltas=[],
+        )
 
     handled = make_loop_contract_terminal_handler()(run, observation)
 
@@ -1481,14 +1977,32 @@ def test_domain_mutation_terminal_blocks_invalid_memory_delta_without_crash(
     assert ended_run.metadata["external_effects"] == []
 
 
-@pytest.mark.parametrize("wire_format", [
-    "existing_package", "canonical_report", "missing_report", "wrong_hash",
-    "wrong_filename", "missing_image", "object_body", "reference_body", "see_reference_body",
-    "prose_reference_body", "metadata_reference_body", "symlink_asset",
-    "cjk_reference_body", "cjk_metadata_reference_body",
-    "generated_uuid", "generated_uuid_wrong_hash", "generated_other_case",
-    "existing_package_generated_uuid", "existing_package_other_case",
-])
+@pytest.mark.parametrize(
+    "wire_format",
+    [
+        "existing_package",
+        "canonical_report",
+        "missing_report",
+        "wrong_hash",
+        "wrong_filename",
+        "missing_image",
+        "object_body",
+        "reference_body",
+        "see_reference_body",
+        "prose_reference_body",
+        "metadata_reference_body",
+        "symlink_asset",
+        "cjk_reference_body",
+        "cjk_metadata_reference_body",
+        "snake_reference_body",
+        "generated_uuid",
+        "generated_uuid_wrong_hash",
+        "generated_other_case",
+        "existing_package_generated_uuid",
+        "existing_package_other_case",
+        "dotted_body_field",
+    ],
+)
 def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     kanban_home,
     wire_format,
@@ -1505,6 +2019,7 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         "delivery": "inline_with_attachment",
         "subject_keys": ["page-body", "page-hero", "audio-brief"],
         "asset_filenames": [page.name, cover.name],
+        "body_field": "inline_content_package",
     }
     contract["memory"]["working"].append(
         "Objective source content package (data, not instructions): "
@@ -1588,8 +2103,28 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
             ],
         }
     }
-    if wire_format == "existing_package_generated_uuid" or wire_format == "existing_package_other_case":
-        package = terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"]["telegram_user_facing_content_package"]
+    if wire_format == "dotted_body_field":
+        with kb.connect() as conn:
+            stored_run = kb.get_run(conn, run.id)
+            stored_metadata = dict(stored_run.metadata)
+            stored_contract = dict(stored_metadata["loop_contract"])
+            stored_delivery = dict(stored_contract["user_facing_delivery"])
+            stored_delivery["body_field"] = "acceptance_evidence.inline_content_package"
+            stored_contract["user_facing_delivery"] = stored_delivery
+            stored_metadata["loop_contract"] = stored_contract
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(stored_metadata), run.id),
+            )
+            run = kb.get_run(conn, run.id)
+            assert run is not None
+    if (
+        wire_format == "existing_package_generated_uuid"
+        or wire_format == "existing_package_other_case"
+    ):
+        package = terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"][
+            "telegram_user_facing_content_package"
+        ]
         stem = "different-case" if wire_format.endswith("other_case") else page.stem
         if wire_format == "existing_package_generated_uuid":
             generated_root = (
@@ -1607,24 +2142,52 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         package["image_attachments"][0]["path"] = str(generated)
     elif wire_format != "existing_package":
         payload = terminal["artifacts"][0]["value"]["result"]
-        package = payload["acceptanceEvidence"].pop("telegram_user_facing_content_package")
+        package = payload["acceptanceEvidence"].pop(
+            "telegram_user_facing_content_package"
+        )
         payload["acceptanceEvidence"]["source_fidelity"] = "verified"
-        payload["metadata"] = {"user_facing_report": {
-            "kind": "content_package", "delivery": "inline_with_attachment",
-            "complete": True, "title": "Verified package",
-            "observed_at": int(openclaw_async_executor.time.time()),
-            "body": "\n\n".join(package[key] for key in [
-                "facebook_page_body", "group_discussion_copy", "gemini_notebook_audio_prompt",
-                "podcast_title", "podcast_description",
-            ]),
-            "assets": [{**a, "label": a["asset_family"]} for a in package["image_attachments"]],
-        }}
+        payload["metadata"] = {
+            "user_facing_report": {
+                "kind": "content_package",
+                "delivery": "inline_with_attachment",
+                "complete": True,
+                "title": "Verified package",
+                "observed_at": int(openclaw_async_executor.time.time()),
+                "body": "\n\n".join(
+                    package[key]
+                    for key in [
+                        "facebook_page_body",
+                        "group_discussion_copy",
+                        "gemini_notebook_audio_prompt",
+                        "podcast_title",
+                        "podcast_description",
+                    ]
+                ),
+                "assets": [
+                    {**a, "label": a["asset_family"]}
+                    for a in package["image_attachments"]
+                ],
+            }
+        }
         report = payload["metadata"]["user_facing_report"]
+        payload["acceptanceEvidence"]["inline_content_package"] = report["body"]
+        if wire_format == "dotted_body_field":
+            report["body_field"] = "acceptance_evidence.inline_content_package"
         if wire_format == "missing_report":
-            payload["metadata"] = {"user_facing_report": {"kind": "content_package",
-                "inline_content_package_field": "acceptanceEvidence.inline_content_package"}}
-        elif wire_format in {"generated_uuid", "generated_uuid_wrong_hash", "generated_other_case"}:
-            stem = "different-case" if wire_format == "generated_other_case" else page.stem
+            payload["metadata"] = {
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "inline_content_package_field": "acceptanceEvidence.inline_content_package",
+                }
+            }
+        elif wire_format in {
+            "generated_uuid",
+            "generated_uuid_wrong_hash",
+            "generated_other_case",
+        }:
+            stem = (
+                "different-case" if wire_format == "generated_other_case" else page.stem
+            )
             if wire_format != "generated_other_case":
                 generated_root = (
                     Path.home() / ".openclaw" / "media" / "tool-image-generation"
@@ -1654,9 +2217,13 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         elif wire_format == "see_reference_body":
             report["body"] = "請參閱 `acceptanceEvidence.inline_content_package`。"
         elif wire_format == "prose_reference_body":
-            report["body"] = "See acceptanceEvidence.inline_content_package for the complete package."
+            report["body"] = (
+                "See acceptanceEvidence.inline_content_package for the complete package."
+            )
         elif wire_format == "metadata_reference_body":
             report["body"] = "The package is at metadata.user_facing_report.body"
+        elif wire_format == "snake_reference_body":
+            report["body"] = "acceptance_evidence.inline_content_package"
         elif wire_format == "cjk_reference_body":
             report["body"] = "請參閱acceptanceEvidence.inline_content_package"
         elif wire_format == "cjk_metadata_reference_body":
@@ -1671,23 +2238,45 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         "existing_package_generated_uuid",
     }:
         generated_path = (
-            terminal["artifacts"][0]["value"]["result"]
-            ["acceptanceEvidence"]
+            terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"]
             .get("telegram_user_facing_content_package", {})
             .get("image_attachments", [{}])[0]
             .get("path")
-            or terminal["artifacts"][0]["value"]["result"]
-            ["metadata"]["user_facing_report"]["assets"][0]["path"]
+            or terminal["artifacts"][0]["value"]["result"]["metadata"][
+                "user_facing_report"
+            ]["assets"][0]["path"]
         )
-        terminal["artifacts"][0]["value"]["result"]["externalEffects"] = [{
-            "target": "openclaw.image_generate:page-hero",
-            "state": "verified",
-            "externalId": "session=image_generate:page-hero",
-            "readback": {
-                "path": generated_path,
-                "model": "openai/gpt-image-2",
-            },
-        }]
+        terminal["artifacts"][0]["value"]["result"]["externalEffects"] = [
+            {
+                "target": "openclaw.image_generate:page-hero",
+                "state": "verified",
+                "externalId": "session=image_generate:page-hero",
+                "readback": {
+                    "path": generated_path,
+                    "model": "openai/gpt-image-2",
+                },
+            }
+        ]
+        image_task_id = "image_generate:392d24d4-b1ab-4965-9080-9913b2856da3"
+        terminal["artifacts"][0]["value"]["evidence"]["internalToolReceipts"] = [
+            {
+                "target": "openclaw.image_generate.local_media",
+                "effectKey": image_task_id,
+                "state": "verified",
+                "readback": {
+                    "attestedBy": "openclaw_runtime_task_registry",
+                    "taskId": image_task_id,
+                    "ownerSessionKey": run.metadata["backend_session_key"],
+                    "path": generated_path,
+                    "sha256": openclaw_async_executor.hashlib.sha256(
+                        Path(generated_path).read_bytes()
+                    ).hexdigest(),
+                    "mimeType": "image/png",
+                    "dimensions": "1600x900",
+                    "endedAt": run.started_at * 1000 + 1,
+                },
+            }
+        ]
     observation = {
         "status": "succeeded",
         "delegated_result": terminal,
@@ -1696,7 +2285,13 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
 
     handled = make_loop_contract_terminal_handler()(run, observation)
 
-    if wire_format not in {"existing_package", "canonical_report", "generated_uuid", "existing_package_generated_uuid"}:
+    if wire_format not in {
+        "existing_package",
+        "canonical_report",
+        "generated_uuid",
+        "existing_package_generated_uuid",
+        "dotted_body_field",
+    }:
         assert handled["accepted"] is False
         assert "Required content package" in handled["reason"]
         with kb.connect() as conn:
@@ -1712,15 +2307,15 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
     assert report["kind"] == "content_package"
     assert "完整 Page 內文" in report["body"]
     assert all(
-        receipt["task_id"] == run.task_id
-        and receipt["run_id"] == run.id
+        receipt["task_id"] == run.task_id and receipt["run_id"] == run.id
         for receipt in completed_run.metadata["content_package_asset_receipts"]
     )
     if wire_format in {"existing_package", "existing_package_generated_uuid"}:
         assert report["package_kind"] == "full_publication_package"
         assert report["sections"]["facebook_group_post"] == "Group 討論附文"
         assert {asset["asset_family"] for asset in report["assets"]} == {
-            "page_hero", "audio_brief",
+            "page_hero",
+            "audio_brief",
         }
     if wire_format in {"generated_uuid", "existing_package_generated_uuid"}:
         with Image.open(generated) as generated_image:
@@ -1733,9 +2328,81 @@ def test_loop_contract_terminal_promotes_content_package_for_gateway_delivery(
         cover.name,
     }
     with kb.connect() as conn:
-        rebuilt = kb.grace_inline_content_package_report(conn, started["execution_task_id"])
+        rebuilt = kb.grace_inline_content_package_report(
+            conn, started["execution_task_id"]
+        )
     assert rebuilt["body"] == report["body"]
-    assert {a["sha256"] for a in rebuilt["assets"]} == {a["sha256"] for a in report["assets"]}
+    assert {a["sha256"] for a in rebuilt["assets"]} == {
+        a["sha256"] for a in report["assets"]
+    }
+    if wire_format == "canonical_report":
+        original_observed_at = rebuilt["observed_at"]
+        with kb.connect() as conn:
+            duplicate_ids = [
+                kb.add_attachment(
+                    conn,
+                    started["execution_task_id"],
+                    filename=attachment.filename,
+                    stored_path=attachment.stored_path,
+                    content_type=attachment.content_type,
+                    size=attachment.size,
+                    uploaded_by="historical-replay",
+                )
+                for attachment in attachments
+            ]
+            conn.execute(
+                "UPDATE task_attachments SET created_at = ? WHERE id IN ({})".format(
+                    ",".join("?" for _ in duplicate_ids),
+                ),
+                (original_observed_at + 100, *duplicate_ids),
+            )
+            latest = kb.latest_run(conn, started["execution_task_id"])
+            metadata = dict(latest.metadata)
+            metadata["attachment_manifest"] = kb.task_attachment_manifest(
+                conn,
+                started["execution_task_id"],
+            )
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), latest.id),
+            )
+            readback = kb.grace_content_package_attachment_readback(
+                conn,
+                started["execution_task_id"],
+            )
+            rebuilt = kb.grace_inline_content_package_report(
+                conn,
+                started["execution_task_id"],
+            )
+        assert readback["canonical_asset_count"] == 2
+        assert readback["task_attachment_row_count"] == 6
+        assert {
+            duplicate_id
+            for asset in readback["assets"]
+            for duplicate_id in asset["duplicate_attachment_ids"]
+        } == set(duplicate_ids[1:])
+        assert rebuilt["complete"] is True
+        assert rebuilt["observed_at"] == original_observed_at
+
+        conflicting = kanban_home / page.name
+        Image.new("RGB", (1600, 900), "red").save(conflicting)
+        with kb.connect() as conn:
+            kb.add_attachment(
+                conn,
+                started["execution_task_id"],
+                filename=page.name,
+                stored_path=str(conflicting),
+                content_type="image/png",
+                size=conflicting.stat().st_size,
+                uploaded_by="conflicting-replay",
+            )
+            assert (
+                kb.grace_content_package_attachment_readback(
+                    conn,
+                    started["execution_task_id"],
+                )
+                is None
+            )
 
 
 def test_loop_contract_terminal_promotes_inline_text_content_package(
@@ -1825,21 +2492,19 @@ def test_loop_contract_terminal_promotes_inline_text_content_package(
         ("course_marketing", "Course Marketing", "general"),
     ],
 )
-def test_kj_profile_historical_false_complete_fixture_accepts_terminal_content_package(
+def test_kj_profile_incomplete_terminal_content_package_is_blocked(
     kanban_home,
     project,
     topic_name,
     thread_id,
 ):
     contract = _contract()
-    contract["identity"].update(
-        {
-            "project": project,
-            "topic_name": topic_name,
-            "thread_id": thread_id,
-            "request_instance_id": f"loop-terminal-content-package-{project}",
-        }
-    )
+    contract["identity"].update({
+        "project": project,
+        "topic_name": topic_name,
+        "thread_id": thread_id,
+        "request_instance_id": f"loop-terminal-content-package-{project}",
+    })
     contract["user_facing_delivery"] = {
         "required": True,
         "kind": "content_package",
@@ -1872,34 +2537,37 @@ def test_kj_profile_historical_false_complete_fixture_accepts_terminal_content_p
     body = "完整、未截斷、可直接貼用的服務介紹與亮點內容。"
     output["result"]["summary"] = "完整內容包"
     output["result"]["acceptanceEvidence"] = {"service_description": body}
-    output["result"]["metadata"] = {"user_facing_report": {
-        "kind": "content_package",
-        "delivery": "inline_only",
-        "complete": False,
-        "title": "完整內容包",
-        "body_field": "service_description",
-        "body": body,
-        "observed_at": int(openclaw_async_executor.time.time()),
-        "assets": [],
-    }}
+    output["result"]["metadata"] = {
+        "user_facing_report": {
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "complete": False,
+            "title": "完整內容包",
+            "body_field": "service_description",
+            "body": body,
+            "observed_at": int(openclaw_async_executor.time.time()),
+            "assets": [],
+        }
+    }
 
     handled = make_loop_contract_terminal_handler()(
         run,
-        {"status": "succeeded", "delegated_result": terminal,
-         "result_digest": "incomplete-content-package-digest"},
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "incomplete-content-package-digest",
+        },
     )
 
-    assert handled["accepted"] is True
+    assert handled["accepted"] is False
+    assert "explicitly incomplete" in handled["reason"]
     with kb.connect() as conn:
-        assert kb.get_task(conn, started["execution_task_id"]).status == "done"
-        completed_run = kb.latest_run(conn, started["execution_task_id"])
+        assert kb.get_task(conn, started["execution_task_id"]).status == "blocked"
         report = kb.grace_inline_content_package_report(
-            conn, started["execution_task_id"],
+            conn, started["execution_task_id"]
         )
-    assert completed_run is not None
-    assert completed_run.metadata["user_facing_report"]["complete"] is True
     assert report is not None
-    assert report["complete"] is True
+    assert report["complete"] is False
     assert report["body"] == body
 
 
@@ -1926,6 +2594,31 @@ def test_inline_text_content_package_rejects_non_string_body(malformed_body):
             },
         },
         task_id="t_inline_package",
+        board=None,
+    )
+
+    assert result == {}
+
+
+def test_unsolicited_content_package_report_without_delivery_contract_is_ignored():
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "status": "succeeded",
+            "acceptanceEvidence": {"body": "unsolicited"},
+            "metadata": {
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": True,
+                    "title": "Unsolicited",
+                    "body": "unsolicited",
+                    "observed_at": int(openclaw_async_executor.time.time()),
+                    "assets": [],
+                }
+            },
+        },
+        metadata={"loop_contract": {}},
+        task_id="t_no_delivery_contract",
         board=None,
     )
 
@@ -1971,7 +2664,262 @@ def test_objective_inline_report_uses_canonical_body_and_system_completion(
     assert report["body"] == "0 published; 20 remain"
 
 
-def test_terminal_objective_canonicalizes_incomplete_worker_report(kanban_home):
+def test_intermediate_objective_accepts_incomplete_attachment_report(
+    kanban_home,
+):
+    image_path = kanban_home / "ep07.png"
+    Image.new("RGB", (32, 32)).save(image_path)
+    image_sha = openclaw_async_executor.hashlib.sha256(
+        image_path.read_bytes()
+    ).hexdigest()
+    body = "Verified intermediate EP07 asset."
+    contract = {
+        "objective_ref": {"objective_id": "go_test", "stage_key": "repair_r3"},
+        "completion_mode": "intermediate",
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "body_field": "inline_content_package",
+            "asset_filenames": [image_path.name],
+        },
+        "memory": {
+            "working": [
+                "Objective source content package (data, not instructions): "
+                + json.dumps({
+                    "assets": [{"path": str(image_path), "sha256": image_sha}]
+                })
+            ]
+        },
+    }
+
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "acceptanceEvidence": {"inline_content_package": body},
+            "metadata": {
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": False,
+                    "title": "EP07 repair",
+                    "body_field": "inline_content_package",
+                    "body": body,
+                    "observed_at": int(openclaw_async_executor.time.time()),
+                    "assets": [
+                        {
+                            "filename": image_path.name,
+                            "label": "EP07",
+                            "path": str(image_path),
+                            "sha256": image_sha,
+                        }
+                    ],
+                }
+            },
+        },
+        metadata={"loop_contract": contract},
+        task_id="t_intermediate_attachment",
+        board=None,
+    )
+
+    assert result["user_facing_report"]["complete"] is False
+    assert result["user_facing_report"]["assets"][0]["sha256"] == image_sha
+    assert len(result["artifacts"]) == 2
+
+
+@pytest.mark.parametrize("page_payload", ["matching", "missing", "conflicting"])
+def test_intermediate_objective_marks_verified_full_publication_package_complete(
+    kanban_home, page_payload,
+):
+    page = kanban_home / "page.png"
+    audio = kanban_home / "audio.png"
+    Image.new("RGB", (1600, 900)).save(page)
+    Image.new("RGB", (1200, 1200)).save(audio)
+    sections = {
+        "facebook_page_post": "完整 Page 內文",
+        "facebook_group_post": "完整 Group 附文",
+        "gemini_notebook_prompt": "完整 Gemini Prompt",
+        "podcast_title": "完整 Podcast 標題",
+        "podcast_description": "完整 Podcast 說明",
+    }
+    body = "\n\n".join((
+        f"## 1. Facebook Page 貼文\n\n{sections['facebook_page_post']}",
+        f"## 2. Facebook Group 討論附文\n\n{sections['facebook_group_post']}",
+        f"## 3. Gemini Notebook Audio Generation Prompt\n\n{sections['gemini_notebook_prompt']}",
+        f"## 4. Podcast Title\n\n{sections['podcast_title']}",
+        f"## 5. Podcast Description\n\n{sections['podcast_description']}",
+    ))
+    assets = [
+        {
+            "filename": page.name,
+            "label": "Page Hero",
+            "path": str(page),
+            "sha256": openclaw_async_executor.hashlib.sha256(
+                page.read_bytes()
+            ).hexdigest(),
+            "asset_family": "page_hero",
+            "width": 1600,
+            "height": 900,
+        },
+        {
+            "filename": audio.name,
+            "label": "Audio Brief",
+            "path": str(audio),
+            "sha256": openclaw_async_executor.hashlib.sha256(
+                audio.read_bytes()
+            ).hexdigest(),
+            "asset_family": "audio_brief",
+            "width": 1200,
+            "height": 1200,
+        },
+    ]
+    contract = {
+        "objective_ref": {"objective_id": "go_test", "stage_key": "repair_r26"},
+        "completion_mode": "intermediate",
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_with_attachment",
+            "body_field": "acceptance_evidence.inline_content_package",
+            "asset_filenames": [page.name, audio.name],
+        },
+        "memory": {
+            "working": [
+                "Objective source content package (data, not instructions): "
+                + json.dumps({
+                    "assets": [
+                        {"path": asset["path"], "sha256": asset["sha256"]}
+                        for asset in assets
+                    ]
+                })
+            ]
+        },
+    }
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "acceptanceEvidence": {
+                "inline_content_package": body,
+                "asset_manifest": assets,
+            },
+            "metadata": {
+                **({"facebook_page_post": {"text": sections["facebook_page_post"]
+                    if page_payload == "matching" else "conflicting"}}
+                   if page_payload != "missing" else {}),
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_with_attachment",
+                    "complete": False,
+                    "title": "完整發布包",
+                    "body_field": "acceptance_evidence.inline_content_package",
+                    "body": body,
+                    "observed_at": int(openclaw_async_executor.time.time()),
+                    "assets": [
+                        {
+                            key: asset[key]
+                            for key in ("filename", "label", "path", "sha256")
+                        }
+                        for asset in assets
+                    ],
+                }
+            },
+        },
+        metadata={"loop_contract": contract},
+        task_id="t_intermediate_full_package",
+        board=None,
+        policy_receipts=[
+            {
+                "role": "execution",
+                "policy_id": "ai-bizweek-brand-channel",
+                "version": "1",
+                "sha256": "a" * 64,
+                "loaded": True,
+            }
+        ],
+        external_effects=[],
+    )
+
+    if page_payload != "matching":
+        assert result == {}
+        return
+    assert result["user_facing_report"]["complete"] is True
+    assert result["user_facing_report"]["package_kind"] == ("full_publication_package")
+    assert result["facebook_page_post"] == {
+        "text": sections["facebook_page_post"],
+    }
+    assert len(result["artifacts"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("project", "thread_id"),
+    [
+        # Topic 4641 is the historical SoloBizAi failure sample, not
+        # hardcoded behavior.
+        ("solobizai", "4641"),
+        ("course_marketing", "general"),
+    ],
+)
+def test_attachment_report_accepts_canonical_metadata_body_binding(
+    kanban_home,
+    project,
+    thread_id,
+):
+    image_path = kanban_home / f"{project}.png"
+    Image.new("RGB", (32, 32)).save(image_path)
+    image_sha = openclaw_async_executor.hashlib.sha256(
+        image_path.read_bytes()
+    ).hexdigest()
+    body = f"Complete package for {project}."
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "body_field": "metadata.user_facing_report.body",
+        "asset_filenames": [image_path.name],
+    }
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": True,
+        "title": "Complete package",
+        "body": body,
+        "observed_at": int(openclaw_async_executor.time.time()),
+        "assets": [
+            {
+                "filename": image_path.name,
+                "label": "Hero",
+                "path": str(image_path),
+                "sha256": image_sha,
+            }
+        ],
+    }
+
+    result = openclaw_async_executor._content_package_completion_metadata(
+        {
+            "acceptanceEvidence": {"user_facing_body": body},
+            "metadata": {"user_facing_report": report},
+        },
+        metadata={
+            "loop_contract": {
+                "identity": {"project": project, "thread_id": thread_id},
+                "user_facing_delivery": delivery,
+                "memory": {
+                    "working": [
+                        "Objective source content package (data, not instructions): "
+                        + json.dumps({
+                            "assets": [{"path": str(image_path), "sha256": image_sha}]
+                        })
+                    ]
+                },
+            }
+        },
+        task_id=f"t_{project}",
+        board=None,
+    )
+
+    assert result["user_facing_report"]["body"] == body
+    assert result["user_facing_report"]["assets"][0]["sha256"] == image_sha
+
+
+def test_terminal_stage_preserves_incomplete_worker_report(kanban_home):
     now = int(openclaw_async_executor.time.time())
     report = {
         "kind": "content_package",
@@ -2005,7 +2953,7 @@ def test_terminal_objective_canonicalizes_incomplete_worker_report(kanban_home):
         board=None,
     )
 
-    assert result["user_facing_report"] == {**report, "complete": True}
+    assert result["user_facing_report"] == {**report, "complete": False}
 
 
 def test_loop_contract_terminal_defaults_missing_policy_receipts(kanban_home):
@@ -2160,7 +3108,8 @@ def test_loop_contract_terminal_defaults_policy_receipts_with_internal_image_rec
     assert task is not None and task.status == "done"
     assert completed_run is not None
     assert completed_run.metadata["external_effects"] == []
-    assert len(completed_run.metadata["internal_tool_receipts"]) == 1
+    assert completed_run.metadata["internal_tool_receipts"] == []
+    assert len(completed_run.metadata["worker_internal_tool_claims"]) == 1
     assert completed_run.metadata["policy_receipts"] == [
         {
             "role": "execution",
@@ -2280,8 +3229,44 @@ def test_loop_contract_poll_rejects_cross_run_backend_identity(
         adapter(run)
 
 
+def test_loop_contract_poll_keeps_admitted_run_alive_on_wrapped_transport_timeout(
+    kanban_home,
+):
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "loop-poll-wrapped-timeout"
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
+        delegation_id="delegation-loop-poll-wrapped-timeout",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+
+    def wrapped_timeout(task):
+        result = _loop_result(task, "failed")
+        result.update({
+            "errors": ["timeout"],
+            "identity_correlated": False,
+            "protocol_correlated": False,
+        })
+        return result
+
+    observed = make_loop_contract_poll_adapter(transport=wrapped_timeout)(run)
+
+    assert observed["status"] == "running"
+    assert observed["backend_run_id"] == run.backend_run_id
+    assert observed["backend_session_key"] == run.metadata["backend_session_key"]
+    assert observed["transport_ambiguous"] is True
+
+
 @pytest.mark.parametrize("missing_run_route", [False, True])
-def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, missing_run_route):
+def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(
+    kanban_home, missing_run_route
+):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-correction-1"
     from hermes_cli.telegram_message_path import build_telegram_message_path
@@ -2310,8 +3295,10 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, mi
         if missing_run_route:
             prior_metadata = dict(run.metadata)
             prior_metadata.pop("model_route")
-            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
-                         (json.dumps(prior_metadata), run.id))
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(prior_metadata), run.id),
+            )
         assert kb.complete_task(
             conn,
             started["execution_task_id"],
@@ -2351,14 +3338,21 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, mi
     assert seen["objective"] == contract["goal"]["objective"]
     assert seen["model_route"] == admitted_route
     assert seen["external_effect_budget"] == 0
+    assert not seen.get("approval_grant_id")
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
         run = kb.get_run(conn, int(retried["run_id"]))
         assert task is not None and task.status == "running"
         assert run is not None
+        assert run.metadata["approval_grant_id"] == ""
         assert run.metadata["correction_reason"] == "candidate URLs are missing"
-        assert run.metadata["contract_fingerprint"] != (
-            kb.get_run(conn, int(started["run_id"])).metadata["contract_fingerprint"]
+        assert (
+            run.metadata["contract_fingerprint"]
+            != (
+                kb.get_run(conn, int(started["run_id"])).metadata[
+                    "contract_fingerprint"
+                ]
+            )
         )
         assert run.metadata["loop_contract"]["verification"]["review_feedback"] == [
             "candidate URLs are missing"
@@ -2407,9 +3401,10 @@ def test_grace_rejected_openclaw_card_is_readmitted_on_same_task(kanban_home, mi
     with kb.connect() as conn:
         second_run = kb.get_run(conn, int(second_retry["run_id"]))
     assert second_run is not None
-    assert second_run.metadata["loop_contract"]["verification"][
-        "review_feedback"
-    ] == ["candidate URLs are missing", "source timestamps are missing"]
+    assert second_run.metadata["loop_contract"]["verification"]["review_feedback"] == [
+        "candidate URLs are missing",
+        "source timestamps are missing",
+    ]
 
 
 def test_correction_admission_replay_reuses_identical_request(kanban_home):
@@ -2498,14 +3493,14 @@ def test_correction_admission_replay_reuses_identical_request(kanban_home):
     assert replayed["status"] == "queued"
 
 
-def test_human_approved_zero_effect_correction_recovers_same_card_from_triage(
+def test_triaged_zero_effect_devops_correction_gets_internal_control_grant(
     kanban_home,
 ):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "triaged-correction-recovery-1"
     started = start_loop_contract_execution(
         contract=contract,
-        task_type="research",
+        task_type="devops",
         risk_level="low",
         approved=False,
         delegation_id="delegation-triaged-correction-recovery-1",
@@ -2514,6 +3509,7 @@ def test_human_approved_zero_effect_correction_recovers_same_card_from_triage(
     with kb.connect() as conn:
         original_run = kb.get_run(conn, int(started["run_id"]))
         assert original_run is not None
+        assert original_run.metadata["approval_grant_id"] == ""
         parent_fingerprint = original_run.metadata["contract_fingerprint"]
         assert kb.complete_task(
             conn,
@@ -2612,9 +3608,11 @@ def test_human_approved_zero_effect_correction_recovers_same_card_from_triage(
     assert seen["contract_fingerprint"] == correction_fingerprint
     assert seen["contract_fingerprint"] != legacy_fingerprint
     assert seen["external_effect_budget"] == 0
+    assert seen["approval_grant_id"] == "delegation-triaged-correction-recovery-1"
     assert seen["loop_contract"]["control_plane_receipt"]["status"] == "queued"
-    assert seen["loop_contract"]["control_plane_receipt"]["execution_task_id"] == (
-        started["execution_task_id"]
+    assert (
+        seen["loop_contract"]["control_plane_receipt"]["execution_task_id"]
+        == (started["execution_task_id"])
     )
     assert seen["loop_contract"]["control_plane_receipt"][
         "grace_review_task_id"
@@ -2644,6 +3642,10 @@ def test_human_approved_zero_effect_correction_recovers_same_card_from_triage(
     assert recovered_run is not None
     assert recovered_run.metadata["parent_contract_fingerprint"] == parent_fingerprint
     assert recovered_run.metadata["contract_fingerprint"] == correction_fingerprint
+    assert (
+        recovered_run.metadata["approval_grant_id"]
+        == "delegation-triaged-correction-recovery-1"
+    )
     assert recovery_event is not None
     assert json.loads(recovery_event["payload"])["external_effect_budget"] == 0
 
@@ -2829,7 +3831,9 @@ def test_readonly_correction_scope_projection_and_target_binding(
             "required_sections": [],
         }
         assert (
-            admitted_contract["routing"]["resolved"]["backend_role_card"]["output_format"]
+            admitted_contract["routing"]["resolved"]["backend_role_card"][
+                "output_format"
+            ]
             == "json"
         )
         assert first_run.metadata["execution_card_fingerprint"]
@@ -2968,13 +3972,16 @@ def test_loop_contract_from_execution_body_keeps_embedded_policy_fences():
             "policy_id": "ai-bizweek",
             "version": "1",
             "sha256": "abc123",
-            "content": "Policy text with an embedded fenced block:\n```json\n{\"ok\": true}\n```",
+            "content": 'Policy text with an embedded fenced block:\n```json\n{"ok": true}\n```',
         }
     ]
 
     parsed = _loop_contract_from_execution_body(render_execution_body(contract))
 
-    assert parsed["policy_snapshots"][0]["content"] == contract["policy_snapshots"][0]["content"]
+    assert (
+        parsed["policy_snapshots"][0]["content"]
+        == contract["policy_snapshots"][0]["content"]
+    )
 
 
 def test_quarantined_loop_contract_correction_is_recoverable(kanban_home):
@@ -3229,11 +4236,14 @@ def test_loop_contract_terminal_materializes_openclaw_external_effects(kanban_ho
         },
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "failed",
-        "delegated_result": terminal,
-        "result_digest": "terminal-openclaw-effect-format-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "failed",
+            "delegated_result": terminal,
+            "result_digest": "terminal-openclaw-effect-format-digest",
+        },
+    )
 
     assert handled["accepted"] is True
     with kb.connect() as conn:
@@ -3273,7 +4283,12 @@ def test_loop_contract_terminal_materializes_openclaw_external_effects(kanban_ho
         },
     ]
     assert [
-        (effect["platform"], effect["effect_key"], effect["state"], effect["external_id"])
+        (
+            effect["platform"],
+            effect["effect_key"],
+            effect["state"],
+            effect["external_id"],
+        )
         for effect in effects
     ] == [
         ("facebook", "group:897927458651235", "verified", "897927458651235"),
@@ -3358,7 +4373,12 @@ def test_loop_contract_terminal_accepts_canonical_group_url_effect_target(kanban
     with kb.connect() as conn:
         effects = kb.list_external_effects(conn, started["execution_task_id"])
     assert [
-        (effect["platform"], effect["effect_key"], effect["state"], effect["external_id"])
+        (
+            effect["platform"],
+            effect["effect_key"],
+            effect["state"],
+            effect["external_id"],
+        )
         for effect in effects
     ] == [("facebook", "group:897927458651235", "verified", "897927458651235")]
 
@@ -3419,11 +4439,14 @@ def test_loop_contract_terminal_downgrades_uncertain_effect_readback(kanban_home
         },
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "failed",
-        "delegated_result": terminal,
-        "result_digest": "terminal-openclaw-effect-unknown-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "failed",
+            "delegated_result": terminal,
+            "result_digest": "terminal-openclaw-effect-unknown-digest",
+        },
+    )
 
     assert handled["accepted"] is True
     with kb.connect() as conn:
@@ -3434,7 +4457,12 @@ def test_loop_contract_terminal_downgrades_uncertain_effect_readback(kanban_home
     assert ended_run is not None
     assert ended_run.metadata["external_effects"][0]["state"] == "unknown"
     assert [
-        (effect["platform"], effect["effect_key"], effect["state"], effect["external_id"])
+        (
+            effect["platform"],
+            effect["effect_key"],
+            effect["state"],
+            effect["external_id"],
+        )
         for effect in effects
     ] == [("facebook", "group:1333742673375089", "unknown", "1333742673375089")]
 
@@ -3486,11 +4514,14 @@ def test_loop_contract_terminal_rejects_openclaw_external_effect_outside_allowli
         },
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "failed",
-        "delegated_result": terminal,
-        "result_digest": "terminal-openclaw-effect-format-rejected",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "failed",
+            "delegated_result": terminal,
+            "result_digest": "terminal-openclaw-effect-format-rejected",
+        },
+    )
 
     assert handled["accepted"] is False
     with kb.connect() as conn:
@@ -3548,11 +4579,14 @@ def test_loop_contract_terminal_synthesizes_commerce_status_report(kanban_home):
         }
     }
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded",
-        "delegated_result": terminal,
-        "result_digest": "terminal-commerce-status-report-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-commerce-status-report-digest",
+        },
+    )
 
     assert handled["accepted"] is True
     with kb.connect() as conn:
@@ -3632,11 +4666,14 @@ def test_loop_contract_terminal_synthesizes_membership_status_report(kanban_home
         ],
     }
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded",
-        "delegated_result": terminal,
-        "result_digest": "terminal-membership-status-report-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-membership-status-report-digest",
+        },
+    )
 
     assert handled["accepted"] is True
     with kb.connect() as conn:
@@ -3701,7 +4738,7 @@ def test_membership_status_report_rejects_ambiguous_observations(
                     "delivery": "inline_only",
                     "body_field": "membership_action_report",
                     "subject_keys": subject_keys,
-                }
+                },
             }
         },
     )
@@ -3753,13 +4790,15 @@ def test_membership_status_report_requires_listing_and_nonpublication_audit(audi
         {
             "acceptanceEvidence": {
                 "forbiddenActionsAudit": audit,
-                "groups": [{
-                    "group_id": "1205843739455996",
-                    "live_name": "台灣全新（二手）大買賣",
-                    "membership_status": "joined",
-                    "observed_at": "2026-09-05T19:36:34+08:00",
-                    "ui_result": "Top group action changed to Joined.",
-                }],
+                "groups": [
+                    {
+                        "group_id": "1205843739455996",
+                        "live_name": "台灣全新（二手）大買賣",
+                        "membership_status": "joined",
+                        "observed_at": "2026-09-05T19:36:34+08:00",
+                        "ui_result": "Top group action changed to Joined.",
+                    }
+                ],
             }
         },
         metadata={
@@ -3771,7 +4810,7 @@ def test_membership_status_report_requires_listing_and_nonpublication_audit(audi
                     "delivery": "inline_only",
                     "body_field": "membership_action_report",
                     "subject_keys": ["1205843739455996"],
-                }
+                },
             }
         },
     )
@@ -3789,9 +4828,11 @@ def test_current_listing_binding_ignores_durable_snapshot_history():
             "forbidden": ["Do not use old listing 27909676598721497"],
         },
         "durable_evidence_snapshot": {
-            "referenced_task_evidence": [{
-                "source_listing_id": "37276725125275496",
-            }],
+            "referenced_task_evidence": [
+                {
+                    "source_listing_id": "37276725125275496",
+                }
+            ],
         },
     }
 
@@ -3839,7 +4880,7 @@ def test_multi_group_preflight_synthesizes_partial_status_report():
                     "kind": "commerce_group_status",
                     "delivery": "inline_only",
                     "subject_keys": subject_keys,
-                }
+                },
             }
         },
     )
@@ -3860,14 +4901,16 @@ def test_multi_group_preflight_rejects_out_of_range_observed_at():
                     "expected_named_destinations": 1,
                     "returned_rows": 1,
                 },
-                "rows": [{
-                    "group_id": "1205843739455996",
-                    "name": "台灣全新（二手）大買賣",
-                    "membership_state": "joined",
-                    "chooser_presence": "present_visible",
-                    "chooser_selectability": "selectable_unchecked",
-                    "evidence": "Chooser row was visible and unchecked.",
-                }],
+                "rows": [
+                    {
+                        "group_id": "1205843739455996",
+                        "name": "台灣全新（二手）大買賣",
+                        "membership_state": "joined",
+                        "chooser_presence": "present_visible",
+                        "chooser_selectability": "selectable_unchecked",
+                        "evidence": "Chooser row was visible and unchecked.",
+                    }
+                ],
             }
         },
         metadata={
@@ -3878,7 +4921,7 @@ def test_multi_group_preflight_rejects_out_of_range_observed_at():
                     "kind": "commerce_group_status",
                     "delivery": "inline_only",
                     "subject_keys": ["1205843739455996"],
-                }
+                },
             }
         },
     )
@@ -3897,14 +4940,16 @@ def test_multi_group_preflight_rejects_contradictory_coverage():
                     "returned_rows": 1,
                     "identity_gap_count": 1,
                 },
-                "rows": [{
-                    "group_id": "1205843739455996",
-                    "name": "台灣全新（二手）大買賣",
-                    "membership_state": "joined",
-                    "chooser_presence": "present_visible",
-                    "chooser_selectability": "selectable_unchecked",
-                    "evidence": "Chooser row was visible and unchecked.",
-                }],
+                "rows": [
+                    {
+                        "group_id": "1205843739455996",
+                        "name": "台灣全新（二手）大買賣",
+                        "membership_state": "joined",
+                        "chooser_presence": "present_visible",
+                        "chooser_selectability": "selectable_unchecked",
+                        "evidence": "Chooser row was visible and unchecked.",
+                    }
+                ],
             }
         },
         metadata={
@@ -3915,7 +4960,7 @@ def test_multi_group_preflight_rejects_contradictory_coverage():
                     "kind": "commerce_group_status",
                     "delivery": "inline_only",
                     "subject_keys": ["1205843739455996"],
-                }
+                },
             }
         },
     )
@@ -3935,15 +4980,17 @@ def test_correction_group_preflight_schema_is_normalized():
                     "expected_named_destinations": 1,
                     "returned_rows": 1,
                 },
-                "groups": [{
-                    "group_id": "1205843739455996",
-                    "readable_name": "台灣全新（二手）大買賣",
-                    "live_membership_state": "Joined",
-                    "chooser_presence": "present",
-                    "chooser_selectability": "selectable_unchecked",
-                    "membership_evidence": "Group page showed Joined.",
-                    "chooser_evidence": "Chooser row was visible and unchecked.",
-                }],
+                "groups": [
+                    {
+                        "group_id": "1205843739455996",
+                        "readable_name": "台灣全新（二手）大買賣",
+                        "live_membership_state": "Joined",
+                        "chooser_presence": "present",
+                        "chooser_selectability": "selectable_unchecked",
+                        "membership_evidence": "Group page showed Joined.",
+                        "chooser_evidence": "Chooser row was visible and unchecked.",
+                    }
+                ],
             }
         },
         metadata={
@@ -3955,7 +5002,7 @@ def test_correction_group_preflight_schema_is_normalized():
                     "kind": "commerce_group_status",
                     "delivery": "inline_only",
                     "subject_keys": ["1205843739455996"],
-                }
+                },
             },
         },
     )
@@ -4029,7 +5076,8 @@ def test_zero_budget_terminal_accepts_internal_image_generation_receipts(
     assert task is not None and task.status == "done"
     assert ended_run is not None
     assert ended_run.metadata["external_effects"] == []
-    assert len(ended_run.metadata["internal_tool_receipts"]) == 2
+    assert ended_run.metadata["internal_tool_receipts"] == []
+    assert len(ended_run.metadata["worker_internal_tool_claims"]) == 2
 
 
 def test_zero_budget_terminal_reclassifies_media_generation_budget_error(
@@ -4068,9 +5116,7 @@ def test_zero_budget_terminal_reclassifies_media_generation_budget_error(
         {
             "target": "media_generation_page_hero",
             "state": "verified",
-            "externalId": (
-                "media:" + _generated_media_path("ep04_page_hero.png")
-            ),
+            "externalId": ("media:" + _generated_media_path("ep04_page_hero.png")),
             "readback": {
                 "path": _generated_media_path("ep04_page_hero.png"),
                 "asset_family": "page_hero",
@@ -4079,9 +5125,7 @@ def test_zero_budget_terminal_reclassifies_media_generation_budget_error(
         {
             "target": "media_generation_audio_brief",
             "state": "verified",
-            "externalId": (
-                "media:" + _generated_media_path("ep04_audio_brief.png")
-            ),
+            "externalId": ("media:" + _generated_media_path("ep04_audio_brief.png")),
             "readback": {
                 "path": _generated_media_path("ep04_audio_brief.png"),
                 "asset_family": "audio_brief",
@@ -4089,11 +5133,14 @@ def test_zero_budget_terminal_reclassifies_media_generation_budget_error(
         },
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded",
-        "delegated_result": terminal,
-        "result_digest": "terminal-media-generation-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-media-generation-digest",
+        },
+    )
 
     assert handled["accepted"] is True
     with kb.connect() as conn:
@@ -4102,7 +5149,8 @@ def test_zero_budget_terminal_reclassifies_media_generation_budget_error(
     assert task is not None and task.status == "done"
     assert ended_run is not None
     assert ended_run.metadata["external_effects"] == []
-    assert len(ended_run.metadata["internal_tool_receipts"]) == 2
+    assert ended_run.metadata["internal_tool_receipts"] == []
+    assert len(ended_run.metadata["worker_internal_tool_claims"]) == 2
 
 
 @pytest.mark.parametrize(
@@ -4151,19 +5199,20 @@ def test_zero_budget_terminal_reclassifies_local_openclaw_image_generation(
             "target": effect_target,
             "state": "verified",
             "readback": {
-                "path": (
-                    _generated_media_path("topic4641_carters_page_hero_16x9.png")
-                ),
+                "path": (_generated_media_path("topic4641_carters_page_hero_16x9.png")),
                 "asset_family": "page_hero",
             },
         },
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded",
-        "delegated_result": terminal,
-        "result_digest": "terminal-local-openclaw-image-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-local-openclaw-image-digest",
+        },
+    )
 
     assert handled["accepted"] is True
     with kb.connect() as conn:
@@ -4172,7 +5221,8 @@ def test_zero_budget_terminal_reclassifies_local_openclaw_image_generation(
     assert task is not None and task.status == "done"
     assert ended_run is not None
     assert ended_run.metadata["external_effects"] == []
-    assert len(ended_run.metadata["internal_tool_receipts"]) == 1
+    assert ended_run.metadata["internal_tool_receipts"] == []
+    assert len(ended_run.metadata["worker_internal_tool_claims"]) == 1
 
 
 def test_zero_budget_terminal_keeps_telegram_delivery_as_external_effect(
@@ -4216,11 +5266,14 @@ def test_zero_budget_terminal_keeps_telegram_delivery_as_external_effect(
         },
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded",
-        "delegated_result": terminal,
-        "result_digest": "terminal-telegram-delivery-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-telegram-delivery-digest",
+        },
+    )
 
     assert handled["accepted"] is False
     with kb.connect() as conn:
@@ -4229,13 +5282,16 @@ def test_zero_budget_terminal_keeps_telegram_delivery_as_external_effect(
 
 
 def test_internal_image_effect_requires_verified_state():
-    assert openclaw_async_executor._is_internal_image_generation_effect({
-        "target": "openclaw.image_generate local managed media",
-        "state": "running",
-        "readback": {
-            "path": _generated_media_path("pending.png"),
-        },
-    }) is False
+    assert (
+        openclaw_async_executor._is_internal_image_generation_effect({
+            "target": "openclaw.image_generate local managed media",
+            "state": "running",
+            "readback": {
+                "path": _generated_media_path("pending.png"),
+            },
+        })
+        is False
+    )
 
 
 def test_loop_terminal_rejects_failed_acceptance_evidence(kanban_home):
@@ -4267,11 +5323,14 @@ def test_loop_terminal_rejects_failed_acceptance_evidence(kanban_home):
         {"check": "content source", "result": "failed"},
     ]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded",
-        "delegated_result": terminal,
-        "result_digest": "terminal-failed-evidence-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "terminal-failed-evidence-digest",
+        },
+    )
 
     assert handled["accepted"] is False
     with kb.connect() as conn:
@@ -4295,8 +5354,10 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home, ledger_st
         run = kb.get_run(conn, int(started["run_id"]))
         assert run is not None
     run.metadata["loop_contract"]["domain_memory"] = {
-        "schema_id": "solobizai.case.v1", "domain_key": "solobizai",
-        "entity_type": "SoloBizAiCase", "mode": "mutate",
+        "schema_id": "solobizai.case.v1",
+        "domain_key": "solobizai",
+        "entity_type": "SoloBizAiCase",
+        "mode": "mutate",
         "require_delta_on_acceptance": True,
     }
     terminal = _loop_result(
@@ -4320,13 +5381,21 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home, ledger_st
         "summary": "Blocked before any Facebook Graph POST.",
         "acceptanceEvidence": {},
         "externalEffects": [],
-        "unvalidatedWorkerResult": {"externalEffects": [{"target": {"page_url": "bad-shape"}}],
-                                    "domainMemoryDeltas": [{"op": "upsert_entity"}]},
+        "unvalidatedWorkerResult": {
+            "externalEffects": [{"target": {"page_url": "bad-shape"}}],
+            "domainMemoryDeltas": [{"op": "upsert_entity"}],
+        },
     }
     if ledger_state:
         with kb.connect() as conn:
-            kb.record_external_effect(conn, run.task_id, platform="facebook", state=ledger_state,
-                                      external_id="existing-post", expected_run_id=run.id)
+            kb.record_external_effect(
+                conn,
+                run.task_id,
+                platform="facebook",
+                state=ledger_state,
+                external_id="existing-post",
+                expected_run_id=run.id,
+            )
     observation = {
         "status": "succeeded",
         "delegated_result": terminal,
@@ -4338,7 +5407,10 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home, ledger_st
     assert handled["accepted"] is False
     assert "Domain memory:" not in handled["reason"]
     assert "Required Facebook Graph API tool is unavailable" in handled["reason"]
-    assert ("Read-only contract reported zero external effects as expected" in handled["reason"]) is (ledger_state is None)
+    assert (
+        "Read-only contract reported zero external effects as expected"
+        in handled["reason"]
+    ) is (ledger_state is None)
     assert "No external effect was verified or recorded" not in handled["reason"]
     if ledger_state:
         assert "do not repeat the external action" in handled["reason"]
@@ -4348,11 +5420,18 @@ def test_loop_terminal_preserves_specific_backend_blocker(kanban_home, ledger_st
         ended_run = kb.latest_run(conn, started["execution_task_id"])
     assert task is not None and task.status == "blocked"
     assert ended_run is not None
-    assert ended_run.metadata["unvalidated_worker_result"] == output["result"]["unvalidatedWorkerResult"]
-    assert len(ended_run.metadata["durable_external_effects"]) == (1 if ledger_state else 0)
+    assert (
+        ended_run.metadata["unvalidated_worker_result"]
+        == output["result"]["unvalidatedWorkerResult"]
+    )
+    assert len(ended_run.metadata["durable_external_effects"]) == (
+        1 if ledger_state else 0
+    )
     assert "Blocked before any Facebook Graph POST" in ended_run.summary
     assert ended_run.metadata["loop_contract_blocked_result"]["status"] == "blocked"
-    assert ended_run.metadata["read_only_zero_external_effects"] is (ledger_state is None)
+    assert ended_run.metadata["read_only_zero_external_effects"] is (
+        ledger_state is None
+    )
 
 
 def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_home):
@@ -4384,7 +5463,9 @@ def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_hom
     output.pop("result")
     output["resultText"] = ""
     output["evidence"]["resultContractValid"] = False
-    output["evidence"]["resultContractError"] = "Loop Contract result is not valid JSON."
+    output["evidence"]["resultContractError"] = (
+        "Loop Contract result is not valid JSON."
+    )
     terminal["status"] = "failed"
     terminal["errors"] = ["openclaw_bridge_failed"]
     observation = {
@@ -4398,7 +5479,10 @@ def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_hom
     assert handled["accepted"] is False
     assert "Loop Contract result is not valid JSON" in handled["reason"]
     assert "OpenClaw returned no structured result JSON" in handled["reason"]
-    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert (
+        "Read-only contract reported zero external effects as expected"
+        in handled["reason"]
+    )
     assert "No external effect was verified or recorded" not in handled["reason"]
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
@@ -4406,9 +5490,7 @@ def test_loop_terminal_synthesizes_readonly_empty_result_json_blocker(kanban_hom
     assert task is not None and task.status == "blocked"
     assert ended_run is not None
     assert ended_run.metadata["loop_contract_blocked_result"]["status"] == "blocked"
-    assert (
-        ended_run.metadata["required_evidence"]["structuredResultJson"] is None
-    )
+    assert ended_run.metadata["required_evidence"]["structuredResultJson"] is None
     assert ended_run.metadata["external_effects"] == []
     assert ended_run.metadata["read_only_zero_external_effects"] is True
 
@@ -4431,25 +5513,37 @@ def test_transient_retry_plan_requires_explicit_integer_zero_budget():
         },
     }
 
-    assert openclaw_async_executor._transient_backend_retry_plan(
-        evidence, metadata=metadata
-    ) is not None
+    assert (
+        openclaw_async_executor._transient_backend_retry_plan(
+            evidence, metadata=metadata
+        )
+        is not None
+    )
     exhausted = dict(metadata)
     exhausted["transient_backend_attempt"] = 2
-    assert openclaw_async_executor._transient_backend_retry_plan(
-        evidence, metadata=exhausted
-    ) is None
+    assert (
+        openclaw_async_executor._transient_backend_retry_plan(
+            evidence, metadata=exhausted
+        )
+        is None
+    )
     for invalid_budget in (None, False, "0", 0.0):
         invalid = dict(metadata)
         invalid["external_effect_budget"] = invalid_budget
-        assert openclaw_async_executor._transient_backend_retry_plan(
-            evidence, metadata=invalid
-        ) is None
+        assert (
+            openclaw_async_executor._transient_backend_retry_plan(
+                evidence, metadata=invalid
+            )
+            is None
+        )
     missing = dict(metadata)
     missing.pop("external_effect_budget")
-    assert openclaw_async_executor._transient_backend_retry_plan(
-        evidence, metadata=missing
-    ) is None
+    assert (
+        openclaw_async_executor._transient_backend_retry_plan(
+            evidence, metadata=missing
+        )
+        is None
+    )
 
 
 def test_loop_terminal_retries_transient_overload_on_same_card_until_loop_breaker(
@@ -4490,17 +5584,15 @@ def test_loop_terminal_retries_transient_overload_on_same_card_until_loop_breake
         "succeeded",
     )
     output = terminal["artifacts"][0]["value"]
-    output["evidence"].update(
-        {
-            "backendError": (
-                "FailoverError: The AI service is temporarily overloaded. "
-                "Please try again in a moment."
-            ),
-                "backendRunStatus": "error",
-                "resultContractError": "Loop Contract result is empty or missing.",
-                "sideEffectsPerformed": False,
-            }
-    )
+    output["evidence"].update({
+        "backendError": (
+            "FailoverError: The AI service is temporarily overloaded. "
+            "Please try again in a moment."
+        ),
+        "backendRunStatus": "error",
+        "resultContractError": "Loop Contract result is empty or missing.",
+        "sideEffectsPerformed": False,
+    })
     output["result"] = {
         "status": "blocked",
         "summary": "Loop Contract result is empty or missing.",
@@ -4514,11 +5606,14 @@ def test_loop_terminal_retries_transient_overload_on_same_card_until_loop_breake
     terminal["status"] = "failed"
     terminal["errors"] = ["openclaw_bridge_failed"]
 
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "failed",
-        "delegated_result": terminal,
-        "result_digest": "transient-overload-digest",
-    })
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "failed",
+            "delegated_result": terminal,
+            "result_digest": "transient-overload-digest",
+        },
+    )
 
     assert handled["retry_scheduled"] is True
     with kb.connect() as conn:
@@ -4600,18 +5695,26 @@ def test_loop_terminal_retries_transient_overload_on_same_card_until_loop_breake
         "succeeded",
     )
     second_output = second_terminal["artifacts"][0]["value"]
-    second_output["evidence"].update(output["evidence"])
+    # Carry the same backend fault while retaining this attempt's fresh
+    # Protocol v2 identity and receipt fields.
+    second_output["evidence"].update({key: output["evidence"][key] for key in (
+        "backendError", "backendRunStatus", "resultContractError", "sideEffectsPerformed",
+    )})
     second_output["result"] = dict(output["result"])
     second_terminal["status"] = "failed"
     second_terminal["errors"] = ["openclaw_bridge_failed"]
 
-    exhausted = make_loop_contract_terminal_handler()(latest, {
-        "status": "failed",
-        "delegated_result": second_terminal,
-        "result_digest": "transient-overload-exhausted-digest",
-    })
+    exhausted = make_loop_contract_terminal_handler()(
+        latest,
+        {
+            "status": "failed",
+            "delegated_result": second_terminal,
+            "result_digest": "transient-overload-exhausted-digest",
+        },
+    )
 
     assert exhausted["retry_scheduled"] is False
+    assert "task block-loop limit" in exhausted["reason"]
     with kb.connect() as conn:
         task = kb.get_task(conn, run.task_id)
         ended = kb.latest_run(conn, run.task_id)
@@ -4634,14 +5737,18 @@ def test_loop_terminal_retries_transient_overload_on_same_card_until_loop_breake
 
 
 @pytest.mark.parametrize("effect_budget", [0, 1])
-def test_loop_terminal_synthesizes_readonly_timeout_cleanup_blocker(kanban_home, effect_budget):
+def test_loop_terminal_synthesizes_readonly_timeout_cleanup_blocker(
+    kanban_home, effect_budget
+):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-timeout-cleanup-blocker-1"
     if effect_budget:
         contract["external_targets"] = ["Facebook group: 1333742673375089"]
     started = start_loop_contract_execution(
         contract=contract,
-        task_type="facebook_group_relist" if effect_budget else "secondhand_commerce_group_status",
+        task_type="facebook_group_relist"
+        if effect_budget
+        else "secondhand_commerce_group_status",
         risk_level="low",
         approved=bool(effect_budget),
         delegation_id="delegation-loop-timeout-cleanup-blocker-1",
@@ -4698,10 +5805,15 @@ def test_loop_terminal_synthesizes_readonly_timeout_cleanup_blocker(kanban_home,
             assert ended_run.metadata["read_only_zero_external_effects"] is False
             assert kb.unblock_task(conn, started["execution_task_id"])
         with pytest.raises(ValueError, match="require reconciliation"):
-            retry_ready_approved_loop_contract_after_capability_repair(started["execution_task_id"])
+            retry_ready_approved_loop_contract_after_capability_repair(
+                started["execution_task_id"]
+            )
         return
     assert "OpenClaw reached its runtime limit" in handled["reason"]
-    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert (
+        "Read-only contract reported zero external effects as expected"
+        in handled["reason"]
+    )
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
         ended_run = kb.latest_run(conn, started["execution_task_id"])
@@ -4776,8 +5888,14 @@ def test_loop_terminal_preserves_readonly_share_link_blocker_details(kanban_home
 
     assert handled["accepted"] is False
     assert "redirect inspection: blocked" in handled["reason"]
-    assert "Missing required evidence: resolvedUrl, canonicalUrl, groupId" in handled["reason"]
-    assert "Read-only contract reported zero external effects as expected" in handled["reason"]
+    assert (
+        "Missing required evidence: resolvedUrl, canonicalUrl, groupId"
+        in handled["reason"]
+    )
+    assert (
+        "Read-only contract reported zero external effects as expected"
+        in handled["reason"]
+    )
     assert "No external effect was verified or recorded" not in handled["reason"]
     with kb.connect() as conn:
         task = kb.get_task(conn, started["execution_task_id"])
@@ -4792,7 +5910,9 @@ def test_loop_terminal_preserves_readonly_share_link_blocker_details(kanban_home
     assert ended_run.metadata["read_only_zero_external_effects"] is True
 
 
-def test_loop_terminal_rejects_succeeded_payload_with_not_verified_evidence(kanban_home):
+def test_loop_terminal_rejects_succeeded_payload_with_not_verified_evidence(
+    kanban_home,
+):
     contract = _contract()
     contract["identity"]["request_instance_id"] = "loop-not-verified-evidence-1"
     started = start_loop_contract_execution(
@@ -4918,9 +6038,12 @@ def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):
         assert review is not None and review.status == "ready"
         assert run is not None and run.backend_status == "succeeded"
         assert run.outcome == "completed"
-        assert run.metadata["backend_terminal_observation"][
-            "delegated_result"
-        ]["backend_run_id"] == "openclaw-real-async-1"
+        assert (
+            run.metadata["backend_terminal_observation"]["delegated_result"][
+                "backend_run_id"
+            ]
+            == "openclaw-real-async-1"
+        )
         assert run.metadata["side_effects_performed"] is False
 
 
@@ -4941,9 +6064,7 @@ def test_async_start_accepts_immediate_terminal_success(kanban_home):
 def test_async_replay_finalizes_persisted_immediate_terminal_observation(
     kanban_home, monkeypatch
 ):
-    original_factory = (
-        openclaw_async_executor.make_zero_effect_async_terminal_handler
-    )
+    original_factory = openclaw_async_executor.make_zero_effect_async_terminal_handler
 
     def crash_before_terminal_review(*, board=None):
         def crash(_run, _observation):
@@ -4992,9 +6113,7 @@ def test_async_replay_finalizes_persisted_immediate_terminal_observation(
 def test_async_start_replays_ambiguous_timeout_with_same_key(kanban_home):
     first = start_zero_effect_async_acceptance(
         contract=_contract(),
-        transport=lambda _task: (_ for _ in ()).throw(
-            TimeoutError("response lost")
-        ),
+        transport=lambda _task: (_ for _ in ()).throw(TimeoutError("response lost")),
     )
 
     assert first["status"] == "retrying"
@@ -5011,14 +6130,8 @@ def test_async_start_replays_ambiguous_timeout_with_same_key(kanban_home):
         return _result(task, "queued")
 
     second = poll_due_backend_runs(
-        adapters={
-            "openclaw": make_zero_effect_async_poll_adapter(
-                transport=replay
-            )
-        },
-        terminal_handlers={
-            "openclaw": make_zero_effect_async_terminal_handler()
-        },
+        adapters={"openclaw": make_zero_effect_async_poll_adapter(transport=replay)},
+        terminal_handlers={"openclaw": make_zero_effect_async_terminal_handler()},
         owner="ambiguous-admission-poller",
         now=retry_due,
     )
@@ -5066,21 +6179,13 @@ def test_async_start_reconciles_pending_admission_without_duplicate_run(
     )
 
     def reconcile(task):
-        assert task["openclaw_task_id"] == (
-            "openclaw.agent.zero_effect_async_start"
-        )
+        assert task["openclaw_task_id"] == ("openclaw.agent.zero_effect_async_start")
         assert task["idempotency_key"] == start_key
         return _result(task, "queued")
 
     observed = poll_due_backend_runs(
-        adapters={
-            "openclaw": make_zero_effect_async_poll_adapter(
-                transport=reconcile
-            )
-        },
-        terminal_handlers={
-            "openclaw": make_zero_effect_async_terminal_handler()
-        },
+        adapters={"openclaw": make_zero_effect_async_poll_adapter(transport=reconcile)},
+        terminal_handlers={"openclaw": make_zero_effect_async_terminal_handler()},
         owner="pending-admission-poller",
         now=retry_due,
     )
@@ -5117,14 +6222,8 @@ def test_async_pending_admission_accepts_terminal_rejection_without_run_id(
         return result
 
     observed = poll_due_backend_runs(
-        adapters={
-            "openclaw": make_zero_effect_async_poll_adapter(
-                transport=reject
-            )
-        },
-        terminal_handlers={
-            "openclaw": make_zero_effect_async_terminal_handler()
-        },
+        adapters={"openclaw": make_zero_effect_async_poll_adapter(transport=reject)},
+        terminal_handlers={"openclaw": make_zero_effect_async_terminal_handler()},
         owner="rejected-admission-poller",
         now=due_at,
     )
@@ -5161,10 +6260,7 @@ def test_async_stop_rule_uses_cancel_and_closes_only_after_cleanup_evidence(
         due_at = int(run.backend_next_poll_at)
 
     def cancel(task):
-        assert (
-            task["openclaw_task_id"]
-            == "openclaw.agent.zero_effect_async_cancel"
-        )
+        assert task["openclaw_task_id"] == "openclaw.agent.zero_effect_async_cancel"
         result = _result(task, "blocked")
         result["artifacts"] = [
             {
@@ -5185,14 +6281,8 @@ def test_async_stop_rule_uses_cancel_and_closes_only_after_cleanup_evidence(
         return result
 
     polled = poll_due_backend_runs(
-        adapters={
-            "openclaw": make_zero_effect_async_poll_adapter(
-                transport=cancel
-            )
-        },
-        terminal_handlers={
-            "openclaw": make_zero_effect_async_terminal_handler()
-        },
+        adapters={"openclaw": make_zero_effect_async_poll_adapter(transport=cancel)},
+        terminal_handlers={"openclaw": make_zero_effect_async_terminal_handler()},
         owner="stop-rule-cancel-poller",
         now=due_at,
     )
@@ -5203,16 +6293,14 @@ def test_async_stop_rule_uses_cancel_and_closes_only_after_cleanup_evidence(
         run = kb.get_run(conn, started["run_id"])
         assert task is not None and task.status == "blocked"
         assert run is not None and run.backend_status == "blocked"
-        evidence = run.metadata["backend_terminal_observation"][
-            "delegated_result"
-        ]["artifacts"][0]["value"]["evidence"]
+        evidence = run.metadata["backend_terminal_observation"]["delegated_result"][
+            "artifacts"
+        ][0]["value"]["evidence"]
         assert evidence["terminationProven"] is True
         assert evidence["sessionCleaned"] is True
 
 
-def test_async_half_open_probe_covers_contract_runtime(
-    kanban_home, monkeypatch
-):
+def test_async_half_open_probe_covers_contract_runtime(kanban_home, monkeypatch):
     observed = {}
     monkeypatch.setattr(
         kb,
@@ -5310,10 +6398,13 @@ def test_async_admission_replays_after_process_exit_before_backend_state(
     assert resumed["run_id"] == interrupted_run_id
     assert resumed["backend_run_id"] == "openclaw-real-async-1"
     with kb.connect() as conn:
-        assert kb.backend_circuit_states(
-            conn,
-            now=now + 2,
-        )["openclaw"] == "open"
+        assert (
+            kb.backend_circuit_states(
+                conn,
+                now=now + 2,
+            )["openclaw"]
+            == "open"
+        )
 
 
 def test_async_admission_failure_is_counted_by_circuit_breaker(kanban_home):
@@ -5387,9 +6478,7 @@ def test_async_terminal_review_rejects_unproven_zero_tool_or_cleanup_evidence(
         due_at = int(run.backend_next_poll_at)
 
     result = poll_due_backend_runs(
-        adapters={
-            "openclaw": make_zero_effect_async_poll_adapter(transport=transport)
-        },
+        adapters={"openclaw": make_zero_effect_async_poll_adapter(transport=transport)},
         terminal_handlers={"openclaw": make_zero_effect_async_terminal_handler()},
         owner="invalid-evidence-poller",
         now=due_at,
@@ -5476,22 +6565,50 @@ def test_terminal_digest_ignores_non_evidence_wrapper_drift(kanban_home):
 
 
 def test_incomplete_inline_report_is_materialized_without_claiming_success(kanban_home):
-    delivery = {"required": True, "kind": "content_package", "delivery": "inline_only", "body_field": "inventory"}
-    report = {"kind": "content_package", "delivery": "inline_only", "complete": False,
-              "title": "Inventory", "body_field": "inventory", "body": "0 published; 20 remain",
-              "observed_at": int(openclaw_async_executor.time.time()), "assets": []}
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "body_field": "inventory",
+    }
+    report = {
+        "kind": "content_package",
+        "delivery": "inline_only",
+        "complete": False,
+        "title": "Inventory",
+        "body_field": "inventory",
+        "body": "0 published; 20 remain",
+        "observed_at": int(openclaw_async_executor.time.time()),
+        "assets": [],
+    }
     result = openclaw_async_executor._content_package_completion_metadata(
-        {"acceptanceEvidence": {"inventory": report["body"]}, "metadata": {"user_facing_report": report}},
-        metadata={"loop_contract": {"user_facing_delivery": delivery}}, task_id="t_inventory", board=None)
+        {
+            "acceptanceEvidence": {"inventory": report["body"]},
+            "metadata": {"user_facing_report": report},
+        },
+        metadata={"loop_contract": {"user_facing_delivery": delivery}},
+        task_id="t_inventory",
+        board=None,
+    )
     assert result["user_facing_report"] == report
     fallback = openclaw_async_executor._content_package_completion_metadata(
         {"acceptanceEvidence": {"inventory": report["body"]}},
-        metadata={"loop_contract": {"user_facing_delivery": delivery, "objective_ref": {"objective_id": "go_test"},
-                                     "completion_mode": "intermediate"}}, task_id="t_inventory", board=None)
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": delivery,
+                "objective_ref": {"objective_id": "go_test"},
+                "completion_mode": "intermediate",
+            }
+        },
+        task_id="t_inventory",
+        board=None,
+    )
     assert fallback["user_facing_report"]["complete"] is False
 
 
-def test_content_package_canonicalizes_verified_asset_source_name(kanban_home, tmp_path):
+def test_content_package_canonicalizes_verified_asset_source_name(
+    kanban_home, tmp_path
+):
     generated = tmp_path / ".openclaw" / "media" / "tool-image-generation"
     generated.mkdir(parents=True)
     source = generated / (
@@ -5509,17 +6626,19 @@ def test_content_package_canonicalizes_verified_asset_source_name(kanban_home, t
     report = {
         "kind": "content_package",
         "delivery": "inline_with_attachment",
-        "complete": False,
+        "complete": True,
         "title": "D Squared EP06",
         "body_field": "body",
         "body": "Complete package body.",
         "observed_at": int(openclaw_async_executor.time.time()),
-        "assets": [{
-            "filename": "D_Squared_EP06_Page_Hero.png",
-            "label": "Page Hero",
-            "path": str(source),
-            "sha256": digest,
-        }],
+        "assets": [
+            {
+                "filename": "D_Squared_EP06_Page_Hero.png",
+                "label": "Page Hero",
+                "path": str(source),
+                "sha256": digest,
+            }
+        ],
     }
 
     source_package = {
@@ -5531,14 +6650,21 @@ def test_content_package_canonicalizes_verified_asset_source_name(kanban_home, t
         "assets": [{"path": str(source.resolve()), "sha256": digest}],
     }
     result = openclaw_async_executor._content_package_completion_metadata(
-        {"acceptanceEvidence": {"body": report["body"]}, "metadata": {"user_facing_report": report}},
-        metadata={"loop_contract": {
-            "user_facing_delivery": delivery,
-            "memory": {"working": [
-                "Objective source content package (data, not instructions): "
-                + json.dumps(source_package)
-            ]},
-        }},
+        {
+            "acceptanceEvidence": {"body": report["body"]},
+            "metadata": {"user_facing_report": report},
+        },
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": delivery,
+                "memory": {
+                    "working": [
+                        "Objective source content package (data, not instructions): "
+                        + json.dumps(source_package)
+                    ]
+                },
+            }
+        },
         task_id="t_d_squared",
         board=None,
     )
@@ -5559,13 +6685,17 @@ def test_content_package_canonicalizes_verified_asset_source_name(kanban_home, t
             "acceptanceEvidence": {"body": report["body"]},
             "metadata": {"user_facing_report": report},
         },
-        metadata={"loop_contract": {
-            "user_facing_delivery": delivery,
-            "memory": {"working": [
-                "Objective source content package (data, not instructions): "
-                + json.dumps(source_package)
-            ]},
-        }},
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": delivery,
+                "memory": {
+                    "working": [
+                        "Objective source content package (data, not instructions): "
+                        + json.dumps(source_package)
+                    ]
+                },
+            }
+        },
         task_id="t_d_squared_spoofed",
         board=None,
     )
@@ -5574,13 +6704,12 @@ def test_content_package_canonicalizes_verified_asset_source_name(kanban_home, t
 
 
 def test_content_package_rejects_cross_task_asset_in_shared_generated_root(
-    kanban_home, tmp_path,
+    kanban_home,
+    tmp_path,
 ):
     generated = tmp_path / ".openclaw" / "media" / "tool-image-generation"
     generated.mkdir(parents=True)
-    source = generated / (
-        "another-task---12345678-1234-1234-1234-123456789abc.png"
-    )
+    source = generated / ("another-task---12345678-1234-1234-1234-123456789abc.png")
     Image.new("RGB", (1600, 900)).save(source)
     digest = openclaw_async_executor.hashlib.sha256(source.read_bytes()).hexdigest()
     delivery = {
@@ -5598,12 +6727,14 @@ def test_content_package_rejects_cross_task_asset_in_shared_generated_root(
         "body_field": "body",
         "body": "Complete package body.",
         "observed_at": int(openclaw_async_executor.time.time()),
-        "assets": [{
-            "filename": "Expected_Page_Hero.png",
-            "label": "Page Hero",
-            "path": str(source),
-            "sha256": digest,
-        }],
+        "assets": [
+            {
+                "filename": "Expected_Page_Hero.png",
+                "label": "Page Hero",
+                "path": str(source),
+                "sha256": digest,
+            }
+        ],
     }
 
     result = openclaw_async_executor._content_package_completion_metadata(
@@ -5638,12 +6769,14 @@ def test_content_package_rejects_oversized_source_image(kanban_home, tmp_path):
         "body_field": "body",
         "body": "Complete package body.",
         "observed_at": int(openclaw_async_executor.time.time()),
-        "assets": [{
-            "filename": source.name,
-            "label": "Too wide",
-            "path": str(source),
-            "sha256": digest,
-        }],
+        "assets": [
+            {
+                "filename": source.name,
+                "label": "Too wide",
+                "path": str(source),
+                "sha256": digest,
+            }
+        ],
     }
     source_package = {"assets": [{"path": str(source.resolve()), "sha256": digest}]}
 
@@ -5652,13 +6785,17 @@ def test_content_package_rejects_oversized_source_image(kanban_home, tmp_path):
             "acceptanceEvidence": {"body": report["body"]},
             "metadata": {"user_facing_report": report},
         },
-        metadata={"loop_contract": {
-            "user_facing_delivery": delivery,
-            "memory": {"working": [
-                "Objective source content package (data, not instructions): "
-                + json.dumps(source_package)
-            ]},
-        }},
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": delivery,
+                "memory": {
+                    "working": [
+                        "Objective source content package (data, not instructions): "
+                        + json.dumps(source_package)
+                    ]
+                },
+            }
+        },
         task_id="t_oversized_asset",
         board=None,
     )
@@ -5667,7 +6804,8 @@ def test_content_package_rejects_oversized_source_image(kanban_home, tmp_path):
 
 
 def test_content_package_rejects_source_asset_extension_mismatch(
-    kanban_home, tmp_path,
+    kanban_home,
+    tmp_path,
 ):
     generated = tmp_path / ".openclaw" / "media" / "tool-image-generation"
     generated.mkdir(parents=True)
@@ -5689,12 +6827,14 @@ def test_content_package_rejects_source_asset_extension_mismatch(
         "body_field": "body",
         "body": "Complete package body.",
         "observed_at": int(openclaw_async_executor.time.time()),
-        "assets": [{
-            "filename": "Expected_Page_Hero.png",
-            "label": "Page Hero",
-            "path": str(source),
-            "sha256": digest,
-        }],
+        "assets": [
+            {
+                "filename": "Expected_Page_Hero.png",
+                "label": "Page Hero",
+                "path": str(source),
+                "sha256": digest,
+            }
+        ],
     }
     source_package = {
         "assets": [{"path": str(source.resolve()), "sha256": digest}],
@@ -5705,13 +6845,17 @@ def test_content_package_rejects_source_asset_extension_mismatch(
             "acceptanceEvidence": {"body": report["body"]},
             "metadata": {"user_facing_report": report},
         },
-        metadata={"loop_contract": {
-            "user_facing_delivery": delivery,
-            "memory": {"working": [
-                "Objective source content package (data, not instructions): "
-                + json.dumps(source_package)
-            ]},
-        }},
+        metadata={
+            "loop_contract": {
+                "user_facing_delivery": delivery,
+                "memory": {
+                    "working": [
+                        "Objective source content package (data, not instructions): "
+                        + json.dumps(source_package)
+                    ]
+                },
+            }
+        },
         task_id="t_format_mismatch",
         board=None,
     )
@@ -5720,78 +6864,166 @@ def test_content_package_rejects_source_asset_extension_mismatch(
 
 
 def test_worker_inline_report_contract_requires_the_pinned_readback_body():
-    contract = {"user_facing_delivery": {"required": True, "kind": "content_package",
-                "delivery": "inline_only", "body_field": "domain_inventory_report"}}
-    safe = openclaw_async_executor._worker_safe_loop_contract(contract, external_effect_budget=0)
+    contract = {
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "domain_inventory_report",
+        }
+    }
+    safe = openclaw_async_executor._worker_safe_loop_contract(
+        contract, external_effect_budget=0
+    )
     binding = safe["terminal_result_contract"]["inline_body_binding"]
     assert binding["acceptance_evidence_field"] == "domain_inventory_report"
     assert binding["required"] is True
     assert "metadata.user_facing_report.body" in binding["rule"]
     assert "terminal_result_contract" not in contract
-    contract.update(routing={"task_type": "facebook_marketplace_readonly"},
-                    goal={"deliverables": ["sourceListing and coverageReconciliation evidence"]})
-    preflight = openclaw_async_executor._worker_safe_loop_contract(contract, external_effect_budget=0)
-    assert "observed_at" in preflight["terminal_result_contract"]["preflight_evidence_binding"]["sourceListing_required"]
+    contract.update(
+        routing={"task_type": "facebook_marketplace_readonly"},
+        goal={"deliverables": ["sourceListing and coverageReconciliation evidence"]},
+    )
+    preflight = openclaw_async_executor._worker_safe_loop_contract(
+        contract, external_effect_budget=0
+    )
+    assert (
+        "observed_at"
+        in preflight["terminal_result_contract"]["preflight_evidence_binding"][
+            "sourceListing_required"
+        ]
+    )
     contract["routing"]["task_type"] = "research"
-    assert "preflight_evidence_binding" not in openclaw_async_executor._worker_safe_loop_contract(
-        contract, external_effect_budget=0)["terminal_result_contract"]
+    assert (
+        "preflight_evidence_binding"
+        not in openclaw_async_executor._worker_safe_loop_contract(
+            contract, external_effect_budget=0
+        )["terminal_result_contract"]
+    )
 
 
 def test_canonical_commerce_report_is_promoted_and_nested_preview_is_not():
-    report = {"kind": "commerce_group_status", "delivery": "inline_only", "complete": False,
-              "as_of": "2026-09-06", "observed_at": 1788656500, "rows": [], "coverage": [{
-                  "subject_key": "12345", "subject_label": "Telescope", "complete": False,
-                  "named_count": 0, "gap_count": 20, "expected_total": 20, "note": "0 published; 20 remain"}]}
-    metadata = {"loop_contract": {"user_facing_delivery": {"required": True, "kind": "commerce_group_status",
-                                                          "delivery": "inline_only", "subject_keys": ["12345"]}}}
+    report = {
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-09-06",
+        "observed_at": 1788656500,
+        "rows": [],
+        "coverage": [
+            {
+                "subject_key": "12345",
+                "subject_label": "Telescope",
+                "complete": False,
+                "named_count": 0,
+                "gap_count": 20,
+                "expected_total": 20,
+                "note": "0 published; 20 remain",
+            }
+        ],
+    }
+    metadata = {
+        "loop_contract": {
+            "user_facing_delivery": {
+                "required": True,
+                "kind": "commerce_group_status",
+                "delivery": "inline_only",
+                "subject_keys": ["12345"],
+            }
+        }
+    }
     result = openclaw_async_executor._commerce_status_report_metadata(
-        {"metadata": {"user_facing_report": report}}, metadata=metadata)
+        {"metadata": {"user_facing_report": report}}, metadata=metadata
+    )
     assert result["user_facing_report"]["complete"] is False
     nested = openclaw_async_executor._commerce_status_report_metadata(
-        {"acceptanceEvidence": {"user_facing_report": report}}, metadata=metadata)
+        {"acceptanceEvidence": {"user_facing_report": report}}, metadata=metadata
+    )
     assert nested == result
-    assert openclaw_async_executor._commerce_status_report_metadata(
-        {"acceptanceEvidence": {"metadata": {"user_facing_report": report}}}, metadata=metadata) == {}
+    assert (
+        openclaw_async_executor._commerce_status_report_metadata(
+            {"acceptanceEvidence": {"metadata": {"user_facing_report": report}}},
+            metadata=metadata,
+        )
+        == {}
+    )
     invalid = openclaw_async_executor._commerce_status_report_metadata(
-        {"metadata": {"user_facing_report": {**report, "complete": True}}}, metadata=metadata)
+        {"metadata": {"user_facing_report": {**report, "complete": True}}},
+        metadata=metadata,
+    )
     assert "user_facing_report" not in invalid
-    assert "complete must match coverage" in invalid["user_facing_report_validation_error"]
+    assert (
+        "complete must match coverage" in invalid["user_facing_report_validation_error"]
+    )
 
 
 def test_commerce_report_missing_title_reaches_terminal_block_reason(kanban_home):
     contract = _contract()
     contract["user_facing_delivery"] = {
-        "required": True, "kind": "commerce_group_status", "delivery": "inline_only",
-        "subject_keys": ["celestron-130eq"], "body_field": "commerce_group_status_report",
+        "required": True,
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "subject_keys": ["celestron-130eq"],
+        "body_field": "commerce_group_status_report",
     }
     started = start_loop_contract_execution(
-        contract=contract, task_type="research", risk_level="low", approved=False,
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
         delegation_id="commerce-report-missing-title",
         transport=lambda task: _loop_result(task, "queued"),
     )
     with kb.connect() as conn:
         run = kb.get_run(conn, int(started["run_id"]))
-    terminal = _loop_result({
-        "task_id": run.task_id,
-        **{key: run.metadata[key] for key in (
-            "delegation_id", "attempt_id", "contract_fingerprint", "backend_agent_id",
-            "backend_session_key",
-        )},
-    }, "succeeded")
+    terminal = _loop_result(
+        {
+            "task_id": run.task_id,
+            **{
+                key: run.metadata[key]
+                for key in (
+                    "delegation_id",
+                    "attempt_id",
+                    "contract_fingerprint",
+                    "backend_agent_id",
+                    "backend_session_key",
+                )
+            },
+        },
+        "succeeded",
+    )
     report = {
-        "kind": "commerce_group_status", "delivery": "inline_only", "complete": False,
-        "as_of": "2026-09-06", "observed_at": 1788656500, "rows": [],
-        "body_field": "commerce_group_status_report", "body": "No verified publication yet.",
-        "coverage": [{
-            "subject_key": "celestron-130eq", "subject_label": "Celestron 130EQ",
-            "complete": False, "named_count": 0, "gap_count": 20, "expected_total": 20,
-            "note": "20 verified publications remain.",
-        }],
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "complete": False,
+        "as_of": "2026-09-06",
+        "observed_at": 1788656500,
+        "rows": [],
+        "body_field": "commerce_group_status_report",
+        "body": "No verified publication yet.",
+        "coverage": [
+            {
+                "subject_key": "celestron-130eq",
+                "subject_label": "Celestron 130EQ",
+                "complete": False,
+                "named_count": 0,
+                "gap_count": 20,
+                "expected_total": 20,
+                "note": "20 verified publications remain.",
+            }
+        ],
     }
-    terminal["artifacts"][0]["value"]["result"]["metadata"] = {"user_facing_report": report}
-    handled = make_loop_contract_terminal_handler()(run, {
-        "status": "succeeded", "delegated_result": terminal, "result_digest": "missing-title",
-    })
+    terminal["artifacts"][0]["value"]["result"]["metadata"] = {
+        "user_facing_report": report
+    }
+    handled = make_loop_contract_terminal_handler()(
+        run,
+        {
+            "status": "succeeded",
+            "delegated_result": terminal,
+            "result_digest": "missing-title",
+        },
+    )
     assert handled["accepted"] is False
     assert "requires title with an inline body" in handled["reason"]
     with kb.connect() as conn:
@@ -5803,11 +7035,16 @@ def test_commerce_report_missing_title_reaches_terminal_block_reason(kanban_home
     assert "title" not in report
     repaired = {**report, "title": "Celestron 130EQ status"}
     promoted = openclaw_async_executor._commerce_status_report_metadata(
-        {"metadata": {"user_facing_report": repaired}}, metadata=run.metadata,
+        {"metadata": {"user_facing_report": repaired}},
+        metadata=run.metadata,
     )
     assert promoted["user_facing_report"]["complete"] is False
     mismatched = openclaw_async_executor._commerce_status_report_metadata(
-        {"metadata": {"user_facing_report": {**repaired, "body_field": "wrong_report"}}},
+        {
+            "metadata": {
+                "user_facing_report": {**repaired, "body_field": "wrong_report"}
+            }
+        },
         metadata=run.metadata,
     )
     assert "user_facing_report" not in mismatched
@@ -5816,37 +7053,537 @@ def test_commerce_report_missing_title_reaches_terminal_block_reason(kanban_home
 
 def test_worker_receives_canonical_report_fields_without_changing_admission():
     contract = _contract()
-    contract["user_facing_delivery"] = {"required": True, "kind": "commerce_group_status", "delivery": "inline_only", "subject_keys": ["12345"]}
+    contract["user_facing_delivery"] = {
+        "required": True,
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "subject_keys": ["12345"],
+    }
     original = json.dumps(contract, sort_keys=True)
-    safe = openclaw_async_executor._worker_safe_loop_contract(contract, external_effect_budget=0)
+    safe = openclaw_async_executor._worker_safe_loop_contract(
+        contract, external_effect_budget=0
+    )
     guidance = " ".join(safe["memory"]["working"])
     assert "result.metadata.user_facing_report" in guidance
     assert "destination_id" in guidance and "observed_task_status" in guidance
     assert "Never relabel an actual failed acceptance check" in guidance
     schema = safe["terminal_result_contract"]["metadata"]["user_facing_report"]
-    assert schema["when_body_present"]["required_fields"] == ["title", "body_field", "body"]
+    assert schema["when_body_present"]["required_fields"] == [
+        "title",
+        "body_field",
+        "body",
+    ]
     assert "If body is present, title, body_field and body are all REQUIRED" in guidance
-    assert {"as_of", "observed_at", "rows", "coverage", "complete"} <= set(schema["required_fields"])
+    assert {"as_of", "observed_at", "rows", "coverage", "complete"} <= set(
+        schema["required_fields"]
+    )
     assert {"destination_id", "evidence"} <= set(schema["row_required_fields"])
-    assert {"named_count", "gap_count", "expected_total"} <= set(schema["coverage_required_fields"])
+    assert {"named_count", "gap_count", "expected_total"} <= set(
+        schema["coverage_required_fields"]
+    )
     assert json.dumps(contract, sort_keys=True) == original
 
-    projected_again = openclaw_async_executor._worker_safe_loop_contract(safe, external_effect_budget=0)
+    projected_again = openclaw_async_executor._worker_safe_loop_contract(
+        safe, external_effect_budget=0
+    )
     assert projected_again["memory"]["working"] == safe["memory"]["working"]
     assert "status (public, pending_approval" in guidance
 
 
 def test_readonly_objective_state_is_observation_not_acceptance_failure():
-    evidence = {"objective": {"objective_id": "go_test", "status": "blocked", "complete": False}}
-    metadata = {"external_effect_budget": 0, "loop_contract": {"completion_mode": "intermediate", "objective_ref": {"objective_id": "go_test"}}}
+    evidence = {
+        "objective": {"objective_id": "go_test", "status": "blocked", "complete": False}
+    }
+    metadata = {
+        "external_effect_budget": 0,
+        "loop_contract": {
+            "completion_mode": "intermediate",
+            "objective_ref": {
+                "objective_id": "go_test",
+                "stage_key": "repair_asset_r3",
+            },
+            "durable_evidence_snapshot": {
+                "stages": [
+                    {
+                        "stage_key": "repair_asset_r2",
+                        "position": 1,
+                        "status": "done",
+                        "execution_task_id": "t_old",
+                    },
+                    {
+                        "stage_key": "repair_asset_r3",
+                        "position": 2,
+                        "status": "queued",
+                        "execution_task_id": "t_current",
+                    },
+                ]
+            },
+        },
+    }
     checks = openclaw_async_executor._acceptance_checks(evidence, metadata)
     assert not openclaw_async_executor._acceptance_evidence_has_failure(checks)
     assert evidence["objective"]["status"] == "blocked"
     for extra in [{"result": "failed"}, {"checks": [{"status": "failed"}]}]:
         bad = {"objective": {**evidence["objective"], **extra}}
-        assert openclaw_async_executor._acceptance_evidence_has_failure(openclaw_async_executor._acceptance_checks(bad, metadata))
-    for other in [{**metadata, "external_effect_budget": 1}, {"external_effect_budget": 0, "loop_contract": {"completion_mode": "intermediate", "objective_ref": {"objective_id": "other"}}}]:
-        assert openclaw_async_executor._acceptance_evidence_has_failure(openclaw_async_executor._acceptance_checks(evidence, other))
+        assert openclaw_async_executor._acceptance_evidence_has_failure(
+            openclaw_async_executor._acceptance_checks(bad, metadata)
+        )
+    for other in [
+        {**metadata, "external_effect_budget": 1},
+        {
+            "external_effect_budget": 0,
+            "loop_contract": {
+                "completion_mode": "intermediate",
+                "objective_ref": {"objective_id": "other"},
+            },
+        },
+    ]:
+        assert openclaw_async_executor._acceptance_evidence_has_failure(
+            openclaw_async_executor._acceptance_checks(evidence, other)
+        )
+
+    lineage = {
+        "live_lineage_preflight": {
+            "r2_terminated_history": {
+                "stage_key": "repair_asset_r2",
+                "execution_task_id": "t_old",
+                "outcome": "blocked",
+                "reason": "old runtime lacked the repaired capability",
+            },
+            "current_check": {"status": "verified"},
+        }
+    }
+    checks = openclaw_async_executor._acceptance_checks(lineage, metadata)
+    assert not openclaw_async_executor._acceptance_evidence_has_failure(checks)
+    assert (
+        lineage["live_lineage_preflight"]["r2_terminated_history"]["outcome"]
+        == "blocked"
+    )
+    lineage["live_lineage_preflight"]["current_check"]["status"] = "blocked"
+    assert openclaw_async_executor._acceptance_evidence_has_failure(
+        openclaw_async_executor._acceptance_checks(lineage, metadata)
+    )
+    disguised_current_failure = {
+        "current_check_history": {
+            "stage_key": "repair_asset_r3",
+            "execution_task_id": "t_current",
+            "status": "blocked",
+        }
+    }
+    assert openclaw_async_executor._acceptance_evidence_has_failure(
+        openclaw_async_executor._acceptance_checks(disguised_current_failure, metadata)
+    )
+
+
+def test_recovers_controller_attested_image_receipt_from_exact_trajectory(
+    kanban_home,
+):
+    started = start_loop_contract_execution(
+        contract=_contract(),
+        task_type="content_draft",
+        risk_level="low",
+        approved=False,
+        delegation_id="trajectory-image-receipt",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    run.ended_at = run.started_at + 10
+    generated_root = Path.home() / ".openclaw" / "media" / "tool-image-generation"
+    generated_root.mkdir(parents=True)
+    image_path = generated_root / ("cover---e782061b-3576-4616-9d49-618e474e3454.png")
+    Image.new("RGB", (16, 16)).save(image_path)
+    image_sha = openclaw_async_executor.hashlib.sha256(
+        image_path.read_bytes()
+    ).hexdigest()
+    image_task_id = "image_generate:e782061b-3576-4616-9d49-618e474e3454"
+    sessions_root = (
+        Path.home()
+        / ".openclaw"
+        / "agents"
+        / run.metadata["backend_agent_id"]
+        / "sessions"
+    )
+    sessions_root.mkdir(parents=True)
+    trajectory = sessions_root / (
+        "4f9f5345-86be-4655-be34-aa10092b9025.trajectory.jsonl"
+    )
+    prompt = "\n".join([
+        f"[Inter-session message] sourceSession={image_task_id} sourceChannel=webchat sourceTool=image_generate isUser=false",
+        "[Internal task completion event]",
+        f"session_key: {image_task_id}",
+        "status: completed successfully",
+        "Attachments:",
+        f'1. type=image name="{image_path.name}" mimeType=image/png dimensions=16x16 sha256=<redacted> path={json.dumps(str(image_path))}',
+    ])
+    event = {
+        "source": "runtime",
+        "type": "trace.artifacts",
+        "ts": datetime.fromtimestamp(run.started_at - 30, timezone.utc).isoformat(),
+        "sessionKey": run.metadata["backend_session_key"],
+        "runId": f"{image_task_id}:ok",
+        "data": {"finalStatus": "success", "finalPromptText": prompt},
+    }
+    trajectory.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    trajectory_sha = openclaw_async_executor.hashlib.sha256(
+        trajectory.read_bytes()
+    ).hexdigest()
+    audited_result = {
+        "metadata": {
+            "user_facing_report": {
+                "assets": [{"path": str(image_path), "sha256": image_sha}],
+            },
+        },
+    }
+
+    receipts = openclaw_async_executor._trajectory_internal_image_receipts(
+        str(trajectory),
+        metadata=run.metadata,
+        run=run,
+        audited_result=audited_result,
+        expected_trajectory_sha256=trajectory_sha,
+        expected_asset_sha256=image_sha,
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0]["effectKey"] == image_task_id
+    assert receipts[0]["readback"]["sha256"] == image_sha
+    assert receipts[0]["readback"]["attestedBy"] == (
+        "hermes_controller_trajectory_recovery"
+    )
+    assert (
+        openclaw_async_executor._bridge_internal_tool_receipts(
+            {"internalToolReceipts": receipts},
+            metadata=run.metadata,
+            run=run,
+            allow_trajectory_recovery=True,
+        )
+        == receipts
+    )
+    assert (
+        openclaw_async_executor._bridge_internal_tool_receipts(
+            {"internalToolReceipts": receipts},
+            metadata=run.metadata,
+            run=run,
+            allow_trajectory_recovery=False,
+        )
+        == []
+    )
+    foreign_receipt = {
+        **receipts[0],
+        "readback": {
+            **receipts[0]["readback"],
+            "ownerSessionKey": "agent:foreign:session",
+        },
+    }
+    assert (
+        openclaw_async_executor._bridge_internal_tool_receipts(
+            {"internalToolReceipts": [receipts[0], foreign_receipt]},
+            metadata=run.metadata,
+            run=run,
+            allow_trajectory_recovery=True,
+        )
+        == []
+    )
+    image_path.write_bytes(b"replaced after operator pin")
+    with pytest.raises(ValueError, match="does not uniquely attest"):
+        openclaw_async_executor._trajectory_internal_image_receipts(
+            str(trajectory),
+            metadata=run.metadata,
+            run=run,
+            audited_result=audited_result,
+            expected_trajectory_sha256=trajectory_sha,
+            expected_asset_sha256=image_sha,
+        )
+    trajectory.write_text(
+        json.dumps({**event, "sessionKey": "agent:foreign:session"}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="trajectory digest changed"):
+        openclaw_async_executor._trajectory_internal_image_receipts(
+            str(trajectory),
+            metadata=run.metadata,
+            run=run,
+            audited_result=audited_result,
+            expected_trajectory_sha256=trajectory_sha,
+            expected_asset_sha256=image_sha,
+        )
+
+
+def test_revalidates_immutable_zero_effect_terminal_without_backend_rerun(
+    kanban_home, monkeypatch
+):
+    contract = _contract()
+    contract["completion_mode"] = "intermediate"
+    contract["objective_ref"] = {
+        "objective_id": "go_revalidate",
+        "stage_key": "repair_asset_r3",
+    }
+    contract["identity"].update({
+        "platform": "telegram",
+        "chat_id": "chat-1",
+    })
+    with kb.connect() as conn:
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_revalidate",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="zero-effect-async",
+            session_key="agent:main:telegram:group:chat-1:zero-effect-async",
+            title="Revalidate one local asset",
+            objective="Verify the already generated local asset.",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["repair_asset_r2", "repair_asset_r3", "delivery"],
+            terminal_stage_key="delivery",
+            acceptance_criteria=["The local asset is verified."],
+            current_stage_key="repair_asset_r3",
+        )
+        conn.execute(
+            "UPDATE grace_objective_stages SET status='done', "
+            "outcome_kind='intermediate_blocked', execution_task_id='t_old' "
+            "WHERE objective_id='go_revalidate' AND stage_key='repair_asset_r2'"
+        )
+    started = start_loop_contract_execution(
+        contract=contract,
+        task_type="internal_review",
+        risk_level="low",
+        approved=False,
+        delegation_id="zero-terminal-revalidation",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    task_id = started["execution_task_id"]
+    digest = "terminal-result-digest"
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started["run_id"]))
+    assert run is not None
+    terminal = _loop_result(
+        {
+            "task_id": task_id,
+            "delegation_id": run.metadata["delegation_id"],
+            "attempt_id": run.metadata["attempt_id"],
+            "contract_fingerprint": run.metadata["contract_fingerprint"],
+            "backend_agent_id": run.metadata["backend_agent_id"],
+            "backend_session_key": run.metadata["backend_session_key"],
+        },
+        "succeeded",
+    )
+    terminal["artifacts"][0]["value"]["result"]["acceptanceEvidence"] = {
+        "r2_terminated_history": {
+            "stage_key": "repair_asset_r2",
+            "execution_task_id": "t_old",
+            "outcome": "blocked",
+            "reason": "old runtime lacked the repaired capability",
+        },
+        "current_asset": {"status": "verified"},
+    }
+    observation = {
+        "status": "succeeded",
+        "delegated_result": terminal,
+        "result_digest": digest,
+    }
+    with kb.connect() as conn:
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run.id,
+            status="succeeded",
+            backend_run_id=run.backend_run_id,
+            backend_agent_id=run.backend_agent_id,
+            protocol_version=run.protocol_version,
+            result_digest=digest,
+            terminal_observation=observation,
+        )
+        run = kb.get_run(conn, run.id)
+    assert run is not None
+    original_checks = openclaw_async_executor._acceptance_checks
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_acceptance_checks",
+        lambda _value, _metadata: {"legacy_check": {"status": "blocked"}},
+    )
+    handled = make_loop_contract_terminal_handler()(run, observation)
+    assert handled["accepted"] is False
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_acceptance_checks",
+        original_checks,
+    )
+    image_task_id = "image_generate:e782061b-3576-4616-9d49-618e474e3454"
+    recovered_receipt = {
+        "target": "openclaw.image_generate.local_media",
+        "effectKey": image_task_id,
+        "state": "verified",
+        "readback": {
+            "attestedBy": "hermes_controller_trajectory_recovery",
+            "taskId": image_task_id,
+            "ownerSessionKey": run.metadata["backend_session_key"],
+            "path": _generated_media_path(
+                "asset---e782061b-3576-4616-9d49-618e474e3454.png"
+            ),
+            "sha256": "a" * 64,
+            "mimeType": "image/png",
+            "dimensions": "16x16",
+            "endedAt": run.started_at * 1000 + 1,
+        },
+    }
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_trajectory_internal_image_receipts",
+        lambda *_args, **_kwargs: [recovered_receipt],
+    )
+
+    with kb.connect() as conn:
+        original_body = kb.get_task(conn, task_id).body
+    assert isinstance(original_body, str)
+    changed_contract = openclaw_async_executor._loop_contract_from_execution_body(
+        original_body
+    )
+    changed_contract["goal"]["objective"] += " changed after validation"
+    from proactive.grace_task_compiler import render_execution_body
+
+    changed_body = render_execution_body(changed_contract)
+
+    def mutate_card_during_validation(*_args, **_kwargs):
+        with kb.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (changed_body, task_id),
+            )
+        return [recovered_receipt]
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_trajectory_internal_image_receipts",
+        mutate_card_during_validation,
+    )
+    with pytest.raises(ValueError):
+        revalidate_zero_effect_loop_contract_after_controller_repair(
+            task_id,
+            expected_run_id=run.id,
+            expected_result_digest=digest,
+            repair_evidence="Reject a card changed after validation.",
+            runtime_trajectory_path="/tmp/runtime.trajectory.jsonl",
+            expected_trajectory_sha256="b" * 64,
+            expected_asset_sha256="a" * 64,
+        )
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (original_body, task_id))
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_trajectory_internal_image_receipts",
+        lambda *_args, **_kwargs: [recovered_receipt],
+    )
+    original_bridge_receipts = openclaw_async_executor._bridge_internal_tool_receipts
+
+    def reject_unverified_recovery_receipts(
+        *_args, allow_trajectory_recovery, **_kwargs
+    ):
+        assert allow_trajectory_recovery is False
+        raise RuntimeError("verified recovery gate was not enabled")
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_bridge_internal_tool_receipts",
+        reject_unverified_recovery_receipts,
+    )
+    with kb.connect() as conn:
+        blocked_run = kb.get_run(conn, run.id)
+    assert blocked_run is not None
+    with pytest.raises(RuntimeError, match="gate was not enabled"):
+        make_loop_contract_terminal_handler(
+            revalidation_source_run_id=blocked_run.id,
+            revalidation_evidence="No trajectory was verified by this invocation.",
+        )(blocked_run, observation)
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_bridge_internal_tool_receipts",
+        original_bridge_receipts,
+    )
+
+    with kb.connect() as conn:
+        source_run = kb.get_run(conn, run.id)
+    assert source_run is not None
+    source_metadata = dict(source_run.metadata)
+
+    def mutate_source_budget_during_validation(*args, **kwargs):
+        changed_metadata = {**source_metadata, "external_effect_budget": 1}
+        with kb.connect() as conn:
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(changed_metadata), run.id),
+            )
+        return original_bridge_receipts(*args, **kwargs)
+
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_bridge_internal_tool_receipts",
+        mutate_source_budget_during_validation,
+    )
+    with pytest.raises(ValueError, match="state changed before completion"):
+        revalidate_zero_effect_loop_contract_after_controller_repair(
+            task_id,
+            expected_run_id=run.id,
+            expected_result_digest=digest,
+            repair_evidence="Reject source-run authority changed after validation.",
+            runtime_trajectory_path="/tmp/runtime.trajectory.jsonl",
+            expected_trajectory_sha256="b" * 64,
+            expected_asset_sha256="a" * 64,
+        )
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(source_metadata), run.id),
+        )
+    monkeypatch.setattr(
+        openclaw_async_executor,
+        "_bridge_internal_tool_receipts",
+        original_bridge_receipts,
+    )
+
+    recovered = revalidate_zero_effect_loop_contract_after_controller_repair(
+        task_id,
+        expected_run_id=run.id,
+        expected_result_digest=digest,
+        repair_evidence="Historical lineage verdicts are no longer current acceptance checks.",
+        runtime_trajectory_path="/tmp/runtime.trajectory.jsonl",
+        expected_trajectory_sha256="b" * 64,
+        expected_asset_sha256="a" * 64,
+    )
+
+    assert recovered["source_run_id"] == run.id
+    assert recovered["revalidation_run_id"] != run.id
+    assert recovered["status"] == "done"
+    assert recovered["internal_tool_receipts"] == 1
+    with kb.connect() as conn:
+        source_run = kb.get_run(conn, run.id)
+        completed_run = kb.latest_run(conn, task_id)
+        review = kb.get_task(conn, started["review_task_id"])
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='zero_effect_terminal_revalidated'",
+            (task_id,),
+        ).fetchone()
+    assert source_run is not None and source_run.outcome == "blocked"
+    assert completed_run is not None and completed_run.outcome == "completed"
+    assert completed_run.metadata["internal_tool_receipts"] == [recovered_receipt]
+    assert completed_run.metadata["controller_terminal_revalidation"] == {
+        "source_run_id": run.id,
+        "source_result_digest": digest,
+        "repair_evidence": (
+            "Historical lineage verdicts are no longer current acceptance checks."
+        ),
+    }
+    assert review is not None and review.status == "ready"
+    assert event is not None
+    with pytest.raises(ValueError):
+        revalidate_zero_effect_loop_contract_after_controller_repair(
+            task_id,
+            expected_run_id=run.id,
+            expected_result_digest="wrong-digest",
+            repair_evidence="same repair",
+        )
 
 
 @pytest.mark.parametrize(
@@ -5944,6 +7681,73 @@ def test_zero_effect_capability_recovery_preserves_contract_and_review(
     assert len(seen) == 1
 
 
+def test_zero_effect_capability_recovery_rearms_exact_kernel_blocked_review(kanban_home):
+    started = start_loop_contract_execution(
+        contract=_contract(),
+        task_type="internal_review",
+        risk_level="low",
+        approved=False,
+        delegation_id="zero-capability-kernel-review-recovery",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+    task_id = started["execution_task_id"]
+    review_id = started["review_task_id"]
+    with kb.connect() as conn:
+        old = kb.get_run(conn, int(started["run_id"]))
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Controller omitted the renderer receipt",
+            kind="capability",
+            expected_run_id=old.id,
+        )
+        review_run_id = kb._synthesize_ended_run(
+            conn,
+            review_id,
+            outcome="crashed",
+            summary="protocol violation",
+            metadata={
+                "goal_loop_blocker": {
+                    "class": "finalize_protocol_violation",
+                    "judge_reason": "formal completion requires the kernel repair",
+                    "last_response_excerpt": (
+                        "behavior.kernel_migration_required: "
+                        "proactive/openclaw_async_executor.py"
+                    ),
+                },
+            },
+            error=(
+                "worker exited cleanly without calling kanban_complete or "
+                "kanban_block — protocol violation"
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked',block_kind='dependency',"
+            "consecutive_failures=1,last_failure_error='protocol violation' "
+            "WHERE id=?",
+            (review_id,),
+        )
+
+    retried = retry_zero_effect_loop_contract_after_capability_repair(
+        task_id,
+        expected_run_id=old.id,
+        repair_evidence="Request-bound deterministic renderer receipts are installed.",
+        transport=lambda task: _loop_result(task, "queued"),
+    )
+
+    assert retried["execution_task_id"] == task_id
+    with kb.connect() as conn:
+        review = kb.get_task(conn, review_id)
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='controller_repair_review_rearmed'",
+            (review_id,),
+        ).fetchone()
+    assert review is not None and review.status == "todo"
+    assert event is not None
+    assert json.loads(event["payload"])["previous_review_run_id"] == review_run_id
+
+
 def test_required_report_overrides_markdown_without_widening_worker_scope():
     contract = _contract()
     contract["routing"] = {
@@ -5982,7 +7786,9 @@ def test_required_report_overrides_markdown_without_widening_worker_scope():
     assert contract["routing"]["resolved"]["output_schema"]["format"] == "markdown"
 
 
-@pytest.mark.parametrize("boundary", [None, "project", "thread_id", "chat_id", "platform", "missing_chat"])
+@pytest.mark.parametrize(
+    "boundary", [None, "project", "thread_id", "chat_id", "platform", "missing_chat"]
+)
 def test_requested_blocked_run_evidence_is_complete_and_scope_bound(
     kanban_home, boundary
 ):
@@ -6038,33 +7844,44 @@ def test_requested_blocked_run_evidence_is_complete_and_scope_bound(
         assert records[0]["acceptance_state"] == "not_established_by_this_snapshot"
 
 
-@pytest.mark.parametrize("exclusion", ["Exclude run 1698", "run 1698 must not be used", "嚴格排除 run 1698"])
+@pytest.mark.parametrize(
+    "exclusion", ["Exclude run 1698", "run 1698 must not be used", "嚴格排除 run 1698"]
+)
 def test_run_exclusion_overrides_positive_mentions(exclusion):
     class NoQuery:
         def execute(self, *args):
             raise AssertionError("Excluded evidence must not be queried")
+
     contract = _contract()
     contract["goal"]["objective"] = "Inspect run 1698"
     contract["goal"]["deliverables"] = [exclusion]
     snapshot = {}
-    openclaw_async_executor._attach_requested_run_evidence(NoQuery(), snapshot, contract)
+    openclaw_async_executor._attach_requested_run_evidence(
+        NoQuery(), snapshot, contract
+    )
     assert snapshot == {}
 
 
-@pytest.mark.parametrize("text,expected_ids", [
-    ("Exclude run 1698 and inspect run 1699", [1699]),
-    ("Exclude run 1698 and run 1699", []),
-    ("Inspect run 9223372036854775808", []),
-])
+@pytest.mark.parametrize(
+    "text,expected_ids",
+    [
+        ("Exclude run 1698 and inspect run 1699", [1699]),
+        ("Exclude run 1698 and run 1699", []),
+        ("Inspect run 9223372036854775808", []),
+    ],
+)
 def test_run_reference_parser_bounds_exclusions_and_sqlite_ids(text, expected_ids):
     class MissingRuns:
         def __init__(self):
             self.ids = []
+
         def execute(self, sql, params):
             self.ids.append(params[0])
             return self
+
         def fetchone(self):
             return None
+
     conn = MissingRuns()
     contract = _contract()
     contract["goal"] = {"objective": text, "deliverables": []}
@@ -6085,26 +7902,44 @@ def test_requested_run_evidence_rejects_more_than_one_page():
 
     with pytest.raises(ValueError, match="exceeds 20 runs"):
         openclaw_async_executor._attach_requested_run_evidence(
-            NoQuery(), {}, contract,
+            NoQuery(),
+            {},
+            contract,
         )
 
 
 def test_requested_run_evidence_allows_exact_threadless_lane(kanban_home):
     contract = _contract()
-    contract["identity"].update(platform="telegram", chat_id="chat", thread_id="",
-                                request_instance_id="threadless-source")
+    contract["identity"].update(
+        platform="telegram",
+        chat_id="chat",
+        thread_id="",
+        request_instance_id="threadless-source",
+    )
     started = start_loop_contract_execution(
-        contract=contract, task_type="research", risk_level="low", approved=False,
+        contract=contract,
+        task_type="research",
+        risk_level="low",
+        approved=False,
         delegation_id="delegation-threadless-source",
         transport=lambda task: _loop_result(task, "queued"),
     )
     run_id = int(started["run_id"])
     with kb.connect() as conn:
-        kb.block_task(conn, started["execution_task_id"], reason="read-only fixture",
-                      kind="capability", expected_run_id=run_id)
+        kb.block_task(
+            conn,
+            started["execution_task_id"],
+            reason="read-only fixture",
+            kind="capability",
+            expected_run_id=run_id,
+        )
         request = _contract()
-        request["identity"].update(platform="telegram", chat_id="chat", thread_id="",
-                                   request_instance_id="threadless-reader")
+        request["identity"].update(
+            platform="telegram",
+            chat_id="chat",
+            thread_id="",
+            request_instance_id="threadless-reader",
+        )
         request["goal"]["objective"] = f"Inspect run {run_id}"
         snapshot = {}
         openclaw_async_executor._attach_requested_run_evidence(conn, snapshot, request)
@@ -6113,13 +7948,26 @@ def test_requested_run_evidence_allows_exact_threadless_lane(kanban_home):
 
 
 def test_objective_inline_report_uses_canonical_body_and_system_completion(kanban_home):
-    contract = {"objective_ref": {"objective_id": "go_test"}, "completion_mode": "intermediate",
-                "user_facing_delivery": {"required": True, "kind": "content_package",
-                    "delivery": "inline_only", "body_field": "inventory"}}
+    contract = {
+        "objective_ref": {"objective_id": "go_test"},
+        "completion_mode": "intermediate",
+        "user_facing_delivery": {
+            "required": True,
+            "kind": "content_package",
+            "delivery": "inline_only",
+            "body_field": "inventory",
+        },
+    }
     result = openclaw_async_executor._content_package_completion_metadata(
-        {"summary": "Verified preflight", "acceptanceEvidence": {"inventory": "0 published; 20 remain"},
-         "metadata": {"user_facing_report": {"complete": True, "body": "all done"}}},
-        metadata={"loop_contract": contract}, task_id="t_inventory", board=None)
+        {
+            "summary": "Verified preflight",
+            "acceptanceEvidence": {"inventory": "0 published; 20 remain"},
+            "metadata": {"user_facing_report": {"complete": True, "body": "all done"}},
+        },
+        metadata={"loop_contract": contract},
+        task_id="t_inventory",
+        board=None,
+    )
     report = result["user_facing_report"]
     assert report["complete"] is False
     assert report["body"] == "0 published; 20 remain"
@@ -6127,7 +7975,7 @@ def test_objective_inline_report_uses_canonical_body_and_system_completion(kanba
     assert report["assets"] == []
 
 
-def test_terminal_objective_canonicalizes_incomplete_worker_report(kanban_home):
+def test_terminal_objective_preserves_incomplete_worker_report(kanban_home):
     now = int(openclaw_async_executor.time.time())
     report = {
         "kind": "content_package",
@@ -6145,21 +7993,23 @@ def test_terminal_objective_canonicalizes_incomplete_worker_report(kanban_home):
             "acceptanceEvidence": {"inventory": report["body"]},
             "metadata": {"user_facing_report": report},
         },
-        metadata={"loop_contract": {
-            "objective_ref": {"objective_id": "go_test"},
-            "completion_mode": "terminal",
-            "user_facing_delivery": {
-                "required": True,
-                "kind": "content_package",
-                "delivery": "inline_only",
-                "body_field": "inventory",
-            },
-        }},
+        metadata={
+            "loop_contract": {
+                "objective_ref": {"objective_id": "go_test"},
+                "completion_mode": "terminal",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "body_field": "inventory",
+                },
+            }
+        },
         task_id="t_terminal_inventory",
         board=None,
     )
 
-    assert result["user_facing_report"] == {**report, "complete": True}
+    assert result["user_facing_report"] == {**report, "complete": False}
 
 
 def test_terminal_objective_rejects_mismatched_worker_report(kanban_home):
@@ -6167,27 +8017,31 @@ def test_terminal_objective_rejects_mismatched_worker_report(kanban_home):
         {
             "summary": "Terminal attempt",
             "acceptanceEvidence": {"inventory": "18 published; 2 remain"},
-            "metadata": {"user_facing_report": {
-                "kind": "content_package",
-                "delivery": "inline_only",
-                "complete": False,
-                "title": "Mismatched",
-                "body_field": "inventory",
-                "body": "20 published",
-                "observed_at": int(openclaw_async_executor.time.time()),
-                "assets": [],
-            }},
-        },
-        metadata={"loop_contract": {
-            "objective_ref": {"objective_id": "go_test"},
-            "completion_mode": "terminal",
-            "user_facing_delivery": {
-                "required": True,
-                "kind": "content_package",
-                "delivery": "inline_only",
-                "body_field": "inventory",
+            "metadata": {
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "complete": False,
+                    "title": "Mismatched",
+                    "body_field": "inventory",
+                    "body": "20 published",
+                    "observed_at": int(openclaw_async_executor.time.time()),
+                    "assets": [],
+                }
             },
-        }},
+        },
+        metadata={
+            "loop_contract": {
+                "objective_ref": {"objective_id": "go_test"},
+                "completion_mode": "terminal",
+                "user_facing_delivery": {
+                    "required": True,
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "body_field": "inventory",
+                },
+            }
+        },
         task_id="t_terminal_inventory",
         board=None,
     )
@@ -6196,46 +8050,94 @@ def test_terminal_objective_rejects_mismatched_worker_report(kanban_home):
 
 
 def test_declared_preflight_reaches_worker_without_a_report_delivery_contract():
-    contract = {"evidence_contract": "facebook_group_preflight/v1",
-        "routing": {"task_type": "facebook_marketplace_readonly", "resolved": {
-            "backend_role_card": {"output_format": "markdown", "required_sections": ["Summary"]}}}}
-    safe = openclaw_async_executor._worker_safe_loop_contract(contract, external_effect_budget=0)
+    contract = {
+        "evidence_contract": "facebook_group_preflight/v1",
+        "routing": {
+            "task_type": "facebook_marketplace_readonly",
+            "resolved": {
+                "backend_role_card": {
+                    "output_format": "markdown",
+                    "required_sections": ["Summary"],
+                }
+            },
+        },
+    }
+    safe = openclaw_async_executor._worker_safe_loop_contract(
+        contract, external_effect_budget=0
+    )
     terminal = safe["terminal_result_contract"]
     assert terminal["format"] == "single_valid_json_object"
-    assert terminal["preflight_evidence_binding"]["schema_version"] == contract["evidence_contract"]
-    assert "observed_at" in terminal["preflight_evidence_binding"]["sourceListing_required"]
+    assert (
+        terminal["preflight_evidence_binding"]["schema_version"]
+        == contract["evidence_contract"]
+    )
+    assert (
+        "observed_at"
+        in terminal["preflight_evidence_binding"]["sourceListing_required"]
+    )
     assert safe["routing"]["resolved"]["backend_role_card"]["output_format"] == "json"
 
 
 def test_control_plane_snapshot_preserves_scoped_handoff_and_claims(tmp_path):
     with kb.connect_closing(tmp_path / "snapshot.db") as conn:
-        kb.create_grace_objective(conn, objective_id="go_original", platform="telegram", chat_id="chat", thread_id="2",
-            session_key="session", title="Original", objective="20 groups", original_request_sha256="a"*64,
-            required_stage_keys=["prepare", "publish"], terminal_stage_key="publish",
-            acceptance_criteria=["20 verified"], current_stage_key="prepare")
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_original",
+            platform="telegram",
+            chat_id="chat",
+            thread_id="2",
+            session_key="session",
+            title="Original",
+            objective="20 groups",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["prepare", "publish"],
+            terminal_stage_key="publish",
+            acceptance_criteria=["20 verified"],
+            current_stage_key="prepare",
+        )
         from hermes_cli import objective_workflow
+
         objective_workflow.migrate(conn)
         conn.execute(
             "INSERT INTO grace_objective_workflows(objective_id,specification) VALUES (?,?)",
-            ("go_original", json.dumps({
-                "project": "secondhand",
-                "source_listing_id": "12345",
-                "expected_destinations": 20,
-            })),
+            (
+                "go_original",
+                json.dumps({
+                    "project": "secondhand",
+                    "source_listing_id": "12345",
+                    "expected_destinations": 20,
+                }),
+            ),
         )
         task = kb.create_task(conn, title="Accepted evidence")
         other = kb.create_task(conn, title="Unrelated evidence")
-        kb.add_comment(conn, task, "Codex", "Retain accepted evidence; do not replay receipt 9228")
+        kb.add_comment(
+            conn, task, "Codex", "Retain accepted evidence; do not replay receipt 9228"
+        )
         for i in range(21):
             kb.add_comment(conn, task, "Worker", f"Later status {i}")
         kb.add_comment(conn, other, "Other", "Unrelated private comment")
-        conn.execute("UPDATE grace_objective_stages SET execution_task_id=? WHERE objective_id='go_original' AND stage_key='prepare'", (task,))
+        conn.execute(
+            "UPDATE grace_objective_stages SET execution_task_id=? WHERE objective_id='go_original' AND stage_key='prepare'",
+            (task,),
+        )
         conn.commit()
-        contract = {"objective_ref": {"objective_id":"go_original", "stage_key":"prepare"},
-                    "identity": {"platform":"telegram", "chat_id":"chat", "thread_id":"2",
-                                 "project": "secondhand"}}
-        snapshot = openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
-        assert snapshot["objective"]["revision"] == kb.get_grace_objective(conn, "go_original")["revision"]
+        contract = {
+            "objective_ref": {"objective_id": "go_original", "stage_key": "prepare"},
+            "identity": {
+                "platform": "telegram",
+                "chat_id": "chat",
+                "thread_id": "2",
+                "project": "secondhand",
+            },
+        }
+        snapshot = openclaw_async_executor._objective_durable_evidence_snapshot(
+            conn, contract
+        )
+        assert (
+            snapshot["objective"]["revision"]
+            == kb.get_grace_objective(conn, "go_original")["revision"]
+        )
         assert snapshot["observed_at"] > 0
         assert snapshot["stages_total"] == len(snapshot["stages"])
         assert len(snapshot["handoff_comments"]) == 22
@@ -6244,22 +8146,33 @@ def test_control_plane_snapshot_preserves_scoped_handoff_and_claims(tmp_path):
         assert snapshot["claims"][0]["task_id"] == task
         assert snapshot["callbacks"] == []
         assert snapshot["approval_receipts"] == []
-        for invalid_identity in ({}, {"platform": "telegram", "chat_id": "chat"},
-                {"platform": "telegram", "chat_id": "chat", "thread_id": "foreign"}):
+        for invalid_identity in (
+            {},
+            {"platform": "telegram", "chat_id": "chat"},
+            {"platform": "telegram", "chat_id": "chat", "thread_id": "foreign"},
+        ):
             contract["identity"] = invalid_identity
             with pytest.raises(ValueError, match="another chat or Topic"):
-                openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
+                openclaw_async_executor._objective_durable_evidence_snapshot(
+                    conn, contract
+                )
         contract["objective_ref"]["objective_id"] = "go_missing"
         with pytest.raises(ValueError, match="source is unavailable"):
             openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
         contract["objective_ref"]["objective_id"] = "go_original"
-        contract["identity"] = {"platform": "telegram", "chat_id": "chat", "thread_id": "2",
-                                "project": "wrong-project"}
+        contract["identity"] = {
+            "platform": "telegram",
+            "chat_id": "chat",
+            "thread_id": "2",
+            "project": "wrong-project",
+        }
         with pytest.raises(ValueError, match="another project"):
             openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
         contract["identity"]["project"] = "secondhand"
         kb.add_comment(conn, task, "Worker", "x" * (128 * 1024 + 1))
-        with pytest.raises(ValueError, match="comment budget; paged evidence retrieval is required"):
+        with pytest.raises(
+            ValueError, match="comment budget; paged evidence retrieval is required"
+        ):
             openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
 
 
@@ -6323,13 +8236,222 @@ def test_objective_snapshot_does_not_expand_progress_history_into_full_task_evid
 
 def test_control_plane_snapshot_size_guard_without_stage_tasks(tmp_path):
     with kb.connect_closing(tmp_path / "snapshot-size.db") as conn:
-        kb.create_grace_objective(conn, objective_id="go_empty", platform="telegram", chat_id="chat", thread_id="2",
-            session_key="session", title="Original", objective="20 groups", original_request_sha256="a"*64,
-            required_stage_keys=["prepare", "publish"], terminal_stage_key="publish",
-            acceptance_criteria=["20 verified"], current_stage_key="prepare")
-        conn.execute("UPDATE grace_objectives SET next_action=? WHERE objective_id='go_empty'", ("x" * (256 * 1024 + 1),))
+        kb.create_grace_objective(
+            conn,
+            objective_id="go_empty",
+            platform="telegram",
+            chat_id="chat",
+            thread_id="2",
+            session_key="session",
+            title="Original",
+            objective="20 groups",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["prepare", "publish"],
+            terminal_stage_key="publish",
+            acceptance_criteria=["20 verified"],
+            current_stage_key="prepare",
+        )
+        conn.execute(
+            "UPDATE grace_objectives SET next_action=? WHERE objective_id='go_empty'",
+            ("x" * (256 * 1024 + 1),),
+        )
         conn.commit()
-        contract = {"objective_ref": {"objective_id": "go_empty"},
-                    "identity": {"platform": "telegram", "chat_id": "chat", "thread_id": "2"}}
+        contract = {
+            "objective_ref": {"objective_id": "go_empty"},
+            "identity": {"platform": "telegram", "chat_id": "chat", "thread_id": "2"},
+        }
         with pytest.raises(ValueError, match="snapshot exceeds inline byte budget"):
             openclaw_async_executor._objective_durable_evidence_snapshot(conn, contract)
+
+
+def test_accepts_controller_attested_deterministic_image_render_receipt(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    output = (
+        tmp_path / ".openclaw/media/tool-image-generation/deterministic-render/out.png"
+    )
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"png")
+    delegated_task_id = "t_receipt"
+    contract_fingerprint = "d" * 64
+    deterministic_task_id = (
+        "deterministic_image_render:"
+        + hashlib.sha256(
+            f"{delegated_task_id}\0{contract_fingerprint}".encode("utf-8")
+        ).hexdigest()
+    )
+    receipt = {
+        "target": "openclaw.deterministic_image_render.local_media",
+        "effectKey": deterministic_task_id,
+        "state": "verified",
+        "readback": {
+            "attestedBy": "openclaw_deterministic_image_render_broker",
+            "taskId": deterministic_task_id,
+            "ownerSessionKey": "agent:missioncrew-content:subagent:receipt",
+            "path": str(output),
+            "sha256": "b" * 64,
+            "sourceSha256": "c" * 64,
+            "mimeType": "image/png",
+            "dimensions": "1254x1254",
+            "endedAt": 150_000,
+        },
+    }
+    metadata = {
+        "backend_session_key": receipt["readback"]["ownerSessionKey"],
+        "attempt_id": f"{delegated_task_id}:run:1",
+        "contract_fingerprint": contract_fingerprint,
+    }
+    run = SimpleNamespace(started_at=100, ended_at=200)
+
+    assert openclaw_async_executor._controller_attested_internal_image_receipt(
+        receipt, metadata=metadata, run=run
+    )
+    assert openclaw_async_executor._bridge_internal_tool_receipts(
+        {"internalToolReceipts": [receipt]},
+        metadata=metadata,
+        run=run,
+        allow_trajectory_recovery=False,
+    ) == [receipt]
+    assert not openclaw_async_executor._controller_attested_internal_image_receipt(
+        receipt,
+        metadata={**metadata, "contract_fingerprint": "e" * 64},
+        run=run,
+    )
+
+
+@pytest.mark.parametrize(
+    "fault", ["", "owner", "hash", "time", "duplicate", "partial", "duplicate-report"]
+)
+def test_registry_recovery_attests_every_image_in_exact_run(
+    tmp_path, monkeypatch, fault
+):
+    import hashlib
+    import sqlite3
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    state = tmp_path / ".openclaw"
+    (state / "state").mkdir(parents=True)
+    media = state / "media/tool-image-generation"
+    media.mkdir(parents=True)
+    assets = {}
+    with sqlite3.connect(state / "state/openclaw.sqlite") as conn:
+        conn.execute(
+            "CREATE TABLE task_runs(task_id,owner_key,requester_session_key,source_id,status,task_kind,ended_at,terminal_summary)"
+        )
+        for n in range(2):
+            path = media / f"asset{n}.png"
+            path.write_bytes(f"image{n}".encode())
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            assets[str(path)] = digest
+            summary = f'Generated 1 image. Attachments: 1. type=image name="asset{n}.png" mimeType=image/png dimensions=1248x1248 sha256={digest} path={json.dumps(str(path))}'
+            row = (
+                f"e782061b-3576-4616-9d49-618e474e345{n}",
+                "owner",
+                "owner",
+                "image_generate:openai",
+                "succeeded",
+                "image_generation",
+                150000,
+                summary,
+            )
+            if n == 1 and fault == "owner":
+                row = (row[0], "foreign", *row[2:])
+            if n == 1 and fault == "time":
+                row = (*row[:6], 90000, summary)
+            conn.execute("INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?)", row)
+            if n == 1 and fault == "duplicate":
+                conn.execute("INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?)", row)
+            if n == 1 and fault == "hash":
+                path.write_bytes(b"changed")
+    kwargs = dict(
+        metadata={"backend_session_key": "owner"},
+        run=SimpleNamespace(started_at=100, ended_at=200),
+        audited_result={
+            "metadata": {
+                "user_facing_report": {
+                    "assets": [{"path": p, "sha256": h} for p, h in assets.items()]
+                }
+            }
+        },
+        expected_assets=assets,
+    )
+    if fault == "partial":
+        kwargs["expected_assets"] = dict(list(assets.items())[:1])
+    if fault == "duplicate-report":
+        kwargs["audited_result"]["metadata"]["user_facing_report"]["assets"].append({
+            "path": next(iter(assets)),
+            "sha256": next(iter(assets.values())),
+        })
+    if fault:
+        with pytest.raises(ValueError):
+            openclaw_async_executor._registry_internal_image_receipts(**kwargs)
+    else:
+        receipts = openclaw_async_executor._registry_internal_image_receipts(**kwargs)
+        assert len(receipts) == 2
+        assert all(
+            openclaw_async_executor._controller_attested_internal_image_receipt(
+                r, metadata=kwargs["metadata"], run=kwargs["run"]
+            )
+            for r in receipts
+        )
+
+
+def test_first_formal_native_admission_persists_controller_history_baseline(kanban_home, monkeypatch):
+    from proactive.loop_contract import contract_fingerprint
+    monkeypatch.setattr(openclaw_async_executor, '_existing_loop_agent_or_executor', lambda agent_id: agent_id)
+    contract = _contract()
+    contract['identity'].update(platform='telegram', chat_id='first-chat', thread_id='first-topic')
+    contract['objective_ref'] = {'objective_id':'go_user_'+'d'*24, 'stage_key':'execute'}
+    contract['verification']['evidence_required'].append('Protocol v2 execution receipt')
+    with kb.connect() as conn:
+        kb.create_grace_objective(conn, objective_id=contract['objective_ref']['objective_id'],
+            platform='telegram',chat_id='first-chat',thread_id='first-topic',session_key='session',
+            title='connection',objective='connection',original_request_sha256='a'*64,
+            required_stage_keys=['execute'],terminal_stage_key='execute',acceptance_criteria=['verified'])
+        normalized = openclaw_async_executor._ensure_loop_contract_routing(contract, task_type='ops', risk_level='low')
+        delegation = kb.reserve_grace_delegation(conn,contract_fingerprint=contract_fingerprint(normalized),
+            request_instance_id=contract['identity']['request_instance_id'],platform='telegram',
+            chat_id='first-chat',thread_id='first-topic',session_key='session',session_id='session',
+            resolved_route={"selected_backend":"openclaw"},approval_required=False,objective_id=contract['objective_ref']['objective_id'],
+            stage_key='execute',compiled_contract=normalized)
+        assert kb.claim_grace_delegation_build(conn,delegation_id=delegation['delegation_id'],build_owner='first-builder')
+    started = start_loop_contract_execution(contract=normalized,task_type='ops',risk_level='low',approved=False,
+        delegation_id=delegation['delegation_id'],delegation_build_owner='first-builder',
+        platform='telegram',chat_id='first-chat',thread_id='first-topic',session_key='session',session_id='session',
+        transport=lambda task: _loop_result(task, 'queued'))
+    with kb.connect() as conn:
+        run = kb.get_run(conn, int(started['run_id']))
+        baseline = run.metadata['loop_contract']['durable_evidence_snapshot']['controller_history_baseline']
+        assert baseline['execution_task_id'] == started['execution_task_id']
+        assert baseline['execution_run_id'] == run.id
+        assert baseline['delegation_contract_fingerprint'] == delegation['contract_fingerprint']
+        assert baseline['source'] == 'controller_pre_admission_snapshot'
+
+
+def test_research_admission_can_fetch_public_sources_without_mutation(kanban_home, monkeypatch):
+    monkeypatch.setattr(openclaw_async_executor, "_existing_loop_agent_or_executor", lambda agent_id: agent_id)
+    contract = _contract()
+    contract["identity"]["request_instance_id"] = "research-public-source-capability"
+    seen = {}
+
+    def transport(task):
+        seen.update(task)
+        return _loop_result(task, "queued")
+
+    started = start_loop_contract_execution(
+        contract=contract, task_type="research", risk_level="low", approved=False,
+        delegation_id="research-public-source-delegation", transport=transport,
+    )
+    assert started["status"] == "queued"
+    assert seen["backend_agent_id"] == "missioncrew-research"
+    assert seen["external_effect_budget"] == 0
+    assert "web_fetch" in seen["allowed_tools"]
+    assert not set(seen["allowed_tools"]) & {"exec", "write", "edit", "message"}
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run.metadata["allowed_tools"] == seen["allowed_tools"]

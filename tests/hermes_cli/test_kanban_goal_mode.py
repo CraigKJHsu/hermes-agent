@@ -343,8 +343,40 @@ def test_loop_blocks_with_structured_finalize_metadata(monkeypatch):
     assert res["outcome"] == "blocked_budget"
     blocker = blocked["metadata"]["goal_loop_blocker"]
     assert blocker["class"] == "finalize_protocol_violation"
+    assert blocker["block_kind"] == "capability"
     assert blocker["judge_verdict"] == "done"
     assert blocker["last_response_excerpt"] == "完整輸出但沒有呼叫工具"
+
+
+def test_goal_loop_blocker_metadata_survives_terminal_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="goal worker", assignee="default")
+        task = kb.claim_task(conn, task_id, claimer="worker-lock")
+        run_id = task.current_run_id
+        blocker = {
+            "class": "turn_budget_exhausted",
+            "block_kind": "capability",
+            "judge_reason": "missing internal mutation capability",
+        }
+        assert kb.merge_active_run_metadata(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            metadata={"goal_loop_blocker": blocker},
+        )
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="goal loop stopped",
+            kind="capability",
+            expected_run_id=run_id,
+        )
+        ended = kb.get_run(conn, run_id)
+        blocked_task = kb.get_task(conn, task_id)
+
+    assert blocked_task.block_kind == "capability"
+    assert ended.metadata["goal_loop_blocker"] == blocker
 
 
 def test_loop_stops_if_task_reclaimed(monkeypatch):

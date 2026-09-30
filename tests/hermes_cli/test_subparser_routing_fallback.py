@@ -14,6 +14,38 @@ import io
 import sys
 
 
+def test_chat_preserves_parent_model_and_toolsets_before_subcommand():
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _, _ = build_top_level_parser()
+    args = parser.parse_args(
+        [
+            "-m", "gpt-5.5", "--provider", "openai-codex",
+            "--toolsets", "kanban", "chat", "-q", "work kanban task t_example",
+        ]
+    )
+
+    assert args.model == "gpt-5.5"
+    assert args.provider == "openai-codex"
+    assert args.toolsets == "kanban"
+
+
+def test_chat_subcommand_flags_override_parent_flags():
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _, _ = build_top_level_parser()
+    args = parser.parse_args(
+        [
+            "-m", "gpt-5.5", "--provider", "openai-codex", "--toolsets", "kanban",
+            "chat", "-m", "gpt-5.6-sol", "--provider", "anthropic",
+            "--toolsets", "file", "-q", "x",
+        ]
+    )
+
+    assert args.model == "gpt-5.6-sol"
+    assert args.provider == "anthropic"
+    assert args.toolsets == "file"
+
 
 def _build_parser():
     """Build a minimal replica of the hermes top-level parser."""
@@ -62,4 +94,3 @@ def _safe_parse(parser, subparsers, argv):
     else:
         subparsers.required = False
         return parser.parse_args(argv)
-
