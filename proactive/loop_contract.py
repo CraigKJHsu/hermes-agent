@@ -8,6 +8,7 @@ import re
 from copy import deepcopy
 from typing import Any, Mapping
 
+from proactive.behavior_observation import emit, observe_contract
 from proactive.policy_registry import PolicyRegistryError, resolve_contract_policies
 from proactive.domain_memory import (
     DomainMemoryError,
@@ -240,11 +241,14 @@ def canonical_marketplace_readonly_sections(
                 "Read the listing-bound List in more places candidate surface",
             ],
             "evidence_required": [
-                "Visible candidate names, statuses, and observation time",
+                "Visible candidate names, statuses, observation time, and any stable "
+                "numeric group ID/canonical URL exposed by each chooser row",
             ],
             "acceptance_criteria": [
                 "Every reported candidate is visibly read from the exact "
                 "listing and no external state changes occur",
+                "A candidate is eligible for later publishing only when its chooser "
+                "row exposes a stable numeric group ID and matching canonical URL",
             ],
         },
     }
@@ -253,13 +257,7 @@ def canonical_marketplace_readonly_sections(
 def facebook_group_publish_destination_ids(
     contract: Mapping[str, Any],
 ) -> set[str]:
-    """Return exact numeric group IDs from canonical per-group publish scope.
-
-    This scope is intentionally separate from Marketplace's ``List in more
-    places`` chooser.  The chooser can hide numeric IDs, so writable contracts
-    must bind every destination to a known canonical group URL before a worker
-    is allowed to navigate there or report an external effect.
-    """
+    """Return exact numeric group IDs from a verified group publish scope."""
     publish = contract.get("facebook_group_publish")
     if not isinstance(publish, Mapping):
         return set()
@@ -286,9 +284,10 @@ def _validate_facebook_group_publish_scope(
     if not isinstance(publish, Mapping):
         return ["facebook_group_publish must be an object"]
     mode = str(publish.get("mode") or "").strip()
-    if mode != "canonical_url_per_group":
+    if mode not in {"canonical_url_per_group", "listing_bound_chooser"}:
         errors.append(
-            "facebook_group_publish.mode must be canonical_url_per_group"
+            "facebook_group_publish.mode must be canonical_url_per_group or "
+            "listing_bound_chooser"
         )
     source_listing_id = str(publish.get("source_listing_id") or "").strip()
     if not re.fullmatch(r"[1-9][0-9]*", source_listing_id):
@@ -328,6 +327,61 @@ def _validate_facebook_group_publish_scope(
             )
         elif group_id and url_match.group(1) != group_id:
             errors.append(f"{prefix}.canonical_url must match group_id")
+    if mode == "listing_bound_chooser":
+        preflight = publish.get("preflight_evidence")
+        if not isinstance(preflight, Mapping):
+            errors.append(
+                "listing_bound_chooser requires compiler-bound preflight_evidence"
+            )
+        else:
+            eligible = preflight.get("eligible_destination_ids")
+            eligible_ids = {
+                str(item or "").strip()
+                for item in eligible
+            } if isinstance(eligible, list) else set()
+            identities = preflight.get("destination_identity")
+            identity_by_id = {
+                str(item.get("group_id") or "").strip(): str(
+                    item.get("canonical_url") or ""
+                ).rstrip("/")
+                for item in identities
+                if isinstance(item, Mapping)
+            } if isinstance(identities, list) else {}
+            if preflight.get("list_in_more_places_available") is not True:
+                errors.append(
+                    "listing_bound_chooser preflight must verify List in more places"
+                )
+            if preflight.get("side_effects_performed") is not False:
+                errors.append(
+                    "listing_bound_chooser preflight must have zero side effects"
+                )
+            for key in ("execution_task_id", "review_task_id"):
+                if not re.fullmatch(r"t_[0-9a-f]+", str(preflight.get(key) or "")):
+                    errors.append(
+                        f"listing_bound_chooser preflight_evidence.{key} is invalid"
+                    )
+            for key in ("execution_run_id", "review_run_id"):
+                if not isinstance(preflight.get(key), int) or preflight[key] < 1:
+                    errors.append(
+                        f"listing_bound_chooser preflight_evidence.{key} is invalid"
+                    )
+            missing_eligible = sorted(seen - eligible_ids)
+            if missing_eligible:
+                errors.append(
+                    "listing_bound_chooser destinations were not selectable in the "
+                    f"accepted preflight: {', '.join(missing_eligible)}"
+                )
+            for item in destinations:
+                if not isinstance(item, Mapping):
+                    continue
+                group_id = str(item.get("group_id") or "").strip()
+                if identity_by_id.get(group_id) != str(
+                    item.get("canonical_url") or ""
+                ).rstrip("/"):
+                    errors.append(
+                        "listing_bound_chooser preflight lacks stable chooser identity "
+                        f"for destination {group_id or '(missing)'}"
+                    )
     external_targets = value.get("external_targets")
     if isinstance(external_targets, list):
         target_ids = {
@@ -366,15 +420,58 @@ def contract_fingerprint(contract: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+@observe_contract("loop_contract.validate", phase="contract")
+def validate_loop_contract(
+    contract: Mapping[str, Any], *, effect_budget_mode: str = "legacy_read",
+) -> dict[str, Any]:
     """Return a normalized contract or reject it before a task is created."""
+    # Stored contracts retain their historical budget representation. New
+    # admissions bind an integer before task creation; a read-only route
+    # further requires the exact zero value.
+    if effect_budget_mode not in {"legacy_read", "new", "zero"}:
+        raise ValueError("Unknown effect_budget_mode")
+    budget = contract.get("external_effect_budget")
+    if effect_budget_mode in {"new", "zero"}:
+        if budget is None:
+            raise LoopContractError("external_effect_budget is required before delegation")
+        if type(budget) is not int or budget < 0:
+            raise LoopContractError("external_effect_budget must be a non-negative integer")
+        if effect_budget_mode == "zero" and budget != 0:
+            raise LoopContractError("Read-only delegation requires external_effect_budget=0")
+        from proactive.hubops_routing import (
+            ALWAYS_APPROVAL_TASK_TYPES,
+            normalize_clawops_task_type,
+        )
+        route = contract.get("routing")
+        route = route if isinstance(route, Mapping) else {}
+        resolved = route.get("resolved")
+        resolved = resolved if isinstance(resolved, Mapping) else {}
+        task_type = normalize_clawops_task_type(
+            str(resolved.get("task_type") or route.get("task_type") or "")
+        )
+        if task_type in ALWAYS_APPROVAL_TASK_TYPES and budget == 0:
+            raise LoopContractError("Effectful delegation requires external_effect_budget greater than 0")
+    elif budget is not None:
+        legacy_count = (
+            budget.get("max_effects") if isinstance(budget, Mapping) else budget
+        )
+        if type(legacy_count) is not int or legacy_count < 0:
+            raise LoopContractError("external_effect_budget must be a non-negative integer or legacy max_effects")
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "contract")
+    if behavior is not None:
+        return behavior.validate_loop_contract(contract)
     try:
         value = attach_domain_memory_contract(
             resolve_contract_policies(contract)
         )
     except PolicyRegistryError as exc:
+        emit(rule_id="loop_contract.policy_resolution", owner="proactive.policy_registry",
+             phase="contract", decision="rejected", contract=contract, reason=exc)
         raise LoopContractError(f"policy resolution failed: {exc}") from exc
     except DomainMemoryError as exc:
+        emit(rule_id="loop_contract.domain_memory", owner="proactive.domain_memory",
+             phase="contract", decision="rejected", contract=contract, reason=exc)
         raise LoopContractError(f"domain memory validation failed: {exc}") from exc
     domain_memory = value.get("domain_memory")
     routing = value.get("routing")
@@ -386,23 +483,75 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     routing_task_type = str(
         resolved_routing.get("task_type") or routing.get("task_type") or ""
     ).strip()
+    delivery_errors: list[str] = []
     if (
         isinstance(domain_memory, Mapping)
         and domain_memory.get("mode") == "query"
         and routing_task_type != "secondhand_commerce_group_status"
-        and value.get("user_facing_delivery") is None
     ):
         # Enumerable Domain Memory questions are always delivered inline.  A
         # compiler-generated attachment contract made a read-only registry
         # lookup depend on unrelated content-package asset validation and can
         # keep an otherwise complete worker alive until the dispatcher limit.
-        value["user_facing_delivery"] = {
-            "required": True,
-            "kind": "content_package",
-            "delivery": "inline_only",
-            "body_field": "domain_inventory_report",
-        }
-    errors: list[str] = []
+        identity = value.get("identity")
+        identity = identity if isinstance(identity, Mapping) else {}
+        external_targets = value.get("external_targets")
+        secondhand_live_query = (
+            identity.get("project") == "secondhand_commerce"
+            and routing_task_type in {
+                "browser_readonly",
+                "facebook_marketplace_readonly",
+            }
+        )
+        if secondhand_live_query:
+            if not (
+                isinstance(external_targets, list)
+                and external_targets
+                and all(
+                    isinstance(target, str)
+                    and target.isascii()
+                    and target.isdigit()
+                    and not target.startswith("0")
+                    for target in external_targets
+                )
+                and len(set(external_targets)) == len(external_targets)
+            ):
+                delivery_errors.append(
+                    "secondhand live query requires distinct numeric external_targets"
+                )
+            else:
+                expected_delivery = {
+                    "required": True,
+                    "kind": "commerce_group_status",
+                    "delivery": "inline_only",
+                    "subject_keys": [
+                        f"facebook_marketplace_listing:{target}"
+                        for target in external_targets
+                    ],
+                }
+                supplied_delivery = value.get("user_facing_delivery")
+                if supplied_delivery is None:
+                    value["user_facing_delivery"] = expected_delivery
+                elif supplied_delivery != expected_delivery:
+                    delivery_errors.append(
+                        "secondhand live query user_facing_delivery must match "
+                        "canonical listing subject keys"
+                    )
+        elif value.get("user_facing_delivery") is None:
+            value["user_facing_delivery"] = {
+                "required": True,
+                "kind": "content_package",
+                "delivery": "inline_only",
+                "body_field": "domain_inventory_report",
+            }
+    errors: list[str] = delivery_errors
+    if value.get("evidence_contract") is not None:
+        from hermes_cli.facebook_group_preflight import requested
+
+        try:
+            requested(value)
+        except ValueError as exc:
+            errors.append(str(exc))
 
     def required_text(path: str) -> None:
         cur: Any = value
@@ -468,7 +617,12 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         )
     if "external_targets" in value:
         required_list("external_targets")
-    errors.extend(_validate_facebook_group_publish_scope(value))
+    publish_errors = _validate_facebook_group_publish_scope(value)
+    if publish_errors:
+        emit(rule_id="loop_contract.facebook_group_publish_scope",
+             owner=__name__, phase="contract", decision="rejected",
+             contract=value, reason="; ".join(publish_errors))
+    errors.extend(publish_errors)
 
     objective_ref = value.get("objective_ref")
     if objective_ref is not None:
@@ -536,6 +690,10 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         errors.append("stop_rules.max_runtime_seconds must be 60..14400")
 
     if errors:
+        emit(rule_id="loop_contract.schema", owner=__name__, phase="contract",
+             decision="rejected", contract=value, reason="; ".join(errors))
         raise LoopContractError("; ".join(errors))
     value["contract_version"] = CONTRACT_VERSION
+    emit(rule_id="loop_contract.schema", owner=__name__, phase="contract",
+         decision="accepted", contract=value, policy_snapshot_verified=True)
     return value

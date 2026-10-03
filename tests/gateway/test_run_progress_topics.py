@@ -263,6 +263,7 @@ def _make_runner(adapter):
     runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
+        platforms={},
         thread_sessions_per_user=False,
         group_sessions_per_user=False,
         stt_enabled=False,
@@ -746,6 +747,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    user_id=None,
 ):
     if config_data:
         import yaml
@@ -772,6 +774,7 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        user_id=user_id,
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
@@ -1684,3 +1687,58 @@ async def test_run_agent_suppresses_thinking_when_thinking_off(monkeypatch, tmp_
         [c["content"] for c in adapter.sent] + [c["content"] for c in adapter.edits]
     )
     assert "weighing the options here" not in blob
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", ["4641", "17585"])
+@pytest.mark.parametrize("sender", ["owner", "other-user"])
+async def test_queued_topic_owner_provenance_uses_inbound_id(
+    monkeypatch, tmp_path, thread_id, sender
+):
+    """4641 is a historical failure sample, not a Topic-specific rule."""
+    from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+    from plugins.openclaw_bridge import objective_control
+
+    monkeypatch.setenv("TELEGRAM_OWNER_USER_ID", "owner")
+    monkeypatch.setattr(objective_control, "resolve_thread_context", lambda **kwargs: kwargs)
+    observed = []
+
+    class ProvenanceAgent:
+        calls = 0
+
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, message, **kwargs):
+            type(self).calls += 1
+            if type(self).calls == 2:
+                observed.append((
+                    get_session_env("HERMES_SESSION_MESSAGE_ID"),
+                    get_session_env("HERMES_SESSION_USER_ID"),
+                    get_session_env("HERMES_SESSION_INTERNAL"),
+                ))
+                if sender == "owner":
+                    admitted = objective_control._owner_turn()
+                    assert admitted[4:6] == ("queued-1", "continue readonly verification")
+                else:
+                    with pytest.raises(ValueError, match="fresh authenticated owner"):
+                        objective_control._owner_turn()
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    tokens = set_session_vars(
+        platform="telegram", chat_id="-1001", thread_id=thread_id,
+        user_id="owner", owner_user_id="owner",
+        session_key=f"agent:main:telegram:group:-1001:{thread_id}",
+        message_id="callback-anchor", message_text="callback", internal=True,
+    )
+    try:
+        adapter, result = await _run_with_agent(
+            monkeypatch, tmp_path, ProvenanceAgent, session_id="queued-owner-proof",
+            pending_text="continue readonly verification", thread_id=thread_id,
+            user_id=sender,
+        )
+        assert observed == [("queued-1", sender, "false")]
+        assert result["final_response"] == "done"
+        assert all(item["reply_to"] is None for item in adapter.sent)
+    finally:
+        clear_session_vars(tokens)

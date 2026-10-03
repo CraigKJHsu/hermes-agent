@@ -181,7 +181,14 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+_KANBAN_DISCOVERY_NAMES = {
+    name.strip()
+    for name in os.environ.get("HERMES_KANBAN_TOOL_NAMES", "").split(",")
+    if name.strip()
+}
+discover_builtin_tools(
+    tool_names=_KANBAN_DISCOVERY_NAMES or None,
+)
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
@@ -198,8 +205,13 @@ discover_builtin_tools()
 
 # Plugin tool discovery (user/project/pip plugins)
 try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
+    missing_scoped_names = {
+        name for name in _KANBAN_DISCOVERY_NAMES
+        if registry.get_entry(name) is None
+    }
+    if not _KANBAN_DISCOVERY_NAMES or missing_scoped_names:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
 except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
 
@@ -317,7 +329,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            frozenset(_KANBAN_DISCOVERY_NAMES),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -427,6 +439,9 @@ def _compute_tool_definitions(
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
+
+    if _KANBAN_DISCOVERY_NAMES:
+        tools_to_include.intersection_update(_KANBAN_DISCOVERY_NAMES)
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()

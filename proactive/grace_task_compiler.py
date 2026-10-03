@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
+from proactive.behavior_observation import observe_contract
 from proactive.clawops_intake import create_clawops_task, subscribe_clawops_task
 from proactive.loop_contract import (
     contract_fingerprint,
@@ -33,12 +34,7 @@ class DelegationResult:
 
 
 KJ_PROFILE_ZH_POLISH_SKILL = "speak-human-tw"
-_OPENCLAW_READONLY_URLS = frozenset(
-    {
-        "https://example.com/",
-        "https://www.linkedin.com/in/craig-k-j-hsu-6012b815",
-    }
-)
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"'，。；、]+")
 _ZH_TW_TARGET_TERMS = (
     "正體中文",
     "繁體中文",
@@ -69,6 +65,44 @@ _INTERNAL_OPS_TOOLS = frozenset(
         "report_generate",
     }
 )
+_INTERNAL_DEVOPS_TOOLS = frozenset(
+    {"filesystem_read", "filesystem_write", "shell", "tests", "docs_read"}
+)
+
+
+def _browser_readonly_url(contract: Mapping[str, Any]) -> str:
+    """Resolve one exact URL from compiler-owned scope and route authority."""
+    scope = contract.get("scope")
+    allowed_scope = scope.get("allowed") if isinstance(scope, Mapping) else []
+    urls: list[str] = []
+    for clause in allowed_scope if isinstance(allowed_scope, list) else []:
+        for match in _HTTP_URL_RE.findall(str(clause or "")):
+            url = match.rstrip(")]}")
+            if url not in urls:
+                urls.append(url)
+    if len(urls) != 1:
+        raise ValueError(
+            "OpenClaw browser-readonly delegation requires exactly one scoped URL."
+        )
+    routing = contract.get("routing")
+    resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
+    assignment = resolved.get("assignment") if isinstance(resolved, Mapping) else {}
+    route_urls = {
+        str(value or "").strip()
+        for value in (
+            assignment.get("allowed_urls")
+            if isinstance(assignment, Mapping)
+            else []
+        ) or []
+        if str(value or "").strip()
+    }
+    if urls[0] not in route_urls:
+        raise ValueError(
+            "OpenClaw browser-readonly URL is outside the resolved route allowlist."
+        )
+    return urls[0]
+
+
 def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
     """Select narrowly scoped, deterministic skills for a Loop Contract.
 
@@ -77,6 +111,10 @@ def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
     avoids activating the skill for English resume work that merely compares
     against an existing Chinese draft elsewhere in the contract.
     """
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "compiler")
+    if behavior is not None:
+        return behavior.contract_execution_skills(contract)
     identity = contract.get("identity")
     goal = contract.get("goal")
     if not isinstance(identity, Mapping) or not isinstance(goal, Mapping):
@@ -96,6 +134,10 @@ def contract_execution_skills(contract: Mapping[str, Any]) -> list[str]:
 
 def contract_requires_image_generation(contract: Mapping[str, Any]) -> bool:
     """Return True when the resolved route requires the image-capable runtime."""
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "compiler")
+    if behavior is not None:
+        return behavior.contract_requires_image_generation(contract)
     routing = contract.get("routing")
     resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
     assignment = (
@@ -109,6 +151,10 @@ def contract_requires_image_generation(contract: Mapping[str, Any]) -> bool:
 
 def contract_declares_page_hero(contract: Mapping[str, Any]) -> bool:
     """Return True only when a review contract explicitly includes page_hero."""
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "compiler")
+    if behavior is not None:
+        return behavior.contract_declares_page_hero(contract)
     def _walk(value: Any) -> bool:
         if isinstance(value, Mapping):
             asset_family = str(value.get("asset_family") or "").strip().lower()
@@ -143,6 +189,21 @@ def contract_internal_hermes_runtime(
     task_type: str,
 ) -> str:
     """Return the trusted Hermes profile for a zero-effect internal route."""
+    verification = contract.get("verification")
+    evidence_required = (
+        verification.get("evidence_required")
+        if isinstance(verification, Mapping)
+        else None
+    )
+    if isinstance(evidence_required, list) and any(
+        re.search(r"\bprotocol[\s-]*(?:v2|2\.0)\b", str(item), re.IGNORECASE)
+        for item in evidence_required
+    ):
+        return ""
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "compiler")
+    if behavior is not None:
+        return behavior.contract_internal_hermes_runtime(contract, task_type=task_type)
     routing = contract.get("routing")
     resolved = routing.get("resolved") if isinstance(routing, Mapping) else {}
     assignment = (
@@ -167,10 +228,21 @@ def contract_internal_hermes_runtime(
         and allowed_tools <= _INTERNAL_OPS_TOOLS
         and assignment.get("approval_required") is False
     )
+    internal_devops_route = bool(
+        allowed_tools
+        and allowed_tools <= _INTERNAL_DEVOPS_TOOLS
+        and assignment.get("approval_required") is False
+    )
     if (
         task_type == "ops"
         and runtime_profile == "clawops-ops"
         and internal_ops_route
+    ):
+        return runtime_profile
+    if (
+        task_type == "devops"
+        and runtime_profile == "clawops-dev"
+        and internal_devops_route
     ):
         return runtime_profile
     return ""
@@ -263,6 +335,9 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
             "For AI BizWeek direct delivery back to KJ, reject if the parent claims worker-side "
             "Telegram delivery in externalEffects instead of providing metadata.user_facing_report "
             "kind=content_package for Gateway post-review delivery.",
+            "For package_kind='full_publication_package', reject unless the parent metadata "
+            "contains facebook_page_post.text exactly equal to "
+            "user_facing_report.sections.facebook_page_post.",
             "For AI BizWeek Carter's Junk Away / EP04 readiness checks, use "
             "managed_policy_read.operational_readiness_evidence when available; otherwise use "
             "the embedded active policy/source evidence compiled by Grace/Hermes. If complete=true "
@@ -301,7 +376,8 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         return common + [
             "kanban_complete metadata must include policy_receipts: one object per policy with "
             "role=execution, policy_id, version, sha256, and loaded=true. The database rejects missing "
-            "or mismatched receipts. When the execution backend returns a structured OpenClaw result "
+            "or mismatched receipts. Use managed_policy_read.execution_policy_receipts when "
+            "available after reading the full policy. When the execution backend returns a structured OpenClaw result "
             "instead of calling kanban_complete directly, return the identical list as policyReceipts.",
         ]
     return common + [
@@ -318,6 +394,10 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         "from the worker. Put the copyable text body and both image assets in "
         "metadata.user_facing_report kind=content_package so Gateway delivers them only "
         "after Grace Review accepts the package.",
+        "When package_kind='full_publication_package', also return "
+        "metadata.facebook_page_post={text:<exact Page body>}. Its text must exactly "
+        "match metadata.user_facing_report.sections.facebook_page_post; Hermes rejects "
+        "the execution completion before review if it is missing or different.",
         "The final OpenClaw JSON must contain metadata.user_facing_report with "
         "kind='content_package', delivery='inline_with_attachment', complete=true, "
         "title, observed_at (current Unix seconds), body (the entire copyable package "
@@ -330,14 +410,24 @@ def _render_policy_guidance(contract: Mapping[str, Any], *, review: bool) -> lis
         "machine-read actual dimensions. Page Hero must be exact 16:9, Audio Brief must "
         "be exact 1:1. If dimensions are unavailable or mismatched, regenerate before "
         "kanban_complete.",
-        "For a Page Hero, never put AI disclosure wording or disclosure placement instructions "
-        "into the image-model prompt; the model may turn them into an obstructive label. Generate "
-        "the base PNG with no disclosure text, then use the local deterministic helper: "
-        "/Users/kj/my_agent_team/hermes-agent/.venv312/bin/python "
-        "/Users/kj/my_agent_team/hermes-agent/tools/add_ai_visual_disclosure.py "
-        "<base_png> <final_png>. Submit only <final_png>. This helper places the single required "
-        "mixed-case disclosure in the bottom-left margin while preserving pixel dimensions. "
-        "The action, risk, flow, and case-information regions must remain unobstructed.",
+        "Never put AI disclosure wording or disclosure placement instructions into an image-model "
+        "prompt; the model may turn them into an obstructive label. Generate the base PNG with no "
+        "disclosure text. deterministic_image_render is a task-scoped capability: allowed_tools "
+        "does not prove exposure in the actual runtime tool list. If absent, record "
+        "acceptanceEvidence.render_attempt with status='capability_unavailable', the tool name, "
+        "and the exact missing-exposure reason; apply the sealed contract's blocker/fallback gate. "
+        "If exposed, call it only with its exact contract-bound source image, the authorized "
+        "Audio Brief filename, and placement='audio_brief_above_footer'; an inherited-only grant "
+        "does not authorize a newly generated PNG. Submit only its returned PNG. The dedicated tool "
+        "preserves pixel dimensions and places the single required mixed-case disclosure in a "
+        "padded strip above the reserved footer. Never substitute exec, process, or an arbitrary "
+        "local command for this rendering step.",
+        "Every delivered image must have controller-admissible provenance: a current verified "
+        "image-generation/render receipt or an exact controller-registered source/candidate asset. "
+        "A local path and matching SHA-256 alone do not authorize reuse from a blocked run. "
+        "If the sealed contract permits image_generate but no admissible inherited asset exists, "
+        "generate or edit that image through the allowed tool and return its actual receipt; "
+        "do not repeatedly regenerate only the other image.",
         "For AI BizWeek image generation, image_generate may return a background task "
         "that stays queued/running before the local file is attached. Do not call this "
         "a content blocker solely because the status is running. Use action=status and "
@@ -400,9 +490,44 @@ def _render_facebook_group_publish_guidance(contract: Mapping[str, Any]) -> list
     publish = contract.get("facebook_group_publish")
     if not isinstance(publish, Mapping):
         return []
-    if str(publish.get("mode") or "").strip() != "canonical_url_per_group":
-        return []
+    mode = str(publish.get("mode") or "").strip()
     group_count = len(facebook_group_publish_destination_ids(contract))
+    if mode == "listing_bound_chooser":
+        return [
+            "Facebook group publish routing: the accepted read-only preflight selected "
+            "the listing_bound_chooser route. This is a narrow task-specific permission, "
+            "not a relaxation of any general Facebook safety restriction.",
+            "Open the exact source listing, then More options → List in more places. "
+            "Before selecting anything, verify every contracted destination is still a "
+            "visible unchecked row whose live numeric group ID and canonical URL match the "
+            "preflight-pinned identity. A matching name alone is insufficient. Record absent, "
+            "ambiguous or contradicted destinations as gaps. If an unexpected row is already "
+            "selected, stop before writes. When the contract's stop rules permit partial "
+            "execution, continue only with the exact still-eligible subset; "
+            "never substitute destinations or count a gap as submitted.",
+            "Select only the exact still-eligible contracted rows and click the listing-bound "
+            "Post control once. If the submit result is uncertain, reconcile before any retry. "
+            "Do not use Share to Group, Sell Something, Create new listing, "
+            "suggested groups, or any replacement destination.",
+            "Every reported Facebook group external effect must use effect_key=group:<group_id>, "
+            "external_id=<group_id>, and details containing action=publish_existing_listing, "
+            "the preflight source task/run IDs, source_listing_id, canonical_url, canonical_name, "
+            "submit readback, and post-submit or pending-review readback.",
+            "Include a verified post_url when the destination post is actually visible. Pending "
+            "review is submitted but not published. Include publication_state=published, pending, "
+            "or unknown in each effect's details/readback; a pending permalink is not proof "
+            "of publication. Report per-destination gaps and preserve "
+            "the original expected count until published evidence satisfies it.",
+            "For a published result, post_submit_or_pending_readback must be an object "
+            "with status=published, visible=true, pending_review=false, exact group_id, "
+            "source_listing_id, matching post_url, and positive observed_at epoch seconds. "
+            "Populate it only from actual visible publication evidence. Pending/unknown "
+            "readback must keep its corresponding status; never relabel it as published.",
+            f"This approved contract covers at most {group_count} listing-bound destination(s); "
+            "do not broaden the set.",
+        ]
+    if mode != "canonical_url_per_group":
+        return []
     return [
         "Facebook group publish routing: this contract uses canonical_url_per_group. "
         "Do not use Marketplace 'List in more places' chooser rows to establish "
@@ -490,10 +615,13 @@ def _render_domain_memory_guidance(
             guidance.extend([
                 "Complete with metadata.acceptance_evidence.domain_inventory_report containing the "
                 "full readable inline answer and metadata.user_facing_report exactly shaped as "
-                "kind=content_package, delivery=inline_only, complete=true, "
+                "kind=content_package, delivery=inline_only, complete=<boolean>, "
                 "body_field=domain_inventory_report, body=<the same full answer>, assets=[]. Include "
                 "title and a plausible Unix-seconds observed_at. Do not invent another report kind "
-                "or require a Markdown attachment.",
+                "or require a Markdown attachment. complete describes the contracted content "
+                "package: use true when the terminal answer is ready for review, and false for "
+                "missing deliverables or an intermediate Objective stage. Pending review, delivery "
+                "or Objective closure alone does not require false; these remain separate gates.",
             ])
     if mode == "mutate":
         guidance.append(
@@ -506,7 +634,12 @@ def _render_domain_memory_guidance(
             "a not_published/unknown state where appropriate; silence is not absence. "
             "Every materialized artifact must carry evidence_ref and the delta-level "
             "evidence_refs must include that same exact completion effect as "
-            "task_external_effect:<platform>:<effect_key>. When the execution backend returns a structured OpenClaw "
+            "task_external_effect:<platform>:<effect_key>. A zero-effect registry mutation may instead "
+            "cite task_external_effect:<platform>:create:<source_task_id>:<source_run_id> for an "
+            "exact existing verified receipt on this same Objective/Topic, schema, case and artifact. "
+            "Keep external_effects=[]; never copy the historical effect into the current task. "
+            "The controller verifies the source again at completion and independent review; "
+            "this reference grants no new external authority. When the execution backend returns a structured OpenClaw "
             "result instead of calling kanban_complete directly, return the identical "
             "list as domainMemoryDeltas. The database rejects missing or uncontracted deltas."
         )
@@ -538,6 +671,18 @@ def _render_user_facing_delivery_guidance(
             "intermediate phase outcome; never treat it as completion or close the "
             "originating objective."
         )
+        detail += (
+            " Preserve contract-requested title, body_field, full body, assets=[], row canonical_url, "
+            "visible, pending_review, post_url, evidence_url, evidence_gaps, and coverage counts "
+            "(use explicit null for unverified counts). For a report-only reuse of accepted historical "
+            "evidence, use evidence_mode=historical_verified and evidence_source with exact integer "
+            "execution_run_id/review_run_id; the review must pin that execution's unchanged evidence. "
+            "Preserve every source destination, original source_task_id, observation time and structured "
+            "status/URL fields; label the body historical and current state unverified, keep complete=false. "
+            "This mode preserves the report without updating the current commerce ledger. Do not refresh "
+            "Facebook or timestamps to repair formatting. Review the parent's canonical user_facing_report "
+            "from kanban_get_task even when acceptance_evidence is absent."
+        )
         if review:
             return [
                 "For the required commerce_group_status delivery, reject the parent unless "
@@ -548,7 +693,7 @@ def _render_user_facing_delivery_guidance(
             "delivery=inline_only, and " + detail
         ]
     if review:
-        return [
+        guidance = [
             "For the requested user-facing delivery, reject the parent unless "
             "metadata.user_facing_report matches user_facing_delivery and truthfully exposes "
             "every known gap. Never accept a Markdown attachment path as a substitute for an "
@@ -557,13 +702,41 @@ def _render_user_facing_delivery_guidance(
             "metadata.loop_contract_blocked_result.metadata.user_facing_report from the "
             "parent run as blocked-draft evidence before saying the deliverable is absent."
         ]
+        if delivery.get("kind") == "content_package":
+            guidance.append(
+                "For inline_with_attachment, count only the controller-verified rows named in "
+                "user_facing_delivery.asset_filenames. The Markdown body artifact is separate, "
+                "and historical duplicate row IDs with the same filename and exact bytes are one "
+                "deliverable; conflicting bytes fail closed. Use Controller content-package "
+                "readback for row IDs, MIME, byte size, dimensions and SHA-256. Never return an "
+                "already-completed content worker solely to change controller-owned report fields "
+                "or attachment rows."
+            )
+            guidance.append(
+                "Controller content-package readback is authoritative for controller-owned "
+                "fields. If it reports package_kind=full_publication_package, "
+                "package_complete=true and every contracted asset row verifies, do not reject "
+                "because an earlier worker report said complete=false, because the separate "
+                "Markdown body artifact increases the total attachment-row count, or because "
+                "worker evidence omits controller row IDs. A resized thumbnail is an optional "
+                "inspection aid, never an additional acceptance artifact or blocker unless the "
+                "pinned managed policy itself requires that exact derivative. A controller/schema "
+                "mismatch is not a human decision: block it as capability with a reason beginning "
+                "`Controller state conflict:`; never use needs_input."
+            )
+        return guidance
     return [
         "The contract requires user_facing_delivery. Return a validated "
         "metadata.user_facing_report matching its declared kind and delivery mode."
     ]
 
 
+@observe_contract("compiler.execution_body", phase="compile")
 def render_execution_body(contract: Mapping[str, Any]) -> str:
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "compiler")
+    if behavior is not None:
+        return behavior.render_execution_body(contract)
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
     policy_marker = policy_snapshot_marker(worker_contract)
@@ -589,6 +762,12 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "kanban_complete metadata.external_effects using platform, effect_key, "
             "state, external_id "
             "(when available), and details. This durable ledger is the create-idempotency gate.",
+            "For a verified read-only task with no external object or effect, do not call "
+            "kanban_external_effect to invent a zero row. Complete with "
+            "metadata.external_effects=[] and read_only_zero_external_effects=true; "
+            "the controller checks its task ledger independently. This check also "
+            "requires the sealed contract to declare external_effect_budget=0 "
+            "or external_effect_budget.max_effects=0.",
             "When every deliverable and verification item is complete, call kanban_complete "
             "even if Grace or KJ must still review or approve a later public/external action. "
             "Record those downstream gates in metadata.approval_needed; they are not execution blockers.",
@@ -605,7 +784,12 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
     )
 
 
+@observe_contract("compiler.review_body", phase="compile")
 def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> str:
+    from proactive.behavior_profiles.registry import implementation
+    behavior = implementation(contract, "compiler")
+    if behavior is not None:
+        return behavior.render_review_body(contract, execution_task_id)
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
     policy_marker = policy_snapshot_marker(worker_contract)
@@ -642,9 +826,14 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "If accepted, complete with metadata review_outcome=accepted and list verified evidence. "
             "Do not set approved=false, accepted=false, review_result=blocked, "
             "review_verdict=blocked, or review_outcome=blocked on an accepted Grace review. "
-            "When accepting that a parent correctly stopped fail-closed, keep the Grace "
-            "review verdict accepted and record the parent's stop/reject/block conclusion "
-            "under parent_verdict or evidence instead.",
+            "A fail-closed parent that did not achieve the originating Objective is not an "
+            "accepted completion: call kanban_block with kind=dependency and preserve the "
+            "parent's exact blocker. Never convert a truthful blocked execution into an "
+            "accepted review or an achieved Objective.",
+            "For every accepted review, metadata.evidence must include "
+            f"parent_execution_task_id={execution_task_id} and the exact positive integer "
+            "parent_execution_run_id of the newest parent run actually reviewed. Never use "
+            "task timing as a substitute for this run-level binding.",
             *page_hero_guidance,
             *_render_policy_guidance(worker_contract, review=True),
             *_render_facebook_group_publish_guidance(worker_contract),
@@ -652,9 +841,11 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             *_render_user_facing_delivery_guidance(worker_contract, review=True),
             *_render_language_polish_guidance(worker_contract, review=True),
             "If rejected but safely correctable, do not call kanban_complete. Call kanban_block with "
-            "kind=dependency and a precise correction contract that preserves the same project, scope, "
+            "kind=dependency, review_outcome=rejected, and a precise correction contract that preserves the same project, scope, "
             "verification, stop rules, and memory namespace. This returns the parent execution card for "
             "correction and keeps this review waiting until that correction completes. Never broaden scope.",
+            "For any other rejected review, call kanban_block with review_outcome=rejected "
+            "and the accurate blocker kind; the blocked run records the verdict without acceptance.",
             "If approval or user input is required, block and state the exact decision needed.",
             *authorization_guidance,
             "After an accepted kanban_complete, Hermes deterministically queues exactly "
@@ -667,6 +858,16 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "```",
         ]
     )
+
+
+def review_max_runtime_seconds(contract: Mapping[str, Any]) -> int:
+    """Resolve the profile-pinned formal-review runtime budget."""
+    from proactive.behavior_profiles.registry import implementation
+
+    behavior = implementation(contract, "compiler")
+    if behavior is not None and hasattr(behavior, "review_max_runtime_seconds"):
+        return int(behavior.review_max_runtime_seconds(contract))
+    return min(1800, int(contract["stop_rules"]["max_runtime_seconds"]))
 
 
 def _render_authorization_guidance(contract: Mapping[str, Any]) -> list[str]:
@@ -707,6 +908,8 @@ def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> 
     original = str(contract.get("original_request") or "")
     if original.lstrip().startswith("[SYSTEM: Grace Loop callback]"):
         return False
+    if "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT" in original:
+        return True
     for key in ("scope", "verification", "goal", "grace_interpretation"):
         value = contract.get(key)
         if isinstance(value, str):
@@ -745,27 +948,36 @@ def _contract_requires_backend_original_request(contract: Mapping[str, Any]) -> 
     )
 
 
-def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove raw wording unless the contract explicitly makes it source material."""
-    safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
-    original = str(safe.get("original_request", "") or "")
-    domain_memory = safe.get("domain_memory")
+def _should_expose_backend_original_request(contract: Mapping[str, Any]) -> bool:
+    domain_memory = contract.get("domain_memory")
     registry_query = (
         isinstance(domain_memory, Mapping)
         and domain_memory.get("mode") == "query"
     )
-    delivery = safe.get("user_facing_delivery")
+    delivery = contract.get("user_facing_delivery")
+    original_request = str(contract.get("original_request") or "")
     source_package = (
         isinstance(delivery, Mapping)
         and delivery.get("kind") == "content_package"
-        and bool(delivery.get("asset_filenames"))
+        and (
+            bool(delivery.get("asset_filenames"))
+            or "facebook_page_source_text" in original_request.casefold()
+            or "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT" in original_request
+        )
     )
+    return (
+        (not registry_query or source_package)
+        and _contract_requires_backend_original_request(contract)
+    )
+
+
+def _worker_safe_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove raw wording unless the contract explicitly makes it source material."""
+    safe = json.loads(json.dumps(dict(contract), ensure_ascii=False))
+    original = str(safe.get("original_request", "") or "")
     # Registry query means no registry mutation; an explicitly source-bound
     # production package still needs its original text in the execution card.
-    expose_original = (
-        (not registry_query or source_package)
-        and _contract_requires_backend_original_request(safe)
-    )
+    expose_original = _should_expose_backend_original_request(safe)
     if not expose_original:
         safe.pop("original_request", None)
     audit = safe.setdefault("audit", {})
@@ -799,82 +1011,14 @@ def compile_and_delegate(
     callback_lease_owner: str = "",
     telegram_message_path: Optional[Mapping[str, Any]] = None,
 ) -> DelegationResult:
-    normalized = validate_loop_contract(contract)
+    normalized = validate_loop_contract(contract, effect_budget_mode="new")
     assert_contract_matches_context(normalized, context)
     identity = normalized["identity"]
 
-    # This route must not fall through to the generic Hermes-only intake.
-    readonly_urls = [
-        value
-        for value in normalized["scope"]["allowed"]
-        if value in _OPENCLAW_READONLY_URLS
-    ]
-    if task_type == "browser_readonly" and readonly_urls:
-        if len(readonly_urls) != 1:
-            raise ValueError(
-                "OpenClaw browser-readonly delegation requires exactly one allowlisted URL."
-            )
-        from proactive.openclaw_executor import execute_readonly_browser_snapshot
-
-        delegated = execute_readonly_browser_snapshot(
-            readonly_urls[0], contract=normalized, board=board
-        )
-        execution_task_id = str(delegated["execution_task_id"])
-        review_task_id = str(delegated["review_task_id"])
-        subscribed = subscribe_clawops_task(
-            execution_task_id, platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id, board=board,
-            notifier_profile=(notifier_profile or "").strip() or None,
-        )
-        review_subscribed = subscribe_clawops_task(
-            review_task_id, platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id, board=board,
-            notifier_profile=(notifier_profile or "").strip() or None,
-        )
-        with kb.connect_closing(board=board) as conn:
-            kb.add_grace_loop_callback(
-                conn,
-                review_task_id=review_task_id,
-                execution_task_id=execution_task_id,
-                platform=platform,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                user_id=user_id,
-                session_key=session_key,
-                session_id=session_id,
-                message_id=message_id,
-                notifier_profile=(notifier_profile or "").strip() or None,
-                contract_fingerprint=contract_fingerprint(normalized),
-                completion_mode=normalized["completion_mode"],
-                objective_id=str(
-                    (normalized.get("objective_ref") or {}).get("objective_id") or ""
-                ),
-                stage_key=str(
-                    (normalized.get("objective_ref") or {}).get("stage_key") or ""
-                ),
-            )
-            if not subscribed or not review_subscribed:
-                raise RuntimeError(
-                    "OpenClaw execution and review subscriptions were not durably created."
-                )
-            kb.mark_grace_delegation_queued(
-                conn,
-                delegation_id=delegation_id,
-                build_owner=delegation_build_owner,
-                execution_task_id=execution_task_id,
-                review_task_id=review_task_id,
-                callback_lease_owner=callback_lease_owner,
-            )
-        return DelegationResult(
-            execution_task_id=execution_task_id,
-            review_task_id=review_task_id,
-            assignee="clawops-browser",
-            backend_agent_id="clawops-browser",
-            execution_backend="openclaw",
-            project=str(identity["project"]),
-            topic_name=str(identity["topic_name"]),
-            subscribed=True,
-        )
+    # Retain exact scoped URL authority, then use the durable async browser
+    # executor and independent review shared by other readonly task types.
+    if task_type == "browser_readonly":
+        _browser_readonly_url(normalized)
     hermes_runtime_profile = contract_internal_hermes_runtime(
         normalized,
         task_type=task_type,
@@ -918,7 +1062,9 @@ def compile_and_delegate(
                     else "none"
                 ),
                 "external_action": bool(
-                    normalized.get("external_effect_budget", {}).get("max_effects", 0)
+                    normalized.get("external_effect_budget", 0)
+                    if type(normalized.get("external_effect_budget", 0)) is int
+                    else normalized.get("external_effect_budget", {}).get("max_effects", 0)
                 ),
             },
         )
@@ -931,9 +1077,7 @@ def compile_and_delegate(
                 created_by="grace-loop-compiler",
                 parents=[execution_task_id],
                 workspace_kind="scratch",
-                max_runtime_seconds=min(
-                    1800, int(normalized["stop_rules"]["max_runtime_seconds"])
-                ),
+                max_runtime_seconds=review_max_runtime_seconds(normalized),
                 goal_mode=True,
                 goal_max_turns=min(
                     8, int(normalized["stop_rules"]["max_iterations"])

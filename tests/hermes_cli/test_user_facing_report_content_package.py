@@ -12,6 +12,7 @@ from proactive import model_routing, policy_registry
 from hermes_cli.user_facing_report import (
     delivery_contract_from_report,
     normalize_user_facing_report,
+    promote_full_publication_package,
     render_user_facing_report_chunks,
     report_satisfies_user_facing_delivery,
 )
@@ -142,6 +143,196 @@ def test_full_publication_package_preserves_structured_manifest():
     assert report["external_effects"] == []
 
 
+@pytest.mark.parametrize("fault", [None, "sha256", "family", "section", "effects"])
+def test_generic_report_promotes_only_from_exact_full_publication_evidence(fault):
+    full = _full_publication_report()
+    generic = {
+        key: value
+        for key, value in full.items()
+        if key not in {"package_kind", "sections", "policy_receipts", "external_effects"}
+    }
+    generic["assets"] = [
+        {
+            key: asset[key]
+            for key in ("filename", "label", "path", "sha256")
+        }
+        for asset in full["assets"]
+    ]
+    evidence = {
+        "sections": dict(full["sections"]),
+        "asset_manifest": [dict(asset) for asset in full["assets"]],
+    }
+    effects = []
+    if fault == "sha256":
+        evidence["asset_manifest"][0]["sha256"] = "0" * 64
+    elif fault == "family":
+        evidence["asset_manifest"][0]["asset_family"] = "audio_brief"
+    elif fault == "section":
+        evidence["sections"].pop("podcast_title")
+    elif fault == "effects":
+        effects = [{"platform": "facebook"}]
+
+    promoted = promote_full_publication_package(
+        generic,
+        evidence=evidence,
+        expected_asset_filenames=["page.png", "audio.png"],
+        policy_receipts=full["policy_receipts"],
+        external_effects=effects,
+    )
+
+    if fault is None:
+        assert normalize_user_facing_report(promoted)["package_kind"] == (
+            "full_publication_package"
+        )
+    else:
+        assert "package_kind" not in promoted
+
+
+def test_generic_report_promotes_from_canonical_inline_section_headings():
+    full = _full_publication_report()
+    headings = (
+        ("facebook_page_post", "## 1. Facebook Page 貼文"),
+        ("facebook_group_post", "## 2. Facebook Group 討論附文"),
+        ("gemini_notebook_prompt", "## 3. Gemini Notebook Audio Generation Prompt"),
+        ("podcast_title", "## 4. Podcast Title"),
+        ("podcast_description", "## 5. Podcast Description"),
+    )
+    body = "\n\n".join(
+        f"{heading}\n\n{full['sections'][field]}" for field, heading in headings
+    )
+    generic = {
+        key: value
+        for key, value in full.items()
+        if key not in {"package_kind", "sections", "policy_receipts", "external_effects"}
+    }
+    generic["body"] = body
+    generic["complete"] = False
+    generic["assets"] = [
+        {key: asset[key] for key in ("filename", "label", "path", "sha256")}
+        for asset in full["assets"]
+    ]
+
+    promoted = promote_full_publication_package(
+        generic,
+        evidence={"asset_manifest": [dict(asset) for asset in full["assets"]]},
+        expected_asset_filenames=["page.png", "audio.png"],
+        policy_receipts=full["policy_receipts"],
+        external_effects=[],
+    )
+
+    assert promoted["package_kind"] == "full_publication_package"
+    assert promoted["sections"] == full["sections"]
+
+
+def test_generic_report_promotes_from_worker_bracket_headings_and_named_readback():
+    full = _full_publication_report()
+    headings = (
+        ("facebook_page_post", "【Facebook Page 正文】"),
+        ("facebook_group_post", "【Facebook Group 附文】"),
+        ("gemini_notebook_prompt", "【Gemini Notebook Audio Generation Prompt】"),
+        ("podcast_title", "【Podcast／Spotify Title】"),
+        ("podcast_description", "【Podcast／Spotify Description】"),
+    )
+    body = "\n\n".join(
+        f"{heading}\n\n{full['sections'][field]}" for field, heading in headings
+    )
+    generic = {
+        key: value
+        for key, value in full.items()
+        if key not in {"package_kind", "sections", "policy_receipts", "external_effects"}
+    }
+    generic.update(body=body, complete=False)
+    generic["assets"] = [
+        {key: asset[key] for key in ("filename", "label", "path", "sha256")}
+        for asset in full["assets"]
+    ]
+
+    readback = [dict(asset) for asset in full["assets"]]
+    for asset in readback:
+        width, height = (
+            map(int, asset["dimensions"].split("x"))
+            if isinstance(asset.get("dimensions"), str)
+            else (asset.pop("width"), asset.pop("height"))
+        )
+        asset["dimensions"] = {
+            "width": width, "height": height,
+        }
+    promoted = promote_full_publication_package(
+        generic,
+        evidence={"asset_readback": readback},
+        expected_asset_filenames=["page.png", "audio.png"],
+        policy_receipts=full["policy_receipts"],
+        external_effects=[],
+    )
+
+    assert promoted["package_kind"] == "full_publication_package"
+    assert promoted["complete"] is False
+    assert promoted["sections"] == full["sections"]
+
+    conflicting = [dict(asset) for asset in readback]
+    conflicting[0]["dimensions"] = {"width": 1, "height": 1}
+    rejected = promote_full_publication_package(
+        generic,
+        evidence={"first": readback, "conflicting": conflicting},
+        expected_asset_filenames=["page.png", "audio.png"],
+        policy_receipts=full["policy_receipts"],
+        external_effects=[],
+    )
+    assert "package_kind" not in rejected
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["missing", "duplicate", "reordered", "fenced", "fake_fence_close", "malformed"],
+)
+def test_inline_section_heading_promotion_fails_closed(fault):
+    full = _full_publication_report()
+    headings = [
+        ("facebook_page_post", "## Facebook Page 內文"),
+        ("facebook_group_post", "## Facebook Group 討論附文"),
+        ("gemini_notebook_prompt", "## Gemini Notebook Prompt"),
+        ("podcast_title", "## Podcast 標題"),
+        ("podcast_description", "## Podcast 說明"),
+    ]
+    if fault == "missing":
+        headings.pop()
+    elif fault == "duplicate":
+        headings.insert(1, headings[0])
+    elif fault == "reordered":
+        headings[0], headings[1] = headings[1], headings[0]
+    body = "\n\n".join(
+        f"{heading}\n\n{full['sections'][field]}" for field, heading in headings
+    )
+    if fault == "fenced":
+        body = "```markdown\n" + body + "\n```"
+    elif fault == "fake_fence_close":
+        body = "```markdown\n```not-a-close\n" + body + "\n```"
+    elif fault == "malformed":
+        body = body.replace("## ", "##")
+    generic = {
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": False,
+        "title": "package",
+        "body": body,
+        "observed_at": full["observed_at"],
+        "assets": [
+            {key: asset[key] for key in ("filename", "label", "path", "sha256")}
+            for asset in full["assets"]
+        ],
+    }
+
+    promoted = promote_full_publication_package(
+        generic,
+        evidence={"asset_manifest": [dict(asset) for asset in full["assets"]]},
+        expected_asset_filenames=["page.png", "audio.png"],
+        policy_receipts=full["policy_receipts"],
+        external_effects=[],
+    )
+
+    assert "package_kind" not in promoted
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     [
@@ -232,10 +423,19 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
             project_namespace="d-squared",
         )
         assert kb.claim_task(conn, execution_id)
-        assert kb.complete_task(conn, execution_id, metadata={
+        execution_metadata = {
             "loop_contract": {"identity": identity, "external_effect_budget": 0},
             "user_facing_report": source_report,
-            "policy_receipts": execution_receipts,
+            **(
+                {
+                    "facebook_page_post": {
+                        "text": source_report["sections"]["facebook_page_post"],
+                    }
+                }
+                if source_report.get("package_kind")
+                == "full_publication_package"
+                else {}
+            ),
             "external_effects": [],
             "external_effect_budget": 0,
             **(
@@ -243,7 +443,9 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
                 if zero_effect_attested
                 else {}
             ),
-        })
+        }
+        execution_metadata["policy_receipts"] = execution_receipts
+        assert kb.complete_task(conn, execution_id, metadata=execution_metadata)
         review_id = kb.create_task(
             conn,
             title=f"review {suffix}",
@@ -287,6 +489,86 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
             (f"gd-{suffix}", suffix * 64, suffix, execution_id, review_id, int(time.time()), int(time.time())),
         )
         return execution_id, review_id
+
+    with kb.connect_closing() as conn:
+        rejected_id = kb.create_task(
+            conn,
+            title="execution missing canonical Page text",
+            body=contract_body("execution"),
+        )
+        assert kb.claim_task(conn, rejected_id)
+        with pytest.raises(
+            ValueError,
+            match=r"metadata\.facebook_page_post\.text",
+        ):
+            kb.complete_task(
+                conn,
+                rejected_id,
+                metadata={
+                    "loop_contract": {
+                        "identity": identity,
+                        "external_effect_budget": 0,
+                    },
+                    "user_facing_report": report,
+                    "external_effects": [],
+                    "external_effect_budget": 0,
+                    "read_only_zero_external_effects": True,
+                    "policy_receipts": execution_receipts,
+                },
+            )
+        assert kb.get_task(conn, rejected_id).status == "running"
+        mismatch_id = kb.create_task(
+            conn,
+            title="execution with mismatched canonical Page text",
+            body=contract_body("execution"),
+        )
+        assert kb.claim_task(conn, mismatch_id)
+        with pytest.raises(ValueError, match="must exactly match"):
+            kb.complete_task(
+                conn,
+                mismatch_id,
+                metadata={
+                    "loop_contract": {
+                        "identity": identity,
+                        "external_effect_budget": 0,
+                    },
+                    "user_facing_report": report,
+                    "facebook_page_post": {"text": "不同的 Page 內文"},
+                    "external_effects": [],
+                    "external_effect_budget": 0,
+                    "read_only_zero_external_effects": True,
+                    "policy_receipts": execution_receipts,
+                },
+            )
+        assert kb.get_task(conn, mismatch_id).status == "running"
+        for suffix, invalid_text in (
+            ("whitespace", report["sections"]["facebook_page_post"] + "\n"),
+            ("non-string", 123),
+        ):
+            invalid_id = kb.create_task(
+                conn,
+                title=f"execution with {suffix} canonical Page text",
+                body=contract_body("execution"),
+            )
+            assert kb.claim_task(conn, invalid_id)
+            with pytest.raises(ValueError, match="must exactly match"):
+                kb.complete_task(
+                    conn,
+                    invalid_id,
+                    metadata={
+                        "loop_contract": {
+                            "identity": identity,
+                            "external_effect_budget": 0,
+                        },
+                        "user_facing_report": report,
+                        "facebook_page_post": {"text": invalid_text},
+                        "external_effects": [],
+                        "external_effect_budget": 0,
+                        "read_only_zero_external_effects": True,
+                        "policy_receipts": execution_receipts,
+                    },
+                )
+            assert kb.get_task(conn, invalid_id).status == "running"
 
     with kb.connect_closing() as conn:
         full_execution, full_review = create_pair(conn, "a", {**report, "complete": True})
@@ -337,12 +619,9 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
                 "external_id": "post-2",
             }],
         )
-        unattested_execution, unattested_review = create_pair(
-            conn,
-            "h",
-            {**report, "complete": True},
-            zero_effect_attested=False,
-        )
+        # The controller now rejects an unattested execution before review exists.
+        with pytest.raises(ValueError, match="Zero-effect execution completion"):
+            create_pair(conn, "h", {**report, "complete": True}, zero_effect_attested=False)
         manifest_execution, manifest_review = create_pair(
             conn, "i", {**report, "complete": True},
         )
@@ -415,13 +694,6 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
                 review_task_id=effect_review,
                 identity=identity,
             )
-        with pytest.raises(ValueError, match="zero-effect admission"):
-            kb.accepted_full_publication_package(
-                conn,
-                execution_task_id=unattested_execution,
-                review_task_id=unattested_review,
-                identity=identity,
-            )
         with pytest.raises(ValueError, match="attachment manifest changed"):
             kb.accepted_full_publication_package(
                 conn,
@@ -460,3 +732,47 @@ def test_accepted_full_publication_selector_rejects_audio_only_patch(tmp_path, m
                 review_task_id=full_review,
                 identity=identity,
             )
+
+
+@pytest.mark.parametrize("fault", ["swapped", "appendix", "localized", "malformed", "nested", "bracket_nested", "bracket_wrapper_nested"])
+def test_publication_binding_candidate(fault):
+    full = _full_publication_report()
+    labels = ["Facebook Page 貼文", "Facebook Group 討論附文",
+              "Gemini Notebook Audio Generation Prompt", "Podcast Title", "Podcast Description"]
+    if fault == "localized":
+        labels[2:] = ["Gemini Notebook 音訊生成提示", "Podcast 單集標題", "Podcast 單集描述"]
+    fields = list(full["sections"])
+    if fault == "nested":
+        full["sections"][fields[0]] += "\n\n### Details\nNested text must remain"
+    if fault == "bracket_nested":
+        full["sections"][fields[0]] += "\n\n【Details】\nPreserve bracket callout"
+    if fault == "bracket_wrapper_nested":
+        full["sections"][fields[0]] += "\n\n## Details\nPreserve Markdown within brackets"
+    body = "\n\n".join(f"## {i+1}｜{label}\n\n{full['sections'][field]}"
+                         for i, (label, field) in enumerate(zip(labels, fields)))
+    if fault == "bracket_wrapper_nested":
+        body = "\n\n".join(f"【{label}】\n\n{full['sections'][field]}"
+                               for label, field in zip(labels, fields))
+    if fault == "appendix":
+        body += "\n\n## 6｜Accepted Source 原文\n\nAppendix outside description"
+    generic = {key: value for key, value in full.items()
+               if key not in {"package_kind", "sections", "policy_receipts", "external_effects"}}
+    generic["body"] = body
+    evidence = {"asset_manifest": [dict(asset) for asset in full["assets"]]}
+    if fault == "malformed":
+        chunks = [f"## {i+1}｜{label}\n\n{full['sections'][field]}"
+                  for i, (label, field) in enumerate(zip(labels, fields))]
+        chunks[0], chunks[1] = chunks[1], chunks[0]
+        generic["body"] = "\n\n".join(chunks)
+        evidence["sections"] = dict(zip(fields, chunks))
+    if fault == "swapped":
+        evidence["sections"] = dict(full["sections"])
+        evidence["sections"][fields[0]], evidence["sections"][fields[1]] = (
+            evidence["sections"][fields[1]], evidence["sections"][fields[0]])
+    result = promote_full_publication_package(
+        generic, evidence=evidence, expected_asset_filenames=["page.png", "audio.png"],
+        policy_receipts=full["policy_receipts"], external_effects=[])
+    if fault in {"swapped", "malformed"}:
+        assert "package_kind" not in result
+    else:
+        assert result["sections"] == full["sections"]

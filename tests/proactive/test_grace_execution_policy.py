@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
+
+import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive import grace_execution_policy
@@ -39,6 +42,13 @@ def _call(monkeypatch, tool_name, args=None, *, platform="telegram", kanban=Fals
 
 def test_grace_can_use_read_only_browser_for_task_classification(monkeypatch):
     for tool_name in ("browser_snapshot", "browser_scroll", "browser_vision"):
+        result, called = _call(monkeypatch, tool_name, {})
+        assert result == "executed"
+        assert called
+
+
+def test_grace_can_complete_simple_direct_web_reads(monkeypatch):
+    for tool_name in ("web_search", "web_extract", "grace_read_url"):
         result, called = _call(monkeypatch, tool_name, {})
         assert result == "executed"
         assert called
@@ -259,10 +269,8 @@ def test_worker_identity_is_bound_to_persisted_execution_delegation(
             ),
         )
         execution = kb.claim_task(conn, execution_id, claimer="worker:execution")
-        review = kb.claim_task(conn, review_id, claimer="worker:review")
 
     assert execution is not None
-    assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", execution_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(execution.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(execution.claim_lock))
@@ -270,9 +278,20 @@ def test_worker_identity_is_bound_to_persisted_execution_delegation(
         "HERMES_KANBAN_WORKER_AUTH_TOKEN",
         str(execution.worker_auth_token),
     )
-    assert grace_execution_policy._is_authorized_clawops_worker(
-        "runtime-session-is-not-the-logical-loop-session",
-    )
+    # A cold worker must read committed authority without taking the writer's
+    # schema-initialization lock. This is a real WAL reader/writer boundary.
+    with monkeypatch.context() as cold:
+        cold.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "50")
+        cold.setattr(kb, "_INITIALIZED_PATHS", set())
+        writer = sqlite3.connect(db_path, isolation_level=None)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            assert grace_execution_policy._is_authorized_clawops_worker(
+                "runtime-session-is-not-the-logical-loop-session",
+            )
+        finally:
+            writer.rollback()
+            writer.close()
     with kb.connect_closing(db_path) as conn:
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -314,6 +333,14 @@ def test_worker_identity_is_bound_to_persisted_execution_delegation(
     assert not grace_execution_policy._is_authorized_clawops_worker(
         "runtime-session-is-not-the-logical-loop-session",
     )
+
+    # Review admission requires a terminal parent; exercise its identity after
+    # the execution lease/token checks, preserving the real workflow boundary.
+    with kb.connect_closing(db_path) as conn:
+        kb.block_task(conn, execution_id, reason="fixture completed execution checks",
+                      expected_run_id=execution.current_run_id)
+        review = kb.claim_task(conn, review_id, claimer="worker:review")
+    assert review is not None
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
@@ -506,3 +533,53 @@ def test_grace_cannot_bypass_delegation_with_kanban_mutations(monkeypatch):
     )
     assert not called
     assert json.loads(result)["status"] == "blocked_by_grace_execution_policy"
+
+
+@pytest.mark.parametrize('thread', ['4641', '17585'])
+@pytest.mark.parametrize('fault', [None, 'topic', 'sender', 'internal', 'board', 'review', 'cursor', 'lease', 'closed'])
+def test_coordinator_guidance_requires_exact_owner_and_active_stage(tmp_path, monkeypatch, thread, fault):
+    from plugins.openclaw_bridge import objective_control
+    db = tmp_path / 'guidance.db'
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(db))
+    for name in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK', 'HERMES_KANBAN_WORKER_AUTH_TOKEN', 'HERMES_KANBAN_BOARD'):
+        monkeypatch.delenv(name, raising=False)
+    env = dict(HERMES_SESSION_PLATFORM='telegram', HERMES_SESSION_CHAT_ID='chat',
+               HERMES_SESSION_THREAD_ID=thread, HERMES_SESSION_USER_ID='owner',
+               HERMES_SESSION_OWNER_USER_ID='owner', HERMES_SESSION_MESSAGE_ID='fresh',
+               HERMES_SESSION_MESSAGE_TEXT='Please relay this technical guidance.', HERMES_SESSION_KEY='key')
+    getter = lambda name, default='': env.get(name, default)
+    monkeypatch.setattr(grace_execution_policy, 'get_session_env', getter)
+    monkeypatch.setattr(objective_control, 'get_session_env', getter)
+    monkeypatch.setattr(objective_control, 'resolve_thread_context', lambda **kw: {'project':'fixture'})
+    with kb.connect_closing(db) as conn:
+        kb.create_grace_objective(conn, objective_id='go_note', platform='telegram', chat_id='chat',
+            thread_id=thread, session_key='key', title='technical repair', objective='repair',
+            original_request_sha256='a'*64, required_stage_keys=['repair'], terminal_stage_key='repair',
+            acceptance_criteria=['repair checked'])
+        task = kb.create_task(conn, title='repair', body='technical fixture', project_namespace='fixture')
+        review = kb.create_task(conn, title='review', body='technical fixture', project_namespace='fixture')
+        claimed = kb.claim_task(conn, task, claimer='repair-worker')
+        assert claimed is not None
+        conn.execute("""INSERT INTO grace_delegations
+            (delegation_id,contract_fingerprint,request_instance_id,platform,chat_id,thread_id,
+             session_key,session_id,resolved_route,approval_required,state,execution_task_id,
+             review_task_id,objective_id,stage_key,created_at,updated_at)
+             VALUES ('gd-note',?,'note','telegram','chat',?,'key','session','{}',0,'queued',?,?,'go_note','repair',1,1)""", ('b'*64,thread,task,review))
+        conn.execute("UPDATE grace_objective_stages SET delegation_id='gd-note',execution_task_id=?,review_task_id=?,status='queued' WHERE objective_id='go_note'",(task,review))
+        if fault == 'cursor':conn.execute("UPDATE grace_objectives SET current_stage_key='other' WHERE objective_id='go_note'")
+        if fault == 'lease':conn.execute('UPDATE tasks SET claim_expires=1 WHERE id=?',(task,))
+        if fault == 'closed':kb.block_task(conn,task,reason='ended repair',expected_run_id=claimed.current_run_id)
+    if fault=='topic':env['HERMES_SESSION_THREAD_ID']='foreign'
+    if fault=='sender':env['HERMES_SESSION_USER_ID']='other'
+    if fault=='internal':env['HERMES_SESSION_INTERNAL']='true'
+    args={'task_id':review if fault=='review' else task,'body':'Use the current runtime baseline; preserve effects and source seals.'}
+    if fault=='board':args['board']='foreign'
+    before=[]
+    result=enforce_grace_execution_boundary(tool_name='kanban_comment',args=args,next_call=lambda effective:before.append(effective) or 'executed',session_id='session')
+    assert bool(before) is (fault is None)
+    if fault is None:
+        assert result=='executed'
+        # A coordinator note cannot become lifecycle or execution authority.
+        for name in ('kanban_complete','kanban_create','terminal','browser_click'):
+            assert json.loads(enforce_grace_execution_boundary(tool_name=name,args={'task_id':task},next_call=lambda _: 'unsafe',session_id='session'))['status']=='blocked_by_grace_execution_policy'
+    else:assert json.loads(result)['status']=='blocked_by_grace_execution_policy'

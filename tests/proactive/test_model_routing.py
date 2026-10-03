@@ -95,6 +95,22 @@ def test_worker_routes_supported_models_by_work_class() -> None:
     assert route_worker("browser_publish")["requested_model"] == MODEL_MECHANICAL
 
 
+def test_devops_uses_its_declared_policy_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    from proactive import model_routing
+
+    monkeypatch.setattr(model_routing, "_load_policy", lambda: (
+        {"workers": {
+            "devops": {"model": "gpt-6-sol", "reasoning": "high"},
+            "complex": {"model": "gpt-6-astra", "reasoning": "high"},
+        }},
+        {"policy_source": "managed_active"},
+    ))
+    route = route_worker("devops")
+    assert route["requested_model"] == "gpt-6-sol"
+    assert route["reasoning_effort"] == "high"
+    assert route_worker("devops", {"task_risk": "high"})["requested_model"] == "gpt-6-astra"
+
+
 @pytest.mark.parametrize(
     "task_type",
     [
@@ -142,7 +158,7 @@ def test_grace_acceptance_rejects_spark_and_fallback(
 ) -> None:
     spark = route_worker("focused_code")
     spark_receipt = _attest(spark, monkeypatch)
-    with pytest.raises(ModelRoutingError, match="gpt-5.6-sol"):
+    with pytest.raises(ModelRoutingError, match="does not match the task policy"):
         validate_grace_acceptance_receipt(
             spark_receipt, expected_route=spark, expected_task_id="t_review"
         )
@@ -218,6 +234,89 @@ def test_grace_acceptance_keeps_verified_task_snapshot_after_rotation(
     validate_grace_acceptance_receipt(
         receipt, expected_route=review, expected_task_id="t_review"
     )
+
+
+def test_gpt6_grace_policy_routes_and_validates_attested_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    policy = json.loads(source)
+    policy["grace"]["model"] = "gpt-6-sol"
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v2",
+        json.dumps(policy, sort_keys=True),
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version="v1",
+    )
+    route = route_grace("acceptance_review")
+    assert route["requested_model"] == "gpt-6-sol"
+    receipt = _attest(route, monkeypatch)
+    validate_grace_acceptance_receipt(
+        receipt, expected_route=route, expected_task_id="t_review"
+    )
+    receipt["effective_model"] = MODEL_SOL
+    with pytest.raises(ModelRoutingError, match="does not match the task policy"):
+        validate_grace_acceptance_receipt(
+            receipt, expected_route=route, expected_task_id="t_review"
+        )
+
+
+def test_legacy_grace_model_default_still_validates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    policy = json.loads(source)
+    policy["grace"].pop("model")
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v2",
+        json.dumps(policy, sort_keys=True),
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version="v1",
+    )
+    route = route_grace("acceptance_review")
+    receipt = _attest(route, monkeypatch)
+    validate_grace_acceptance_receipt(
+        receipt, expected_route=route, expected_task_id="t_review"
+    )
+
+
+def test_pro_mode_remains_disabled_for_gpt6_policy() -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "managed-policies"
+        / "missioncrew-model-routing-v1.json"
+    ).read_text(encoding="utf-8")
+    policy = json.loads(source)
+    policy["grace"]["model"] = "gpt-6-sol"
+    policy["pro_mode_enabled"] = True
+    create_policy_version(
+        "missioncrew-model-routing-v1",
+        "v2",
+        json.dumps(policy, sort_keys=True),
+        owner_scope="global",
+        owner_id="missioncrew",
+        activate=True,
+        expected_active_version="v1",
+    )
+    with pytest.raises(ModelRoutingError, match="Pro mode must remain disabled"):
+        route_grace("planning")
 
 
 def test_grace_rejects_invalid_critical_reasoning_policy() -> None:

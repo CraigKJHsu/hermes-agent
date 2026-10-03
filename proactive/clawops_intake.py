@@ -182,7 +182,8 @@ def create_clawops_task(
 
     enriched_source = infer_clawops_metadata(clean_objective, source=source)
     normalized_contract = (
-        validate_loop_contract(contract) if contract is not None else None
+        validate_loop_contract(contract, effect_budget_mode="new")
+        if contract is not None else None
     )
     contract = normalized_contract
     contract_fingerprint = (
@@ -190,10 +191,16 @@ def create_clawops_task(
         if normalized_contract is not None
         else ""
     )
+    if contract is None or not contract_fingerprint or not delegation_id.strip():
+        raise ValueError(
+            "Every ClawOps execution requires a validated Loop Contract and "
+            "reserved Grace delegation."
+        )
     hubops_envelope = _route_hubops_if_requested(
         clean_objective,
         enriched_source,
         contract_fingerprint=contract_fingerprint,
+        **({"behavior_contract": contract} if contract is not None else {}),
     )
     if hubops_envelope and hubops_envelope.get("status") == "blocked":
         raise ValueError(str(hubops_envelope.get("blocked_reason") or "HubOps routing blocked this task."))
@@ -226,11 +233,6 @@ def create_clawops_task(
         else bool(hubops_envelope and route_requires_owner_approval(hubops_envelope))
     )
     delegation: Optional[dict[str, Any]] = None
-    if contract is None or not contract_fingerprint or not delegation_id.strip():
-        raise ValueError(
-            "Every ClawOps execution requires a validated Loop Contract and "
-            "reserved Grace delegation."
-        )
     with kb.connect_closing(board=board) as conn:
         delegation = kb.get_grace_delegation(
             conn, delegation_id=delegation_id,
@@ -453,6 +455,7 @@ def _route_hubops_if_requested(
     source: Optional[Mapping[str, Any]],
     *,
     contract_fingerprint: str = "",
+    behavior_contract: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     if not source or not any(key in source for key in ("project", "task_type", "risk_level", "approved")):
         return None
@@ -463,6 +466,7 @@ def _route_hubops_if_requested(
         risk_level=str(source.get("risk_level") or "low"),
         approved=_read_bool(source.get("approved")),
         contract_fingerprint=contract_fingerprint,
+        **({"behavior_contract": behavior_contract} if behavior_contract is not None else {}),
     )
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -56,6 +58,7 @@ def test_hubops_routing_selects_dev_worker_from_yaml():
         project="hub_ops",
         task_type="devops",
         risk_level="low",
+        runtime_callable_tools={"clawops-dev": {"terminal"}},
     )
 
     assert envelope["status"] == "routed"
@@ -126,7 +129,7 @@ def test_hubops_routing_admits_worker_with_all_required_callable_tools():
         risk_level="medium",
         approved=True,
         runtime_callable_tools={
-            "clawops-ops": {
+            "missioncrew-facebook-page-operator": {
                 "facebook_page_graph_status",
                 "facebook_page_graph_publish",
             }
@@ -135,9 +138,113 @@ def test_hubops_routing_admits_worker_with_all_required_callable_tools():
 
     assert envelope["status"] == "routed"
     assert envelope["assignment"]["required_callable_tools"] == [
-        "facebook_page_graph_status",
         "facebook_page_graph_publish",
+        "facebook_page_graph_status",
     ]
+
+
+def test_content_route_probes_openclaw_agent_tools(monkeypatch):
+    monkeypatch.setattr(
+        "proactive.hubops_routing._probe_openclaw_runtime_tools",
+        lambda profile, required: {
+            "ok": profile == "missioncrew-content",
+            "available_tools": sorted(required),
+        },
+    )
+
+    envelope = route_clawops_objective(
+        "產出完整刊登包並用 deterministic renderer 處理 Audio Brief",
+        project="ai_bizweek",
+        task_type="campaign",
+        risk_level="medium",
+        approved=True,
+        hub_ops_dir=(
+            Path(__file__).resolve().parents[2]
+            / "proactive"
+            / "behavior_profiles"
+            / "v3"
+            / "ai_bizweek"
+        ),
+    )
+
+    assert envelope["status"] == "routed"
+    assert envelope["assignment"]["runtime_profile"] == "missioncrew-content"
+    assert envelope["assignment"]["required_callable_tools"] == [
+        "deterministic_image_render"
+    ]
+
+
+def test_devops_route_requires_and_seals_terminal_callable():
+    missing = route_clawops_objective(
+        "Run the supported Objective workflow CLI.",
+        project="hub_ops",
+        task_type="devops",
+        risk_level="low",
+        approved=False,
+        runtime_callable_tools={"clawops-dev": set()},
+    )
+    assert missing["status"] == "blocked"
+    assert "terminal" in missing["blocked_reason"]
+
+    routed = route_clawops_objective(
+        "Run the supported Objective workflow CLI.",
+        project="hub_ops",
+        task_type="devops",
+        risk_level="low",
+        approved=False,
+        runtime_callable_tools={"clawops-dev": {"terminal"}},
+    )
+    assert routed["status"] == "routed"
+    assert routed["assignment"]["runtime_profile"] == "clawops-dev"
+    assert routed["assignment"]["required_callable_tools"] == ["terminal"]
+
+
+@pytest.mark.parametrize("required", [None, [], "terminal", [1], ["terminal", "terminal"], [" terminal"]])
+def test_required_tools_rejects_invalid_declarations(required):
+    with pytest.raises(ValueError, match="required_tools"):
+        route_clawops_objective(
+            "Status readback", task_type="ops",
+            behavior_contract={"routing": {"required_tools": required}},
+            runtime_callable_tools={"clawops-ops": {"kanban_show"}},
+        )
+
+
+def test_required_tools_cannot_expand_role_even_when_profile_has_tool():
+    result = route_clawops_objective(
+        "Artifact readback", task_type="ops",
+        behavior_contract={"routing": {"required_tools": ["terminal"]}},
+        runtime_callable_tools={"clawops-ops": {"kanban_show", "terminal"}},
+    )
+    assert result["status"] == "blocked"
+    assert "outside" in result["blocked_reason"]
+
+
+@pytest.mark.parametrize("available, status", [(set(), "blocked"), ({"kanban_show"}, "routed")])
+def test_required_tools_probe_and_seal_status_route(available, status):
+    result = route_clawops_objective(
+        "Report that source.png failed review", task_type="ops",
+        behavior_contract={"routing": {"required_tools": ["kanban_show"]}},
+        runtime_callable_tools={"clawops-ops": available},
+    )
+    assert result["status"] == status
+    if status == "routed":
+        assert result["assignment"]["required_callable_tools"] == ["kanban_show"]
+
+
+def test_required_tools_apply_after_versioned_routing(monkeypatch):
+    from types import SimpleNamespace
+    from proactive.behavior_profiles import registry
+
+    base = route_clawops_objective("Status", task_type="ops")
+    monkeypatch.setattr(registry, "implementation", lambda *_: SimpleNamespace(route_clawops_objective=lambda *a, **k: base))
+    monkeypatch.setattr(registry, "route_directory", lambda _: Path("unused"))
+    result = route_clawops_objective(
+        "Artifact", task_type="ops",
+        behavior_contract={"behavior_pin": {"project_namespace": "hub_ops", "behavior_profile_id": "ai_bizweek"},
+                           "routing": {"required_tools": ["terminal"]}},
+    )
+    assert result["status"] == "blocked"
+    assert base["status"] == "routed"
 
 
 def test_hubops_routing_normalizes_listing_aliases_to_browser_publish():
@@ -314,6 +421,7 @@ def test_incomplete_browser_contract_is_rejected_at_final_intake_boundary(tmp_pa
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     contract = {
         "goal": {"objective": "上架已核准二手商品"},
+        "external_effect_budget": 1,
         "stop_rules": {"max_iterations": 6},
         "scope": {"allowed": ["使用指定實拍圖"], "forbidden": ["不得變更圖片"]},
     }

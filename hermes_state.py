@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+from contextlib import closing
 import json
 import logging
 import random
@@ -858,6 +859,7 @@ class SessionDB:
     # unrelated gateway turn until agent.gateway_timeout.  Callers already
     # degrade safely on state-store failures, so fail fast and retry next turn.
     _PROCESS_LOCK_TIMEOUT_S = 5.0
+    _SEARCH_TIMEOUT_S = 15.0
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
@@ -2398,9 +2400,13 @@ class SessionDB:
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
+            # Filter using the title index before ordering matches. Ordering
+            # the whole session timeline first reads every large prompt row.
             cursor = self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
+                "WHERE id IN (SELECT id FROM sessions "
+                "WHERE title IS NOT NULL AND title LIKE ? ESCAPE '\\') "
+                "ORDER BY started_at DESC LIMIT 1",
                 (f"{escaped} #%",),
             )
             numbered = cursor.fetchall()
@@ -3922,6 +3928,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        include_context: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -3960,6 +3967,38 @@ class SessionDB:
         query = self._sanitize_fts5_query(query)
         if not query:
             return []
+
+        # One budget covers the scan and optional context reads. Keep progress
+        # callbacks off the shared gateway connection: concurrent cursor reads
+        # can hold the GIL while waiting for SQLite's mutex, deadlocking a
+        # callback that holds that mutex while waiting for the GIL.
+        deadline = time.monotonic() + self._SEARCH_TIMEOUT_S
+
+        def fetch_rows(sql, params):
+            expired = False
+
+            def interrupt():
+                nonlocal expired
+                expired = time.monotonic() >= deadline
+                return int(expired)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Session search exceeded its read budget")
+            with closing(sqlite3.connect(
+                Path(self.db_path).resolve().as_uri() + "?mode=ro",
+                uri=True, timeout=remaining, isolation_level=None,
+            )) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.set_progress_handler(interrupt, 1000)
+                try:
+                    return conn.execute(sql, params).fetchall()
+                except sqlite3.OperationalError as exc:
+                    if expired or time.monotonic() >= deadline:
+                        raise TimeoutError("Session search exceeded its read budget") from exc
+                    raise
+                finally:
+                    conn.set_progress_handler(None, 0)
 
         # Normalise sort. Anything not in the allowed set falls back to None
         # (FTS5 rank-only) so callers can pass through user input without
@@ -4099,15 +4138,13 @@ class SessionDB:
                     LIMIT ? OFFSET ?
                 """
                 tri_params.extend([limit, offset])
-                with self._lock:
-                    try:
-                        tri_cursor = self._conn.execute(tri_sql, tri_params)
-                    except sqlite3.OperationalError:
-                        # Trigram query failed at runtime — fall through to LIKE.
-                        pass
-                    else:
-                        matches = [dict(row) for row in tri_cursor.fetchall()]
-                        _trigram_succeeded = True
+                try:
+                    matches = [dict(row) for row in fetch_rows(tri_sql, tri_params)]
+                except sqlite3.OperationalError:
+                    # Syntax/capability failures may fall back; budget expiry may not.
+                    pass
+                else:
+                    _trigram_succeeded = True
             if not _trigram_succeeded:
                 # Short / mixed CJK query, trigram unavailable, or trigram
                 # <3 CJK chars. Fall back to LIKE substring search.
@@ -4152,78 +4189,74 @@ class SessionDB:
                 like_params.extend([limit, offset])
                 # instr() for snippet uses first search token
                 like_params = [non_op_tokens[0]] + like_params
-                with self._lock:
-                    like_cursor = self._conn.execute(like_sql, like_params)
-                    matches = [dict(row) for row in like_cursor.fetchall()]
+                matches = [dict(row) for row in fetch_rows(like_sql, like_params)]
         else:
-            with self._lock:
-                try:
-                    cursor = self._conn.execute(sql, params)
-                except sqlite3.OperationalError:
-                    # FTS5 query syntax error despite sanitization — return empty
-                    return []
-                else:
-                    matches = [dict(row) for row in cursor.fetchall()]
+            try:
+                matches = [dict(row) for row in fetch_rows(sql, params)]
+            except sqlite3.OperationalError:
+                # FTS5 query syntax error despite sanitization — return empty
+                return []
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.
-        for match in matches:
+        for match in matches if include_context else []:
             try:
-                with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
-                               FROM messages
-                               WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
+                ctx_rows = fetch_rows(
+                    """WITH target AS (
+                           SELECT session_id, timestamp, id
                            FROM messages
                            WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
+                       )
+                       SELECT role, content
+                       FROM (
+                           SELECT m.id, m.timestamp, m.role, m.content
+                           FROM messages m
+                           JOIN target t ON t.session_id = m.session_id
+                           WHERE (m.timestamp < t.timestamp)
+                              OR (m.timestamp = t.timestamp AND m.id < t.id)
+                           ORDER BY m.timestamp DESC, m.id DESC
+                           LIMIT 1
+                       )
+                       UNION ALL
+                       SELECT role, content
+                       FROM messages
+                       WHERE id = ?
+                       UNION ALL
+                       SELECT role, content
+                       FROM (
+                           SELECT m.id, m.timestamp, m.role, m.content
+                           FROM messages m
+                           JOIN target t ON t.session_id = m.session_id
+                           WHERE (m.timestamp > t.timestamp)
+                              OR (m.timestamp = t.timestamp AND m.id > t.id)
+                           ORDER BY m.timestamp ASC, m.id ASC
+                           LIMIT 1
+                       )""",
+                    (match["id"], match["id"]),
+                )
+                context_msgs = []
+                for r in ctx_rows:
+                    raw = r["content"]
+                    decoded = self._decode_content(raw)
+                    # Multimodal context: render a compact text-only
+                    # summary for search previews.
+                    if isinstance(decoded, list):
+                        text_parts = [
+                            p.get("text", "") for p in decoded
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        text = " ".join(t for t in text_parts if t).strip()
+                        preview = text or "[multimodal content]"
+                    elif isinstance(decoded, str):
+                        preview = decoded
+                    else:
+                        preview = ""
+                    context_msgs.append(
+                        {"role": r["role"], "content": preview[:200]}
                     )
-                    context_msgs = []
-                    for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
-                        )
                 match["context"] = context_msgs
+            except TimeoutError:
+                raise
             except Exception:
                 match["context"] = []
 

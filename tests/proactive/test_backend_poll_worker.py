@@ -183,6 +183,70 @@ def test_poll_worker_retries_adapter_failure_without_losing_run(kanban_home):
         }
 
 
+def test_poll_worker_retries_transient_terminal_backend_failure(kanban_home):
+    task_id, run_id, due_at = _queued_backend_run()
+
+    def overloaded(run):
+        return {
+            "status": "blocked",
+            "backend_run_id": run.backend_run_id,
+            "backend_agent_id": run.backend_agent_id,
+            "protocol_version": run.protocol_version,
+            "result_digest": "empty-result-digest",
+            "delegated_result": {
+                "status": "blocked",
+                "artifacts": [
+                    {
+                        "type": "openclaw_result",
+                        "value": {
+                            "evidence": {
+                                "backendRunStatus": "error",
+                                "backendError": (
+                                    "FailoverError: The AI service is "
+                                    "temporarily overloaded. Please try again "
+                                    "in a moment."
+                                ),
+                                "resultContractError": (
+                                    "Loop Contract result is empty or missing."
+                                ),
+                            },
+                            "result": {},
+                        },
+                    }
+                ],
+            },
+        }
+
+    def terminal_handler(_run, _observation):
+        pytest.fail("transient backend failures must not reach terminal review")
+
+    result = poll_due_backend_runs(
+        adapters={"openclaw": overloaded},
+        terminal_handlers={"openclaw": terminal_handler},
+        owner="poll-worker",
+        now=due_at,
+    )
+
+    assert result.claimed == 1
+    assert result.observed == 0
+    assert result.terminal == 0
+    assert result.retried == 1
+    assert "Transient backend terminal error" in result.errors[0]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task is not None and task.status == "running"
+        assert run is not None
+        assert run.backend_status == "queued"
+        assert run.backend_poll_owner is None
+        assert run.backend_last_error == result.errors[0]
+        assert run.metadata["same_poll_error_count"] == 1
+        assert (
+            run.metadata["last_transient_terminal_observation"]["status"]
+            == "blocked"
+        )
+
+
 def test_poll_worker_only_claims_runs_for_registered_adapters(kanban_home):
     openclaw_task_id, openclaw_run_id, due_at = _queued_backend_run("openclaw")
     codex_task_id, codex_run_id, codex_due_at = _queued_backend_run("codex")
@@ -277,6 +341,75 @@ def test_poll_worker_defers_adapter_while_backend_circuit_is_open(kanban_home):
         run = kb.get_run(conn, run_id)
         assert run is not None
         assert run.backend_last_error == "Backend circuit is open; poll deferred."
+
+
+def test_poll_worker_derives_no_progress_limit_for_legacy_loop_contract_run(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Legacy ambiguous loop admission",
+            executor_backend="openclaw",
+            max_runtime_seconds=900,
+        )
+        task = kb.claim_task(conn, task_id, claimer="router")
+        assert task is not None and task.current_run_id is not None
+        run_id = int(task.current_run_id)
+        assert kb.merge_active_run_metadata(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            metadata={
+                "max_poll_iterations": 0,
+                "loop_contract": {
+                    "stop_rules": {
+                        "no_progress": ["Same poll error twice"],
+                    },
+                },
+            },
+        )
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="queued",
+            protocol_version="2.0",
+            next_poll_seconds=0,
+        )
+        run = kb.get_run(conn, run_id)
+        assert run is not None and run.backend_next_poll_at is not None
+        due_at = int(run.backend_next_poll_at)
+
+    def unavailable(_run):
+        raise TimeoutError("OpenClaw Loop Contract admission remains ambiguous.")
+
+    first = poll_due_backend_runs(
+        adapters={"openclaw": unavailable},
+        owner="legacy-loop-poller-1",
+        now=due_at,
+    )
+    assert first.retried == 1
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.metadata["same_poll_error_count"] == 1
+        due_at = int(run.backend_next_poll_at)
+
+    second = poll_due_backend_runs(
+        adapters={"openclaw": unavailable},
+        owner="legacy-loop-poller-2",
+        now=due_at,
+    )
+    assert second.retried == 0
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task is not None and task.status == "blocked"
+        assert run is not None and run.status == "blocked"
+        assert "no_progress rule reached" in run.summary
 
 
 def test_poll_worker_uses_full_io_lease_for_task_claim_and_half_open_probe(
@@ -689,6 +822,25 @@ def test_successful_poll_resets_consecutive_error_count(kanban_home):
         assert final.metadata["same_poll_error_count"] == 1
 
 
+def test_transient_terminal_error_identity_uses_the_matched_backend_message():
+    from proactive.backend_poll_worker import _transient_terminal_error
+
+    first = _transient_terminal_error({
+        "status": "blocked",
+        "error": "invalid_terminal_result",
+        "message": "Temporarily overloaded on backend alpha",
+    })
+    second = _transient_terminal_error({
+        "status": "blocked",
+        "error": "invalid_terminal_result",
+        "message": "Temporarily overloaded on backend beta",
+    })
+
+    assert first == "Temporarily overloaded on backend alpha"
+    assert second == "Temporarily overloaded on backend beta"
+    assert first != second
+
+
 def test_successful_poll_bookkeeping_uses_one_outer_transaction(
     kanban_home, monkeypatch
 ):
@@ -918,36 +1070,87 @@ def test_poll_worker_requires_terminal_evidence_handler(kanban_home):
         assert task.status == "blocked"
 
 
-def test_poll_worker_blocks_when_terminal_evidence_handler_raises(kanban_home):
+def test_poll_worker_retries_terminal_handler_locally_before_blocking(kanban_home):
     task_id, run_id, due_at = _queued_backend_run()
+    adapter_calls = 0
+
+    def terminal_observation(run):
+        nonlocal adapter_calls
+        adapter_calls += 1
+        return {
+            "status": "succeeded",
+            "backend_run_id": run.backend_run_id,
+            "backend_agent_id": run.backend_agent_id,
+            "protocol_version": run.protocol_version,
+            "result_digest": "digest",
+        }
 
     def fail_terminal(_run, _observation):
         raise RuntimeError("review database unavailable")
 
-    result = poll_due_backend_runs(
-        adapters={
-            "openclaw": lambda run: {
-                "status": "succeeded",
-                "backend_run_id": run.backend_run_id,
-                "backend_agent_id": run.backend_agent_id,
-                "protocol_version": run.protocol_version,
-                "result_digest": "digest",
-            }
-        },
-        terminal_handlers={"openclaw": fail_terminal},
-        owner="poll-worker",
-        now=due_at,
-    )
+    results = [
+        poll_due_backend_runs(
+            adapters={"openclaw": terminal_observation},
+            terminal_handlers={"openclaw": fail_terminal},
+            owner=f"poll-worker-{attempt}",
+            lease_seconds=1,
+            now=due_at + attempt + 1,
+        )
+        for attempt in range(3)
+    ]
 
-    assert result.terminal == 0
-    assert result.retried == 0
-    assert result.errors == ("RuntimeError: review database unavailable",)
+    assert [result.retried for result in results] == [1, 1, 0]
+    assert all(
+        result.errors == ("RuntimeError: review database unavailable",)
+        for result in results
+    )
+    assert adapter_calls == 1
     with kb.connect() as conn:
         task = kb.get_task(conn, task_id)
         run = kb.get_run(conn, run_id)
         assert task is not None and task.status == "blocked"
         assert run is not None and run.backend_status == "succeeded"
         assert run.outcome == "blocked"
+        assert run.metadata["terminal_handler_error_count"] == 3
+
+
+def test_terminal_handler_retry_limit_counts_changing_errors(kanban_home):
+    task_id, run_id, due_at = _queued_backend_run()
+    handler_calls = 0
+
+    def terminal_observation(run):
+        return {
+            "status": "succeeded",
+            "backend_run_id": run.backend_run_id,
+            "backend_agent_id": run.backend_agent_id,
+            "protocol_version": run.protocol_version,
+            "result_digest": "digest",
+        }
+
+    def fail_terminal(_run, _observation):
+        nonlocal handler_calls
+        handler_calls += 1
+        raise RuntimeError(f"changing failure {handler_calls}")
+
+    results = [
+        poll_due_backend_runs(
+            adapters={"openclaw": terminal_observation},
+            terminal_handlers={"openclaw": fail_terminal},
+            owner=f"poll-worker-changing-{attempt}",
+            lease_seconds=1,
+            now=due_at + attempt + 1,
+        )
+        for attempt in range(3)
+    ]
+
+    assert [result.retried for result in results] == [1, 1, 0]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task is not None and task.status == "blocked"
+        assert run is not None
+        assert run.metadata["terminal_handler_error_count"] == 3
+        assert run.metadata["terminal_handler_error"].endswith("changing failure 3")
 
 
 def test_terminal_observation_remains_claimable_after_process_exit(kanban_home):

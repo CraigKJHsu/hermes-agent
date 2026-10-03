@@ -19,6 +19,7 @@ from proactive.policy_registry import (
 
 POLICY_ID = "missioncrew-model-routing-v1"
 MODEL_SOL = "gpt-5.6-sol"
+MODEL_GPT6_SOL = "gpt-6-sol"
 MODEL_TERRA = "gpt-5.6-terra"
 MODEL_LUNA = "gpt-5.6-luna"
 MODEL_MECHANICAL = "gpt-5.5"
@@ -219,7 +220,7 @@ def _configured_grace_route(
         raise ModelRoutingError("model-routing policy grace section is missing")
     model = str(grace.get("model") or MODEL_SOL).strip()
     effort = str(grace.get(reasoning_key) or default_effort).strip().lower()
-    if model != MODEL_SOL or effort not in _EFFORT_RANK:
+    if model not in {MODEL_SOL, MODEL_GPT6_SOL} or effort not in _EFFORT_RANK:
         raise ModelRoutingError("model-routing Grace configuration is invalid")
     return model, effort
 
@@ -290,6 +291,7 @@ def route_grace(
 def route_worker(
     task_type: str,
     fields: Mapping[str, Any] | None = None,
+    *, interaction_mode: str = "",
 ) -> dict[str, Any]:
     """Route delegated work; Spark is reserved for focused coding/tool work."""
     policy, receipt = _load_policy()
@@ -312,6 +314,21 @@ def route_worker(
             default_effort="high",
         )
         reason = "high_risk_worker_requires_independent_grace_gate"
+    elif interaction_mode == "interactive_readonly" and kind in {
+        "browser_readonly", "facebook_marketplace_readonly", "secondhand_commerce_group_status",
+    }:
+        model, effort = _configured_route(
+            workers, "complex", default_model=MODEL_MECHANICAL, default_effort="high",
+        )
+        reason = "interactive_readonly_worker"
+    elif kind == "devops" and "devops" in workers:
+        model, effort = _configured_route(
+            workers,
+            "devops",
+            default_model=MODEL_MECHANICAL,
+            default_effort="high",
+        )
+        reason = "devops_worker"
     elif kind in {
         "focused_code",
         "code_edit",
@@ -417,8 +434,20 @@ def validate_grace_acceptance_receipt(
         or value.get("policy_sha256") != snapshot.get("sha256")
     ):
         raise ModelRoutingError("Grace acceptance policy snapshot is not verified")
-    if value.get("effective_model") != MODEL_SOL:
-        raise ModelRoutingError("Grace acceptance requires gpt-5.6-sol")
+    policy = json.loads(snapshot["content"])
+    grace_policy = policy.get("grace")
+    policy_model = (
+        str(grace_policy.get("model") or MODEL_SOL).strip()
+        if isinstance(grace_policy, Mapping)
+        else ""
+    )
+    if (
+        policy_model not in {MODEL_SOL, MODEL_GPT6_SOL}
+        or expected.get("requested_model") != policy_model
+        or value.get("requested_model") != policy_model
+        or value.get("effective_model") != policy_model
+    ):
+        raise ModelRoutingError("Grace acceptance model does not match the task policy")
     effort = str(value.get("effective_reasoning_effort") or "").lower()
     expected_effort = str(expected.get("reasoning_effort") or "").lower()
     required_rank = max(

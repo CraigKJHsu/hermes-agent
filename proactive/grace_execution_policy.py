@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -79,7 +80,7 @@ def _authorized_loop_worker_role(session_id: str = "") -> str:
     try:
         from hermes_cli import kanban_db as kb
 
-        with kb.connect_closing(board=board) as conn:
+        with closing(kb.connect_readonly(board=board)) as conn:
             role = kb.validate_grace_loop_worker_auth(
                 conn,
                 task_id=task_id,
@@ -123,7 +124,7 @@ def _review_self_report_matches_active_claim() -> bool:
     try:
         from hermes_cli import kanban_db as kb
 
-        with kb.connect_closing(board=board) as conn:
+        with closing(kb.connect_readonly(board=board)) as conn:
             row = conn.execute(
                 """
                 SELECT t.id, t.status, t.current_run_id, t.claim_lock,
@@ -176,6 +177,44 @@ def is_direct_execution_tool(tool_name: str, args: dict[str, Any] | None = None)
         method = str((args or {}).get("method") or "").strip()
         return method not in _READ_ONLY_CDP_METHODS
     return name in _DIRECT_EXECUTION_NAMES or name.startswith(_DIRECT_EXECUTION_PREFIXES)
+
+
+def _coordinator_comment_matches_active_stage(args: dict[str, Any]) -> bool:
+    """Owner-authorized guidance is not a card or execution mutation."""
+    if (set(args) - {"task_id", "body", "board"}
+            or not isinstance(args.get("body"), str) or not args["body"].strip()
+            or not str(args.get("task_id") or "").strip()):
+        return False
+    board = os.getenv("HERMES_KANBAN_BOARD", "").strip() or "default"
+    if str(args.get("board") or board).strip() != board:
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+        from plugins.openclaw_bridge.objective_control import _owner_turn
+        import time
+
+        platform, chat, thread, _session, _message, _source, context = _owner_turn()
+        with closing(kb.connect_readonly(board=board)) as conn:
+            return conn.execute(
+                """SELECT 1 FROM grace_objectives o
+                   JOIN grace_objective_stages s ON s.objective_id=o.objective_id
+                     AND s.stage_key=o.current_stage_key
+                   JOIN grace_delegations d ON d.delegation_id=s.delegation_id
+                     AND d.objective_id=s.objective_id AND d.stage_key=s.stage_key
+                     AND d.execution_task_id=s.execution_task_id AND d.review_task_id=s.review_task_id
+                   JOIN tasks t ON t.id=d.execution_task_id
+                   JOIN task_runs r ON r.id=t.current_run_id AND r.task_id=t.id
+                   WHERE t.id=? AND t.project_namespace=? AND t.status='running'
+                     AND r.status='running' AND r.ended_at IS NULL
+                     AND t.claim_expires>? AND r.claim_expires>?
+                     AND d.state='queued' AND s.status='queued' AND o.status='active'
+                     AND o.platform=? AND o.chat_id=? AND o.thread_id=?
+                     AND d.platform=o.platform AND d.chat_id=o.chat_id AND d.thread_id=o.thread_id""",
+                (args['task_id'], context['project'], int(time.time()), int(time.time()),
+                 platform, chat, thread),
+            ).fetchone() is not None
+    except (KeyError, OSError, ValueError, RuntimeError, sqlite3.Error):
+        return False
 
 
 def enforce_grace_execution_boundary(
@@ -236,6 +275,10 @@ def enforce_grace_execution_boundary(
         )
     )
     is_forbidden_control_mutation = normalized_tool in _KANBAN_CONTROL_MUTATIONS
+    if (not has_worker_provenance and normalized_tool == "kanban_comment"
+            and _coordinator_comment_matches_active_stage(args)):
+        # Notes keep the sealed contract and lifecycle under controller ownership.
+        return next_call(args)
     if worker_role == "review" and normalized_tool in _REVIEW_SELF_MUTATIONS:
         target_task_id = str((args or {}).get("task_id") or "").strip()
         active_task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
@@ -275,8 +318,10 @@ def enforce_grace_execution_boundary(
         )
     else:
         reason = (
-            "Grace may use read-only browser inspection to understand and classify the task, "
-            "but may not click, type, submit, upload, mutate external state, or execute the task. "
+            "Grace should complete simple read-only retrieval with web_search, web_extract, "
+            "grace_read_url for an exact allowlisted loopback page, or current-page browser "
+            "inspection, but may not click, type, submit, upload, mutate external state, or "
+            "execute the task. "
             "Compile a complete Loop Contract and call clawops_delegate; ClawOps performs "
             "execution and Grace reviews the evidence."
         )

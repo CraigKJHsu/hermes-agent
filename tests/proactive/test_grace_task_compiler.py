@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import (
+    _browser_readonly_url,
     compile_and_delegate,
     contract_internal_hermes_runtime,
     contract_requires_image_generation,
@@ -88,7 +89,56 @@ def _image_contract() -> dict:
             "risk_level": "low",
         },
         "completion_mode": "terminal",
+        "external_effect_budget": 0,
     }
+
+
+def test_browser_readonly_route_carries_exact_local_url_authority():
+    preview = route_clawops_objective(
+        "唯讀檢查本機首頁",
+        project="ingrids_marketing",
+        task_type="browser_readonly",
+        risk_level="low",
+        approved=False,
+    )
+
+    assert preview["status"] == "routed"
+    assert "http://127.0.0.1:8766/" in preview["assignment"]["allowed_urls"]
+    assert "http://127.0.0.1:8766/" in preview["backend_role_card"]["allowed_urls"]
+
+
+def test_browser_readonly_url_is_extracted_from_scoped_prose_and_route_bound():
+    contract = _image_contract()
+    contract["scope"]["allowed"] = [
+        "以唯讀方式開啟與檢視 http://127.0.0.1:8766/"
+    ]
+    contract["routing"]["resolved"] = {
+        "assignment": {"allowed_urls": ["http://127.0.0.1:8766/"]}
+    }
+
+    assert _browser_readonly_url(contract) == "http://127.0.0.1:8766/"
+
+    contract["routing"]["resolved"]["assignment"]["allowed_urls"] = [
+        "https://example.com/"
+    ]
+    with pytest.raises(ValueError, match="outside the resolved route allowlist"):
+        _browser_readonly_url(contract)
+
+
+@pytest.mark.parametrize(
+    ("execution_runtime", "review_runtime"),
+    [(60, 900), (600, 1200), (900, 1500), (1800, 1800), (14_400, 1800)],
+)
+def test_v47_review_runtime_adds_bounded_cold_start_margin(
+    execution_runtime, review_runtime,
+):
+    from proactive.behavior_profiles.v47.compiler import (
+        review_max_runtime_seconds,
+    )
+
+    assert review_max_runtime_seconds(
+        {"stop_rules": {"max_runtime_seconds": execution_runtime}}
+    ) == review_runtime
 
 
 def _route_image_contract(contract: dict) -> tuple[dict, str]:
@@ -185,6 +235,19 @@ def test_secondhand_policy_does_not_inject_ai_bizweek_asset_rules(policy_id) -> 
     assert "policy_receipts" in body
     assert "For AI BizWeek" not in body
     assert "contract's asset_filenames" not in body
+
+
+def test_image_guidance_preserves_task_scoped_capability_and_provenance() -> None:
+    contract = _image_contract()
+    contract["identity"]["project"] = "ai_bizweek"
+    contract["policy_snapshots"] = [{"policy_id": "asset-production", "version": "v1", "sha256": "a" * 64}]
+    body = render_execution_body(contract)
+
+    assert "actual runtime tool list" in body
+    assert "acceptanceEvidence.render_attempt" in body
+    assert "exact contract-bound source image" in body
+    assert "Every delivered image" in body
+    assert "call deterministic_image_render with the completed generated PNG" not in body
 
 
 def test_explicit_user_facing_delivery_keeps_report_guidance() -> None:
@@ -668,6 +731,7 @@ def test_source_truth_content_contract_exposes_original_request_to_openclaw(
 
 def test_facebook_page_api_contract_uses_openclaw_operator_runtime():
     contract = _image_contract()
+    contract["external_effect_budget"] = 1
     contract["routing"] = {
         "task_type": "facebook_page_api_publish",
         "risk_level": "medium",
@@ -758,6 +822,21 @@ def test_internal_ops_contract_uses_hermes_ops_runtime(tmp_path, monkeypatch):
         normalized,
         task_type="ops",
     ) == "clawops-ops"
+    protocol_required = json.loads(json.dumps(normalized, ensure_ascii=False))
+    protocol_required["verification"]["evidence_required"].append(
+        "正式 Protocol v2 執行回執"
+    )
+    assert contract_internal_hermes_runtime(
+        protocol_required,
+        task_type="ops",
+    ) == ""
+    protocol_required["verification"]["evidence_required"][-1] = (
+        "正式 Protocol-v2 執行回執"
+    )
+    assert contract_internal_hermes_runtime(
+        protocol_required,
+        task_type="ops",
+    ) == ""
     unsafe_route = json.loads(json.dumps(normalized, ensure_ascii=False))
     unsafe_route["routing"]["resolved"]["assignment"]["allowed_tools"].append(
         "browser_snapshot"
@@ -850,8 +929,91 @@ def test_registry_readonly_package_preserves_exact_source_in_card(source_kind):
             "kind": "content_package", "asset_filenames": ["newcase_page.png"],
         }
     safe = _worker_safe_contract(contract)
+    async_safe = _worker_safe_loop_contract(contract)
     if source_kind == "package":
         assert safe["original_request"].encode("utf-8") == original.encode("utf-8")
-        assert _worker_safe_loop_contract(safe)["original_request"] == original
+        assert async_safe["original_request"].encode("utf-8") == original.encode("utf-8")
     else:
         assert "original_request" not in safe
+        assert "original_request" not in async_safe
+
+
+def test_registry_readonly_assetless_page_marker_preserves_exact_source_in_card():
+    from proactive.grace_task_compiler import _worker_safe_contract
+
+    original = (
+        "BEGIN_FACEBOOK_PAGE_SOURCE_TEXT\n"
+        "  完整 Page 原文，保留空白與標點！\n"
+        "END_FACEBOOK_PAGE_SOURCE_TEXT"
+    )
+    contract = {
+        "original_request": original,
+        "grace_interpretation": "Preserve the Page source verbatim.",
+        "domain_memory": {"mode": "query"},
+        "user_facing_delivery": {"kind": "content_package", "assets": []},
+    }
+
+    safe = _worker_safe_contract(contract)
+
+    assert safe["original_request"].encode("utf-8") == original.encode("utf-8")
+
+
+def test_browser_readonly_compiler_uses_durable_async_route(monkeypatch):
+    import proactive.grace_task_compiler as compiler
+    import proactive.openclaw_async_executor as async_executor
+    import proactive.openclaw_executor as legacy_executor
+    contract = _image_contract()
+    contract["routing"] = {"task_type": "browser_readonly", "risk_level": "low",
+        "resolved": {"assignment": {"allowed_urls": ["https://example.com/"]}}}
+    contract["scope"]["allowed"] = ["Read https://example.com/"]
+    monkeypatch.setattr(compiler, "assert_contract_matches_context", lambda *args: None)
+    monkeypatch.setattr(compiler, "contract_internal_hermes_runtime", lambda *args, **kwargs: "")
+    calls = []
+    def start(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["task_type"] == "browser_readonly"
+        assert kwargs["contract"]["scope"]["allowed"] == ["Read https://example.com/"]
+        assert kwargs["contract"]["external_effect_budget"] == 0 and kwargs["approved"] is False
+        return {"execution_task_id": "execution", "review_task_id": "review", "backend_agent_id": "missioncrew-browser-readonly"}
+    monkeypatch.setattr(async_executor, "start_loop_contract_execution", start)
+    def legacy(*args, **kwargs): raise AssertionError("Legacy snapshot must not receive formal async work")
+    monkeypatch.setattr(legacy_executor, "execute_readonly_browser_snapshot", legacy)
+    result = compiler.compile_and_delegate(contract, context={}, task_type="browser_readonly", risk_level="low", approved=False, delegation_id="delegation", delegation_build_owner="builder", platform="telegram", chat_id="chat-1", thread_id="4641")
+    assert result.backend_agent_id == "missioncrew-browser-readonly" and len(calls) == 1
+    contract["routing"]["resolved"]["assignment"]["allowed_urls"] = []
+    with pytest.raises(ValueError, match="outside the resolved route allowlist"):
+        compiler.compile_and_delegate(contract, context={}, task_type="browser_readonly", risk_level="low", approved=False, delegation_id="delegation", delegation_build_owner="builder", platform="telegram", chat_id="chat-1", thread_id="4641")
+    assert len(calls) == 1
+
+
+def test_browser_readonly_compiler_binds_actual_async_cards(tmp_path, monkeypatch):
+    from proactive import openclaw_async_executor
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db()
+    _activate_model_routing_policy()
+    monkeypatch.setattr(openclaw_async_executor, "delegate_loop_contract_to_openclaw", lambda args, **kw: _openclaw_loop_result(args))
+    contract = _image_contract()
+    contract["original_request"] = "Read the public page"
+    contract["grace_interpretation"] = "Verify a public page without changes"
+    contract["goal"]["objective"] = "Read https://example.com/"
+    contract["scope"]["allowed"] = ["https://example.com/"]
+    contract["routing"] = {"task_type": "browser_readonly", "risk_level": "low"}
+    preview = route_clawops_objective(contract["goal"]["objective"], project=contract["identity"]["project"], task_type="browser_readonly", risk_level="low", approved=False)
+    contract["routing"]["resolved"] = resolved_route_binding(preview)
+    fingerprint = contract_fingerprint(validate_loop_contract(contract))
+    with kb.connect_closing() as conn:
+        delegation = kb.reserve_grace_delegation(conn, contract_fingerprint=fingerprint,
+            request_instance_id=contract["identity"]["request_instance_id"], platform="telegram", chat_id="chat-1", thread_id="4641",
+            session_key="session", session_id="session", resolved_route=contract["routing"]["resolved"], approval_required=False)
+        assert kb.claim_grace_delegation_build(conn, delegation_id=delegation["delegation_id"], build_owner="builder")
+    result = compile_and_delegate(contract, context={**contract["identity"], "memory_namespace": contract["memory"]["namespace"]},
+        task_type="browser_readonly", risk_level="low", approved=False,
+        delegation_id=delegation["delegation_id"], delegation_build_owner="builder", platform="telegram", chat_id="chat-1", thread_id="4641")
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, result.execution_task_id)
+        assert run.metadata["backend_agent_id"] == "missioncrew-browser-readonly"
+        assert run.metadata["allowed_tools"] == ["read", "web_search", "browser"]
+        assert run.metadata["external_effect_budget"] == 0 and not run.metadata["approval_grant_id"]
+        assert kb.get_task(conn, result.review_task_id).executor_profile == "grace-policy-review"
+        assert conn.execute("SELECT state FROM grace_delegations WHERE delegation_id=?", (delegation["delegation_id"],)).fetchone()[0] == "queued"
+        assert not conn.execute("SELECT 1 FROM task_external_effects").fetchone()

@@ -8,6 +8,7 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -55,7 +56,9 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_domain_inventory",
+        "kanban_domain_episode_reserve",
+        "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -135,7 +138,9 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_domain_inventory",
+        "kanban_domain_episode_reserve",
+        "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
     }
@@ -171,6 +176,68 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def _authorize_workspace_file_completion(
+    monkeypatch,
+    task_id,
+    *,
+    task_type="devops",
+    runtime_profile="clawops-dev",
+    metadata_source="workspace_file",
+    required_callable_tools=("terminal",),
+    spawn_ok=True,
+    spawn_profile="clawops-dev",
+    spawn_required_tools=("terminal",),
+):
+    """Seal the controller-owned route required by ``metadata_path`` tests."""
+    from hermes_cli import kanban_db as kb
+
+    contract = {
+        "completion_handoff": {"metadata_source": metadata_source},
+        "routing": {
+            "resolved": {
+                "task_type": task_type,
+                "assignment": {
+                    "runtime_profile": runtime_profile,
+                    "required_callable_tools": list(required_callable_tools),
+                },
+            },
+        },
+    }
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+        + json.dumps(contract, sort_keys=True)
+        + "\n```"
+    )
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        conn.execute(
+            "UPDATE tasks SET body = ?, assignee = ?, executor_profile = ? "
+            "WHERE id = ?",
+            (body, runtime_profile, runtime_profile, task_id),
+        )
+        run_metadata = {
+            "worker_spawn": {
+                "ok": spawn_ok,
+                "profile": spawn_profile,
+                "required_runtime_tools": list(spawn_required_tools),
+                "missing_required_tools": [],
+            },
+        }
+        conn.execute(
+            "UPDATE task_runs SET profile = ?, metadata = ? WHERE id = ?",
+            (
+                runtime_profile,
+                json.dumps(run_metadata, sort_keys=True),
+                task.current_run_id,
+            ),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    finally:
+        conn.close()
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
@@ -178,8 +245,8 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
-    assert "worker_context" in d
-    assert "runs" in d
+    assert d["view"] == "summary"
+    assert d["run_count"] == 1
 
 
 def test_show_explicit_task_id(worker_env):
@@ -294,6 +361,45 @@ def test_domain_inventory_schema_requires_typed_entity():
     ]
 
 
+def test_hermes_zero_effect_completion_has_positive_controller_readback(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn,
+            title="Read-only execution",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+                '```json\n{"external_effect_budget":0}\n```'
+            ),
+            assignee="test-worker",
+        )
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None and claimed.current_run_id
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="Verified read-only work",
+            metadata={"external_effects": [], "read_only_zero_external_effects": True},
+            expected_run_id=claimed.current_run_id,
+        )
+        review = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\nReview evidence.",
+            assignee="test-worker",
+            parents=[parent],
+        )
+        kb.recompute_ready(conn)
+        assert kb.claim_task(conn, review) is not None
+
+    shown = json.loads(kt._handle_show({"task_id": review}))
+    parent_evidence = shown["parent_evidence"][0]
+    assert parent_evidence["external_effect_ledger"]["controller_zero_effect_check"] is True
+    assert parent_evidence["completion_metadata"]["external_effects"] == []
+
+
 def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
@@ -303,8 +409,12 @@ def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
         parent = kb.create_task(
             conn,
             title="OpenClaw execution",
-            body="GRACE_LOOP_CONTRACT_STAGE: execution\ncontract",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+                '```json\n{"external_effect_budget":0}\n```'
+            ),
             assignee="openclaw",
+            idempotency_key="sealed-task-key",
             executor_backend="openclaw",
         )
         claimed_parent = kb.claim_task(conn, parent)
@@ -314,16 +424,46 @@ def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
             "destinations": [{"name": f"group-{index}"} for index in range(10)],
         }
         policy_receipts = [{"policy_id": "brand", "loaded": True}]
+        assert kb.record_backend_lifecycle(
+            conn,
+            parent,
+            expected_run_id=int(claimed_parent.current_run_id),
+            status="succeeded",
+            backend_run_id="backend-123",
+            backend_agent_id="missioncrew-ops",
+            protocol_version="2.0",
+            result_digest="a" * 64,
+            terminal_observation={
+                "delegated_result": {
+                    "protocol_correlated": True,
+                    "token_usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 4,
+                        "model": "gpt-5.5",
+                        "source": "openclaw-transcript",
+                    }
+                }
+            },
+        )
         assert kb.complete_task(
             conn,
             parent,
             result="large wrapped backend result",
             summary="read-only evidence complete",
             metadata={
+                "start_idempotency_key": "durable-start-key",
                 "acceptance_evidence": evidence,
                 "external_effects": [],
                 "deliverables_completed": ["complete package"],
                 "policy_receipts": policy_receipts,
+                "read_only_zero_external_effects": True,
+                "source_inventory": [{"locator": "config.yaml", "sha256": "a" * 64}],
+                "gateway_correlations": [{"gateway_reported_model": "gpt-6-sol"}],
+                "role_worker_runtime_matrix": {"roles": [{"id": "translator"}]},
+                "safety_window": {"evidence_status": "unknown"},
+                "missing_evidence": ["provider response.model"],
+                "trust_scope": {"trusted": "controller binding only"},
+                "external_actions": [],
             },
             expected_run_id=int(claimed_parent.current_run_id),
         )
@@ -346,11 +486,467 @@ def test_show_grace_review_prioritizes_parent_acceptance_evidence(worker_env):
     assert "worker_context" not in shown
     assert shown["parent_evidence"][0]["acceptance_evidence"] == evidence
     assert shown["parent_evidence"][0]["external_effects"] == []
-    assert shown["parent_evidence"][0]["review_evidence"] == {
+    with kb.connect() as conn:
+        raw_metadata = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id=?",
+            (shown["parent_evidence"][0]["run_id"],),
+        ).fetchone()["metadata"]
+    assert shown["parent_evidence"][0]["completion_metadata"] == json.loads(raw_metadata)
+    assert shown["parent_evidence"][0]["completion_metadata_source"] == {
+        "field": "task_runs.metadata",
+        "run_id": shown["parent_evidence"][0]["run_id"],
+        "sha256": hashlib.sha256(raw_metadata.encode("utf-8")).hexdigest(),
+        "utf8_byte_count": len(raw_metadata.encode("utf-8")),
+        "trust_scope": "stored worker-authored completion metadata",
+    }
+    review_evidence = shown["parent_evidence"][0]["review_evidence"]
+    assert review_evidence["source_inventory"] == [{"locator": "config.yaml", "sha256": "a" * 64}]
+    assert review_evidence["gateway_correlations"] == [{"gateway_reported_model": "gpt-6-sol"}]
+    assert review_evidence["role_worker_runtime_matrix"] == {"roles": [{"id": "translator"}]}
+    assert review_evidence["safety_window"] == {"evidence_status": "unknown"}
+    assert review_evidence["missing_evidence"] == ["provider response.model"]
+    assert review_evidence["trust_scope"] == {"trusted": "controller binding only"}
+    assert review_evidence["external_actions"] == []
+    assert shown["parent_evidence"][0]["backend_receipt"]["actual_model"] == "gpt-5.5"
+    assert shown["parent_evidence"][0]["backend_receipt"]["idempotency_key"] == "durable-start-key"
+    assert shown["parent_evidence"][0]["backend_receipt"]["task_idempotency_key"] == "sealed-task-key"
+    assert shown["parent_evidence"][0]["backend_receipt"]["backend_agent_id"] == "missioncrew-ops"
+    assert shown["parent_evidence"][0]["external_effect_ledger"]["records"] == []
+    assert shown["parent_evidence"][0]["external_effect_ledger"]["scope"] == "task"
+    assert shown["parent_evidence"][0]["external_effect_ledger"]["controller_zero_effect_check"] is True
+    from proactive.loop_contract import contract_fingerprint
+
+    runtime_contract = {"goal": {"objective": "read-only audit"}}
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET body=? WHERE id=?",
+            (
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n```json\n"
+                + json.dumps(runtime_contract)
+                + "\n```",
+                parent,
+            ),
+        )
+        run = kb.latest_run(conn, parent)
+        runtime_metadata = dict(run.metadata or {})
+        runtime_metadata.pop("read_only_zero_external_effects", None)
+        runtime_metadata["external_effect_budget"] = 0
+        runtime_metadata["execution_card_fingerprint"] = contract_fingerprint(runtime_contract)
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(runtime_metadata), run.id),
+        )
+        conn.commit()
+    controller_budget = json.loads(kt._handle_show({"task_id": review}))
+    assert controller_budget["parent_evidence"][0]["external_effect_ledger"]["controller_zero_effect_check"] is True
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET body=? WHERE id=?",
+            (
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+                '```json\n{"external_effect_budget":1}\n```',
+                parent,
+            ),
+        )
+        conn.commit()
+    external_scope = json.loads(kt._handle_show({"task_id": review}))
+    assert external_scope["parent_evidence"][0]["external_effect_ledger"]["controller_zero_effect_check"] is False
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET body=? WHERE id=?",
+            (
+                "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+                '```json\n{"external_effect_budget":0}\n```',
+                parent,
+            ),
+        )
+        run = kb.latest_run(conn, parent)
+        assert run is not None
+        metadata = dict(run.metadata or {})
+        metadata["backend_terminal_observation"]["delegated_result"]["protocol_correlated"] = False
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), run.id),
+        )
+        conn.commit()
+    uncorrelated = json.loads(kt._handle_show({"task_id": review}))
+    assert uncorrelated["parent_evidence"][0]["backend_receipt"]["actual_model"] is None
+    assert {key: review_evidence[key] for key in (
+        "deliverables_completed", "policy_receipts", "external_effects",
+    )} == {
         "deliverables_completed": ["complete package"],
         "policy_receipts": policy_receipts,
         "external_effects": [],
     }
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, parent)
+        metadata = dict(run.metadata or {})
+        metadata["external_effects"] = [{"platform": "generic"}]
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), run.id),
+        )
+        conn.commit()
+    conflicting = json.loads(kt._handle_show({"task_id": review}))
+    assert conflicting["parent_evidence"][0]["external_effect_ledger"]["controller_zero_effect_check"] is False
+
+    with kb.connect() as conn:
+        metadata["external_effects"] = []
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), run.id),
+        )
+        conn.execute(
+            "INSERT INTO task_external_effects "
+            "(task_id,platform,effect_key,state,run_id,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (parent, "generic", "readback", "verified", run.id, 1, 1),
+        )
+        conn.commit()
+    recorded = json.loads(kt._handle_show({"task_id": review}))
+    assert recorded["parent_evidence"][0]["external_effect_ledger"]["controller_zero_effect_check"] is False
+
+
+def test_show_grace_review_compact_keeps_criteria_without_policy_content(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    contract = {
+        "goal": {"objective": "Review the exact Page preflight"},
+        "scope": {"allowed": ["read-only Page preflight"]},
+        "verification": {"checks": ["inspect Hero pixels"]},
+        "stop_rules": {"max_runtime_seconds": 900},
+        "policy_snapshots": [
+            {
+                "policy_id": "brand-policy",
+                "version": "v7",
+                "sha256": "a" * 64,
+                "path": "/managed/brand-policy-v7.json",
+                "content": "large canonical policy body",
+            }
+        ],
+    }
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: grace_review\n```json\n"
+        + json.dumps(contract, ensure_ascii=False)
+        + "\n```"
+    )
+    conn = kb.connect()
+    try:
+        review = kb.create_task(conn, title="Grace review", body=body)
+    finally:
+        conn.close()
+
+    shown = json.loads(kt._handle_show({"task_id": review}))
+
+    assert shown["view"] == "grace_review_compact"
+    assert shown["review_contract"]["goal"] == contract["goal"]
+    assert shown["review_contract"]["verification"] == contract["verification"]
+    assert "content" not in shown["review_contract"]["policy_snapshots"][0]
+    assert shown["policy_references"] == [
+        {key: value for key, value in contract["policy_snapshots"][0].items()
+         if key != "content"}
+    ]
+    compact_json = json.dumps(
+        shown["review_contract"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    sealed_json = json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    assert shown["review_contract_sha256"] == hashlib.sha256(
+        compact_json.encode("utf-8")
+    ).hexdigest()
+    assert shown["sealed_contract_sha256"] == hashlib.sha256(
+        sealed_json.encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize("artifact_location", ["success", "absent"])
+def test_show_grace_review_exposes_controller_content_package_readback(
+    worker_env, monkeypatch, tmp_path, artifact_location
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    artifacts = []
+    for name in ["body.md", "hero.png", "audio.png"]:
+        path = tmp_path / name
+        path.write_bytes(b"Synthetic readback test artifact")
+        artifacts.append(str(path))
+    artifact_metadata = ({"artifacts": artifacts} if artifact_location == "success"
+        else {})
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="completed content package",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\ncontract",
+        )
+        claimed_parent = kb.claim_task(conn, parent)
+        assert claimed_parent is not None and claimed_parent.current_run_id
+        assert kb.complete_task(
+            conn,
+            parent,
+            metadata={
+                **artifact_metadata,
+                "user_facing_report": {
+                    "kind": "content_package",
+                    "delivery": "inline_only",
+                    "complete": False,
+                    "title": "stale worker report",
+                    "body": "stale",
+                    "body_field": "stale_body",
+                    "observed_at": 1_700_000_000,
+                    "assets": [],
+                },
+            },
+            expected_run_id=int(claimed_parent.current_run_id),
+        )
+        review = kb.create_task(
+            conn,
+            title="Grace review",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\ncontract",
+            parents=[parent],
+        )
+        claimed_review = kb.claim_task(conn, review)
+        assert claimed_review is not None
+    finally:
+        conn.close()
+
+    canonical_report = {
+        "kind": "content_package",
+        "package_kind": "full_publication_package",
+        "delivery": "inline_with_attachment",
+        "complete": True,
+        "title": "canonical",
+        "body": "exact body",
+        "observed_at": 1_700_000_001,
+        "assets": [],
+    }
+    attachment_readback = {
+        "canonical_asset_count": 2,
+        "task_attachment_row_count": 3,
+        "assets": [{"attachment_id": 41}, {"attachment_id": 42}],
+        "body_artifact": {"attachment_id": 40},
+    }
+    observed_runs = []
+
+    def report_for_run(_conn, task_id, *, execution_run=None):
+        observed_runs.append(("report", execution_run.id if execution_run else None))
+        return canonical_report if task_id == parent else None
+
+    def attachments_for_run(_conn, task_id, *, execution_run=None):
+        observed_runs.append(("attachments", execution_run.id if execution_run else None))
+        return attachment_readback if task_id == parent else None
+
+    monkeypatch.setattr(kb, "grace_inline_content_package_report", report_for_run)
+    monkeypatch.setattr(
+        kb, "grace_content_package_attachment_readback", attachments_for_run,
+    )
+
+    shown = json.loads(kt._handle_show({"task_id": review}))
+    evidence = shown["parent_evidence"][0]
+    assert evidence["declared_artifacts"] == (artifacts if artifact_location == "success" else None)
+    assert evidence["user_facing_report"] == canonical_report
+    digest_readback = evidence["controller_content_package_readback"].pop("digest_readback")
+    assert digest_readback["body_sha256"] == hashlib.sha256(b"exact body").hexdigest()
+    assert digest_readback["body_utf8_byte_count"] == 10
+    assert "delivery_error" in digest_readback  # Deliberately incomplete mocked report.
+    evidence["review_evidence"]["controller_content_package_readback"].pop("digest_readback", None)
+    assert evidence["controller_content_package_readback"] == {
+        "package_kind": "full_publication_package",
+        "package_complete": True,
+        "delivery_receipt_phase": "post_review",
+        "delivery_receipt_required_before_review": False,
+        "body_sha256": hashlib.sha256(b"exact body").hexdigest(),
+        "attachment_readback": attachment_readback,
+    }
+    assert (
+        evidence["review_evidence"]["controller_content_package_readback"]
+        == evidence["controller_content_package_readback"]
+    )
+    assert observed_runs == [
+        ("report", claimed_parent.current_run_id),
+        ("attachments", claimed_parent.current_run_id),
+    ]
+
+
+def test_show_grace_review_paginates_parent_evidence_losslessly(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    evidence = {"exact_text": "不可截斷。" * 8_000}
+    parent_comment = "執行證據不可截斷。" * 1_500
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(
+            conn,
+            title="large execution evidence",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\ncontract",
+        )
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None and claimed.current_run_id
+        assert kb.complete_task(
+            conn,
+            parent,
+            metadata={"acceptance_evidence": evidence, "external_effects": []},
+            expected_run_id=int(claimed.current_run_id),
+        )
+        comment_id = kb.add_comment(conn, parent, "clawops-dev", parent_comment)
+        review = kb.create_task(
+            conn,
+            title="Grace review large evidence",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\ncontract",
+            parents=[parent],
+        )
+
+        assert kb.claim_task(conn, review) is not None
+
+    clock = [2_000_000_000]
+    monkeypatch.setattr(kt.time, "time", lambda: clock[0])
+    args = {"task_id": review}
+    shown = json.loads(kt._handle_show(args))
+    old_digest = shown["review_evidence_json_sha256"]
+    with kb.connect_closing() as conn:
+        later_comment_id = kb.add_comment(conn, parent, "clawops-dev", "Added after review claim")
+    changed = json.loads(kt._handle_show({**args, "offset": shown["next_offset"]}))
+    assert changed["review_evidence_json_sha256"] != old_digest
+    shown = json.loads(kt._handle_show(args))
+    chunks = [shown["review_evidence_json_chunk"]]
+    digest = shown["review_evidence_json_sha256"]
+    while not shown["complete"]:
+        clock[0] += 10
+        with kb.connect_closing() as conn:
+            assert kb.heartbeat_worker(conn, review, note="Review still reading paged evidence")
+        shown = json.loads(kt._handle_show({
+            **args,
+            "offset": shown["next_offset"],
+        }))
+        chunks.append(shown["review_evidence_json_chunk"])
+        assert shown["review_evidence_json_sha256"] == digest
+        assert shown["observed_at"] == clock[0]
+        assert shown["review_heartbeat_events"][-1]["kind"] == "heartbeat"
+    canonical = "".join(chunks)
+    reconstructed = json.loads(canonical)
+    assert reconstructed["parent_evidence"][0]["acceptance_evidence"] == evidence
+    assert reconstructed["parent_evidence"][0]["comments"] == [{
+        "id": comment_id,
+        "author": "clawops-dev",
+        "body": parent_comment,
+        "created_at": reconstructed["parent_evidence"][0]["comments"][0]["created_at"],
+    }, {
+        "id": later_comment_id,
+        "author": "clawops-dev",
+        "body": "Added after review claim",
+        "created_at": reconstructed["parent_evidence"][0]["comments"][1]["created_at"],
+    }]
+    assert all(event["kind"] != "heartbeat" for event in reconstructed["recent_events"])
+    with kb.connect_closing() as conn:
+        assert any(event.kind == "heartbeat" for event in kb.list_events(conn, review))
+    assert "observed_at" not in reconstructed["parent_evidence"][0]["controller_readback"]
+    assert reconstructed["parent_evidence"][0]["controller_readback"]["observation_time_field"] == "response.observed_at"
+    assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == digest
+
+
+def test_show_grace_review_exposes_pinned_plan_and_live_objective(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        objective_id = "go_review_readback"
+        kb.create_grace_objective(
+            conn,
+            objective_id=objective_id,
+            platform="telegram",
+            chat_id="chat",
+            session_key="session",
+            title="Objective",
+            objective="Finish the workflow",
+            original_request_sha256="a" * 64,
+            required_stage_keys=["prepare", "publish"],
+            terminal_stage_key="publish",
+            acceptance_criteria=["verified"],
+        )
+        parent = kb.create_task(
+            conn,
+            title="execution",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution\ncontract",
+            assignee="worker",
+        )
+        claimed_parent = kb.claim_task(conn, parent)
+        assert claimed_parent is not None and claimed_parent.current_run_id
+        plan_request = {
+            "request_id": "gpr_review_readback",
+            "specification_sha256": "b" * 64,
+            "specification": {
+                "objective_id": objective_id,
+                "expected_revision": 1,
+                "required_stage_keys": ["prepare", "repair", "publish"],
+                "current_stage_key": "repair",
+            },
+        }
+        assert kb.complete_task(
+            conn,
+            parent,
+            metadata={"objective_plan_request": plan_request, "external_effects": []},
+            expected_run_id=int(claimed_parent.current_run_id),
+        )
+        parent_run = kb.latest_run(conn, parent)
+        assert parent_run is not None
+        conn.execute(
+            "INSERT INTO grace_objective_plan_requests "
+            "(request_id,objective_id,delegation_id,execution_task_id,execution_run_id,"
+            "expected_revision,specification,state,created_at) "
+            "VALUES (?,?,?,?,?,?,?,'pending',1)",
+            (
+                plan_request["request_id"], objective_id, "gd_review_readback",
+                parent, parent_run.id, 1,
+                json.dumps(plan_request["specification"]),
+            ),
+        )
+        review = kb.create_task(
+            conn,
+            title="review",
+            body="GRACE_LOOP_CONTRACT_STAGE: review\ncontract",
+            assignee="reviewer",
+            parents=[parent],
+        )
+        conn.execute(
+            "INSERT INTO grace_delegations ("
+            "delegation_id,contract_fingerprint,request_instance_id,platform,chat_id,thread_id,session_key,"
+            "session_id,resolved_route,approval_required,state,execution_task_id,"
+            "review_task_id,objective_id,stage_key,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,0,'queued',?,?,?,?,1,1)",
+            (
+                "gd_review_readback", "c" * 64, "request-review-readback",
+                "telegram", "chat", "", "session",
+                "session", "{}", parent, review, objective_id, "prepare",
+            ),
+        )
+        assert kb.claim_task(conn, review, claimer="controller") is not None
+    finally:
+        conn.close()
+
+    shown = json.loads(kt._handle_show({"task_id": review}))
+    evidence = shown["parent_evidence"][0]
+
+    assert evidence["run_id"] == parent_run.id
+    assert evidence["review_evidence"]["objective_plan_request"] == plan_request
+    assert evidence["objective_readback"]["objective"] == {
+        "objective_id": objective_id,
+        "status": "active",
+        "current_stage_key": "prepare",
+        "terminal_stage_key": "publish",
+        "required_stage_keys": '["prepare","publish"]',
+        "revision": 1,
+    }
+    assert [stage["stage_key"] for stage in evidence["objective_readback"]["stages"]] == [
+        "prepare", "publish",
+    ]
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -487,11 +1083,347 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     })
     assert json.loads(complete_out)["ok"] is True
 
-    show_out = kt._handle_show({"task_id": worker_env})
+    show_out = kt._handle_show({"task_id": worker_env, "view": "full"})
     shown = json.loads(show_out)
     assert shown["task"]["status"] == "done"
     assert shown["runs"][-1]["summary"] == "finished with structured evidence"
     assert shown["runs"][-1]["metadata"] == handoff
+
+
+def test_complete_loads_large_metadata_from_current_workspace(
+    monkeypatch, tmp_path, worker_env
+):
+    """A worker can submit its validated JSON without retyping it in a call."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "task-workspace"
+    workspace.mkdir()
+    metadata_path = workspace / "completion_metadata.json"
+    handoff = {
+        "facebook_page_post": {"text": "完整正文" * 2_000},
+        "acceptance_evidence": {"source_equals_relay": True},
+        "external_effects": [],
+    }
+    metadata_path.write_text(
+        json.dumps(handoff, ensure_ascii=False), encoding="utf-8"
+    )
+    artifact = workspace / "hero.png"
+    artifact.write_bytes(b"png-bytes")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    _authorize_workspace_file_completion(monkeypatch, worker_env)
+
+    out = kt._handle_complete({
+        "summary": "submitted durable evidence",
+        "metadata_path": "completion_metadata.json",
+        "artifacts": [str(artifact)],
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata["facebook_page_post"] == handoff["facebook_page_post"]
+        assert run.metadata["acceptance_evidence"] == handoff["acceptance_evidence"]
+        assert run.metadata["external_effects"] == []
+        assert run.metadata["artifacts"] == [str(artifact)]
+        workspace_completion = kb.workspace_completion_evidence(run.metadata)
+        assert workspace_completion is not None
+        assert workspace_completion["metadata"] == {
+            key: value for key, value in run.metadata.items()
+            if key != kt.WORKSPACE_COMPLETION_RECEIPT_KEY
+        }
+        assert workspace_completion["metadata"]["facebook_page_post"] == (
+            handoff["facebook_page_post"]
+        )
+        assert workspace_completion["metadata"]["worker_spawn"]["ok"] is True
+        assert workspace_completion["receipt"]["source_relative_path"] == (
+            "completion_metadata.json"
+        )
+        assert workspace_completion["receipt"]["source_size_bytes"] == (
+            metadata_path.stat().st_size
+        )
+        evidence_hash = kb.workflow_review_evidence_hash(run)
+        review = kb.create_task(
+            conn,
+            title="Grace review workspace handoff",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review\ncontract",
+            parents=[worker_env],
+        )
+        kb.recompute_ready(conn)
+        assert kb.claim_task(conn, review) is not None
+    finally:
+        conn.close()
+
+    shown = json.loads(kt._handle_show({"task_id": review}))
+    if shown["view"] == "grace_review_evidence_chunk":
+        chunks = [shown["review_evidence_json_chunk"]]
+        while not shown["complete"]:
+            shown = json.loads(kt._handle_show({
+                "task_id": review, "offset": shown["next_offset"],
+            }))
+            chunks.append(shown["review_evidence_json_chunk"])
+        shown = json.loads("".join(chunks))
+    assert (
+        shown["parent_evidence"][0]["review_evidence"]["workspace_completion"]
+        == workspace_completion
+    )
+
+    conn = kb.connect()
+    try:
+        persisted = kb.latest_run(conn, worker_env)
+        tampered = dict(persisted.metadata)
+        tampered["verification"] = {"unexpected": True}
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(tampered), persisted.id),
+        )
+        assert kb.workflow_review_evidence_hash(kb.get_run(conn, persisted.id)) != evidence_hash
+        assert kb.workspace_completion_evidence(tampered) is None
+    finally:
+        conn.close()
+
+
+def test_complete_inline_metadata_cannot_spoof_workspace_receipt(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "inline completion",
+        "metadata": {
+            "result": "inline",
+            kt.WORKSPACE_COMPLETION_RECEIPT_KEY: {
+                "kind": "controller_verified_workspace_file",
+                "schema_version": 1,
+                "source_relative_path": "fake.json",
+                "source_size_bytes": 2,
+                "source_sha256": "a" * 64,
+                "metadata_sha256": "b" * 64,
+            },
+        },
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert kt.WORKSPACE_COMPLETION_RECEIPT_KEY not in run.metadata
+        assert kb.workspace_completion_evidence(run.metadata) is None
+
+        direct = kb.create_task(conn, title="direct completion receipt spoof")
+        claimed = kb.claim_task(conn, direct)
+        assert claimed is not None and claimed.current_run_id
+        content = {"result": "direct"}
+        forged = {
+            **content,
+            kt.WORKSPACE_COMPLETION_RECEIPT_KEY: {
+                "kind": "controller_verified_workspace_file",
+                "schema_version": 1,
+                "source_relative_path": "fake.json",
+                "source_size_bytes": 2,
+                "source_sha256": "a" * 64,
+                "metadata_sha256": hashlib.sha256(
+                    kb._canonical_json(content).encode("utf-8")
+                ).hexdigest(),
+            },
+        }
+        assert kb.complete_task(
+            conn,
+            direct,
+            summary="direct completion",
+            metadata=forged,
+            expected_run_id=int(claimed.current_run_id),
+        )
+        direct_run = kb.latest_run(conn, direct)
+        assert kt.WORKSPACE_COMPLETION_RECEIPT_KEY not in direct_run.metadata
+        assert kb.workspace_completion_evidence(direct_run.metadata) is None
+    finally:
+        conn.close()
+
+
+def test_complete_empty_workspace_metadata_seals_synthetic_run(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="empty workspace completion")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="empty workspace completion",
+            metadata={},
+            workspace_completion_source={
+                "source_relative_path": "empty.json",
+                "source_size_bytes": 2,
+                "source_sha256": hashlib.sha256(b"{}").hexdigest(),
+            },
+        )
+        run = kb.latest_run(conn, task_id)
+        evidence = kb.workspace_completion_evidence(run.metadata)
+        assert evidence is not None
+        assert evidence["metadata"] == {}
+        assert evidence["receipt"]["source_relative_path"] == "empty.json"
+    finally:
+        conn.close()
+
+
+def test_complete_metadata_path_rejects_unsafe_or_ambiguous_input(
+    monkeypatch, tmp_path, worker_env
+):
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "task-workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    link = workspace / "escape.json"
+    link.symlink_to(outside)
+    hard_link = workspace / "hard-link.json"
+    os.link(outside, hard_link)
+    non_object = workspace / "list.json"
+    non_object.write_text("[]", encoding="utf-8")
+    malformed = workspace / "bad.json"
+    malformed.write_text("{", encoding="utf-8")
+    non_finite = workspace / "non-finite.json"
+    non_finite.write_text('{"value": NaN}', encoding="utf-8")
+    overflow = workspace / "overflow.json"
+    overflow.write_text('{"value": 1e10000}', encoding="utf-8")
+    recursive = workspace / "recursive.json"
+    recursive.write_text("[" * 10_000 + "]" * 10_000, encoding="utf-8")
+    oversized = workspace / "large.json"
+    oversized.write_bytes(b" " * (kt.KANBAN_COMPLETE_METADATA_MAX_BYTES + 1))
+    valid = workspace / "valid.json"
+    valid.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    _authorize_workspace_file_completion(monkeypatch, worker_env)
+
+    cases = [
+        ({"metadata_path": str(outside)}, "must stay inside"),
+        ({"metadata_path": str(link)}, "must stay inside"),
+        ({"metadata_path": str(hard_link)}, "regular file"),
+        ({"metadata_path": "~missing-user/completion.json"}, "regular file"),
+        ({"metadata_path": str(non_object)}, "must be an object"),
+        ({"metadata_path": str(malformed)}, "valid JSON"),
+        ({"metadata_path": str(non_finite)}, "valid JSON"),
+        ({"metadata_path": str(overflow)}, "valid JSON"),
+        ({"metadata_path": str(recursive)}, "valid JSON"),
+        ({"metadata_path": str(oversized)}, "1000000-byte"),
+        (
+            {"metadata": {}, "metadata_path": str(valid)},
+            "provide only one of",
+        ),
+    ]
+    for extra, expected in cases:
+        out = kt._handle_complete({"summary": "x", **extra})
+        assert expected in json.loads(out).get("error", "")
+
+
+def test_complete_metadata_path_accepts_dispatcher_workspace_symlink(
+    monkeypatch, tmp_path, worker_env
+):
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "real-workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+    metadata_path = alias / "completion.json"
+    metadata_path.write_text('{"source_equals_relay": true}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(alias))
+    _authorize_workspace_file_completion(monkeypatch, worker_env)
+
+    out = kt._handle_complete({
+        "summary": "submitted through dispatcher workspace alias",
+        "metadata_path": str(metadata_path),
+    })
+    assert json.loads(out)["ok"] is True
+
+
+def test_complete_metadata_path_rejects_workspace_symlink_loop(
+    monkeypatch, tmp_path, worker_env
+):
+    from tools import kanban_tools as kt
+
+    loop = tmp_path / "workspace-loop"
+    loop.symlink_to(loop, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(loop))
+    _authorize_workspace_file_completion(monkeypatch, worker_env)
+
+    out = kt._handle_complete({
+        "summary": "must remain a structured failure",
+        "metadata_path": "completion.json",
+    })
+    assert "worker workspace is invalid" in json.loads(out).get("error", "")
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        {},
+        {"task_type": "ops"},
+        {"runtime_profile": "clawops-ops"},
+        {"required_callable_tools": ()},
+        {"metadata_source": "inline"},
+        {"spawn_ok": False},
+        {"spawn_profile": "clawops-ops"},
+        {"spawn_required_tools": ()},
+        {"body_variant": "wrong_header"},
+        {"body_variant": "multiple_fences"},
+    ],
+)
+def test_complete_metadata_path_requires_sealed_devops_contract(
+    monkeypatch, tmp_path, worker_env, route,
+):
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "task-workspace"
+    workspace.mkdir()
+    (workspace / "completion.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    _authorize_workspace_file_completion(
+        monkeypatch,
+        worker_env,
+        task_type=route.get("task_type", "devops"),
+        runtime_profile=route.get("runtime_profile", "clawops-dev"),
+        metadata_source=route.get("metadata_source", "workspace_file"),
+        required_callable_tools=route.get(
+            "required_callable_tools", ("terminal",)
+        ),
+        spawn_ok=route.get("spawn_ok", True),
+        spawn_profile=route.get("spawn_profile", "clawops-dev"),
+        spawn_required_tools=route.get("spawn_required_tools", ("terminal",)),
+    )
+    if not route:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing() as conn:
+            conn.execute(
+                "UPDATE tasks SET body = 'legacy task' WHERE id = ?",
+                (worker_env,),
+            )
+    elif route.get("body_variant"):
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, worker_env)
+            assert task is not None
+            if route["body_variant"] == "wrong_header":
+                body = "UNTRUSTED PREFIX\n" + task.body
+            else:
+                body = task.body + "\n```json\n{}\n```"
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (body, worker_env),
+            )
+
+    out = kt._handle_complete({
+        "summary": "must fail closed",
+        "metadata_path": "completion.json",
+    })
+
+    assert "requires a compiled completion_handoff" in json.loads(out).get(
+        "error", ""
+    )
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
@@ -1982,6 +2914,18 @@ def test_board_param_in_all_schemas():
         )
 
 
+def test_complete_schema_exposes_domain_memory_delta_contract():
+    from tools import kanban_tools as kt
+
+    description = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"][
+        "metadata"
+    ]["description"]
+    assert "metadata.domain_memory_deltas" in description
+    assert "domain_episode_reservation:<reservation_id>" in description
+    assert "artifact.evidence_ref" in description
+    assert "delta.evidence_refs" in description
+
+
 # ---------------------------------------------------------------------------
 # kanban_create auto-subscribe behaviour
 #
@@ -2170,3 +3114,103 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+@pytest.mark.parametrize("failure", ["pinned", "verdict", "domain", "other"])
+def test_review_error_guidance_preserves_required_evidence(worker_env, monkeypatch, failure):
+    from copy import deepcopy
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.grace_review_metadata import grace_review_acceptance_error
+    from tools import kanban_tools as kt
+    message = (
+        "behavior.pinned_version_not_verified"
+        if failure == "pinned"
+        else grace_review_acceptance_error({})
+        if failure == "verdict"
+        else "this domain mutation requires at least one domain_memory_delta"
+        if failure == "domain"
+        else "unrelated rejection"
+    )
+    args = {"summary": "review", "metadata": {"page_hero": {"required": True}}}
+    before = deepcopy(args)
+    def reject(*args, **kwargs):
+        raise ValueError(message)
+    monkeypatch.setattr(kb, "complete_task", reject)
+    result = json.loads(kt._handle_complete(args))
+    assert args == before
+    assert "error" in result and not result.get("ok")
+    if failure == "pinned":
+        assert "policy_receipts[i].pinned_version_verified" in result["error"]
+    elif failure == "verdict":
+        assert "do not add page_hero" not in result["error"]
+        assert "retain all contract-required evidence" in result["error"]
+    elif failure == "domain":
+        assert "metadata.domain_memory_deltas" in result["error"]
+        assert "artifact.evidence_ref" in result["error"]
+        assert "delta.evidence_refs" in result["error"]
+    else:
+        assert result["error"] == "kanban_complete: unrelated rejection"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_controller_package_digests_use_canonical_utf8_and_verified_source(monkeypatch):
+    from types import SimpleNamespace
+    from tools import kanban_tools as kt
+    from hermes_cli import source_binding
+    from hermes_cli.user_facing_report import normalize_user_facing_report, user_facing_report_digest
+
+    source = {"original_request": "來源字\n", "execution_task_id": "source", "review_task_id": "review",
+              "run_id": 1, "review_run_id": 2}
+    monkeypatch.setattr(source_binding, "accepted_source_package", lambda conn, contract: source)
+    run = SimpleNamespace(id=3, metadata={"loop_contract": {}, "delivery_sha256": "wrong"})
+    body = "繁體正文\n## 6｜原文\n\n來源字\n"
+    report = {"kind": "content_package", "delivery": "inline_only", "complete": True,
+              "title": "發布包", "body": body, "body_field": "package", "observed_at": 1_700_000_000,
+              "assets": [], "delivery_sha256": "wrong"}
+    got = kt._content_package_digest_readback(None, report, run)
+    payload = json.dumps(normalize_user_facing_report(report), ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert got["body_sha256"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert got["body_utf8_byte_count"] == len(body.encode("utf-8")) > len(body)
+    assert got["delivery_sha256"] == user_facing_report_digest(report) == hashlib.sha256(payload).hexdigest()
+    assert got["delivery_utf8_byte_count"] == len(payload)
+    assert got["section6"]["exact_bytes_equal_accepted_source"] is True
+    assert body.encode()[got["section6"]["start_utf8_offset"]:] == source["original_request"].encode()
+    report["body"] = body.rstrip("\n")
+    changed = kt._content_package_digest_readback(None, report, run)
+    assert changed["section6"]["exact_bytes_equal_accepted_source"] is False
+    assert changed["body_sha256"] != got["body_sha256"]
+    # Delivery uses the existing normalizer, which trims report boundary whitespace.
+    assert changed["delivery_sha256"] == got["delivery_sha256"]
+    report["body"] = body + "## 6 duplicate\n\n來源字\n"
+    assert kt._content_package_digest_readback(None, report, run)["section6"] is None
+
+
+@pytest.mark.parametrize("view", ["summary", "full", "controller"])
+def test_show_never_initializes_or_writes_existing_board(worker_env, monkeypatch, view):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    import sqlite3
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="Existing readback")
+    def no_initializer(*args, **kwargs):
+        raise AssertionError("A readback must not initialize or integrity-scan the board")
+    monkeypatch.setattr(kb, "connect", no_initializer)
+    shown = json.loads(kt._handle_show({"task_id": task_id, "view": view}))
+    assert not shown.get("error"), shown
+    assert shown["task"]["id"] == task_id
+    with kb.connect_readonly() as conn:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("UPDATE tasks SET title='Forbidden' WHERE id=?", (task_id,))
+        assert kb.get_task(conn, task_id).title == "Existing readback"
+
+
+def test_readonly_board_does_not_create_missing_database(tmp_path):
+    from hermes_cli import kanban_db as kb
+    import sqlite3
+    path = tmp_path / "missing" / "board.db"
+    with pytest.raises(sqlite3.OperationalError):
+        kb.connect_readonly(path)
+    assert not path.parent.exists()

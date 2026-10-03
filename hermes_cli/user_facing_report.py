@@ -28,6 +28,29 @@ FULL_PUBLICATION_SECTION_FIELDS = (
     "podcast_title",
     "podcast_description",
 )
+_FULL_PUBLICATION_SECTION_HEADINGS = {
+    "facebook_page_post": (
+        "facebook page 貼文", "facebook page 內文", "facebook page 正文",
+        "facebook page 完整可貼正文", "facebook page post",
+    ),
+    "facebook_group_post": (
+        "facebook group 討論附文", "facebook group 附文",
+        "facebook group 手動轉貼附文", "facebook group post",
+    ),
+    "gemini_notebook_prompt": (
+        "gemini notebook audio generation prompt（100 字內）",
+        "gemini notebook audio generation prompt",
+        "gemini notebook audio prompt",
+        "gemini notebook prompt",
+        "gemini notebook 音訊生成提示",
+    ),
+    "podcast_title": (
+        "podcast title", "podcast 標題", "podcast／spotify title", "podcast 單集標題",
+    ),
+    "podcast_description": (
+        "podcast description", "podcast 說明", "podcast／spotify description", "podcast 單集描述",
+    ),
+}
 SECONDHAND_COMMERCE_RECONCILIATION_SUBJECT_KEYS = frozenset({
     "carimali-armonia-soft-plus",
     "kolin-kd291m06",
@@ -62,6 +85,197 @@ MAX_REPORT_JSON_CHARS = 12_000
 MAX_CONTENT_PACKAGE_JSON_CHARS = 80_000
 MAX_FUTURE_SKEW_SECONDS = 300
 MIN_PLAUSIBLE_UNIX_SECONDS = 946_684_800  # 2000-01-01T00:00:00Z
+
+
+def promote_full_publication_package(
+    report: Mapping[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+    expected_asset_filenames: Any,
+    policy_receipts: Any,
+    external_effects: Any,
+) -> dict[str, Any]:
+    """Promote an older generic report only from an exact complete evidence set."""
+    if report.get("package_kind") or not (
+        report.get("kind") == CONTENT_PACKAGE_REPORT_KIND
+        and report.get("delivery") == "inline_with_attachment"
+    ):
+        return dict(report)
+    sections = evidence.get("sections")
+    body = report.get("body")
+    parsed = _full_publication_sections_from_body(body) if isinstance(body, str) else None
+    if not isinstance(sections, Mapping):
+        sections = parsed
+    assets = report.get("assets")
+    if not (
+        isinstance(sections, Mapping)
+        and all(
+            isinstance(sections.get(name), str) and sections[name].strip()
+            for name in FULL_PUBLICATION_SECTION_FIELDS
+        )
+        and isinstance(body, str)
+        and (
+            all(sections[name].strip() == parsed[name] for name in FULL_PUBLICATION_SECTION_FIELDS)
+            if parsed else
+            parsed == {} and body.strip() == "\n\n".join(sections[name] for name in FULL_PUBLICATION_SECTION_FIELDS).strip()
+        )
+        and isinstance(assets, list)
+        and isinstance(expected_asset_filenames, list)
+        and len(assets) == len(expected_asset_filenames) == 2
+        and isinstance(policy_receipts, list)
+        and external_effects == []
+    ):
+        return dict(report)
+    if any(not isinstance(item, Mapping) for item in assets):
+        return dict(report)
+    report_by_name = {str(item.get("filename") or ""): item for item in assets}
+    if (
+        list(report_by_name) != expected_asset_filenames
+        or len(report_by_name) != 2
+    ):
+        return dict(report)
+    manifests: dict[tuple[tuple[Any, ...], ...], list[dict[str, Any]]] = {}
+    for value in evidence.values():
+        if not isinstance(value, list) or len(value) != 2 or any(
+            not isinstance(item, Mapping) for item in value
+        ):
+            continue
+        by_name = {str(item.get("filename") or ""): item for item in value}
+        if len(by_name) != 2 or set(by_name) != set(expected_asset_filenames):
+            continue
+        promoted_assets = []
+        identity = []
+        for filename in expected_asset_filenames:
+            raw_asset = report_by_name[filename]
+            asset_evidence = by_name[filename]
+            family = asset_evidence.get("asset_family")
+            width = asset_evidence.get("width")
+            height = asset_evidence.get("height")
+            dimensions = asset_evidence.get("dimensions")
+            if isinstance(dimensions, Mapping):
+                width = dimensions.get("width", width)
+                height = dimensions.get("height", height)
+                dimensions = None
+            dimension_match = (
+                re.fullmatch(
+                    r"\s*([1-9][0-9]*)\s*[x×]\s*([1-9][0-9]*)\s*",
+                    dimensions,
+                    flags=re.IGNORECASE,
+                )
+                if isinstance(dimensions, str)
+                else None
+            )
+            if dimension_match is not None and width is None and height is None:
+                width, height = map(int, dimension_match.groups())
+            digest = str(asset_evidence.get("sha256") or "").strip().lower()
+            if not (
+                family in {"page_hero", "audio_brief"}
+                and type(width) is int and width > 0
+                and type(height) is int and height > 0
+                and re.fullmatch(r"[0-9a-f]{64}", digest)
+                and str(raw_asset.get("sha256") or "").strip().lower() == digest
+                and all(
+                    key not in raw_asset or raw_asset[key] == expected
+                    for key, expected in (
+                        ("asset_family", family), ("width", width), ("height", height)
+                    )
+                )
+            ):
+                break
+            identity.append((filename, family, width, height, digest))
+            promoted_assets.append({
+                **raw_asset,
+                "asset_family": family,
+                "width": width,
+                "height": height,
+                "dimensions": f"{width}x{height}",
+            })
+        if len(promoted_assets) == 2 and {
+            asset["asset_family"] for asset in promoted_assets
+        } == {"page_hero", "audio_brief"}:
+            manifests[tuple(identity)] = promoted_assets
+    if len(manifests) != 1:
+        return dict(report)
+    promoted_assets = next(iter(manifests.values()))
+    return {
+        **report,
+        "package_kind": FULL_PUBLICATION_PACKAGE_KIND,
+        "sections": {
+            name: sections[name] for name in FULL_PUBLICATION_SECTION_FIELDS
+        },
+        "assets": promoted_assets,
+        "policy_receipts": [dict(receipt) for receipt in policy_receipts],
+        "external_effects": [],
+    }
+
+
+def _full_publication_sections_from_body(body: str) -> dict[str, str] | None:
+    """Recover the five canonical sections from a complete inline package.
+
+    A zero-change continuation may carry the canonical body and image manifest
+    without redundantly copying controller-owned ``sections`` metadata.  The
+    headings are the stable user-facing boundary; fail closed on duplicates,
+    missing headings, reordering, or empty sections.
+    """
+    # None means malformed wrappers; an empty mapping means no wrapper headings.
+    matches: list[tuple[int, int, str | None, bool]] = []
+    offset = 0
+    fence: tuple[str, int] | None = None
+    for line in body.splitlines(keepends=True):
+        if fence is not None:
+            marker, minimum = fence
+            if re.match(
+                rf"^ {{0,3}}{re.escape(marker)}{{{minimum},}}[ \t]*(?:\r?\n)?$",
+                line,
+            ):
+                fence = None
+            offset += len(line)
+            continue
+        fence_match = re.match(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)(?:\r?\n)?$", line)
+        if fence_match:
+            marker, info = fence_match.groups()
+            if marker[0] == "~" or "`" not in info:
+                fence = (marker[0], len(marker))
+                offset += len(line)
+                continue
+        match = None if fence else re.match(
+            r"^(?:##[ \t]+(?:[1-5][ \t]*[.、|｜][ \t]*)?(.+?)|【(.+?)】)"
+            r"[ \t]*(?:\r?\n)?$",
+            line,
+        )
+        if match is None:
+            offset += len(line)
+            continue
+        heading = " ".join(
+            (match.group(1) or match.group(2)).strip().casefold().split()
+        )
+        fields = [
+            field
+            for field, aliases in _FULL_PUBLICATION_SECTION_HEADINGS.items()
+            if heading in aliases
+        ]
+        if len(fields) == 1:
+            matches.append((offset, offset + len(line), fields[0], match.group(1) is not None))
+        else:
+            matches.append((offset, offset + len(line), None, match.group(1) is not None))
+        offset += len(line)
+    if not matches:
+        return {}
+    if [field for _, _, field, _ in matches if field is not None] != list(FULL_PUBLICATION_SECTION_FIELDS):
+        return None
+    sections: dict[str, str] = {}
+    for index, (_, end, field, markdown) in enumerate(matches):
+        if field is None:
+            continue
+        # Only H2 headings match the Markdown wrapper grammar; H3+ stay literal.
+        # A bracket callout inside Markdown (or vice versa) is source content.
+        next_start = next((start for start, _, following, style in matches[index + 1:]
+                           if following is not None or style == markdown), len(body))
+        value = body[end:next_start].strip()
+        if not value:
+            return None
+        sections[field] = value
+    return sections
 
 
 def _required_text(value: Any, field: str) -> str:

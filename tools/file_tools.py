@@ -2,9 +2,12 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
+import stat
+import sys
 import threading
 from pathlib import Path
 
@@ -1766,6 +1769,22 @@ READ_FILE_SCHEMA = {
     }
 }
 
+FILE_SHA256_SCHEMA = {
+    "name": "file_sha256",
+    "description": "Compute SHA-256 and byte size, maximum 4 MiB. Choose path (regular file with read_file denylist), text_chunks (ordered exact UTF-8 strings), or review_task_id with expected_sha256 (re-fetch and hash your own active Grace review's canonical kanban_show pages without copying large chunks). The review mode does not read arbitrary files or write files.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Absolute or task-relative file path"},
+            "text_chunks": {"type": "array", "items": {"type": "string"}, "maxItems": 1024,
+                            "description": "Exact text chunks in offset order, with no added separators"},
+            "review_task_id": {"type": "string", "description": "Your own active Grace review task ID; hashes canonical kanban_show pages directly"},
+            "expected_sha256": {"type": "string", "description": "Exact lowercase 64-character digest observed consistently on all review pages; required with review_task_id"},
+        },
+        "required": [],
+    },
+}
+
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
     "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
@@ -1860,6 +1879,134 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+def _handle_file_sha256(args, **kw):
+    if 'review_task_id' in args or 'expected_sha256' in args:
+        from tools.kanban_tools import _handle_show
+        tid = args.get('review_task_id')
+        expected = args.get('expected_sha256')
+        run = os.environ.get('HERMES_KANBAN_RUN_ID', '')
+        if ('path' in args or 'text_chunks' in args or not isinstance(tid, str)
+                or not tid or tid != os.environ.get('HERMES_KANBAN_TASK')
+                or not run.isdecimal() or len(run) > 18 or int(run) < 1
+                or not isinstance(expected, str) or len(expected) != 64
+                or any(c not in '0123456789abcdef' for c in expected)):
+            return tool_error('file_sha256: review mode requires your own active task/run and exact expected SHA-256, without path or text_chunks')
+        digest, size, offset, total = hashlib.sha256(), 0, 0, None
+        try:
+            # The one-character first page forces canonical chunk mode even for small reviews.
+            # ponytail: bounded re-fetch, not persistent snapshots; restart if evidence changes.
+            for count in range(1, 1025):
+                page = json.loads(_handle_show({'task_id': tid, 'offset': offset, 'limit': 1 if offset == 0 else 12000}))
+                task = page.get('task', {})
+                chunk = page.get('review_evidence_json_chunk')
+                end = page.get('next_offset')
+                length = page.get('total_chars')
+                if (page.get('view') != 'grace_review_evidence_chunk'
+                        or task.get('id') != tid or task.get('status') != 'running'
+                        or task.get('current_run_id') != int(run)
+                        or page.get('review_evidence_json_sha256') != expected
+                        or type(page.get('offset')) is not int or page['offset'] != offset
+                        or not isinstance(chunk, str) or not chunk or len(chunk) > 12000
+                        or type(end) is not int or end != offset + len(chunk)
+                        or type(length) is not int or length < end or length > 4 * 1024 * 1024
+                        or (total is not None and length != total)
+                        or type(page.get('complete')) is not bool or page['complete'] != (end == length)):
+                    return tool_error('file_sha256: canonical review pages changed or are invalid; restart reading at offset 0')
+                raw = chunk.encode('utf-8')
+                size += len(raw)
+                if size > 4 * 1024 * 1024:
+                    return tool_error('file_sha256: canonical review evidence exceeds 4 MiB')
+                digest.update(raw)
+                total, offset = length, end
+                if page['complete']:
+                    actual = digest.hexdigest()
+                    if actual != expected:
+                        return tool_error('file_sha256: concatenated canonical review SHA-256 mismatch')
+                    return json.dumps({'source': 'canonical_kanban_review_pages', 'review_task_id': tid,
+                                       'run_id': int(run), 'size': size, 'sha256': actual,
+                                       'total_chars': total, 'pages': count, 'complete': True})
+        except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+            return tool_error(f'file_sha256: canonical review read failed: {exc}')
+        return tool_error('file_sha256: canonical review exceeds 1024 pages')
+    if 'text_chunks' in args:
+        chunks = args['text_chunks']
+        if 'path' in args or not isinstance(chunks, list) or len(chunks) > 1024 or any(not isinstance(chunk, str) for chunk in chunks):
+            return tool_error('file_sha256: provide only an array of up to 1024 text chunks')
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            for chunk in chunks:
+                if len(chunk) > 4 * 1024 * 1024:
+                    return tool_error('file_sha256: text chunks up to 4 MiB only')
+                encoded = chunk.encode('utf-8')
+                total += len(encoded)
+                if total > 4 * 1024 * 1024:
+                    return tool_error('file_sha256: text chunks up to 4 MiB only')
+                digest.update(encoded)
+        except UnicodeError:
+            return tool_error('file_sha256: text chunks must encode as UTF-8')
+        return json.dumps({'source': 'provided_utf8_text_chunks', 'size': total, 'sha256': digest.hexdigest()})
+    path = args.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return tool_error("file_sha256: path is required")
+    task_id = kw.get("task_id") or "default"
+
+    def descriptor_path(fd):
+        if sys.platform == "darwin":
+            import fcntl
+
+            value = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0]
+            return os.fsdecode(value)
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/self/fd/{fd}")
+        return None
+
+    try:
+        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
+        if _is_blocked_device(path, base_dir=device_base):
+            return tool_error("file_sha256: device paths are not allowed")
+        resolved = _resolve_path_for_task(path, task_id)
+        block_error = get_read_block_error(str(resolved))
+        if block_error:
+            return tool_error(block_error)
+        # Reject final-component symlinks and FIFOs before any blocking read.
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(resolved, flags), "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 4 * 1024 * 1024:
+                return tool_error("file_sha256: regular files up to 4 MiB only")
+            opened_path = descriptor_path(source.fileno())
+            if opened_path is None:
+                return tool_error("file_sha256: descriptor path verification unavailable")
+            if Path(opened_path).resolve() != resolved or get_read_block_error(opened_path):
+                return tool_error("file_sha256: opened file path changed or is blocked")
+            digest = hashlib.sha256()
+            total = 0
+            for chunk in iter(lambda: source.read(65536), b""):
+                total += len(chunk)
+                if total > 4 * 1024 * 1024:
+                    return tool_error("file_sha256: regular files up to 4 MiB only")
+                digest.update(chunk)
+            after = os.fstat(source.fileno())
+            final_opened_path = descriptor_path(source.fileno())
+            final_path_stat = os.stat(resolved)
+            if (
+                final_opened_path is None
+                or Path(final_opened_path).resolve() != resolved
+                or get_read_block_error(final_opened_path)
+                or (final_path_stat.st_dev, final_path_stat.st_ino)
+                != (after.st_dev, after.st_ino)
+            ):
+                return tool_error("file_sha256: file path changed during read")
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            return tool_error("file_sha256: file changed during read")
+    except (OSError, ValueError, RuntimeError) as exc:
+        return tool_error(f"file_sha256: {getattr(exc, 'strerror', None) or type(exc).__name__}")
+    return json.dumps({"path": str(resolved), "size": after.st_size, "sha256": digest.hexdigest()})
+
+
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1910,6 +2057,7 @@ def _handle_search_files(args, **kw):
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="file_sha256", toolset="file", schema=FILE_SHA256_SCHEMA, handler=_handle_file_sha256, check_fn=_check_file_reqs, emoji="🔏")
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

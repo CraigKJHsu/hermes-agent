@@ -4725,3 +4725,59 @@ def test_gateway_session_recovery_reopens_legacy_agent_close_rows(db):
         chat_id="chat-1",
         chat_type="dm",
     ) is None
+
+
+@pytest.mark.parametrize("query", ["needle", "記憶系統", "確認"])
+def test_search_timeout_is_explicit_and_connection_remains_usable(db, monkeypatch, query):
+    """All search routes fail explicitly; a timeout is never no-match evidence."""
+    db.create_session("search-budget", source="telegram")
+    db.append_message("search-budget", role="user", content="needle 記憶系統 確認")
+    monkeypatch.setattr(db, "_SEARCH_TIMEOUT_S", -1, raising=False)
+    with pytest.raises(TimeoutError, match="search.*budget"):
+        db.search_messages(query)
+    assert db.get_session("search-budget") is not None
+    monkeypatch.setattr(db, "_SEARCH_TIMEOUT_S", 15, raising=False)
+    assert db.search_messages(query)
+
+
+def test_search_sql_progress_timeout_releases_handler_and_lock(db, monkeypatch):
+    """Interrupt a real CJK scan, then allow an independent connection operation."""
+    db.create_session("search-progress", source="cli")
+    for _ in range(400):
+        db.append_message("search-progress", role="user", content="確認 needle")
+    calls = 0
+    def clock():
+        nonlocal calls
+        calls += 1
+        return 0 if calls <= 2 else 20
+    monkeypatch.setattr("hermes_state.time.monotonic", clock)
+    monkeypatch.setattr(db, "_SEARCH_TIMEOUT_S", 15, raising=False)
+    with pytest.raises(TimeoutError, match="search.*budget"):
+        db.search_messages("確認")
+    # A leaked handler would interrupt this VM-heavy statement too.
+    with db._lock:
+        assert db._conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000) SELECT max(x) FROM n").fetchone()[0] == 2000
+
+
+def test_search_optional_context_preserves_hits(db):
+    db.create_session("context-option", source="cli")
+    db.append_message("context-option", role="user", content="needle")
+    full = db.search_messages("needle")
+    lean = db.search_messages("needle", include_context=False)
+    assert lean == [{k: v for k, v in hit.items() if k != "context"} for hit in full]
+
+
+def test_numbered_title_lookup_filters_before_scanning_session_timeline(db):
+    for i in range(20):
+        db.create_session(f"title-noise-{i}", source="cli")
+    db.create_session("title-old", source="telegram")
+    db.create_session("title-new", source="telegram")
+    db._conn.execute("UPDATE sessions SET title='Recall #2',started_at=1 WHERE id='title-old'")
+    db._conn.execute("UPDATE sessions SET title='Recall #3',started_at=2 WHERE id='title-new'")
+    statements = []
+    db._conn.set_trace_callback(statements.append)
+    assert db.resolve_session_by_title("recall") == "title-new"
+    db._conn.set_trace_callback(None)
+    numbered = next(q for q in statements if "title LIKE" in q)
+    plan = db._conn.execute("EXPLAIN QUERY PLAN " + numbered).fetchall()
+    assert not any("SCAN sessions" in row[3] for row in plan)

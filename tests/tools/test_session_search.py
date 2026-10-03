@@ -17,8 +17,25 @@ from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
     _format_timestamp,
+    _shape_message,
     session_search,
 )
+
+
+def test_message_shape_bounds_large_content_and_tool_calls():
+    shaped = _shape_message({
+        "id": 1,
+        "role": "tool",
+        "content": "x" * 5_000,
+        "tool_calls": [{"arguments": "y" * 5_000}],
+    })
+
+    assert shaped["content_truncated"] is True
+    assert shaped["content_original_chars"] == 5_000
+    assert "<truncated chars=" in shaped["content"]
+    assert shaped["tool_calls_truncated"] is True
+    assert shaped["tool_calls_original_chars"] > 5_000
+    assert "<truncated chars=" in shaped["tool_calls"]
 
 
 @pytest.fixture
@@ -638,3 +655,15 @@ class TestCronDemotion:
         # Interactive rows first, in original relative order; cron last, in
         # original relative order.
         assert [r["id"] for r in ordered] == [2, 4, 5, 1, 3]
+
+
+def test_discovery_skips_unused_context_but_returns_anchored_evidence(db, monkeypatch):
+    _seed_modpack_sessions(db)
+    original = db.search_messages
+    def search(**kwargs):
+        assert kwargs["include_context"] is False
+        return original(**kwargs)
+    monkeypatch.setattr(db, "search_messages", search)
+    result = json.loads(session_search(query="modpack", db=db))
+    assert result["success"] and result["results"]
+    assert all(hit["messages"] for hit in result["results"])

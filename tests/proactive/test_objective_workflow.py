@@ -1,11 +1,15 @@
 """Real SQLite workflow boundaries, including restart/readback and rollback."""
 import hashlib
 import json
+import time
 
 import pytest
+from PIL import Image
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import objective_workflow as wf
+from proactive.grace_task_compiler import render_execution_body
+from proactive.loop_contract import contract_fingerprint
 
 
 @pytest.fixture
@@ -115,6 +119,29 @@ def test_plan_reorders_existing_reverse_spine_without_changing_bindings(db):
     assert snapshot["objective"]["required_stage_keys"].index("publish") < snapshot["objective"]["required_stage_keys"].index("preflight")
     with pytest.raises(ValueError, match="revision changed"):
         _plan(db)
+
+
+def test_blocked_objective_can_register_internal_repair_stage(db):
+    db.execute(
+        "UPDATE grace_objectives SET status='blocked' WHERE objective_id='go_test'"
+    )
+
+    mode = kb.grace_objective_stage_mode(
+        db,
+        objective_id="go_test",
+        stage_key="repair_runtime_capability_123",
+        platform="telegram",
+        chat_id="chat",
+        thread_id="2",
+    )
+
+    assert mode == "intermediate"
+    objective = kb.get_grace_objective(db, "go_test")
+    assert objective["current_stage_key"] == "repair_runtime_capability_123"
+    assert "repair_runtime_capability_123" in json.loads(
+        objective["required_stage_keys"]
+    )
+    assert json.loads(objective["required_stage_keys"])[-1] == "terminal"
 
 
 def test_transaction_failure_rolls_back_entire_plan(db):
@@ -244,8 +271,147 @@ def test_blocked_workflow_parent_evidence_is_visible_only_to_its_reviewer(db):
     assert '"acceptance_not_established": true' in context
     assert "actual chooser readback" in context
     assert "not-for-review" not in context and "omit-me" not in context
+    active_review_source = kb._workflow_review_source(db, review)
+    active_review_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,metadata) "
+        "VALUES (?,'default','running',203,?)",
+        (review, json.dumps({"workflow_review_source": active_review_source})),
+    ).lastrowid
+    db.execute(
+        "UPDATE tasks SET status='running',current_run_id=? WHERE id=?",
+        (active_review_run_id, review),
+    )
+    with pytest.raises(ValueError, match="cannot accept a blocked execution parent"):
+        kb.complete_task(
+            db,
+            review,
+            summary="blocked parent was truthful",
+            metadata={
+                "review_outcome": "accepted",
+                "evidence": review_source,
+            },
+            expected_run_id=active_review_run_id,
+        )
+    assert kb.get_task(db, review).status == "running"
     other = kb.create_task(db, title="ordinary dependent", parents=[execution])
     assert "actual chooser readback" not in kb.build_worker_context(db, other)
+
+
+def test_workflow_review_context_counts_only_canonical_package_assets(db, tmp_path):
+    _plan(db)
+    execution, review, run_id, review_run_id = _pair(db, objective_id="go_test")
+    body = tmp_path / "package.md"
+    page = tmp_path / "page.png"
+    audio = tmp_path / "audio.png"
+    sections = {
+        "facebook_page_post": "Page 內文",
+        "facebook_group_post": "Group 附文",
+        "gemini_notebook_prompt": "Gemini prompt",
+        "podcast_title": "Podcast title",
+        "podcast_description": "Podcast description",
+    }
+    package_body = "\n\n".join(sections.values())
+    body.write_text(package_body + "\n", encoding="utf-8")
+    Image.new("RGB", (1600, 900)).save(page)
+    Image.new("RGB", (1200, 1200)).save(audio)
+    delivery = {
+        "required": True,
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "asset_filenames": [page.name, audio.name],
+        "body_field": "acceptance_evidence.inline_content_package",
+    }
+    for path in (body, page, audio):
+        for _ in range(2):
+            kb.add_attachment(
+                db,
+                execution,
+                filename=path.name,
+                stored_path=str(path),
+                content_type=("text/markdown" if path == body else "image/png"),
+                size=path.stat().st_size,
+                uploaded_by="historical-replay",
+            )
+    run = kb.get_run(db, run_id)
+    metadata = dict(run.metadata)
+    metadata["loop_contract"] = {
+        **metadata["loop_contract"],
+        "user_facing_delivery": delivery,
+    }
+    db.execute(
+        "UPDATE tasks SET body=? WHERE id=?",
+        (render_execution_body(metadata["loop_contract"]), execution),
+    )
+    metadata["user_facing_report"] = {
+        "kind": "content_package",
+        "delivery": "inline_with_attachment",
+        "complete": True,
+        "title": "完整發布包",
+        "body": package_body,
+        "observed_at": int(time.time()),
+        "assets": [
+            {
+                "filename": path.name,
+                "label": path.stem,
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in (page, audio)
+        ],
+    }
+    metadata["acceptance_evidence"].update({
+        "inline_content_package": package_body,
+        "sections": sections,
+        "asset_manifest": [
+            {
+                "filename": page.name,
+                "asset_family": "page_hero",
+                "path": str(page),
+                "sha256": hashlib.sha256(page.read_bytes()).hexdigest(),
+                "width": 1600,
+                "height": 900,
+            },
+            {
+                "filename": audio.name,
+                "asset_family": "audio_brief",
+                "path": str(audio),
+                "sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+                "width": 1200,
+                "height": 1200,
+            },
+        ],
+    })
+    metadata["policy_receipts"] = []
+    metadata["external_effects"] = []
+    metadata["attachment_manifest"] = kb.task_attachment_manifest(db, execution)
+    db.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps(metadata), run_id),
+    )
+    source = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": run_id,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, run_id)
+        ),
+    }
+    db.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps({"workflow_review_source": source}), review_run_id),
+    )
+
+    report = kb.grace_inline_content_package_report(db, execution)
+    assert report is not None
+    assert report["package_kind"] == "full_publication_package"
+    assert report["complete"] is True
+    assert report["body"] == package_body
+    context = kb.build_worker_context(db, review)
+
+    assert "## Controller content-package readback" in context
+    assert '"canonical_asset_count": 2' in context
+    assert '"task_attachment_row_count": 6' in context
+    assert '"package_complete": true' in context
+    assert "Markdown body artifact is separate" in context
 
 
 def test_cancelled_workflow_stage_finishes_lifecycle_without_acceptance(db):
@@ -776,6 +942,19 @@ def test_self_planner_rejects_unsupported_fields_before_persisting(db):
     ).fetchone()[0] == 0
 
 
+def test_self_planner_requires_integer_expected_revision(db):
+    execution, _, _, _ = _active_self_planner(db)
+    specification = _deferred_spec(execution)
+    specification["expected_revision"] = "1"
+
+    with pytest.raises(ValueError, match="expected_revision must be an integer"):
+        wf.request_plan(db, **specification)
+
+    assert db.execute(
+        "SELECT COUNT(*) FROM grace_objective_plan_requests"
+    ).fetchone()[0] == 0
+
+
 def test_exact_accepted_review_applies_self_plan_after_execution_ends(db):
     execution, review, run_id, _ = _active_self_planner(db)
     request = wf.request_plan(db, **_deferred_spec(execution))
@@ -802,6 +981,182 @@ def test_exact_accepted_review_applies_self_plan_after_execution_ends(db):
     assert wf.apply_reviewed_plan_request(
         db, review_task_id=review, review_run_id=review_run_id,
     ) is None
+
+
+@pytest.mark.parametrize("thread_id", ["4641", "2"])
+@pytest.mark.parametrize("corruption", [None, "lease", "route", "spec", "result", "source", "event", "superseded", "effect", "still_origin", "other_review_run", "result_shell", "result_route", "result_spine", "result_cursor", "later_terminal", "result_terminal"])
+def test_applied_planner_attention_does_not_hold_migration_authority(db, thread_id, corruption):
+    from proactive.behavior_profiles import registry as br
+
+    db.execute("UPDATE grace_objectives SET thread_id=? WHERE objective_id='go_test'", (thread_id,))
+    execution, review, run_id, delegation = _active_self_planner(db)
+    specification = _deferred_spec(execution)
+    specification["thread_id"] = thread_id
+    request = wf.request_plan(db, **specification)
+    db.execute("UPDATE task_runs SET status='done',ended_at=2,outcome='completed' WHERE id=?", (run_id,))
+    db.execute("UPDATE tasks SET status='done' WHERE id=?", (execution,))
+    metadata = _plan_review_receipt(db, execution, run_id, request)
+    review_run = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',3,4,'completed',?)", (review, json.dumps(metadata)),
+    ).lastrowid
+    db.execute("UPDATE tasks SET status='done' WHERE id=?", (review,))
+    wf.apply_reviewed_plan_request(db, review_task_id=review, review_run_id=review_run)
+    # A later authorized continuation has advanced the cursor, as in the live
+    # incident. Application alone keeps origin ownership until that handoff.
+    db.execute("UPDATE grace_objectives SET current_stage_key='preflight',status='blocked' WHERE objective_id='go_test'")
+    event = db.execute(
+        "INSERT INTO task_events(task_id,kind,run_id,created_at) VALUES (?,'completed',?,5)",
+        (review, review_run),
+    ).lastrowid
+    fingerprint = db.execute("SELECT contract_fingerprint FROM grace_delegations WHERE delegation_id=?", (delegation,)).fetchone()[0]
+    kb.add_grace_loop_callback(
+        db, review_task_id=review, execution_task_id=execution, platform="telegram", chat_id="chat",
+        thread_id=thread_id, contract_fingerprint=fingerprint, objective_id="go_test", stage_key="prepare",
+    )
+    db.execute("UPDATE grace_loop_callbacks SET state='attention',attempt_event_id=? WHERE review_task_id=?", (event, review))
+    if corruption == "lease":
+        db.execute("UPDATE grace_loop_callbacks SET lease_owner='other' WHERE review_task_id=?", (review,))
+    elif corruption == "route":
+        db.execute("UPDATE grace_loop_callbacks SET thread_id='wrong' WHERE review_task_id=?", (review,))
+    elif corruption == "spec":
+        db.execute("UPDATE grace_objective_plan_requests SET specification='{}' WHERE request_id=?", (request["request_id"],))
+    elif corruption == "result":
+        db.execute("UPDATE grace_objective_plan_requests SET result='{}' WHERE request_id=?", (request["request_id"],))
+    elif corruption == "source":
+        metadata["workflow_review_source"]["parent_execution_evidence_sha256"] = "0" * 64
+        db.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), review_run))
+    elif corruption == "event":
+        db.execute("UPDATE task_events SET kind='blocked' WHERE id=?", (event,))
+    elif corruption == "superseded":
+        metadata["review_outcome"] = "rejected"
+        db.execute(
+            "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+            "VALUES (?,'default','done',6,7,'completed',?)", (review, json.dumps(metadata)),
+        )
+    elif corruption == "effect":
+        db.execute("INSERT INTO task_external_effects(task_id,platform,effect_key,state,details,created_at,updated_at) VALUES (?,'facebook','page:1','verified','{}',1,1)", (execution,))
+    elif corruption == "still_origin":
+        db.execute("UPDATE grace_objectives SET current_stage_key='prepare' WHERE objective_id='go_test'")
+    elif corruption == "other_review_run":
+        other = kb.create_task(db, title="unrelated review", body="unrelated")
+        db.execute("UPDATE task_runs SET task_id=? WHERE id=?", (other, review_run))
+    elif corruption == "later_terminal":
+        # Model the readback after a later authorized terminal retry plan.
+        db.execute("UPDATE grace_objectives SET terminal_stage_key='terminal_r3',revision=3 WHERE objective_id='go_test'")
+    elif corruption in {"result_shell", "result_route", "result_spine", "result_cursor", "result_terminal"}:
+        applied = json.loads(db.execute("SELECT result FROM grace_objective_plan_requests WHERE request_id=?", (request["request_id"],)).fetchone()[0])
+        if corruption == "result_shell":
+            applied = {"objective": {"objective_id": "go_test", "revision": 2}}
+        elif corruption == "result_route":
+            applied["objective"]["thread_id"] = "wrong"
+        elif corruption == "result_terminal":
+            applied["objective"]["terminal_stage_key"] = "other"
+        elif corruption == "result_cursor":
+            applied["objective"]["current_stage_key"] = "preflight"
+        else:
+            applied["stages"] = []
+        db.execute("UPDATE grace_objective_plan_requests SET result=? WHERE request_id=?", (json.dumps(applied), request["request_id"]))
+    objective = kb.get_grace_objective(db, "go_test")
+    callback = kb.get_grace_loop_callback(db, review)
+    before = db.total_changes
+    assert br._applied_plan_callback_is_idle(db, objective=objective, callback=callback) is (corruption in {None, "later_terminal"})
+    assert db.total_changes == before
+    assert kb.get_grace_objective(db, "go_test") == objective
+    assert kb.get_grace_loop_callback(db, review) == callback
+
+
+def test_later_exact_rejection_supersedes_reviewed_self_plan(db):
+    execution, review, run_id, _ = _active_self_planner(db)
+    request = wf.request_plan(db, **_deferred_spec(execution))
+    db.execute(
+        "UPDATE task_runs SET status='done',ended_at=2,outcome='completed' WHERE id=?",
+        (run_id,),
+    )
+    accepted = _plan_review_receipt(db, execution, run_id, request)
+    accepted_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',3,4,'completed',?)",
+        (review, json.dumps(accepted)),
+    ).lastrowid
+    rejected = _plan_review_receipt(db, execution, run_id, request)
+    rejected["review_outcome"] = "rejected"
+    db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',5,6,'completed',?)",
+        (review, json.dumps(rejected)),
+    )
+
+    with pytest.raises(ValueError, match="superseded by a later exact verdict"):
+        wf.apply_reviewed_plan_request(
+            db,
+            review_task_id=review,
+            review_run_id=accepted_run_id,
+        )
+
+    assert kb.get_grace_objective(db, "go_test")["revision"] == 1
+    assert db.execute(
+        "SELECT state FROM grace_objective_plan_requests WHERE request_id=?",
+        (request["request_id"],),
+    ).fetchone()[0] == "pending"
+
+
+def test_reviewed_plan_cannot_replace_controller_pinned_execution_run(db):
+    execution, review, run_id, _ = _active_self_planner(db)
+    request = wf.request_plan(db, **_deferred_spec(execution))
+    db.execute(
+        "UPDATE task_runs SET status='done',ended_at=2,outcome='completed' WHERE id=?",
+        (run_id,),
+    )
+    newer_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',3,4,'completed','{}')",
+        (execution,),
+    ).lastrowid
+    evidence = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": run_id,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, run_id)
+        ),
+        "objective_plan_request_id": request["request_id"],
+        "objective_plan_specification_sha256": hashlib.sha256(
+            request["specification"].encode()
+        ).hexdigest(),
+    }
+    review_source = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": newer_run_id,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, newer_run_id)
+        ),
+    }
+    review_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',5,6,'completed',?)",
+        (
+            review,
+            json.dumps(
+                {
+                    "review_outcome": "accepted",
+                    "evidence": evidence,
+                    "workflow_review_source": review_source,
+                }
+            ),
+        ),
+    ).lastrowid
+
+    with pytest.raises(ValueError, match="controller-pinned"):
+        wf.apply_reviewed_plan_request(
+            db,
+            review_task_id=review,
+            review_run_id=review_run_id,
+        )
+    assert kb.get_grace_objective(db, "go_test")["revision"] == 1
+    assert db.execute(
+        "SELECT state FROM grace_objective_plan_requests WHERE request_id=?",
+        (request["request_id"],),
+    ).fetchone()[0] == "pending"
 
 
 def test_reviewed_self_plan_can_resume_before_its_completed_origin(db):
@@ -1032,9 +1387,10 @@ def test_rejected_or_wrong_run_review_cannot_apply_self_plan(db):
         "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
         "VALUES (?,'default','done',3,4,'completed',?)", (review, json.dumps(metadata)),
     ).lastrowid
-    assert wf.apply_reviewed_plan_request(
-        db, review_task_id=review, review_run_id=review_run_id,
-    ) is None
+    with pytest.raises(ValueError, match="controller-pinned"):
+        wf.apply_reviewed_plan_request(
+            db, review_task_id=review, review_run_id=review_run_id,
+        )
     assert kb.get_grace_objective(db, "go_test")["revision"] == 1
     assert db.execute("SELECT state FROM grace_objective_plan_requests").fetchone()[0] == "pending"
 
@@ -1092,8 +1448,18 @@ def test_effect_approval_remains_bound_to_originating_run_across_retries(db):
     assert wf._accepted_execution_runs(db, "go_test", execution) == {first_run}
     retry = db.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome) VALUES (?,'default','done',5,6,'completed')", (execution,)).lastrowid
     assert wf._accepted_execution_runs(db, "go_test", execution) == {first_run}
-    metadata = {"review_outcome": "accepted", "evidence": {"parent_execution_task_id": execution, "parent_execution_run_id": retry,
-        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(kb.get_run(db, retry))}}
+    review_source = {
+        "parent_execution_task_id": execution,
+        "parent_execution_run_id": retry,
+        "parent_execution_evidence_sha256": kb.workflow_review_evidence_hash(
+            kb.get_run(db, retry)
+        ),
+    }
+    metadata = {
+        "review_outcome": "accepted",
+        "evidence": review_source,
+        "workflow_review_source": review_source,
+    }
     db.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) VALUES (?,'default','done',7,8,'completed',?)", (review, json.dumps(metadata)))
     assert wf._accepted_execution_runs(db, "go_test", execution) == {first_run, retry}
     db.execute(
@@ -1161,6 +1527,29 @@ def test_hashless_review_cannot_authorize_preflight_or_progress(db):
         preflight_source={"execution_task_id": execution, "review_task_id": review})
     with pytest.raises(ValueError, match="unpinned"):
         wf.resolve_preflight(db, contract)
+
+
+def test_worker_review_evidence_cannot_override_controller_pinned_run(db):
+    _plan(db)
+    execution, review, _, review_run_id = _pair(db, objective_id="go_test")
+    forged_run_id = db.execute(
+        "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,metadata) "
+        "VALUES (?,'default','done',203,204,'completed','{}')",
+        (execution,),
+    ).lastrowid
+    review_metadata = kb.get_run(db, review_run_id).metadata
+    review_metadata["evidence"].update(
+        parent_execution_run_id=forged_run_id,
+        parent_execution_evidence_sha256=kb.workflow_review_evidence_hash(
+            kb.get_run(db, forged_run_id)
+        ),
+    )
+    db.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (json.dumps(review_metadata), review_run_id),
+    )
+
+    assert wf._accepted_execution_runs(db, "go_test", execution) == set()
 
 
 def test_unclaimed_review_metadata_cannot_grant_preflight_authority(db):
@@ -1454,6 +1843,21 @@ def test_content_report_and_gateway_rebuild_do_not_claim_objective_success(db, m
     rebuilt = kb.grace_inline_content_package_report(db, execution)
     assert rebuilt["complete"] is False
     assert rebuilt["body"] == report["body"]
+    assert wf.progress(db, "go_test")["complete"] is False
+
+
+def test_intermediate_full_publication_package_is_complete_without_closing_objective(db):
+    _plan(db)
+    execution, _, _, _ = _pair(db, objective_id="go_test")
+    report = {
+        "kind": "content_package",
+        "package_kind": "full_publication_package",
+        "complete": True,
+    }
+
+    canonical = kb.canonical_objective_report(db, execution, report)
+
+    assert canonical["complete"] is True
     assert wf.progress(db, "go_test")["complete"] is False
 
 
@@ -1787,3 +2191,82 @@ def test_recovery_excludes_only_its_own_reserved_delegation(db):
     assert not wf.has_in_flight_delegation(db, 'go_test', excluding_delegation_id='gd_'+first)
     db.execute("UPDATE tasks SET status='running' WHERE id=?", (second,))
     assert wf.has_in_flight_delegation(db, 'go_test', excluding_delegation_id='gd_'+first)
+
+
+def _accepted_zero_terminal(db):
+    execution, review, run_id, review_id = _pair(db, objective_id="go_test")
+    contract = {"external_effect_budget": 0, "external_targets": [], "routing": {"task_type": "devops"},
+                "identity": {"platform": "telegram", "chat_id": "chat", "thread_id": "2"},
+                "objective_ref": {"objective_id": "go_test", "stage_key": "terminal"}}
+    db.execute("UPDATE grace_delegations SET contract_snapshot=?,contract_fingerprint=?,stage_key='terminal' WHERE execution_task_id=?",
+               (json.dumps(contract), contract_fingerprint(contract), execution))
+    db.execute("UPDATE grace_objective_stages SET status='waiting_approval',delegation_id=?,execution_task_id=?,review_task_id=? WHERE stage_key='terminal'",
+               ("gd_" + execution, execution, review))
+    kb.add_grace_loop_callback(db, review_task_id=review, execution_task_id=execution,
+        platform="telegram", chat_id="chat", thread_id="2", user_id="user",
+        session_key="session", session_id="session", message_id="message",
+        contract_fingerprint=contract_fingerprint(contract), completion_mode="terminal",
+        objective_id="go_test", stage_key="terminal")
+    db.execute("UPDATE grace_loop_callbacks SET state='attention' WHERE review_task_id=?", (review,))
+    db.execute("INSERT INTO grace_objective_plan_requests(request_id,objective_id,delegation_id,execution_task_id,execution_run_id,expected_revision,specification,state,created_at,applied_at) VALUES ('plan','go_test',?,?,?,1,'{}','applied',1,2)", ("gd_" + execution, execution, run_id))
+    metadata = dict(kb.get_run(db, review_id).metadata)
+    for key in ("evidence", "workflow_review_source"):
+        metadata[key].update(objective_plan_request_id="plan", objective_plan_specification_sha256=hashlib.sha256(b"{}").hexdigest())
+    db.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), review_id))
+    return execution, review
+
+
+@pytest.mark.parametrize("implementation", ["canonical", "frozen"])
+def test_terminal_retry_plan_defers_supersession_until_formal_binding(db, monkeypatch, implementation):
+    if implementation == "frozen":
+        from proactive.behavior_profiles.v59 import workflow as frozen
+        monkeypatch.setattr(wf, "plan", frozen.plan)
+    execution, review = _accepted_zero_terminal(db)
+    result = _plan(db, required_stage_keys=["prepare", "terminal", "verify", "terminal_r2"], current_stage_key="verify")
+    assert result["objective"]["terminal_stage_key"] == "terminal_r2"
+    old = db.execute("SELECT * FROM grace_objective_stages WHERE stage_key='terminal'").fetchone()
+    assert old["status"] == "waiting_approval" and old["execution_task_id"] == execution
+    assert db.execute("SELECT state FROM grace_loop_callbacks WHERE review_task_id=?", (review,)).fetchone()[0] == "attention"
+    kb._bind_grace_objective_stage(db, objective_id="go_test", stage_key="terminal_r2", delegation_id="new")
+    old = db.execute("SELECT * FROM grace_objective_stages WHERE stage_key='terminal'").fetchone()
+    assert old["outcome_kind"] == "superseded_by_retry" and old["execution_task_id"] == execution
+    assert db.execute("SELECT state FROM grace_loop_callbacks WHERE review_task_id=?", (review,)).fetchone()[0] == "cancelled"
+    assert kb.get_task(db, execution).status == kb.get_task(db, review).status == "done"
+
+
+@pytest.mark.parametrize("unsafe", ["wrong_key", "budget", "targets", "unsealed", "rejected", "active", "leased", "topic", "revision", "criteria", "effects", "missing_callback", "callback_topic", "callback_stage", "callback_fingerprint", "cancelled_callback", "no_plan", "unapplied_plan", "wrong_plan", "wrong_type", "omit_history"])
+def test_terminal_retry_plan_rejects_unsafe_source_atomically(db, unsafe):
+    execution, review = _accepted_zero_terminal(db)
+    changes = dict(required_stage_keys=["prepare", "terminal", "verify", "terminal_r2"], current_stage_key="verify")
+    if unsafe == "wrong_key": changes["required_stage_keys"][-1] = "other_terminal"
+    if unsafe in {"budget", "targets", "unsealed", "wrong_type"}:
+        row = db.execute("SELECT contract_snapshot FROM grace_delegations WHERE execution_task_id=?", (execution,)).fetchone()
+        contract = json.loads(row[0])
+        if unsafe == "budget": contract["external_effect_budget"] = 1
+        if unsafe == "targets": contract["external_targets"] = [{"url": "https://example.com/"}]
+        if unsafe == "wrong_type": contract["routing"]["task_type"] = "browser_readonly"
+        fingerprint = "wrong" if unsafe == "unsealed" else contract_fingerprint(contract)
+        db.execute("UPDATE grace_delegations SET contract_snapshot=?,contract_fingerprint=? WHERE execution_task_id=?", (json.dumps(contract), fingerprint, execution))
+    if unsafe == "rejected":
+        run = kb.latest_run(db, review); metadata = dict(run.metadata); metadata["review_outcome"] = "rejected"
+        db.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), run.id))
+    if unsafe == "active": db.execute("UPDATE task_runs SET ended_at=NULL WHERE task_id=?", (execution,))
+    if unsafe == "leased": db.execute("UPDATE grace_loop_callbacks SET lease_owner='owner' WHERE review_task_id=?", (review,))
+    if unsafe == "topic": changes["thread_id"] = "other"
+    if unsafe == "revision": changes["expected_revision"] = 2
+    if unsafe == "criteria": changes["acceptance_criteria"] = []
+    if unsafe == "effects":
+        db.execute("INSERT INTO task_external_effects(task_id,platform,effect_key,state,run_id,created_at,updated_at) VALUES (?,'facebook','create','unknown',?,1,1)", (execution, kb.latest_run(db, execution).id))
+    if unsafe == "missing_callback": db.execute("DELETE FROM grace_loop_callbacks WHERE review_task_id=?", (review,))
+    if unsafe == "callback_topic": db.execute("UPDATE grace_loop_callbacks SET thread_id='other' WHERE review_task_id=?", (review,))
+    if unsafe == "callback_stage": db.execute("UPDATE grace_loop_callbacks SET stage_key='other' WHERE review_task_id=?", (review,))
+    if unsafe == "callback_fingerprint": db.execute("UPDATE grace_loop_callbacks SET contract_fingerprint='wrong' WHERE review_task_id=?", (review,))
+    if unsafe == "cancelled_callback": db.execute("UPDATE grace_loop_callbacks SET state='cancelled' WHERE review_task_id=?", (review,))
+    if unsafe == "no_plan": db.execute("DELETE FROM grace_objective_plan_requests")
+    if unsafe == "unapplied_plan": db.execute("UPDATE grace_objective_plan_requests SET state='pending'")
+    if unsafe == "wrong_plan": db.execute("UPDATE grace_objective_plan_requests SET specification='changed'")
+    if unsafe == "omit_history": changes["required_stage_keys"] = ["prepare", "verify", "terminal_r2"]
+    before = dict(kb.get_grace_objective(db, "go_test"))
+    with pytest.raises(ValueError): _plan(db, **changes)
+    assert kb.get_grace_objective(db, "go_test") == before
+    assert not db.execute("SELECT 1 FROM grace_objective_stages WHERE stage_key='terminal_r2'").fetchone()

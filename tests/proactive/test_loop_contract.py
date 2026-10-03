@@ -29,6 +29,7 @@ def _contract():
         "grace_interpretation": "完成已定義的 Lighthouse 下一步，不跨到其他專案",
         "trigger": "KJ 明確要求執行",
         "completion_mode": "terminal",
+        "external_effect_budget": 0,
         "goal": {"objective": "完成 Lighthouse 文件核對", "deliverables": ["核對報告"], "non_goals": ["不發布"]},
         "scope": {"allowed": ["Project Lighthouse 文件"], "forbidden": ["二手拍賣"]},
         "verification": {"checks": ["逐檔核對"], "evidence_required": ["檔案路徑"], "acceptance_criteria": ["無跨專案內容"]},
@@ -39,6 +40,50 @@ def _contract():
 
 def test_complete_loop_contract_is_accepted():
     assert validate_loop_contract(_contract())["contract_version"] == "1.0"
+
+
+def test_missing_external_effect_budget_is_rejected():
+    contract = _contract()
+    contract.pop("external_effect_budget")
+    with pytest.raises(LoopContractError, match="external_effect_budget is required"):
+        validate_loop_contract(contract, effect_budget_mode="new")
+    assert validate_loop_contract(contract)["contract_version"] == "1.0"
+
+
+def test_legacy_budget_shape_remains_readable_but_cannot_admit_new_work():
+    contract = _contract()
+    contract["external_effect_budget"] = {"max_effects": 0}
+    assert validate_loop_contract(contract)["external_effect_budget"] == {"max_effects": 0}
+    with pytest.raises(LoopContractError, match="non-negative integer"):
+        validate_loop_contract(contract, effect_budget_mode="new")
+
+
+def test_readonly_admission_requires_exact_zero_budget():
+    contract = _contract()
+    contract["external_effect_budget"] = 1
+    with pytest.raises(LoopContractError, match="requires external_effect_budget=0"):
+        validate_loop_contract(contract, effect_budget_mode="zero")
+
+
+def test_effectful_contract_cannot_claim_zero_budget():
+    contract = _contract()
+    contract["routing"] = {"task_type": "browser_publish"}
+    with pytest.raises(LoopContractError, match="greater than 0"):
+        validate_loop_contract(contract, effect_budget_mode="new")
+
+
+def test_review_body_routes_rejection_to_blocked_verdict():
+    review = render_review_body(_contract(), "t_execution")
+    assert "review_outcome=rejected" in review
+    assert "blocked run records the verdict without acceptance" in review
+
+
+@pytest.mark.parametrize("budget", [True, -1, "0"])
+def test_invalid_external_effect_budget_is_rejected(budget):
+    contract = _contract()
+    contract["external_effect_budget"] = budget
+    with pytest.raises(LoopContractError, match="external_effect_budget"):
+        validate_loop_contract(contract)
 
 
 def test_contract_can_explicitly_disable_durable_memory_promotion():
@@ -141,16 +186,58 @@ def test_live_marketplace_query_gets_canonical_inline_delivery(routing):
     contract["identity"]["project"] = "secondhand_commerce"
     contract["identity"]["topic_name"] = "二手拍賣"
     contract["routing"] = routing
+    contract["external_targets"] = ["36803832485927906"]
 
     accepted = validate_loop_contract(contract)
 
     assert accepted["domain_memory"]["mode"] == "query"
     assert accepted["user_facing_delivery"] == {
         "required": True,
+        "kind": "commerce_group_status",
+        "delivery": "inline_only",
+        "subject_keys": [
+            "facebook_marketplace_listing:36803832485927906"
+        ],
+    }
+    execution = render_execution_body(accepted)
+    review = render_review_body(accepted, "t_execution")
+    assert "kind=commerce_group_status" in execution
+    assert "For the required commerce_group_status delivery" in review
+    assert "kind=content_package" not in execution
+
+
+def test_live_marketplace_query_requires_exact_numeric_subjects():
+    contract = _contract()
+    contract["identity"]["project"] = "secondhand_commerce"
+    contract["identity"]["topic_name"] = "二手拍賣"
+    contract["routing"] = {"task_type": "facebook_marketplace_readonly"}
+    contract["external_targets"] = ["coffee maker listing"]
+
+    with pytest.raises(
+        LoopContractError,
+        match="secondhand live query requires distinct numeric external_targets",
+    ):
+        validate_loop_contract(contract)
+
+
+def test_live_marketplace_query_rejects_prepopulated_content_package():
+    contract = _contract()
+    contract["identity"]["project"] = "secondhand_commerce"
+    contract["identity"]["topic_name"] = "二手拍賣"
+    contract["routing"] = {"task_type": "facebook_marketplace_readonly"}
+    contract["external_targets"] = ["36803832485927906"]
+    contract["user_facing_delivery"] = {
+        "required": True,
         "kind": "content_package",
         "delivery": "inline_only",
         "body_field": "domain_inventory_report",
     }
+
+    with pytest.raises(
+        LoopContractError,
+        match="user_facing_delivery must match canonical listing subject keys",
+    ):
+        validate_loop_contract(contract)
 
 
 def test_domain_inventory_query_never_exposes_page_source_to_worker():
@@ -192,6 +279,42 @@ def test_facebook_group_publish_requires_canonical_url_per_group():
     accepted = validate_loop_contract(contract)
 
     assert facebook_group_publish_destination_ids(accepted) == {"897927458651235"}
+
+
+def test_facebook_group_publish_accepts_only_preflight_pinned_chooser_destinations():
+    contract = _contract()
+    contract["external_targets"] = ["group:897927458651235"]
+    contract["facebook_group_publish"] = {
+        "mode": "listing_bound_chooser",
+        "source_listing_id": "37276725125275496",
+        "destinations": [{
+            "group_id": "897927458651235",
+            "canonical_name": "二手家具 家電 買賣",
+            "canonical_url": "https://www.facebook.com/groups/897927458651235",
+        }],
+        "preflight_evidence": {
+            "execution_task_id": "t_1234abcd",
+            "execution_run_id": 11,
+            "review_task_id": "t_5678abcd",
+            "review_run_id": 12,
+            "list_in_more_places_available": True,
+            "side_effects_performed": False,
+            "eligible_destination_ids": ["897927458651235"],
+            "destination_identity": [{
+                "group_id": "897927458651235",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }],
+        },
+    }
+
+    accepted = validate_loop_contract(contract)
+    assert accepted["facebook_group_publish"]["mode"] == "listing_bound_chooser"
+
+    contract["facebook_group_publish"]["preflight_evidence"][
+        "eligible_destination_ids"
+    ] = []
+    with pytest.raises(LoopContractError, match="not selectable in the accepted preflight"):
+        validate_loop_contract(contract)
 
 
 def test_facebook_group_publish_rejects_chooser_only_or_mismatched_identity():
@@ -322,6 +445,8 @@ def test_review_body_explains_canonical_verdict_for_fail_closed_parent():
     assert "Do not set approved=false" in review
     assert "review_outcome=blocked" in review
     assert "parent_verdict" in review
+    assert "parent_execution_task_id=t_execution" in review
+    assert "parent_execution_run_id" in review
 
 
 def test_facebook_group_publish_body_forbids_chooser_identity():
@@ -345,6 +470,38 @@ def test_facebook_group_publish_body_forbids_chooser_identity():
     assert "canonical_url_per_group" in execution
     assert "Do not use Marketplace 'List in more places' chooser rows" in execution
     assert "canonical_url_per_group" in review
+
+
+def test_facebook_group_publish_body_uses_only_preflight_selected_chooser_route():
+    contract = _contract()
+    contract["external_targets"] = ["group:897927458651235"]
+    contract["facebook_group_publish"] = {
+        "mode": "listing_bound_chooser",
+        "source_listing_id": "37276725125275496",
+        "destinations": [{
+            "group_id": "897927458651235",
+            "canonical_name": "二手家具 家電 買賣",
+            "canonical_url": "https://www.facebook.com/groups/897927458651235",
+        }],
+        "preflight_evidence": {
+            "execution_task_id": "t_1234abcd",
+            "execution_run_id": 11,
+            "review_task_id": "t_5678abcd",
+            "review_run_id": 12,
+            "list_in_more_places_available": True,
+            "side_effects_performed": False,
+            "eligible_destination_ids": ["897927458651235"],
+            "destination_identity": [{
+                "group_id": "897927458651235",
+                "canonical_url": "https://www.facebook.com/groups/897927458651235",
+            }],
+        },
+    }
+
+    execution = render_execution_body(validate_loop_contract(contract))
+    assert "accepted read-only preflight selected" in execution
+    assert "not a relaxation of any general Facebook safety restriction" in execution
+    assert "Do not use Share to Group" in execution
 
 
 def test_text_only_review_body_does_not_require_page_hero_visual_review():
@@ -566,3 +723,54 @@ def test_grace_bodies_require_durable_external_effect_handoff():
     assert "metadata.external_effects" in execution
     assert "all cumulative evidence" in review
     assert "external-effect ledger" in review
+
+
+@pytest.mark.parametrize("route,version,valid", [
+    ("facebook_marketplace_readonly", "facebook_group_preflight/v1", True),
+    ("browser_publish", "facebook_group_preflight/v1", False),
+    ("facebook_marketplace_readonly", "facebook_group_preflight/v99", False),
+])
+def test_declared_preflight_schema_is_validated_before_dispatch(route, version, valid):
+    contract = _contract()
+    contract["routing"] = {"task_type": route}
+    if route == "browser_publish":
+        contract["external_effect_budget"] = 1
+    contract["evidence_contract"] = version
+    if valid:
+        assert validate_loop_contract(contract)["evidence_contract"] == version
+    else:
+        with pytest.raises(LoopContractError, match="Unsupported evidence_contract"):
+            validate_loop_contract(contract)
+
+
+def test_legacy_preflight_schema_requires_structured_deliverables():
+    from hermes_cli.facebook_group_preflight import requested
+
+    contract = {
+        "routing": {"task_type": "facebook_marketplace_readonly"},
+        "goal": {
+            "objective": (
+                "Explain why sourceListing and coverageReconciliation are not requested"
+            ),
+            "deliverables": ["Generic read-only report"],
+        },
+    }
+
+    assert requested(contract) is False
+    contract["goal"]["deliverables"] = [
+        "sourceListing and coverageReconciliation evidence"
+    ]
+    assert requested(contract) is True
+    contract["goal"]["deliverables"] = [
+        "Do not return sourceListing and coverageReconciliation evidence"
+    ]
+    assert requested(contract) is False
+
+
+@pytest.mark.parametrize("routing", [None, [], True, "facebook_marketplace_readonly"])
+def test_declared_preflight_rejects_non_object_routing(routing):
+    contract = _contract()
+    contract["routing"] = routing
+    contract["evidence_contract"] = "facebook_group_preflight/v1"
+    with pytest.raises(LoopContractError, match="Unsupported evidence_contract"):
+        validate_loop_contract(contract)

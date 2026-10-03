@@ -38,7 +38,7 @@ _HERMES_CORE_TOOLS = [
     # hidden outside the GUI).
     "read_terminal", "close_terminal",
     # File manipulation
-    "read_file", "write_file", "patch", "search_files",
+    "read_file", "file_sha256", "write_file", "patch", "search_files",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -78,7 +78,8 @@ _HERMES_CORE_TOOLS = [
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
-    "kanban_show", "kanban_list",
+    "kanban_show", "kanban_list", "kanban_domain_inventory",
+    "kanban_domain_episode_reserve",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
@@ -226,7 +227,7 @@ TOOLSETS = {
 
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        "tools": ["read_file", "file_sha256", "write_file", "patch", "search_files"],
         "includes": []
     },
     
@@ -310,7 +311,8 @@ TOOLSETS = {
             "orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
-            "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_show", "kanban_list", "kanban_domain_inventory",
+            "kanban_domain_episode_reserve", "kanban_complete", "kanban_block",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
@@ -390,7 +392,7 @@ TOOLSETS = {
         "tools": [
             "web_search", "web_extract",
             "terminal", "process", "read_terminal", "close_terminal",
-            "read_file", "write_file", "patch", "search_files",
+            "read_file", "file_sha256", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
@@ -422,7 +424,7 @@ TOOLSETS = {
         "tools": [
             "web_search", "web_extract",
             "terminal", "process",
-            "read_file", "write_file", "patch", "search_files",
+            "read_file", "file_sha256", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
@@ -444,7 +446,7 @@ TOOLSETS = {
             # Terminal + process management
             "terminal", "process",
             # File manipulation
-            "read_file", "write_file", "patch", "search_files",
+            "read_file", "file_sha256", "write_file", "patch", "search_files",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # Skills
